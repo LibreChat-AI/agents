@@ -19,6 +19,10 @@ import type {
   ToolHistoryCallMirrors,
 } from './toolHistoryProjection';
 import type {
+  AnthropicReasoningReplay,
+  AnthropicReasoningReplayBlock,
+  BedrockReasoningReplay,
+  BedrockReasoningReplayBlock,
   BedrockReasoningContentText,
   ExtendedMessageContent,
   GoogleReasoningContentText,
@@ -397,6 +401,7 @@ interface FormatAssistantMessageOptions {
   intentToolNames?: ReadonlySet<string>;
   preserveUnpairedServerToolUses?: boolean;
   preserveReasoningContent?: boolean;
+  model?: string;
   provider?: ProviderName;
   retainedSourceContentEnd?: number;
   sourceMessageId?: string;
@@ -408,6 +413,7 @@ interface FormatAssistantMessageOptions {
 type SourceContentPartIndices = number | readonly number[];
 
 export interface FormatAgentMessagesOptions {
+  model?: string;
   provider?: ProviderName;
   /** Emit flattenable text content as the joined string the legacy-content
    *  projection would produce, so the per-request `formatContentStrings` pass
@@ -467,6 +473,136 @@ function extractReasoningContent(
     return typeof reasoningText.text === 'string' ? reasoningText.text : '';
   }
   return '';
+}
+
+function extractBedrockReasoningReplay(
+  part: MessageContentComplex | undefined | null
+): BedrockReasoningReplay | undefined {
+  if (part?.type !== ContentTypes.THINK) {
+    return undefined;
+  }
+  const replay = (part as ReasoningContentText).provider_replay?.bedrock;
+  if (
+    replay == null ||
+    typeof replay.model !== 'string' ||
+    replay.model === '' ||
+    !Array.isArray(replay.blocks)
+  ) {
+    return undefined;
+  }
+  const blocks = replay.blocks.flatMap(
+    (block): BedrockReasoningReplayBlock[] => {
+      const { reasoningText, redactedContent } = block;
+      if (
+        typeof reasoningText?.text === 'string' &&
+        reasoningText.text !== '' &&
+        typeof reasoningText.signature === 'string' &&
+        reasoningText.signature !== ''
+      ) {
+        return [
+          {
+            type: ContentTypes.REASONING_CONTENT,
+            reasoningText: {
+              text: reasoningText.text,
+              signature: reasoningText.signature,
+            },
+          },
+        ];
+      }
+      if (typeof redactedContent === 'string' && redactedContent !== '') {
+        return [
+          {
+            type: ContentTypes.REASONING_CONTENT,
+            redactedContent,
+          },
+        ];
+      }
+      return [];
+    }
+  );
+  return blocks.length > 0 ? { model: replay.model, blocks } : undefined;
+}
+
+function extractAnthropicReasoningReplay(
+  part: MessageContentComplex | undefined | null
+): AnthropicReasoningReplay | undefined {
+  if (part?.type !== ContentTypes.THINK) {
+    return undefined;
+  }
+  const replay = (part as ReasoningContentText).provider_replay?.anthropic;
+  if (
+    replay == null ||
+    typeof replay.model !== 'string' ||
+    replay.model === '' ||
+    !Array.isArray(replay.blocks)
+  ) {
+    return undefined;
+  }
+  const blocks = replay.blocks.flatMap(
+    (block): AnthropicReasoningReplayBlock[] => {
+      if (
+        block.type === ContentTypes.THINKING &&
+        typeof block.signature === 'string' &&
+        block.signature !== ''
+      ) {
+        return [
+          {
+            type: ContentTypes.THINKING,
+            thinking: block.thinking ?? '',
+            signature: block.signature,
+          },
+        ];
+      }
+      if (
+        block.type === 'redacted_thinking' &&
+        typeof block.data === 'string' &&
+        block.data !== ''
+      ) {
+        return [{ type: 'redacted_thinking', data: block.data }];
+      }
+      return [];
+    }
+  );
+  return blocks.length > 0 ? { model: replay.model, blocks } : undefined;
+}
+
+function shouldInvalidateReplayTokenCount(
+  message: Partial<TMessage>,
+  options?: FormatAssistantMessageOptions
+): boolean {
+  if (!Array.isArray(message.content)) {
+    return false;
+  }
+  let hasReplay = false;
+  let hasCompatibleReplay = false;
+  for (const part of message.content as Array<
+    MessageContentComplex | undefined | null
+  >) {
+    if (part?.type !== ContentTypes.THINK) {
+      continue;
+    }
+    const replay = (part as ReasoningContentText).provider_replay;
+    if (replay == null) {
+      continue;
+    }
+    if (replay.anthropic != null) {
+      hasReplay = true;
+      const anthropic = extractAnthropicReasoningReplay(part);
+      hasCompatibleReplay ||=
+        options?.provider === Providers.ANTHROPIC &&
+        options.model != null &&
+        anthropic?.model === options.model;
+    }
+    if (replay.bedrock != null) {
+      hasReplay = true;
+      const bedrock = extractBedrockReasoningReplay(part);
+      hasCompatibleReplay ||=
+        options?.provider === Providers.BEDROCK &&
+        options.model != null &&
+        bedrock?.model === options.model;
+    }
+  }
+  return hasReplay && !hasCompatibleReplay;
 }
 
 type ServerToolInput = Exclude<NonNullable<ToolCallPart['args']>, string>;
@@ -1634,6 +1770,8 @@ function formatAssistantMessage(
   let hasReasoning = false;
   let pendingReasoningContent = '';
   let pendingReasoningSourcePartIndices: number[] = [];
+  let pendingAnthropicReasoning: AnthropicReasoningReplay | undefined;
+  let pendingBedrockReasoning: BedrockReasoningReplay | undefined;
   const emittedServerToolUseIds = new Set<string>();
   const pendingServerToolUses = new Map<
     string,
@@ -1672,6 +1810,46 @@ function formatAssistantMessage(
     return { content, sourceContentPartIndices };
   };
 
+  const takePendingBedrockReasoning = (): BedrockReasoningReplayBlock[] => {
+    if (
+      options?.provider !== Providers.BEDROCK ||
+      options.model == null ||
+      pendingBedrockReasoning?.model !== options.model
+    ) {
+      pendingBedrockReasoning = undefined;
+      return [];
+    }
+    const blocks = pendingBedrockReasoning.blocks;
+    pendingBedrockReasoning = undefined;
+    return blocks;
+  };
+
+  const takePendingAnthropicReasoning = (): AnthropicReasoningReplayBlock[] => {
+    if (
+      options?.provider !== Providers.ANTHROPIC ||
+      options.model == null ||
+      pendingAnthropicReasoning?.model !== options.model
+    ) {
+      pendingAnthropicReasoning = undefined;
+      return [];
+    }
+    const blocks = pendingAnthropicReasoning.blocks;
+    pendingAnthropicReasoning = undefined;
+    return blocks;
+  };
+
+  const normalizeReplayContent = (
+    content: MessageContent
+  ): MessageContentComplex[] => {
+    if (typeof content !== 'string') {
+      return content as MessageContentComplex[];
+    }
+    if (content === '') {
+      return [];
+    }
+    return [{ type: ContentTypes.TEXT, text: content }];
+  };
+
   const createAIMessage = (
     content: MessageContent
   ): {
@@ -1679,9 +1857,19 @@ function formatAssistantMessage(
     reasoningSourceContentPartIndices: number[];
   } => {
     const reasoning = takePendingReasoningContent();
+    const anthropicReasoning = takePendingAnthropicReasoning();
+    const bedrockReasoning = takePendingBedrockReasoning();
+    let replayContent = content;
+    if (anthropicReasoning.length > 0 || bedrockReasoning.length > 0) {
+      replayContent = [
+        ...anthropicReasoning,
+        ...bedrockReasoning,
+        ...normalizeReplayContent(content),
+      ] as MessageContent;
+    }
     const message = withMessageRole(
       new AIMessage({
-        content,
+        content: replayContent,
         ...(reasoning.content != null && {
           additional_kwargs: { reasoning_content: reasoning.content },
         }),
@@ -1733,6 +1921,28 @@ function formatAssistantMessage(
       'model',
       reasoning.sourceContentPartIndices
     );
+  };
+
+  const attachPendingBedrockReasoning = (aiMessage: AIMessage): void => {
+    const bedrockReasoning = takePendingBedrockReasoning();
+    if (bedrockReasoning.length === 0) {
+      return;
+    }
+    aiMessage.content = [
+      ...normalizeReplayContent(aiMessage.content),
+      ...bedrockReasoning,
+    ] as MessageContent;
+  };
+
+  const attachPendingAnthropicReasoning = (aiMessage: AIMessage): void => {
+    const anthropicReasoning = takePendingAnthropicReasoning();
+    if (anthropicReasoning.length === 0) {
+      return;
+    }
+    aiMessage.content = [
+      ...normalizeReplayContent(aiMessage.content),
+      ...anthropicReasoning,
+    ] as MessageContent;
   };
 
   const flushPendingServerToolUse = (toolUseId: string): void => {
@@ -1981,6 +2191,8 @@ function formatAssistantMessage(
         } else {
           attachPendingReasoningContent(lastAIMessage);
           appendSourcePartIndices(lastAIMessage, 'model', sourcePartIndices);
+          attachPendingAnthropicReasoning(lastAIMessage);
+          attachPendingBedrockReasoning(lastAIMessage);
         }
 
         const tool_call: ToolCallPart = _tool_call;
@@ -2073,6 +2285,10 @@ function formatAssistantMessage(
           pendingReasoningSourcePartIndices,
           sourcePartIndices
         );
+        pendingAnthropicReasoning =
+          extractAnthropicReasoningReplay(part) ?? pendingAnthropicReasoning;
+        pendingBedrockReasoning =
+          extractBedrockReasoningReplay(part) ?? pendingBedrockReasoning;
         continue;
       } else if (part.type === ContentTypes.STEER) {
         /*
@@ -2142,6 +2358,8 @@ function formatAssistantMessage(
         hasReasoning = false;
         pendingReasoningContent = '';
         pendingReasoningSourcePartIndices = [];
+        pendingAnthropicReasoning = undefined;
+        pendingBedrockReasoning = undefined;
       } else if (
         part.type === ContentTypes.ERROR ||
         part.type === ContentTypes.AGENT_UPDATE ||
@@ -2943,6 +3161,7 @@ export const formatAgentMessages = (
   let boundaryTokenAdjustment: SummaryTokenAdjustment | undefined;
   // Keep track of the mapping from original payload indices to result indices
   const indexMapping: Record<number, number[] | undefined> = {};
+  const invalidatedReplayTokenCounts = new Set<number>();
   const { boundary: summaryBoundary } = scanSummaryBlocks(payload);
 
   // Summary metadata is returned to the caller so it can be forwarded to the
@@ -3167,7 +3386,7 @@ export const formatAgentMessages = (
       }
     }
 
-    const formattedMessages = formatAssistantMessage(processedMessage, {
+    const assistantFormatOptions: FormatAssistantMessageOptions = {
       compactionSemanticIndex: compactionSemanticIndexCollector,
       intentToolNames: options?.compactionSemanticIndex?.intentToolNames,
       preserveUnpairedServerToolUses: i === payload.length - 1,
@@ -3182,7 +3401,17 @@ export const formatAgentMessages = (
       sourceContentPartOffset,
       sourceContentPartIndices: processedSourceContentPartIndices,
       toolSourceContentPartIndices: processedToolSourceContentPartIndices,
-    });
+      model: options?.model,
+    };
+    if (
+      shouldInvalidateReplayTokenCount(processedMessage, assistantFormatOptions)
+    ) {
+      invalidatedReplayTokenCounts.add(i);
+    }
+    const formattedMessages = formatAssistantMessage(
+      processedMessage,
+      assistantFormatOptions
+    );
     /**
      * A steer that ends an assistant message leaves the replay on a
      * `HumanMessage`. The next payload message is itself a user turn, so the
@@ -3274,7 +3503,10 @@ export const formatAgentMessages = (
       const resultIndices = indexMapping[originalIndex] || [];
       let tokenCount = indexTokenCountMap[originalIndex];
 
-      if (tokenCount === undefined) {
+      if (
+        tokenCount === undefined ||
+        invalidatedReplayTokenCounts.has(originalIndex)
+      ) {
         continue;
       }
 

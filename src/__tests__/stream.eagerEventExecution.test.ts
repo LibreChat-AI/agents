@@ -2137,6 +2137,179 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
     expect(messageDeltas[0]?.delta).toEqual({ content: [toolCallPart] });
   });
 
+  it('captures raw Anthropic thinking text and signatures for replay', async () => {
+    const dispatchReasoningDelta = jest.fn<
+      StandardGraph['dispatchReasoningDelta']
+    >(async () => undefined);
+    const graph = createGraph({
+      dispatchReasoningDelta,
+      getAgentContext: jest.fn(
+        (): Partial<AgentContext> => ({
+          provider: Providers.ANTHROPIC,
+          clientOptions: { model: 'claude-sonnet-5' },
+          reasoningKey: 'reasoning',
+          currentTokenType: ContentTypes.THINK,
+          toolDefinitions: [],
+          graphTools: [],
+          agentId: 'agent_1',
+        })
+      ) as unknown as StandardGraph['getAgentContext'],
+    });
+    const handler = new ChatModelStreamHandler();
+    const metadata = { langgraph_node: 'agent' };
+
+    for (const content of [
+      [{ type: ContentTypes.THINKING, thinking: 'private thought' }],
+      [{ type: ContentTypes.THINKING, signature: 'signed-thinking' }],
+      [{ type: 'redacted_thinking', data: 'encrypted-redaction' }],
+    ] satisfies t.MessageContentComplex[][]) {
+      await handler.handle(
+        GraphEvents.CHAT_MODEL_STREAM,
+        {
+          chunk: { content } as unknown as t.StreamChunk,
+        },
+        metadata,
+        graph
+      );
+    }
+
+    expect(dispatchReasoningDelta).toHaveBeenNthCalledWith(
+      1,
+      expect.stringMatching(/^step_/),
+      {
+        content: [
+          {
+            type: ContentTypes.THINK,
+            think: 'private thought',
+            provider_replay: {
+              anthropic: {
+                model: 'claude-sonnet-5',
+                blocks: [
+                  {
+                    type: ContentTypes.THINKING,
+                    thinking: 'private thought',
+                  },
+                ],
+              },
+            },
+          },
+        ],
+      },
+      metadata
+    );
+    expect(dispatchReasoningDelta).toHaveBeenNthCalledWith(
+      2,
+      expect.stringMatching(/^step_/),
+      {
+        content: [
+          {
+            type: ContentTypes.THINK,
+            think: '',
+            provider_replay: {
+              anthropic: {
+                model: 'claude-sonnet-5',
+                blocks: [
+                  {
+                    type: ContentTypes.THINKING,
+                    signature: 'signed-thinking',
+                  },
+                ],
+              },
+            },
+          },
+        ],
+      },
+      metadata
+    );
+    expect(dispatchReasoningDelta).toHaveBeenNthCalledWith(
+      3,
+      expect.stringMatching(/^step_/),
+      {
+        content: [
+          {
+            type: ContentTypes.THINK,
+            think: '',
+            provider_replay: {
+              anthropic: {
+                model: 'claude-sonnet-5',
+                blocks: [
+                  {
+                    type: 'redacted_thinking',
+                    data: 'encrypted-redaction',
+                  },
+                ],
+              },
+            },
+          },
+        ],
+      },
+      metadata
+    );
+  });
+
+  it('captures signed Anthropic reasoning normalized by inherited stream events', async () => {
+    const dispatchReasoningDelta = jest.fn<
+      StandardGraph['dispatchReasoningDelta']
+    >(async () => undefined);
+    const graph = createGraph({
+      dispatchReasoningDelta,
+      getAgentContext: jest.fn(
+        (): Partial<AgentContext> => ({
+          provider: 'Raw Anthropic E2E' as Providers,
+          clientOptions: { model: 'claude-sonnet-5' },
+          reasoningKey: 'reasoning',
+          currentTokenType: ContentTypes.THINK,
+          toolDefinitions: [],
+          graphTools: [],
+          agentId: 'agent_1',
+        })
+      ) as unknown as StandardGraph['getAgentContext'],
+    });
+    const metadata = { langgraph_node: 'agent' };
+
+    await new ChatModelStreamHandler().handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: [
+            {
+              type: ContentTypes.REASONING,
+              reasoning: 'normalized thought',
+              signature: 'normalized-signature',
+            },
+          ],
+        } as unknown as t.StreamChunk,
+      },
+      metadata,
+      graph
+    );
+
+    expect(dispatchReasoningDelta).toHaveBeenCalledWith(
+      expect.stringMatching(/^step_/),
+      {
+        content: [
+          {
+            type: ContentTypes.THINK,
+            think: 'normalized thought',
+            provider_replay: {
+              anthropic: {
+                model: 'claude-sonnet-5',
+                blocks: [
+                  {
+                    type: ContentTypes.THINKING,
+                    thinking: 'normalized thought',
+                    signature: 'normalized-signature',
+                  },
+                ],
+              },
+            },
+          },
+        ],
+      },
+      metadata
+    );
+  });
+
   it('dispatches Gemini server-side tool context when reasoning is present', async () => {
     const dispatchMessageDelta = jest.fn<StandardGraph['dispatchMessageDelta']>(
       async () => undefined

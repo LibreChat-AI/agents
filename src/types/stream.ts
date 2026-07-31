@@ -410,7 +410,43 @@ export type MessageDeltaUpdate = {
   /** Provider-supplied source citations, accumulated across deltas. */
   citations?: Anthropic.TextCitation[];
 };
-export type ReasoningDeltaUpdate = { type: ContentTypes.THINK; think: string };
+export type BedrockReasoningReplayBlock = {
+  type: ContentTypes.REASONING_CONTENT;
+  reasoningText?: { text?: string; signature?: string };
+  redactedContent?: string;
+};
+
+export type AnthropicReasoningReplayBlock =
+  | {
+      type: ContentTypes.THINKING;
+      thinking?: string;
+      signature?: string;
+    }
+  | {
+      type: 'redacted_thinking';
+      data: string;
+    };
+
+export type AnthropicReasoningReplay = {
+  model: string;
+  blocks: AnthropicReasoningReplayBlock[];
+};
+
+export type BedrockReasoningReplay = {
+  model: string;
+  blocks: BedrockReasoningReplayBlock[];
+};
+
+export type ProviderReasoningReplay = {
+  anthropic?: AnthropicReasoningReplay;
+  bedrock?: BedrockReasoningReplay;
+};
+
+export type ReasoningDeltaUpdate = {
+  type: ContentTypes.THINK;
+  think: string;
+  provider_replay?: ProviderReasoningReplay;
+};
 
 export type ContentType =
   | 'text'
@@ -423,6 +459,7 @@ export type ContentType =
 export type ReasoningContentText = {
   type: ContentTypes.THINK;
   think: string;
+  provider_replay?: ProviderReasoningReplay;
 };
 
 export type SummaryBoundary = {

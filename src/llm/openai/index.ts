@@ -667,7 +667,7 @@ export function shouldIncludeEncryptedReasoning(
       | undefined
   )?.context;
   return (
-    (/^gpt-5\.6(?:-|$)/i.test(model) || astraRulesApply) &&
+    (/(?:^|[./:])gpt-5\.6(?:-|$)/i.test(model) || astraRulesApply) &&
     (params.store === false || reasoningContext !== 'current_turn')
   );
 }

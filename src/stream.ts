@@ -472,6 +472,121 @@ function getReasoningTextFromContentPart(
   );
 }
 
+function getBedrockReasoningReplay(
+  contentPart: t.MessageContentComplex,
+  agentContext: AgentContext
+): t.ProviderReasoningReplay | undefined {
+  const model = (agentContext.clientOptions as { model?: unknown } | undefined)
+    ?.model;
+  if (
+    typeof model !== 'string' ||
+    model === '' ||
+    contentPart.type !== ContentTypes.REASONING_CONTENT
+  ) {
+    return undefined;
+  }
+  const block = contentPart as Partial<t.BedrockReasoningReplayBlock>;
+  const reasoningText = block.reasoningText;
+  if (
+    reasoningText != null &&
+    (typeof reasoningText.text === 'string' ||
+      typeof reasoningText.signature === 'string')
+  ) {
+    return {
+      bedrock: {
+        model,
+        blocks: [
+          {
+            type: ContentTypes.REASONING_CONTENT,
+            reasoningText: {
+              ...(typeof reasoningText.text === 'string' && {
+                text: reasoningText.text,
+              }),
+              ...(typeof reasoningText.signature === 'string' && {
+                signature: reasoningText.signature,
+              }),
+            },
+          },
+        ],
+      },
+    };
+  }
+  if (
+    typeof block.redactedContent === 'string' &&
+    block.redactedContent !== ''
+  ) {
+    return {
+      bedrock: {
+        model,
+        blocks: [
+          {
+            type: ContentTypes.REASONING_CONTENT,
+            redactedContent: block.redactedContent,
+          },
+        ],
+      },
+    };
+  }
+  return undefined;
+}
+
+function getAnthropicReasoningReplay(
+  contentPart: t.MessageContentComplex,
+  agentContext: AgentContext
+): t.ProviderReasoningReplay | undefined {
+  const model = (agentContext.clientOptions as { model?: unknown } | undefined)
+    ?.model;
+  if (typeof model !== 'string' || model === '') {
+    return undefined;
+  }
+  if (
+    contentPart.type === ContentTypes.THINKING ||
+    contentPart.type === ContentTypes.REASONING
+  ) {
+    const block = contentPart as Partial<t.AnthropicReasoningReplayBlock> & {
+      thinking?: string;
+      reasoning?: string;
+      signature?: string;
+    };
+    const thinking =
+      contentPart.type === ContentTypes.THINKING
+        ? block.thinking
+        : block.reasoning;
+    if (typeof thinking !== 'string' && typeof block.signature !== 'string') {
+      return undefined;
+    }
+    return {
+      anthropic: {
+        model,
+        blocks: [
+          {
+            type: ContentTypes.THINKING,
+            ...(typeof thinking === 'string' && {
+              thinking,
+            }),
+            ...(typeof block.signature === 'string' && {
+              signature: block.signature,
+            }),
+          },
+        ],
+      },
+    };
+  }
+  if (contentPart.type === 'redacted_thinking') {
+    const data = (contentPart as { data?: unknown }).data;
+    if (typeof data !== 'string' || data === '') {
+      return undefined;
+    }
+    return {
+      anthropic: {
+        model,
+        blocks: [{ type: 'redacted_thinking', data }],
+      },
+    };
+  }
+  return undefined;
+}
+
 function getReasoningTextFromChunk(
   chunk: Partial<AIMessageChunk>,
   agentContext: AgentContext
@@ -2173,15 +2288,28 @@ hasToolCallChunks: ${hasToolCallChunks}
       await graph.dispatchReasoningDelta(
         stepId,
         {
-          content: content.map((c) => ({
-            type: ContentTypes.THINK,
-            think:
-              (c as t.ThinkingContentText).thinking ??
-              (c as Partial<t.GoogleReasoningContentText>).reasoning ??
-              (c as Partial<t.BedrockReasoningContentText>).reasoningText
-                ?.text ??
-              '',
-          })),
+          content: content.map((c) => {
+            const isAnthropicReplayShape =
+              c.type === ContentTypes.THINKING ||
+              c.type === 'redacted_thinking' ||
+              (c.type === ContentTypes.REASONING &&
+                typeof (c as { signature?: unknown }).signature === 'string');
+            const providerReplay = isAnthropicReplayShape
+              ? getAnthropicReasoningReplay(c, agentContext)
+              : getBedrockReasoningReplay(c, agentContext);
+            return {
+              type: ContentTypes.THINK,
+              think:
+                (c as t.ThinkingContentText).thinking ??
+                (c as Partial<t.GoogleReasoningContentText>).reasoning ??
+                (c as Partial<t.BedrockReasoningContentText>).reasoningText
+                  ?.text ??
+                '',
+              ...(providerReplay != null && {
+                provider_replay: providerReplay,
+              }),
+            };
+          }),
         },
         metadata
       );
@@ -2273,6 +2401,92 @@ hasToolCallChunks: ${hasToolCallChunks}
     }
     agentContext.lastToken = chunk.content;
   }
+}
+
+function mergeProviderReasoningReplay(
+  existing: t.ProviderReasoningReplay | undefined,
+  incoming: t.ProviderReasoningReplay | undefined
+): t.ProviderReasoningReplay | undefined {
+  if (incoming == null) {
+    return existing;
+  }
+  const anthropicModelChanged =
+    incoming.anthropic != null &&
+    existing?.anthropic?.model !== incoming.anthropic.model;
+  const anthropic = anthropicModelChanged
+    ? structuredClone(incoming.anthropic)
+    : structuredClone(existing?.anthropic);
+  if (
+    !anthropicModelChanged &&
+    anthropic != null &&
+    incoming.anthropic != null
+  ) {
+    for (const incomingBlock of incoming.anthropic.blocks) {
+      const lastBlock = anthropic.blocks[anthropic.blocks.length - 1];
+      const startsNewSignedBlock =
+        incomingBlock.type === ContentTypes.THINKING &&
+        typeof incomingBlock.thinking === 'string' &&
+        anthropic.blocks.length > 0 &&
+        lastBlock.type === ContentTypes.THINKING &&
+        typeof lastBlock.signature === 'string' &&
+        lastBlock.signature !== '';
+      if (
+        incomingBlock.type === ContentTypes.THINKING &&
+        anthropic.blocks.length > 0 &&
+        lastBlock.type === ContentTypes.THINKING &&
+        !startsNewSignedBlock
+      ) {
+        if (typeof incomingBlock.thinking === 'string') {
+          lastBlock.thinking =
+            (lastBlock.thinking ?? '') + incomingBlock.thinking;
+        }
+        if (typeof incomingBlock.signature === 'string') {
+          lastBlock.signature =
+            (lastBlock.signature ?? '') + incomingBlock.signature;
+        }
+        continue;
+      }
+      anthropic.blocks.push(structuredClone(incomingBlock));
+    }
+  }
+  const bedrockModelChanged =
+    incoming.bedrock != null &&
+    existing?.bedrock?.model !== incoming.bedrock.model;
+  const bedrock = bedrockModelChanged
+    ? structuredClone(incoming.bedrock)
+    : structuredClone(existing?.bedrock);
+  if (!bedrockModelChanged && bedrock != null && incoming.bedrock != null) {
+    for (const incomingBlock of incoming.bedrock.blocks) {
+      const incomingReasoningText = incomingBlock.reasoningText;
+      const lastBlock = bedrock.blocks[bedrock.blocks.length - 1];
+      const lastReasoningText =
+        bedrock.blocks.length > 0 ? lastBlock.reasoningText : undefined;
+      const startsNewSignedBlock =
+        typeof incomingReasoningText?.text === 'string' &&
+        lastReasoningText?.signature != null;
+      if (
+        incomingReasoningText != null &&
+        lastReasoningText != null &&
+        !startsNewSignedBlock
+      ) {
+        if (typeof incomingReasoningText.text === 'string') {
+          lastReasoningText.text =
+            (lastReasoningText.text ?? '') + incomingReasoningText.text;
+        }
+        if (typeof incomingReasoningText.signature === 'string') {
+          lastReasoningText.signature =
+            (lastReasoningText.signature ?? '') +
+            incomingReasoningText.signature;
+        }
+        continue;
+      }
+      bedrock.blocks.push(structuredClone(incomingBlock));
+    }
+  }
+  return {
+    ...(anthropic != null && anthropic.blocks.length > 0 && { anthropic }),
+    ...(bedrock != null && bedrock.blocks.length > 0 && { bedrock }),
+  };
 }
 
 export function createContentAggregator(): t.ContentAggregatorResult {
@@ -2514,6 +2728,10 @@ export function createContentAggregator(): t.ContentAggregatorResult {
       const update: t.ReasoningDeltaUpdate = {
         type: ContentTypes.THINK,
         think: (currentContent.think || '') + contentPart.think,
+        provider_replay: mergeProviderReasoningReplay(
+          currentContent.provider_replay,
+          (contentPart as t.ReasoningContentText).provider_replay
+        ),
       };
       contentParts[index] = update;
     } else if (
