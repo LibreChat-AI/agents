@@ -2446,6 +2446,10 @@ describe('AgentContext', () => {
       ctx.systemMessageTokens = 100;
       ctx.indexTokenCountMap = { '0': 50 };
       ctx.currentUsage = { input_tokens: 100 };
+      ctx.reasoningReplaySource = {
+        provider: Providers.ANTHROPIC,
+        model: 'claude-test',
+      };
 
       ctx.reset();
 
@@ -2453,6 +2457,7 @@ describe('AgentContext', () => {
       expect(ctx.instructionTokens).toBe(0);
       expect(ctx.indexTokenCountMap).toEqual({});
       expect(ctx.currentUsage).toBeUndefined();
+      expect(ctx.reasoningReplaySource).toBeUndefined();
     });
 
     it('preserves summarization settings across resets', () => {

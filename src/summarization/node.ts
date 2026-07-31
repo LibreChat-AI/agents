@@ -3,10 +3,10 @@ import type { UsageMetadata, BaseMessage } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { RenderedCompactionSemanticIndex } from '@/summarization/semanticIndex';
 import type { StreamLimitState } from '@/llm/streamLimits';
+import type { OnChunk, ReasoningReplaySource } from '@/llm/invoke';
 import type { AgentContext } from '@/agents/AgentContext';
 import type { EncodingName } from '@/utils/tokens';
 import type { HookRegistry } from '@/hooks';
-import type { OnChunk } from '@/llm/invoke';
 import type * as t from '@/types';
 import {
   DEFAULT_SUMMARIZATION_PROMPT,
@@ -59,7 +59,12 @@ import { renderCompactionSemanticIndex } from '@/summarization/semanticIndex';
 import { ProviderTextProtectionError } from '@/protection/providerText';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { prepareToolsForPromptCache } from '@/llm/promptCacheTools';
-import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
+import {
+  attemptInvoke,
+  tryFallbackProviders,
+  filterReasoningReplayForInvocation,
+  resolveReasoningReplaySource,
+} from '@/llm/invoke';
 import { calculateMaxToolResultChars } from '@/utils/truncation';
 import { makeIsDeferred } from '@/messages/anthropicToolCache';
 import { createRemoveAllMessage } from '@/messages/reducer';
@@ -674,6 +679,12 @@ async function executeSummarizationWithFallback(params: {
   let summaryText = '';
   let summaryUsage: Partial<UsageMetadata> | undefined;
   let usedMetadataStub = false;
+  let summarizationMessages = messages;
+  let reasoningReplaySource: ReasoningReplaySource =
+    agentContext.reasoningReplaySource ?? {
+      provider: agentContext.provider,
+      model: resolveClientOptionsModel(agentContext.clientOptions),
+    };
 
   try {
     /**
@@ -701,9 +712,23 @@ async function executeSummarizationWithFallback(params: {
       tools: summarizationTools,
     }) as t.ChatModel;
 
+    const summarizationProvider = clientConfig.provider as Providers;
+    const summarizationReplaySource = resolveReasoningReplaySource({
+      model: summarizationModel,
+      provider: summarizationProvider,
+      clientOptions: clientConfig.clientOptions as t.ClientOptions,
+      callOptions: summarizeConfig,
+    });
+    summarizationMessages = filterReasoningReplayForInvocation({
+      messages,
+      source: reasoningReplaySource,
+      target: summarizationReplaySource,
+    });
+    reasoningReplaySource = summarizationReplaySource;
+
     const result = await summarizeWithCacheHit({
       model: summarizationModel,
-      messages,
+      messages: summarizationMessages,
       promptText: clientConfig.promptText,
       updatePromptText: clientConfig.updatePromptText,
       priorSummaryText,
@@ -795,7 +820,7 @@ async function executeSummarizationWithFallback(params: {
           fallbacks,
           tools: agentContext.getToolsForBinding(),
           messages: [
-            ...messages,
+            ...summarizationMessages,
             new HumanMessage(
               buildSummarizationInstruction(
                 clientConfig.promptText,
@@ -812,6 +837,7 @@ async function executeSummarizationWithFallback(params: {
           primaryError,
           onChunk,
           streamLimitState: graph,
+          reasoningReplaySource,
         });
         const fbMsg = fbResult?.messages?.[0];
         if (fbMsg) {

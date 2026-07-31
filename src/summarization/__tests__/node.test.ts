@@ -17,7 +17,7 @@ import { ProviderTextProtectionError } from '@/protection/providerText';
 import { createTokenCounter, encodingForModel } from '@/utils/tokens';
 import { StreamLimitExceededError } from '@/llm/streamLimits';
 import { convertInjectedMessages } from '@/messages/injected';
-import { Constants, GraphEvents, Providers } from '@/common';
+import { Constants, ContentTypes, GraphEvents, Providers } from '@/common';
 import { registerProvider } from '@/llm/providerRegistry';
 import { AgentContext } from '@/agents/AgentContext';
 import * as providers from '@/llm/providers';
@@ -487,6 +487,157 @@ describe('createSummarizeNode', () => {
     expect(config.metadata?.[Constants.INVOKED_MODEL]).toBe('gpt-4.1-mini');
     expect(config.metadata?.[Constants.INVOKED_PROVIDER]).toBe(
       Providers.OPENAI
+    );
+  });
+
+  it('removes main-model native reasoning before a different summarizer invocation', async () => {
+    captureEvents();
+
+    const capturedMessages: BaseMessage[][] = [];
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        model = 'gpt-5.4-mini';
+
+        invoke = jest.fn(async (messages: BaseMessage[]) => {
+          capturedMessages.push(messages);
+          return { content: 'Summary text' };
+        });
+      } as never
+    );
+
+    const agentContext = createAgentContext({
+      provider: Providers.BEDROCK,
+      clientOptions: { model: 'claude-sonnet-primary' },
+      reasoningReplaySource: {
+        provider: Providers.BEDROCK,
+        model: 'claude-sonnet-primary',
+      },
+      summarizationConfig: {
+        retainRecent: { turns: 0 },
+        provider: Providers.OPENAI,
+        model: 'gpt-5.4-mini',
+      },
+    });
+    const node = createSummarizeNode({
+      agentContext,
+      graph: mockGraph(),
+      generateStepId,
+    });
+
+    await node(
+      {
+        messages: [
+          new AIMessage({
+            content: [
+              {
+                type: ContentTypes.REASONING_CONTENT,
+                reasoningText: {
+                  text: 'private reasoning',
+                  signature: 'bedrock-main-signature',
+                },
+              },
+              { type: ContentTypes.TEXT, text: 'visible answer' },
+            ],
+          }),
+          new HumanMessage('Continue'),
+        ],
+        summarizationRequest: {
+          remainingContextTokens: 1000,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    expect(JSON.stringify(capturedMessages[0])).not.toContain(
+      'bedrock-main-signature'
+    );
+    expect(JSON.stringify(capturedMessages[0])).toContain('visible answer');
+  });
+
+  it('revalidates summarizer-native reasoning for the fallback that serves the call', async () => {
+    captureEvents();
+
+    const capturedInvocations: Array<{
+      provider: string;
+      messages: BaseMessage[];
+    }> = [];
+    jest.spyOn(providers, 'getChatModelClass').mockImplementation(
+      (provider) =>
+        class {
+          model: string;
+
+          constructor(options: { model?: string }) {
+            this.model = options.model ?? '';
+          }
+
+          invoke = jest.fn(async (messages: BaseMessage[]) => {
+            capturedInvocations.push({ provider, messages });
+            if (provider === Providers.BEDROCK) {
+              throw new Error('Primary summarizer unavailable');
+            }
+            return new AIMessage({ content: 'Fallback summary' });
+          });
+        } as never
+    );
+
+    const agentContext = createAgentContext({
+      provider: Providers.BEDROCK,
+      clientOptions: {
+        model: 'claude-sonnet-primary',
+        fallbacks: [
+          {
+            provider: Providers.OPENAI,
+            clientOptions: { model: 'gpt-5.4-mini' },
+          },
+        ],
+      },
+      reasoningReplaySource: {
+        provider: Providers.BEDROCK,
+        model: 'claude-sonnet-primary',
+      },
+      summarizationConfig: { retainRecent: { turns: 0 } },
+    });
+    const node = createSummarizeNode({
+      agentContext,
+      graph: mockGraph(),
+      generateStepId,
+    });
+
+    await node(
+      {
+        messages: [
+          new AIMessage({
+            content: [
+              {
+                type: ContentTypes.REASONING_CONTENT,
+                reasoningText: {
+                  text: 'private reasoning',
+                  signature: 'summarizer-primary-signature',
+                },
+              },
+              { type: ContentTypes.TEXT, text: 'visible answer' },
+            ],
+          }),
+          new HumanMessage('Continue'),
+        ],
+        summarizationRequest: {
+          remainingContextTokens: 1000,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    expect(capturedInvocations).toHaveLength(2);
+    expect(JSON.stringify(capturedInvocations[0].messages)).toContain(
+      'summarizer-primary-signature'
+    );
+    expect(JSON.stringify(capturedInvocations[1].messages)).not.toContain(
+      'summarizer-primary-signature'
+    );
+    expect(JSON.stringify(capturedInvocations[1].messages)).toContain(
+      'visible answer'
     );
   });
 

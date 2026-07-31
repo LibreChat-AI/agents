@@ -14,15 +14,20 @@ import {
 } from '@langchain/openai';
 import type { StructuredToolInterface } from '@langchain/core/tools';
 import type { BaseMessage } from '@langchain/core/messages';
+import type { ReasoningReplaySource } from '@/llm/invoke';
 import type * as t from '@/types';
+import {
+  attemptInvoke,
+  filterReasoningReplayForInvocation,
+  tryFallbackProviders,
+} from '@/llm/invoke';
 import { _convertMessagesToAnthropicPayload } from '@/llm/anthropic/utils/message_inputs';
 import { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import { convertMessageContentToParts } from '@/llm/google/utils/common';
 import { _convertMessagesToOpenAIParams } from '@/llm/openai/utils';
-import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { StreamLimitExceededError } from '@/llm/streamLimits';
+import { Constants, ContentTypes, Providers } from '@/common';
 import { toLangChainContent } from '@/messages/langchain';
-import { Constants, Providers } from '@/common';
 import { ToolNode } from '@/tools/ToolNode';
 import { ChatOpenAI } from '@/llm/openai';
 
@@ -1016,6 +1021,221 @@ describe('tryFallbackProviders applies the same lazy annotation transform', () =
   });
 });
 
+describe('reasoning replay compatibility', () => {
+  const anthropicReplay = (): BaseMessage[] => [
+    new AIMessage({
+      content: [
+        {
+          type: ContentTypes.THINKING,
+          thinking: 'primary reasoning',
+          signature: 'anthropic-primary-signature',
+        },
+        { type: ContentTypes.TEXT, text: 'visible answer' },
+      ],
+    }),
+  ];
+  const bedrockReplay = (): BaseMessage[] => [
+    new AIMessage({
+      content: [
+        {
+          type: ContentTypes.REASONING_CONTENT,
+          reasoningText: {
+            text: 'primary reasoning',
+            signature: 'bedrock-primary-signature',
+          },
+        },
+        { type: ContentTypes.TEXT, text: 'visible answer' },
+      ],
+    }),
+  ];
+  const anthropicSource: ReasoningReplaySource = {
+    provider: Providers.ANTHROPIC,
+    model: 'claude-sonnet-primary',
+  };
+  const bedrockSource: ReasoningReplaySource = {
+    provider: Providers.BEDROCK,
+    model: 'claude-sonnet-primary',
+  };
+  const otherSource: ReasoningReplaySource = {
+    provider: Providers.OPENAI,
+    model: 'gpt-other',
+  };
+  const compatibilityCases: Array<{
+    name: string;
+    messages: () => BaseMessage[];
+    source: ReasoningReplaySource;
+    target: ReasoningReplaySource;
+    markers: string[];
+    retained: boolean;
+  }> = [
+    {
+      name: 'retains exact Anthropic replay',
+      messages: anthropicReplay,
+      source: anthropicSource,
+      target: anthropicSource,
+      markers: ['anthropic-primary-signature'],
+      retained: true,
+    },
+    {
+      name: 'strips replay for another Anthropic model',
+      messages: anthropicReplay,
+      source: anthropicSource,
+      target: { ...anthropicSource, model: 'claude-opus-fallback' },
+      markers: ['anthropic-primary-signature'],
+      retained: false,
+    },
+    {
+      name: 'retains exact Bedrock replay',
+      messages: bedrockReplay,
+      source: bedrockSource,
+      target: bedrockSource,
+      markers: ['bedrock-primary-signature'],
+      retained: true,
+    },
+    {
+      name: 'strips replay across providers',
+      messages: bedrockReplay,
+      source: bedrockSource,
+      target: anthropicSource,
+      markers: ['bedrock-primary-signature'],
+      retained: false,
+    },
+  ];
+
+  it.each(compatibilityCases)(
+    '$name',
+    ({ messages, source, target, markers, retained }) => {
+      const input = messages();
+      const filtered = filterReasoningReplayForInvocation({
+        messages: input,
+        source,
+        target,
+      });
+      const serialized = JSON.stringify(filtered);
+
+      for (const marker of markers) {
+        if (retained) {
+          expect(serialized).toContain(marker);
+        } else {
+          expect(serialized).not.toContain(marker);
+        }
+      }
+      expect(serialized).toContain('visible answer');
+      if (retained) {
+        expect(filtered).toBe(input);
+      }
+    }
+  );
+
+  it('uses the initialized fallback identity when filtering replay', async () => {
+    const invoked: BaseMessage[][] = [];
+    jest.doMock('@/llm/init', () => ({
+      initializeModel: ({
+        clientOptions,
+      }: {
+        clientOptions?: { model?: string };
+      }): StubModel => ({
+        model: clientOptions?.model,
+        invoke: jest.fn(async (messages: BaseMessage[]): Promise<AIMessage> => {
+          invoked.push(messages);
+          return new AIMessage({ content: 'ok' });
+        }),
+      }),
+    }));
+    jest.resetModules();
+
+    try {
+      const { tryFallbackProviders: freshTry } = (await import(
+        '@/llm/invoke'
+      )) as { tryFallbackProviders: typeof tryFallbackProviders };
+      await freshTry({
+        fallbacks: [
+          {
+            provider: Providers.ANTHROPIC,
+            clientOptions: { model: 'claude-opus-fallback' },
+          },
+        ],
+        messages: anthropicReplay(),
+        primaryError: new Error('primary failed'),
+        reasoningReplaySource: anthropicSource,
+      });
+
+      expect(JSON.stringify(invoked[0])).not.toContain(
+        'anthropic-primary-signature'
+      );
+      expect(JSON.stringify(invoked[0])).toContain('visible answer');
+    } finally {
+      jest.dontMock('@/llm/init');
+      jest.resetModules();
+    }
+  });
+
+  it('preserves message identity when there is no native replay to remove', () => {
+    const message = new AIMessage({ content: 'visible answer' });
+    const filtered = filterReasoningReplayForInvocation({
+      messages: [message],
+      source: anthropicSource,
+      target: otherSource,
+    });
+
+    expect(filtered[0]).toBe(message);
+  });
+
+  it('removes signed generic Anthropic reasoning', () => {
+    const filtered = filterReasoningReplayForInvocation({
+      messages: [
+        new AIMessage({
+          content: [
+            {
+              type: ContentTypes.REASONING,
+              reasoning: 'private reasoning',
+              signature: 'anthropic-generic-signature',
+            },
+            { type: ContentTypes.TEXT, text: 'visible answer' },
+          ],
+        }),
+      ],
+      source: anthropicSource,
+      target: otherSource,
+    });
+
+    expect(JSON.stringify(filtered)).not.toContain(
+      'anthropic-generic-signature'
+    );
+    expect(JSON.stringify(filtered)).toContain('visible answer');
+  });
+
+  it.each([
+    {
+      name: 'Bedrock array content',
+      messages: [
+        new AIMessage({
+          content: [
+            {
+              type: ContentTypes.REASONING_CONTENT,
+              reasoningText: {
+                text: 'reasoning only',
+                signature: 'bedrock-only-signature',
+              },
+            },
+          ],
+        }),
+      ],
+      source: bedrockSource,
+    },
+  ])(
+    'removes replay-only assistant messages with $name',
+    ({ messages, source }) => {
+      expect(
+        filterReasoningReplayForInvocation({
+          messages,
+          source,
+          target: anthropicSource,
+        })
+      ).toEqual([]);
+    }
+  );
+});
 describe('invocation attribution metadata', () => {
   it('stamps INVOKED_PROVIDER on the config passed to the model', async () => {
     const capturedConfigs: unknown[] = [];

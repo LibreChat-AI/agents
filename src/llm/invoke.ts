@@ -1,5 +1,5 @@
 import { concat } from '@langchain/core/utils/stream';
-import { AIMessageChunk } from '@langchain/core/messages';
+import { AIMessage, AIMessageChunk } from '@langchain/core/messages';
 import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
 import { getCallbackManagerForConfig } from '@langchain/core/runnables';
 import {
@@ -56,6 +56,7 @@ import {
 import {
   assertPreparedProviderRequestFor,
   prepareProviderRequest,
+  resolveServingModelId,
 } from '@/llm/prepareProviderRequest';
 import {
   getProviderFamily,
@@ -515,6 +516,102 @@ function collectModelCallbackSources(model: unknown): Callbacks[] {
         : undefined);
   }
   return sources;
+}
+
+export interface ReasoningReplaySource {
+  provider: t.ProviderName;
+  model?: string;
+}
+
+/** Resolves the replay identity of the model that will serve an invocation. */
+export function resolveReasoningReplaySource({
+  model,
+  provider,
+  clientOptions,
+}: {
+  model: t.ChatModel;
+  provider: t.ProviderName;
+  clientOptions?: t.ClientOptions;
+  callOptions?: unknown;
+}): ReasoningReplaySource {
+  return {
+    provider,
+    model: resolveServingModelId(model) ?? resolveClientOptionsModel(clientOptions),
+  };
+}
+
+/**
+ * Removes provider-native reasoning that is not valid for the model serving
+ * this invocation. Fallbacks start from messages formatted for the primary,
+ * so compatibility must be checked again after the fallback model is known.
+ * OpenAI Responses reasoning travels as `providerItems` and is gated by its
+ * own origin check, so it is not touched here.
+ */
+export function filterReasoningReplayForInvocation({
+  messages,
+  source,
+  target,
+}: {
+  messages: BaseMessage[];
+  source: ReasoningReplaySource;
+  target: ReasoningReplaySource;
+}): BaseMessage[] {
+  const compatible =
+    source.provider === target.provider &&
+    source.model != null &&
+    source.model === target.model;
+  if (compatible) {
+    return messages;
+  }
+
+  return messages.flatMap((message) => {
+    if (message.getType() !== 'ai') {
+      return [message];
+    }
+    const aiMessage = message as AIMessage;
+    const content = aiMessage.content;
+    if (!Array.isArray(content)) {
+      return [message];
+    }
+    let filtered = content;
+    if (source.provider === Providers.ANTHROPIC) {
+      filtered = content.filter(
+        (part) =>
+          part.type !== ContentTypes.THINKING &&
+          part.type !== 'redacted_thinking' &&
+          !(
+            part.type === ContentTypes.REASONING &&
+            typeof (part as { signature?: unknown }).signature === 'string'
+          )
+      );
+    } else if (source.provider === Providers.BEDROCK) {
+      filtered = content.filter(
+        (part) => part.type !== ContentTypes.REASONING_CONTENT
+      );
+    }
+    if (filtered.length === content.length) {
+      return [message];
+    }
+    if (
+      filtered.length === 0 &&
+      (aiMessage.tool_calls?.length ?? 0) === 0 &&
+      (aiMessage.invalid_tool_calls?.length ?? 0) === 0
+    ) {
+      return [];
+    }
+    return [
+      new AIMessage({
+        id: aiMessage.id,
+        name: aiMessage.name,
+        content: filtered,
+        additional_kwargs: aiMessage.additional_kwargs,
+        response_metadata: aiMessage.response_metadata,
+        tool_calls: aiMessage.tool_calls,
+        invalid_tool_calls: aiMessage.invalid_tool_calls,
+        usage_metadata: aiMessage.usage_metadata,
+      }),
+    ];
+  });
 }
 
 async function endSealedModelRun(
@@ -1603,6 +1700,7 @@ export async function tryFallbackProviders({
   overflowContext,
   prepareProviderRequest: prepareFallbackRequest,
   prepareProviderMessages,
+  reasoningReplaySource,
 }: {
   fallbacks: t.FallbackConfig[];
   tools?: t.GraphTools;
@@ -1648,6 +1746,8 @@ export async function tryFallbackProviders({
     maxContextTokens?: number;
     config?: RunnableConfig;
   }) => BaseMessage[] | Promise<BaseMessage[]>;
+  /** Provider/model identity used when native reasoning entered `messages`. */
+  reasoningReplaySource?: ReasoningReplaySource;
 }): Promise<Partial<t.BaseGraphState> | undefined> {
   if (primaryError instanceof ProviderTextProtectionError) throw primaryError;
   const isOverflow = (
@@ -1690,9 +1790,22 @@ export async function tryFallbackProviders({
               [Constants.INVOKED_MODEL]: fbModelName,
             },
           };
+      const replayValidatedMessages =
+        reasoningReplaySource == null
+          ? messages
+          : filterReasoningReplayForInvocation({
+            messages,
+            source: reasoningReplaySource,
+            target: resolveReasoningReplaySource({
+              model: fbModel as t.ChatModel,
+              provider: fb.provider,
+              clientOptions: fb.clientOptions,
+              callOptions: fbConfig,
+            }),
+          });
       const preparationInput = {
         model: fbModel as t.ChatModel,
-        messages,
+        messages: replayValidatedMessages,
         provider: fb.provider,
         clientOptions: fb.clientOptions,
         maxContextTokens: fb.maxContextTokens,
@@ -1707,17 +1820,17 @@ export async function tryFallbackProviders({
           fbConfig
         );
       }
-      let fallbackMessages = messages;
+      let fallbackMessages = replayValidatedMessages;
       if (preparedRequest == null) {
         fallbackMessages =
           (await prepareProviderMessages?.({
             model: fbModel as t.ChatModel,
-            messages,
+            messages: replayValidatedMessages,
             provider: fb.provider,
             clientOptions: fb.clientOptions,
             maxContextTokens: fb.maxContextTokens,
             config: fbConfig,
-          })) ?? messages;
+          })) ?? replayValidatedMessages;
       }
       /** A sibling can trip the breaker while the preparation above is
        * awaited — and the catch below only sees attempts that THROW, so a

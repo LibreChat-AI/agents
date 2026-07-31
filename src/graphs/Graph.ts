@@ -127,6 +127,7 @@ import {
   tryFallbackProviders,
   getFallbackErrorContext,
   getFallbackOverflowCandidates,
+  resolveReasoningReplaySource,
 } from '@/llm/invoke';
 import {
   hasToolOutputTracingConfig,
@@ -3660,6 +3661,13 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           .withConfig({ runName: AGENT_MODEL_CALL_RUN_NAME });
       }
 
+      agentContext.reasoningReplaySource = resolveReasoningReplaySource({
+        model: (this.overrideModel ?? model) as t.ChatModel,
+        provider: agentContext.provider,
+        clientOptions: agentContext.clientOptions,
+        callOptions: config,
+      });
+
       let finalMessages = messagesToUse;
       /** Primary wire shaping is lossy; each fallback starts from pruned source history. */
       const fallbackBaseMessages = messagesToUse;
@@ -4681,6 +4689,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                   estimatedPromptTokens: getEstimatedPromptTokens(contextUsage),
                   maxContextTokens: agentContext.maxContextTokens,
                 },
+                reasoningReplaySource: agentContext.reasoningReplaySource,
                 prepareProviderRequest: ({
                   model: fallbackModel,
                   messages: fallbackMessages,
@@ -4690,6 +4699,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                   config: fallbackConfig,
                 }) => {
                   const fallbackToolHistory = createToolHistoryPreparation();
+                  const replayValidatedFallbackMessages =
+                    trackProviderMessageOrigins(
+                      fallbackBaseMessages,
+                      fallbackMessages
+                    );
                   const fallbackToolResultChars =
                     agentContext.maxToolResultChars ??
                     calculateMaxToolResultChars(
@@ -4712,10 +4726,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                     });
                   const source = agentContext.useLegacyContent
                     ? trackProviderMessageOrigins(
-                      fallbackMessages,
-                      formatContentStrings(fallbackMessages)
+                      replayValidatedFallbackMessages,
+                      formatContentStrings(replayValidatedFallbackMessages)
                     )
-                    : fallbackMessages;
+                    : replayValidatedFallbackMessages;
                   const boundedSource = trackProviderMessageOrigins(
                     source,
                     projectToolMessagesForProvider(

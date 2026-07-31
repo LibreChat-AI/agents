@@ -456,6 +456,17 @@ function isGoogleServerSideToolContentPart(
   return contentPart.type === 'toolCall' || contentPart.type === 'toolResponse';
 }
 
+function isReasoningContentPart(
+  contentPart: t.MessageContentComplex
+): boolean {
+  return (
+    (contentPart.type?.startsWith(ContentTypes.THINKING) ?? false) ||
+    (contentPart.type?.startsWith(ContentTypes.REASONING) ?? false) ||
+    (contentPart.type?.startsWith(ContentTypes.REASONING_CONTENT) ?? false) ||
+    contentPart.type === 'redacted_thinking'
+  );
+}
+
 function isTextContentPart(contentPart: t.MessageContentComplex): boolean {
   return contentPart.type?.startsWith(ContentTypes.TEXT) ?? false;
 }
@@ -1549,6 +1560,15 @@ export function getChunkContent({
     isGoogleLike(provider) &&
     Array.isArray(chunk?.content) &&
     chunk.content.some((c) => isGoogleServerSideToolContentPart(c))
+  ) {
+    return chunk.content;
+  }
+
+  if (
+    provider === Providers.BEDROCK &&
+    Array.isArray(chunk?.content) &&
+    chunk.content.length > 0 &&
+    chunk.content.every((contentPart) => isReasoningContentPart(contentPart))
   ) {
     return chunk.content;
   }
