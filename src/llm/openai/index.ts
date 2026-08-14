@@ -64,7 +64,11 @@ import {
   getReasoningKwargsText,
 } from '@/llm/stream/chunkAdapters';
 import { registerProviderTextChunkConstructor } from '@/llm/providerTextChunk';
-import { isReasoningModel, _convertMessagesToOpenAIParams } from './utils';
+import {
+  isReasoningModel,
+  _convertMessagesToOpenAIParams,
+  stripImagesFromMessages,
+} from './utils';
 import { smoothStream, resolveStreamDelay } from '@/llm/stream/smoother';
 import { INTENT_ARG, isIntentLabelProperty } from '@/tools/intentArg';
 import { dropRepeatedScalarMetadata } from './streamMetadata';
@@ -132,12 +136,16 @@ type LibreChatOpenAIFields = t.ChatOpenAIFields & {
   responsesPromptCacheTtl?: PromptCacheTtl;
   promptCacheExplicit?: boolean;
   safety_identifier?: string;
+  /** Whether the model can accept image input; false strips images (default true). */
+  vision?: boolean;
 };
 type LibreChatAzureOpenAIFields = t.AzureOpenAIInput & {
   _lc_stream_delay?: number;
   firstPartyEndpoint?: boolean;
   promptCacheExplicit?: boolean;
   safety_identifier?: string;
+  /** Whether the model can accept image input; false strips images (default true). */
+  vision?: boolean;
 };
 type ReasoningCallOptions = {
   reasoning?: OpenAIClient.Reasoning;
@@ -2849,12 +2857,19 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
     return astraRulesApply(this.model, this.firstPartyEndpoint);
   }
 
+  /**
+   * Whether the target model can accept image input. Defaults to true, so existing
+   * callers are unaffected; set false to have image content stripped before the request.
+   */
+  protected visionCapable: boolean;
+
   _lc_stream_delay: number;
 
   constructor(
     fields?: LibreChatOpenAIFields & t.OpenAIChatInput['modelKwargs']
   ) {
     super(withLibreChatOpenAIFields(fields));
+    this.visionCapable = fields?.vision ?? true;
     this._lc_stream_delay = resolveStreamDelay(fields?._lc_stream_delay);
     this.firstPartyEndpoint = fields?.firstPartyEndpoint;
   }
@@ -2919,7 +2934,11 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
     yield* delayStreamChunks(
-      super._streamResponseChunks(messages, options, undefined),
+      super._streamResponseChunks(
+        stripImagesFromMessages(messages, this.visionCapable),
+        options,
+        undefined
+      ),
       this._lc_stream_delay,
       options.signal,
       runManager,
@@ -2938,7 +2957,11 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
     return delayStreamChunks(
-      super._streamResponseChunks(messages, options, undefined),
+      super._streamResponseChunks(
+        stripImagesFromMessages(messages, this.visionCapable),
+        options,
+        undefined
+      ),
       this._lc_stream_delay,
       options.signal,
       runManager
@@ -2954,10 +2977,17 @@ export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
     return astraRulesApply(this.model, this.firstPartyEndpoint);
   }
 
+  /**
+   * Whether the target model can accept image input. Defaults to true, so existing
+   * callers are unaffected; set false to have image content stripped before the request.
+   */
+  protected visionCapable: boolean;
+
   _lc_stream_delay: number;
 
   constructor(fields?: LibreChatAzureOpenAIFields) {
     super(fields);
+    this.visionCapable = fields?.vision ?? true;
     this.completions = new LibreChatAzureOpenAICompletions(fields);
     this.responses = new LibreChatAzureOpenAIResponses(fields);
     this.fields = {
@@ -3069,7 +3099,11 @@ export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
     yield* delayStreamChunks(
-      super._streamResponseChunks(messages, options, undefined),
+      super._streamResponseChunks(
+        stripImagesFromMessages(messages, this.visionCapable),
+        options,
+        undefined
+      ),
       this._lc_stream_delay,
       options.signal,
       runManager,
@@ -3078,14 +3112,23 @@ export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
   }
 }
 export class ChatDeepSeek extends OriginalChatDeepSeek {
+  /**
+   * Whether the target model can accept image input. Defaults to true, so existing
+   * callers are unaffected; set false to have image content stripped before the request.
+   */
+  protected visionCapable: boolean;
+
   _lc_stream_delay: number;
 
   constructor(
     fields?: ConstructorParameters<typeof OriginalChatDeepSeek>[0] & {
       _lc_stream_delay?: number;
+      /** Whether the model can accept image input; false strips images (default true). */
+      vision?: boolean;
     }
   ) {
     super(fields);
+    this.visionCapable = fields?.vision ?? true;
     this._lc_stream_delay = resolveStreamDelay(fields?._lc_stream_delay);
   }
 
@@ -3599,6 +3642,12 @@ export class ChatMoonshot extends ChatOpenAI {
 }
 
 export class ChatXAI extends OriginalChatXAI {
+  /**
+   * Whether the target model can accept image input. Defaults to true, so existing
+   * callers are unaffected; set false to have image content stripped before the request.
+   */
+  protected visionCapable: boolean;
+
   _lc_stream_delay: number;
 
   constructor(
@@ -3606,9 +3655,12 @@ export class ChatXAI extends OriginalChatXAI {
       configuration?: { baseURL?: string };
       clientConfig?: { baseURL?: string };
       _lc_stream_delay?: number;
+      /** Whether the model can accept image input; false strips images (default true). */
+      vision?: boolean;
     }
   ) {
     super(fields);
+    this.visionCapable = fields?.vision ?? true;
     this._lc_stream_delay = resolveStreamDelay(fields?._lc_stream_delay);
     const customBaseURL =
       fields?.configuration?.baseURL ?? fields?.clientConfig?.baseURL;
@@ -3665,7 +3717,11 @@ export class ChatXAI extends OriginalChatXAI {
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
     yield* delayStreamChunks(
-      super._streamResponseChunks(messages, options, undefined),
+      super._streamResponseChunks(
+        stripImagesFromMessages(messages, this.visionCapable),
+        options,
+        undefined
+      ),
       this._lc_stream_delay,
       options.signal,
       runManager,
