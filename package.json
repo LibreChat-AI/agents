@@ -250,6 +250,7 @@
     "bench:execution-world": "tsx ./src/scripts/bench-execution-world.ts",
     "bench:compaction-semantic-index": "tsx ./src/scripts/bench-compaction-semantic-index.ts",
     "probe:overflow": "tsx -r dotenv/config ./src/scripts/context-overflow-probe.ts",
+    "probe:ratelimit": "tsx -r dotenv/config ./src/scripts/rate-limit-probe.ts",
     "subagent": "tsx -r dotenv/config ./src/scripts/multi-agent-subagent.ts",
     "subagent:events": "tsx -r dotenv/config ./src/scripts/subagent-event-driven-debug.ts",
     "subagent:tools": "tsx -r dotenv/config ./src/scripts/subagent-tools-debug.ts",
