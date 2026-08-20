@@ -1,6 +1,10 @@
 const mockLangfuseSpanProcessorInstance = {};
+type MockLangfuseSpanProcessorParams = {
+  mask?: (input: { data: unknown }) => string;
+};
 const mockLangfuseSpanProcessor = jest.fn(
-  () => mockLangfuseSpanProcessorInstance
+  (_params?: MockLangfuseSpanProcessorParams) =>
+    mockLangfuseSpanProcessorInstance
 );
 const mockSetLangfuseTracerProvider = jest.fn();
 let mockContextHasActiveValue = false;
@@ -214,10 +218,8 @@ describe('Langfuse instrumentation', () => {
         mask: expect.any(Function),
       })
     );
-    const params = mockLangfuseSpanProcessor.mock.calls[0][0] as {
-      mask?: (input: { data: unknown }) => string;
-    };
-    expect(params.mask?.({ data: 'conversation text' })).toBe('[private]');
+    const params = mockLangfuseSpanProcessor.mock.calls[0][0];
+    expect(params?.mask?.({ data: 'conversation text' })).toBe('[private]');
   });
 
   it('falls back to NODE_ENV when LANGFUSE_TRACING_ENVIRONMENT is unset', async () => {

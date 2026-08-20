@@ -7,6 +7,7 @@ import type {
   SpanExporter,
 } from '@opentelemetry/sdk-trace-base';
 import type { ExportResult } from '@opentelemetry/core';
+import type { Attributes } from '@opentelemetry/api';
 import { getLangfuseSpanProcessorParams } from '@/langfuseSpanRegistry';
 
 class InMemoryExporter implements SpanExporter {
@@ -34,7 +35,7 @@ class InMemoryExporter implements SpanExporter {
 describe('Langfuse privacy masking', () => {
   async function exportSpanWithPrivacy(
     privacy: { mode: 'full' | 'metricsOnly'; redactionText?: string },
-    attributes: Record<string, unknown>
+    attributes: Attributes
   ): Promise<ReadableSpan | undefined> {
     const exporter = new InMemoryExporter();
     const params = getLangfuseSpanProcessorParams({
