@@ -1,6 +1,7 @@
 import type { MaskFunction } from '@langfuse/otel';
 import type { ResolvedLangfuseToolOutputTracingConfig } from '@/langfuseRuntimeContext';
 import type * as t from '@/types';
+import { LANGFUSE_OPERATION_METADATA_KEY } from '@/langfuseOperation';
 import { parseBooleanEnv } from '@/utils/misc';
 
 export const LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT = '[tool output redacted]';
@@ -162,19 +163,37 @@ export function resolveLangfusePrivacyConfig(
   runLangfuse?: t.LangfuseConfig,
   agentLangfuse?: t.LangfuseConfig
 ): t.LangfusePrivacyConfig | undefined {
-  const runPrivacy = runLangfuse?.privacy;
-  const agentPrivacy = agentLangfuse?.privacy;
-  if (runPrivacy == null && agentPrivacy == null) {
+  // Overlay order: the agent's fields win per-field, like every other
+  // per-field merge in this module.
+  return resolveStrictestLangfusePrivacy([
+    agentLangfuse?.privacy,
+    runLangfuse?.privacy,
+  ]);
+}
+
+/**
+ * Resolves the strictest policy across any number of configs (a run plus
+ * every agent overlay). Shared spans (the run's root trace, conversation
+ * payloads, activity-phase traces) carry every agent's content, so their
+ * policy must be at least as strict as each contributor's.
+ */
+export function resolveStrictestLangfusePrivacy(
+  privacies: Array<t.LangfusePrivacyConfig | undefined>
+): t.LangfusePrivacyConfig | undefined {
+  const present = privacies.filter(
+    (privacy): privacy is t.LangfusePrivacyConfig => privacy != null
+  );
+  if (present.length === 0) {
     return undefined;
   }
   // The stricter mode wins so an agent overlay can tighten the run's
   // privacy policy but never loosen it.
-  const mode =
-    runPrivacy?.mode === 'metricsOnly' || agentPrivacy?.mode === 'metricsOnly'
-      ? 'metricsOnly'
-      : 'full';
-  const redactionText =
-    agentPrivacy?.redactionText ?? runPrivacy?.redactionText;
+  const mode = present.some((privacy) => privacy.mode === 'metricsOnly')
+    ? 'metricsOnly'
+    : 'full';
+  const redactionText = present.find(
+    (privacy) => privacy.redactionText != null
+  )?.redactionText;
   return {
     mode,
     ...(redactionText != null ? { redactionText } : {}),
@@ -182,10 +201,48 @@ export function resolveLangfusePrivacyConfig(
 }
 
 /**
+ * Run-correlation identity preserved from masked metadata values. These keys
+ * are SDK-written identifiers (never user content) that Langfuse consumers
+ * need to link observations back to LibreChat runs, so `metricsOnly` keeps
+ * them while every other metadata entry is dropped.
+ */
+const PRESERVED_TRACE_IDENTITY_KEYS = [
+  'messageId',
+  'parentMessageId',
+  'agentId',
+  'agentName',
+  'sourceRunId',
+  'responseId',
+  LANGFUSE_OPERATION_METADATA_KEY,
+] as const;
+
+export function resolveLangfuseContentRedactionText(
+  privacy?: t.LangfusePrivacyConfig
+): string {
+  return isPresent(privacy?.redactionText)
+    ? privacy.redactionText.trim()
+    : LANGFUSE_CONTENT_REDACTION_TEXT;
+}
+
+function preserveTraceIdentity(value: object, redactionText: string): string {
+  const preserved: Record<string, unknown> = {};
+  for (const key of PRESERVED_TRACE_IDENTITY_KEYS) {
+    if (key in value) {
+      preserved[key] = (value as Record<string, unknown>)[key];
+    }
+  }
+  return Object.keys(preserved).length > 0
+    ? JSON.stringify(preserved)
+    : redactionText;
+}
+
+/**
  * Builds the SDK mask that replaces content-bearing trace and observation
  * attributes (input, output, metadata) with the configured redaction text.
- * The span processor applies the mask before export and, should the mask
- * itself throw, fully masks the value instead of exporting it verbatim.
+ * Object-shaped values keep only run-correlation identity keys, so trace
+ * metadata still links observations to runs. The span processor applies the
+ * mask before export and, should the mask itself throw, fully masks the
+ * value instead of exporting it verbatim.
  */
 export function createLangfusePrivacyMask(
   privacy?: t.LangfusePrivacyConfig
@@ -193,10 +250,24 @@ export function createLangfusePrivacyMask(
   if (privacy?.mode !== 'metricsOnly') {
     return undefined;
   }
-  const redactionText = isPresent(privacy.redactionText)
-    ? privacy.redactionText.trim()
-    : LANGFUSE_CONTENT_REDACTION_TEXT;
-  return () => redactionText;
+  const redactionText = resolveLangfuseContentRedactionText(privacy);
+  return ({ data }) => {
+    if (typeof data === 'string') {
+      const trimmed = data.trim();
+      if (trimmed.startsWith('{')) {
+        try {
+          return preserveTraceIdentity(JSON.parse(trimmed), redactionText);
+        } catch {
+          return redactionText;
+        }
+      }
+      return redactionText;
+    }
+    if (data != null && typeof data === 'object' && !Array.isArray(data)) {
+      return preserveTraceIdentity(data, redactionText);
+    }
+    return redactionText;
+  };
 }
 
 export function resolveToolOutputTracingConfig(

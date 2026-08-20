@@ -20,13 +20,14 @@ import {
   withLangfuseRuntimeScope,
 } from '@/langfuseRuntimeScope';
 import {
+  resolveLangfuseConfig,
+  resolveStrictestLangfusePrivacy,
+  resolveToolOutputTracingConfig,
+} from '@/langfuseConfig';
+import {
   runWithLangfuseRuntimeContext,
   type ResolvedLangfuseToolOutputTracingConfig,
 } from '@/langfuseRuntimeContext';
-import {
-  resolveLangfuseConfig,
-  resolveToolOutputTracingConfig,
-} from '@/langfuseConfig';
 import { ensureOpenTelemetryContextManager } from '@/instrumentation';
 import { projectToolStreamContentForProvider } from '@/messages/core';
 import { formatAgentMessages } from '@/messages/format';
@@ -1798,6 +1799,26 @@ describe('Langfuse tool output tracing redaction', () => {
         { privacy: { mode: 'full' } }
       )?.privacy
     ).toEqual({ mode: 'full' });
+  });
+
+  it('resolves the strictest privacy across every agent overlay', () => {
+    expect(
+      resolveStrictestLangfusePrivacy([
+        undefined,
+        { mode: 'full' },
+        { mode: 'metricsOnly' },
+        { mode: 'full' },
+      ])
+    ).toEqual({ mode: 'metricsOnly' });
+    expect(
+      resolveStrictestLangfusePrivacy([
+        { mode: 'full' },
+        { mode: 'full', redactionText: '[agent]' },
+      ])
+    ).toEqual({ mode: 'full', redactionText: '[agent]' });
+    expect(resolveStrictestLangfusePrivacy([undefined, undefined])).toBe(
+      undefined
+    );
   });
 
   it('merges run and agent custom headers with the agent winning collisions', () => {

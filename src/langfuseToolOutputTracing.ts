@@ -15,6 +15,8 @@ import {
   normalizeToolName,
   resolveLangfuseConfig,
   resolveToolOutputTracingConfig,
+  resolveLangfuseContentRedactionText,
+  resolveLangfusePrivacyConfig
 } from '@/langfuseConfig';
 import {
   shapeLangfuseSpan,
@@ -882,20 +884,60 @@ export function redactLangfuseSpanToolOutputs(
   }
 }
 
+/**
+ * Redacts content the SDK mask never sees: the OTel status message and
+ * exception events. Error strings routinely embed request data (a tool
+ * reporting an invalid user value, an upstream response body), and the
+ * Langfuse mask only rewrites the input, output, and metadata attribute
+ * families, so `metricsOnly` closes this channel itself. The status code
+ * stays: error vs. ok is operational data.
+ */
+function redactLangfuseSpanStatusContent(
+  span: ReadableSpan,
+  redactionText: string
+): void {
+  if (isPresent(span.status.message)) {
+    span.status.message = redactionText;
+  }
+  const statusMessageKey =
+    LangfuseOtelSpanAttributes.OBSERVATION_STATUS_MESSAGE;
+  if (statusMessageKey in span.attributes) {
+    span.attributes[statusMessageKey] = redactionText;
+  }
+  for (const event of span.events) {
+    if (event.name !== 'exception') {
+      continue;
+    }
+    for (const key of ['exception.message', 'exception.stacktrace']) {
+      if (event.attributes != null && key in event.attributes) {
+        event.attributes[key] = redactionText;
+      }
+    }
+  }
+}
+
 export function prepareLangfuseSpanForExport(
   span: ReadableSpan,
-  config?: ResolvedLangfuseToolOutputTracingConfig
+  config?: ResolvedLangfuseToolOutputTracingConfig,
+  privacy?: t.LangfusePrivacyConfig
 ): void {
   classifyLangfuseToolNodeSpan(span);
   if (config != null) {
     redactLangfuseSpanToolOutputs(span, config);
   }
   shapeLangfuseSpan(span);
+  if (privacy?.mode === 'metricsOnly') {
+    redactLangfuseSpanStatusContent(
+      span,
+      resolveLangfuseContentRedactionText(privacy)
+    );
+  }
 }
 
 class ToolOutputRedactingLangfuseSpanProcessor implements SpanProcessor {
   private readonly processor: LangfuseSpanProcessor;
   private readonly fallbackConfig?: ResolvedLangfuseToolOutputTracingConfig;
+  private readonly privacy?: t.LangfusePrivacyConfig;
   private readonly spanConfigs = new WeakMap<
     object,
     ResolvedLangfuseToolOutputTracingConfig
@@ -903,10 +945,12 @@ class ToolOutputRedactingLangfuseSpanProcessor implements SpanProcessor {
 
   constructor(
     params?: LangfuseSpanProcessorParams,
-    fallbackConfig?: ResolvedLangfuseToolOutputTracingConfig
+    fallbackConfig?: ResolvedLangfuseToolOutputTracingConfig,
+    privacy?: t.LangfusePrivacyConfig
   ) {
     this.processor = new LangfuseSpanProcessor(params);
     this.fallbackConfig = fallbackConfig;
+    this.privacy = privacy;
   }
 
   onStart(span: Span, parentContext: Context): void {
@@ -927,7 +971,7 @@ class ToolOutputRedactingLangfuseSpanProcessor implements SpanProcessor {
       return;
     }
     const config = this.spanConfigs.get(span) ?? this.fallbackConfig;
-    prepareLangfuseSpanForExport(span, config);
+    prepareLangfuseSpanForExport(span, config, this.privacy);
     this.processor.onEnd(span);
   }
 
@@ -948,7 +992,11 @@ export function createLangfuseSpanProcessor(
   const fallbackConfig = hasToolOutputTracingConfig(runLangfuse, agentLangfuse)
     ? resolveToolOutputTracingConfig(runLangfuse, agentLangfuse)
     : undefined;
-  return new ToolOutputRedactingLangfuseSpanProcessor(params, fallbackConfig);
+  return new ToolOutputRedactingLangfuseSpanProcessor(
+    params,
+    fallbackConfig,
+    resolveLangfusePrivacyConfig(runLangfuse, agentLangfuse)
+  );
 }
 
 function hasLangfuseEnvKeys(): boolean {
