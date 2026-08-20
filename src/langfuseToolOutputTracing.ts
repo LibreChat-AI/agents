@@ -930,6 +930,28 @@ function preserveTraceIdentity(value: unknown, redactionText: string): string {
     : redactionText;
 }
 
+/** Metadata also rides flattened, one attribute per entry. */
+const PRESERVED_TRACE_IDENTITY_KEY_SET = new Set<string>(
+  PRESERVED_TRACE_IDENTITY_KEYS
+);
+
+function redactFlattenedMetadata(attributes: Record<string, unknown>): void {
+  const prefixes = [
+    `${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.`,
+    `${LangfuseOtelSpanAttributes.TRACE_METADATA}.`,
+  ];
+  for (const key of Object.keys(attributes)) {
+    const prefix = prefixes.find((candidate) => key.startsWith(candidate));
+    if (prefix == null) {
+      continue;
+    }
+    if (PRESERVED_TRACE_IDENTITY_KEY_SET.has(key.slice(prefix.length))) {
+      continue;
+    }
+    delete attributes[key];
+  }
+}
+
 /**
  * Applies the `metricsOnly` policy to a span's content-bearing attributes
  * before export.
@@ -940,7 +962,12 @@ function preserveTraceIdentity(value: unknown, redactionText: string): string {
  * preserve same-named keys in user content (a tool returning
  * `{"messageId": "..."}`), and a blanket replacement would strip the
  * identity Langfuse consumers need. Per-attribute, input and output values
- * are replaced wholesale while metadata keeps only SDK-written identifiers.
+ * are replaced wholesale while metadata keeps only SDK-written identifiers;
+ * flattened metadata entries are dropped unless they carry that identity.
+ *
+ * Model parameters are redacted too: they can embed content-bearing values
+ * (caller-supplied stop strings, user identifiers, tool schemas and
+ * descriptions). The model name, usage, and cost attributes stay.
  *
  * Fail closed: if any step throws, every masked family is replaced with the
  * redaction text instead of exporting the value verbatim.
@@ -956,6 +983,7 @@ function redactLangfuseSpanContent(
     LangfuseOtelSpanAttributes.TRACE_INPUT,
     LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT,
     LangfuseOtelSpanAttributes.TRACE_OUTPUT,
+    LangfuseOtelSpanAttributes.OBSERVATION_MODEL_PARAMETERS,
   ];
   const metadataKeys = [
     LangfuseOtelSpanAttributes.OBSERVATION_METADATA,
@@ -972,6 +1000,7 @@ function redactLangfuseSpanContent(
         attributes[key] = preserveTraceIdentity(attributes[key], redactionText);
       }
     }
+    redactFlattenedMetadata(attributes);
     redactLangfuseSpanStatusContent(span, redactionText);
   } catch {
     for (const key of [...contentKeys, ...metadataKeys]) {
@@ -980,6 +1009,7 @@ function redactLangfuseSpanContent(
       }
     }
     try {
+      redactFlattenedMetadata(attributes);
       redactLangfuseSpanStatusContent(span, redactionText);
     } catch {
       // Status redaction is best-effort; content attributes above are the

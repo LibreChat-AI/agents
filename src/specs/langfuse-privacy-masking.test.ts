@@ -95,6 +95,12 @@ describe('Langfuse privacy masking', () => {
         [LangfuseOtelSpanAttributes.TRACE_METADATA]: JSON.stringify({
           source: 'api',
         }),
+        [`${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.customerNote`]:
+          'internal note with content',
+        [`${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.messageId`]:
+          'run-1',
+        [LangfuseOtelSpanAttributes.OBSERVATION_MODEL_PARAMETERS]:
+          JSON.stringify({ stop: ['reveal the key'], temperature: 0.7 }),
         [LangfuseOtelSpanAttributes.OBSERVATION_MODEL]: 'gpt-5.2',
         [LangfuseOtelSpanAttributes.OBSERVATION_USAGE_DETAILS]: JSON.stringify({
           input: 120,
@@ -116,6 +122,19 @@ describe('Langfuse privacy masking', () => {
     expect(span?.attributes[LangfuseOtelSpanAttributes.TRACE_METADATA]).toBe(
       '[private]'
     );
+    expect(
+      span?.attributes[
+        `${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.customerNote`
+      ]
+    ).toBeUndefined();
+    expect(
+      span?.attributes[
+        `${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.messageId`
+      ]
+    ).toBe('run-1');
+    expect(
+      span?.attributes[LangfuseOtelSpanAttributes.OBSERVATION_MODEL_PARAMETERS]
+    ).toBe('[private]');
     expect(span?.attributes[LangfuseOtelSpanAttributes.OBSERVATION_MODEL]).toBe(
       'gpt-5.2'
     );
@@ -210,6 +229,10 @@ describe('Langfuse privacy masking', () => {
         [LangfuseOtelSpanAttributes.OBSERVATION_METADATA]: JSON.stringify({
           messageId: 'run-1',
         }),
+        [`${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.customerNote`]:
+          'kept note',
+        [LangfuseOtelSpanAttributes.OBSERVATION_MODEL_PARAMETERS]:
+          JSON.stringify({ stop: ['kept stop'] }),
       },
       {
         statusMessage: 'kept status message',
@@ -226,6 +249,14 @@ describe('Langfuse privacy masking', () => {
     expect(
       span?.attributes[LangfuseOtelSpanAttributes.OBSERVATION_METADATA]
     ).toBe(JSON.stringify({ messageId: 'run-1' }));
+    expect(
+      span?.attributes[
+        `${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.customerNote`
+      ]
+    ).toBe('kept note');
+    expect(
+      span?.attributes[LangfuseOtelSpanAttributes.OBSERVATION_MODEL_PARAMETERS]
+    ).toBe(JSON.stringify({ stop: ['kept stop'] }));
     expect(span?.status.message).toBe('kept status message');
     const exceptionEvent = span?.events.find(
       (event) => event.name === 'exception'
