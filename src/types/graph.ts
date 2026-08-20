@@ -896,6 +896,18 @@ export type LangfuseToolNodeTracingConfig = {
   enabled?: boolean;
 };
 
+export type LangfusePrivacyConfig = {
+  /**
+   * `metricsOnly` replaces every exported trace and observation input,
+   * output, and metadata value with `redactionText` and disables media
+   * upload, while trace structure, timing, model, usage, and status stay
+   * intact. The default `full` mode exports content unchanged.
+   */
+  mode?: 'full' | 'metricsOnly';
+  /** Replacement text used for suppressed content. */
+  redactionText?: string;
+};
+
 export interface LangfuseConfig {
   enabled?: boolean;
   publicKey?: string;
@@ -945,6 +957,11 @@ export interface LangfuseConfig {
   tags?: string[];
   toolNodeTracing?: LangfuseToolNodeTracingConfig;
   toolOutputTracing?: LangfuseToolOutputTracingConfig;
+  /**
+   * Content privacy policy applied to trace data before it leaves the
+   * process. Applies to every export destination the run resolves to.
+   */
+  privacy?: LangfusePrivacyConfig;
   /**
    * When true, derive the run's root Langfuse trace id deterministically from
    * its `runId` (`sha256(runId)` → 32 hex chars, matching `@langfuse/tracing`

@@ -1,8 +1,10 @@
+import type { MaskFunction } from '@langfuse/otel';
 import type { ResolvedLangfuseToolOutputTracingConfig } from '@/langfuseRuntimeContext';
 import type * as t from '@/types';
 import { parseBooleanEnv } from '@/utils/misc';
 
 export const LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT = '[tool output redacted]';
+export const LANGFUSE_CONTENT_REDACTION_TEXT = '[CONTENT REDACTED]';
 
 function isPresent(value: unknown): value is string {
   return typeof value === 'string' && value.trim() !== '';
@@ -156,6 +158,47 @@ export function hasToolOutputTracingConfig(
   );
 }
 
+export function resolveLangfusePrivacyConfig(
+  runLangfuse?: t.LangfuseConfig,
+  agentLangfuse?: t.LangfuseConfig
+): t.LangfusePrivacyConfig | undefined {
+  const runPrivacy = runLangfuse?.privacy;
+  const agentPrivacy = agentLangfuse?.privacy;
+  if (runPrivacy == null && agentPrivacy == null) {
+    return undefined;
+  }
+  // The stricter mode wins so an agent overlay can tighten the run's
+  // privacy policy but never loosen it.
+  const mode =
+    runPrivacy?.mode === 'metricsOnly' || agentPrivacy?.mode === 'metricsOnly'
+      ? 'metricsOnly'
+      : 'full';
+  const redactionText =
+    agentPrivacy?.redactionText ?? runPrivacy?.redactionText;
+  return {
+    mode,
+    ...(redactionText != null ? { redactionText } : {}),
+  };
+}
+
+/**
+ * Builds the SDK mask that replaces content-bearing trace and observation
+ * attributes (input, output, metadata) with the configured redaction text.
+ * The span processor applies the mask before export and, should the mask
+ * itself throw, fully masks the value instead of exporting it verbatim.
+ */
+export function createLangfusePrivacyMask(
+  privacy?: t.LangfusePrivacyConfig
+): MaskFunction | undefined {
+  if (privacy?.mode !== 'metricsOnly') {
+    return undefined;
+  }
+  const redactionText = isPresent(privacy.redactionText)
+    ? privacy.redactionText.trim()
+    : LANGFUSE_CONTENT_REDACTION_TEXT;
+  return () => redactionText;
+}
+
 export function resolveToolOutputTracingConfig(
   runLangfuse?: t.LangfuseConfig,
   agentLangfuse?: t.LangfuseConfig
@@ -267,6 +310,7 @@ export function resolveLangfuseConfig(
         ]),
       ]
       : undefined;
+  const privacy = resolveLangfusePrivacyConfig(runLangfuse, agentLangfuse);
 
   return {
     ...runLangfuse,
@@ -277,5 +321,6 @@ export function resolveLangfuseConfig(
     ...(tags != null ? { tags } : {}),
     ...(toolNodeTracing != null ? { toolNodeTracing } : {}),
     ...(toolOutputTracing != null ? { toolOutputTracing } : {}),
+    ...(privacy != null ? { privacy } : {}),
   };
 }

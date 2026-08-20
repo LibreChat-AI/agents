@@ -4,6 +4,7 @@ import type { LangfuseSpanProcessorParams } from '@langfuse/otel';
 import type { Span, SpanContext } from '@opentelemetry/api';
 import type * as t from '@/types';
 import {
+  createLangfusePrivacyMask,
   hasLangfuseConfigCredentials,
   hasLangfuseEnvCredentials,
   hasLangfuseEnvConfig,
@@ -151,15 +152,22 @@ export function getLangfuseSpanProcessorParams(
   const additionalHeaders = hasAdditionalHeaders(langfuse?.additionalHeaders)
     ? { additionalHeaders: langfuse.additionalHeaders }
     : {};
+  const mask = createLangfusePrivacyMask(langfuse?.privacy);
+  // metricsOnly suppresses media too: media payloads are content, so the
+  // processor must not run its media create/upload/patch operations.
+  const mediaUploadEnabled =
+    mask != null ? false : langfuse?.mediaUploadEnabled;
+  const contentPolicy = {
+    ...(mediaUploadEnabled != null ? { mediaUploadEnabled } : {}),
+    ...(mask != null ? { mask } : {}),
+  };
   if (hasLangfuseConfigCredentials(langfuse)) {
     return {
       publicKey: langfuse.publicKey,
       secretKey: langfuse.secretKey,
       ...(isPresent(langfuse.baseUrl) ? { baseUrl: langfuse.baseUrl } : {}),
       ...(isPresent(environment) ? { environment } : {}),
-      ...(langfuse.mediaUploadEnabled != null
-        ? { mediaUploadEnabled: langfuse.mediaUploadEnabled }
-        : {}),
+      ...contentPolicy,
       ...additionalHeaders,
     };
   }
@@ -173,9 +181,7 @@ export function getLangfuseSpanProcessorParams(
       secretKey: process.env.LANGFUSE_SECRET_KEY as string,
       ...(isPresent(baseUrl) ? { baseUrl } : {}),
       ...(isPresent(environment) ? { environment } : {}),
-      ...(langfuse?.mediaUploadEnabled != null
-        ? { mediaUploadEnabled: langfuse.mediaUploadEnabled }
-        : {}),
+      ...contentPolicy,
       ...additionalHeaders,
     };
   }
@@ -185,9 +191,7 @@ export function getLangfuseSpanProcessorParams(
       secretKey: process.env.LANGFUSE_SECRET_KEY as string,
       baseUrl: langfuse.baseUrl,
       ...(isPresent(environment) ? { environment } : {}),
-      ...(langfuse.mediaUploadEnabled != null
-        ? { mediaUploadEnabled: langfuse.mediaUploadEnabled }
-        : {}),
+      ...contentPolicy,
       ...additionalHeaders,
     };
   }

@@ -199,6 +199,27 @@ describe('Langfuse instrumentation', () => {
     );
   });
 
+  it('constructs the span processor with a privacy mask under metricsOnly', async () => {
+    const { initializeLangfuseTracing } = await import('@/instrumentation');
+    initializeLangfuseTracing({
+      publicKey: 'pk-config',
+      secretKey: 'sk-config',
+      baseUrl: 'https://langfuse.config',
+      privacy: { mode: 'metricsOnly', redactionText: '[private]' },
+    });
+
+    expect(mockLangfuseSpanProcessor).toHaveBeenCalledWith(
+      expect.objectContaining({
+        mediaUploadEnabled: false,
+        mask: expect.any(Function),
+      })
+    );
+    const params = mockLangfuseSpanProcessor.mock.calls[0][0] as {
+      mask?: (input: { data: unknown }) => string;
+    };
+    expect(params.mask?.({ data: 'conversation text' })).toBe('[private]');
+  });
+
   it('falls back to NODE_ENV when LANGFUSE_TRACING_ENVIRONMENT is unset', async () => {
     delete process.env.LANGFUSE_TRACING_ENVIRONMENT;
     process.env.NODE_ENV = 'production';

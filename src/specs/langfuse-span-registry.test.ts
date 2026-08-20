@@ -69,8 +69,12 @@ describe('Langfuse span registry', () => {
     const mediaDisabled = resolveLangfuseDestinationKey(
       tenantConfig({ mediaUploadEnabled: false })
     );
+    const privacyOnly = resolveLangfuseDestinationKey(
+      tenantConfig({ privacy: { mode: 'metricsOnly' } })
+    );
     expect(redacting).toBe(base);
     expect(mediaDisabled).toBe(base);
+    expect(privacyOnly).toBe(base);
   });
 
   it('passes media upload policy to the Langfuse span processor params', () => {
@@ -83,6 +87,41 @@ describe('Langfuse span registry', () => {
         mediaUploadEnabled: false,
       })
     );
+  });
+
+  it('masks content and disables media upload under metricsOnly privacy', () => {
+    const params = getLangfuseSpanProcessorParams(
+      tenantConfig({
+        mediaUploadEnabled: true,
+        privacy: { mode: 'metricsOnly' },
+      })
+    );
+    expect(params).toEqual(
+      expect.objectContaining({
+        mediaUploadEnabled: false,
+      })
+    );
+    expect(typeof params?.mask).toBe('function');
+    expect(params?.mask?.({ data: { messages: ['secret'] } })).toBe(
+      '[CONTENT REDACTED]'
+    );
+  });
+
+  it('uses the configured redaction text in the privacy mask', () => {
+    const params = getLangfuseSpanProcessorParams(
+      tenantConfig({
+        privacy: { mode: 'metricsOnly', redactionText: '[private]' },
+      })
+    );
+    expect(params?.mask?.({ data: 'prompt text' })).toBe('[private]');
+  });
+
+  it('leaves content params untouched in full privacy mode', () => {
+    const params = getLangfuseSpanProcessorParams(
+      tenantConfig({ mediaUploadEnabled: true, privacy: { mode: 'full' } })
+    );
+    expect(params?.mediaUploadEnabled).toBe(true);
+    expect(params?.mask).toBeUndefined();
   });
 
   it('separates destinations by credentials, endpoint, and environment', () => {
