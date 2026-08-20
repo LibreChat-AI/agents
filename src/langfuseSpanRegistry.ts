@@ -4,7 +4,6 @@ import type { LangfuseSpanProcessorParams } from '@langfuse/otel';
 import type { Span, SpanContext } from '@opentelemetry/api';
 import type * as t from '@/types';
 import {
-  createLangfusePrivacyMask,
   hasLangfuseConfigCredentials,
   hasLangfuseEnvCredentials,
   hasLangfuseEnvConfig,
@@ -152,14 +151,14 @@ export function getLangfuseSpanProcessorParams(
   const additionalHeaders = hasAdditionalHeaders(langfuse?.additionalHeaders)
     ? { additionalHeaders: langfuse.additionalHeaders }
     : {};
-  const mask = createLangfusePrivacyMask(langfuse?.privacy);
   // metricsOnly suppresses media too: media payloads are content, so the
-  // processor must not run its media create/upload/patch operations.
-  const mediaUploadEnabled =
-    mask != null ? false : langfuse?.mediaUploadEnabled;
+  // processor must not run its media create/upload/patch operations. Content
+  // attributes themselves are redacted by the wrapping span processor, which
+  // unlike the SDK `mask` callback knows which attribute it is handling.
+  const metricsOnly = langfuse?.privacy?.mode === 'metricsOnly';
+  const mediaUploadEnabled = metricsOnly ? false : langfuse?.mediaUploadEnabled;
   const contentPolicy = {
     ...(mediaUploadEnabled != null ? { mediaUploadEnabled } : {}),
-    ...(mask != null ? { mask } : {}),
   };
   if (hasLangfuseConfigCredentials(langfuse)) {
     return {

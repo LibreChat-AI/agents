@@ -203,7 +203,7 @@ describe('Langfuse instrumentation', () => {
     );
   });
 
-  it('constructs the span processor with a privacy mask under metricsOnly', async () => {
+  it('constructs the span processor with media upload disabled under metricsOnly', async () => {
     const { initializeLangfuseTracing } = await import('@/instrumentation');
     initializeLangfuseTracing({
       publicKey: 'pk-config',
@@ -215,11 +215,10 @@ describe('Langfuse instrumentation', () => {
     expect(mockLangfuseSpanProcessor).toHaveBeenCalledWith(
       expect.objectContaining({
         mediaUploadEnabled: false,
-        mask: expect.any(Function),
       })
     );
     const params = mockLangfuseSpanProcessor.mock.calls[0][0];
-    expect(params?.mask?.({ data: 'conversation text' })).toBe('[private]');
+    expect(params?.mask).toBeUndefined();
   });
 
   it('falls back to NODE_ENV when LANGFUSE_TRACING_ENVIRONMENT is unset', async () => {

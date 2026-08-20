@@ -157,6 +157,21 @@ describe('Langfuse privacy masking', () => {
     ).toBe(JSON.stringify({ messageId: 'run-1' }));
   });
 
+  it('does not preserve identity keys from content attributes', async () => {
+    const span = await exportSpanWithPrivacy(
+      { mode: 'metricsOnly' },
+      {
+        [LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]: JSON.stringify({
+          messageId: 'private user value produced by a tool',
+        }),
+      }
+    );
+
+    expect(
+      span?.attributes[LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]
+    ).toBe('[CONTENT REDACTED]');
+  });
+
   it('redacts status messages and exception content in metricsOnly', async () => {
     const span = await exportSpanWithPrivacy(
       { mode: 'metricsOnly' },

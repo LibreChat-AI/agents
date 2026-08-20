@@ -89,7 +89,7 @@ describe('Langfuse span registry', () => {
     );
   });
 
-  it('masks content and disables media upload under metricsOnly privacy', () => {
+  it('disables media upload under metricsOnly privacy', () => {
     const params = getLangfuseSpanProcessorParams(
       tenantConfig({
         mediaUploadEnabled: true,
@@ -101,19 +101,7 @@ describe('Langfuse span registry', () => {
         mediaUploadEnabled: false,
       })
     );
-    expect(typeof params?.mask).toBe('function');
-    expect(params?.mask?.({ data: { messages: ['secret'] } })).toBe(
-      '[CONTENT REDACTED]'
-    );
-  });
-
-  it('uses the configured redaction text in the privacy mask', () => {
-    const params = getLangfuseSpanProcessorParams(
-      tenantConfig({
-        privacy: { mode: 'metricsOnly', redactionText: '[private]' },
-      })
-    );
-    expect(params?.mask?.({ data: 'prompt text' })).toBe('[private]');
+    expect(params?.mask).toBeUndefined();
   });
 
   it('leaves content params untouched in full privacy mode', () => {
@@ -121,7 +109,6 @@ describe('Langfuse span registry', () => {
       tenantConfig({ mediaUploadEnabled: true, privacy: { mode: 'full' } })
     );
     expect(params?.mediaUploadEnabled).toBe(true);
-    expect(params?.mask).toBeUndefined();
   });
 
   it('separates destinations by credentials, endpoint, and environment', () => {

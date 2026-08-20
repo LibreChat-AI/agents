@@ -1,7 +1,5 @@
-import type { MaskFunction } from '@langfuse/otel';
 import type { ResolvedLangfuseToolOutputTracingConfig } from '@/langfuseRuntimeContext';
 import type * as t from '@/types';
-import { LANGFUSE_OPERATION_METADATA_KEY } from '@/langfuseOperation';
 import { parseBooleanEnv } from '@/utils/misc';
 
 export const LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT = '[tool output redacted]';
@@ -159,62 +157,31 @@ export function hasToolOutputTracingConfig(
   );
 }
 
+/**
+ * Resolves the effective privacy policy. Privacy is a run-level deployment
+ * policy, not a per-agent knob: shared spans (the root trace, conversation
+ * payloads, activity-phase traces, parent generations embedding subagent
+ * results) carry every agent's content, and a policy that only some of them
+ * enforce would leak the others'. Agent overlays therefore cannot set it,
+ * and one that asks for `metricsOnly` when the run has not fails closed
+ * (export disabled) rather than export content the host asked to suppress.
+ */
 export function resolveLangfusePrivacyConfig(
+  runLangfuse?: t.LangfuseConfig
+): t.LangfusePrivacyConfig | undefined {
+  return runLangfuse?.privacy;
+}
+
+/** Whether an agent overlay demands privacy the run does not provide. */
+export function hasUnsupportedAgentPrivacy(
   runLangfuse?: t.LangfuseConfig,
   agentLangfuse?: t.LangfuseConfig
-): t.LangfusePrivacyConfig | undefined {
-  // Overlay order: the agent's fields win per-field, like every other
-  // per-field merge in this module.
-  return resolveStrictestLangfusePrivacy([
-    agentLangfuse?.privacy,
-    runLangfuse?.privacy,
-  ]);
-}
-
-/**
- * Resolves the strictest policy across any number of configs (a run plus
- * every agent overlay). Shared spans (the run's root trace, conversation
- * payloads, activity-phase traces) carry every agent's content, so their
- * policy must be at least as strict as each contributor's.
- */
-export function resolveStrictestLangfusePrivacy(
-  privacies: Array<t.LangfusePrivacyConfig | undefined>
-): t.LangfusePrivacyConfig | undefined {
-  const present = privacies.filter(
-    (privacy): privacy is t.LangfusePrivacyConfig => privacy != null
+): boolean {
+  return (
+    agentLangfuse?.privacy?.mode === 'metricsOnly' &&
+    runLangfuse?.privacy?.mode !== 'metricsOnly'
   );
-  if (present.length === 0) {
-    return undefined;
-  }
-  // The stricter mode wins so an agent overlay can tighten the run's
-  // privacy policy but never loosen it.
-  const mode = present.some((privacy) => privacy.mode === 'metricsOnly')
-    ? 'metricsOnly'
-    : 'full';
-  const redactionText = present.find(
-    (privacy) => privacy.redactionText != null
-  )?.redactionText;
-  return {
-    mode,
-    ...(redactionText != null ? { redactionText } : {}),
-  };
 }
-
-/**
- * Run-correlation identity preserved from masked metadata values. These keys
- * are SDK-written identifiers (never user content) that Langfuse consumers
- * need to link observations back to LibreChat runs, so `metricsOnly` keeps
- * them while every other metadata entry is dropped.
- */
-const PRESERVED_TRACE_IDENTITY_KEYS = [
-  'messageId',
-  'parentMessageId',
-  'agentId',
-  'agentName',
-  'sourceRunId',
-  'responseId',
-  LANGFUSE_OPERATION_METADATA_KEY,
-] as const;
 
 export function resolveLangfuseContentRedactionText(
   privacy?: t.LangfusePrivacyConfig
@@ -222,52 +189,6 @@ export function resolveLangfuseContentRedactionText(
   return isPresent(privacy?.redactionText)
     ? privacy.redactionText.trim()
     : LANGFUSE_CONTENT_REDACTION_TEXT;
-}
-
-function preserveTraceIdentity(value: object, redactionText: string): string {
-  const preserved: Record<string, unknown> = {};
-  for (const key of PRESERVED_TRACE_IDENTITY_KEYS) {
-    if (key in value) {
-      preserved[key] = (value as Record<string, unknown>)[key];
-    }
-  }
-  return Object.keys(preserved).length > 0
-    ? JSON.stringify(preserved)
-    : redactionText;
-}
-
-/**
- * Builds the SDK mask that replaces content-bearing trace and observation
- * attributes (input, output, metadata) with the configured redaction text.
- * Object-shaped values keep only run-correlation identity keys, so trace
- * metadata still links observations to runs. The span processor applies the
- * mask before export and, should the mask itself throw, fully masks the
- * value instead of exporting it verbatim.
- */
-export function createLangfusePrivacyMask(
-  privacy?: t.LangfusePrivacyConfig
-): MaskFunction | undefined {
-  if (privacy?.mode !== 'metricsOnly') {
-    return undefined;
-  }
-  const redactionText = resolveLangfuseContentRedactionText(privacy);
-  return ({ data }) => {
-    if (typeof data === 'string') {
-      const trimmed = data.trim();
-      if (trimmed.startsWith('{')) {
-        try {
-          return preserveTraceIdentity(JSON.parse(trimmed), redactionText);
-        } catch {
-          return redactionText;
-        }
-      }
-      return redactionText;
-    }
-    if (data != null && typeof data === 'object' && !Array.isArray(data)) {
-      return preserveTraceIdentity(data, redactionText);
-    }
-    return redactionText;
-  };
 }
 
 export function resolveToolOutputTracingConfig(
@@ -332,7 +253,15 @@ export function resolveLangfuseConfig(
   agentLangfuse?: t.LangfuseConfig
 ): t.LangfuseConfig | undefined {
   if (runLangfuse == null) {
-    return agentLangfuse;
+    // No run config exists to carry a run-level policy, so the overlay's
+    // privacy cannot be enforced either: strip it, failing closed when it
+    // asked for metricsOnly.
+    if (agentLangfuse?.privacy?.mode === 'metricsOnly') {
+      return { ...agentLangfuse, privacy: undefined, enabled: false };
+    }
+    return agentLangfuse?.privacy == null
+      ? agentLangfuse
+      : { ...agentLangfuse, privacy: undefined };
   }
   if (agentLangfuse == null) {
     return runLangfuse;
@@ -381,8 +310,6 @@ export function resolveLangfuseConfig(
         ]),
       ]
       : undefined;
-  const privacy = resolveLangfusePrivacyConfig(runLangfuse, agentLangfuse);
-
   return {
     ...runLangfuse,
     ...agentLangfuse,
@@ -392,6 +319,12 @@ export function resolveLangfuseConfig(
     ...(tags != null ? { tags } : {}),
     ...(toolNodeTracing != null ? { toolNodeTracing } : {}),
     ...(toolOutputTracing != null ? { toolOutputTracing } : {}),
-    ...(privacy != null ? { privacy } : {}),
+    // Privacy is run-level: the overlay's copy above never takes effect.
+    ...(runLangfuse.privacy != null
+      ? { privacy: runLangfuse.privacy }
+      : { privacy: undefined }),
+    ...(hasUnsupportedAgentPrivacy(runLangfuse, agentLangfuse)
+      ? { enabled: false }
+      : {}),
   };
 }

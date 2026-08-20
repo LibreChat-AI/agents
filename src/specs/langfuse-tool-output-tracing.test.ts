@@ -20,14 +20,13 @@ import {
   withLangfuseRuntimeScope,
 } from '@/langfuseRuntimeScope';
 import {
-  resolveLangfuseConfig,
-  resolveStrictestLangfusePrivacy,
-  resolveToolOutputTracingConfig,
-} from '@/langfuseConfig';
-import {
   runWithLangfuseRuntimeContext,
   type ResolvedLangfuseToolOutputTracingConfig,
 } from '@/langfuseRuntimeContext';
+import {
+  resolveLangfuseConfig,
+  resolveToolOutputTracingConfig,
+} from '@/langfuseConfig';
 import { ensureOpenTelemetryContextManager } from '@/instrumentation';
 import { projectToolStreamContentForProvider } from '@/messages/core';
 import { formatAgentMessages } from '@/messages/format';
@@ -1773,7 +1772,7 @@ describe('Langfuse tool output tracing redaction', () => {
     });
   });
 
-  it('merges privacy policy with the stricter mode winning', () => {
+  it('keeps privacy run-level and fails closed on agent overlays', () => {
     const credentials = {
       publicKey: 'pk-run',
       secretKey: 'sk-run',
@@ -1786,39 +1785,31 @@ describe('Langfuse tool output tracing redaction', () => {
           privacy: { mode: 'metricsOnly', redactionText: '[run]' },
         },
         { privacy: { mode: 'full' } }
-      )?.privacy
-    ).toEqual({ mode: 'metricsOnly', redactionText: '[run]' });
+      )
+    ).toMatchObject({
+      privacy: { mode: 'metricsOnly', redactionText: '[run]' },
+    });
+    // An agent overlay asking for metricsOnly without a run-level policy
+    // cannot be enforced on the shared trace, so export is disabled.
+    expect(
+      resolveLangfuseConfig(credentials, {
+        privacy: { mode: 'metricsOnly', redactionText: '[agent]' },
+      })
+    ).toMatchObject({ enabled: false });
     expect(
       resolveLangfuseConfig(credentials, {
         privacy: { mode: 'metricsOnly', redactionText: '[agent]' },
       })?.privacy
-    ).toEqual({ mode: 'metricsOnly', redactionText: '[agent]' });
+    ).toBeUndefined();
+    // Agent-only configs cannot carry privacy either.
     expect(
-      resolveLangfuseConfig(
-        { privacy: { mode: 'full' } },
-        { privacy: { mode: 'full' } }
-      )?.privacy
-    ).toEqual({ mode: 'full' });
-  });
-
-  it('resolves the strictest privacy across every agent overlay', () => {
+      resolveLangfuseConfig(undefined, {
+        privacy: { mode: 'metricsOnly' },
+      })
+    ).toMatchObject({ enabled: false });
     expect(
-      resolveStrictestLangfusePrivacy([
-        undefined,
-        { mode: 'full' },
-        { mode: 'metricsOnly' },
-        { mode: 'full' },
-      ])
-    ).toEqual({ mode: 'metricsOnly' });
-    expect(
-      resolveStrictestLangfusePrivacy([
-        { mode: 'full' },
-        { mode: 'full', redactionText: '[agent]' },
-      ])
-    ).toEqual({ mode: 'full', redactionText: '[agent]' });
-    expect(resolveStrictestLangfusePrivacy([undefined, undefined])).toBe(
-      undefined
-    );
+      resolveLangfuseConfig(undefined, { privacy: { mode: 'full' } })?.privacy
+    ).toBeUndefined();
   });
 
   it('merges run and agent custom headers with the agent winning collisions', () => {

@@ -960,6 +960,13 @@ export interface LangfuseConfig {
   /**
    * Content privacy policy applied to trace data before it leaves the
    * process. Applies to every export destination the run resolves to.
+   *
+   * Run-level only: shared observations (the root trace, conversation
+   * payloads, activity-phase traces, parent generations embedding subagent
+   * results) carry every agent's content, so a policy only some spans enforce
+   * would leak the rest. An agent overlay setting `metricsOnly` while the run
+   * does not fails closed: export is disabled for those spans instead of
+   * sending content the host asked to suppress.
    */
   privacy?: LangfusePrivacyConfig;
   /**

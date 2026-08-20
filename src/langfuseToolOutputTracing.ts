@@ -16,7 +16,7 @@ import {
   resolveLangfuseConfig,
   resolveToolOutputTracingConfig,
   resolveLangfuseContentRedactionText,
-  resolveLangfusePrivacyConfig
+  resolveLangfusePrivacyConfig,
 } from '@/langfuseConfig';
 import {
   shapeLangfuseSpan,
@@ -24,6 +24,7 @@ import {
 } from '@/langfuseTraceShaping';
 import { resolveToolOutputTracingConfigForSpan } from '@/langfuseRuntimeScope';
 import { DECISION_PROMPT_PREFIX } from '@/decisions/traceMarker';
+import { LANGFUSE_OPERATION_METADATA_KEY } from '@/langfuseOperation';
 
 export { LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT, resolveLangfuseConfig };
 
@@ -885,12 +886,113 @@ export function redactLangfuseSpanToolOutputs(
 }
 
 /**
- * Redacts content the SDK mask never sees: the OTel status message and
- * exception events. Error strings routinely embed request data (a tool
- * reporting an invalid user value, an upstream response body), and the
- * Langfuse mask only rewrites the input, output, and metadata attribute
- * families, so `metricsOnly` closes this channel itself. The status code
- * stays: error vs. ok is operational data.
+ * Run-correlation identity preserved from masked metadata values. These keys
+ * are SDK-written identifiers (never user content) that Langfuse consumers
+ * need to link observations back to LibreChat runs, so `metricsOnly` keeps
+ * them while every other metadata entry is dropped.
+ */
+const PRESERVED_TRACE_IDENTITY_KEYS = [
+  'messageId',
+  'parentMessageId',
+  'agentId',
+  'agentName',
+  'sourceRunId',
+  'responseId',
+  LANGFUSE_OPERATION_METADATA_KEY,
+] as const;
+
+function preserveTraceIdentity(value: unknown, redactionText: string): string {
+  if (typeof value !== 'string') {
+    return redactionText;
+  }
+  const trimmed = value.trim();
+  if (!trimmed.startsWith('{')) {
+    return redactionText;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return redactionText;
+  }
+  if (parsed == null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return redactionText;
+  }
+  const source = parsed as Record<string, unknown>;
+  const preserved: Record<string, unknown> = {};
+  for (const key of PRESERVED_TRACE_IDENTITY_KEYS) {
+    if (key in source) {
+      preserved[key] = source[key];
+    }
+  }
+  return Object.keys(preserved).length > 0
+    ? JSON.stringify(preserved)
+    : redactionText;
+}
+
+/**
+ * Applies the `metricsOnly` policy to a span's content-bearing attributes
+ * before export.
+ *
+ * Redaction happens here rather than through the Langfuse span processor's
+ * `mask` callback because the callback cannot tell which attribute it is
+ * handling: preserving run-correlation identity in metadata would also
+ * preserve same-named keys in user content (a tool returning
+ * `{"messageId": "..."}`), and a blanket replacement would strip the
+ * identity Langfuse consumers need. Per-attribute, input and output values
+ * are replaced wholesale while metadata keeps only SDK-written identifiers.
+ *
+ * Fail closed: if any step throws, every masked family is replaced with the
+ * redaction text instead of exporting the value verbatim.
+ */
+function redactLangfuseSpanContent(
+  span: ReadableSpan,
+  privacy: t.LangfusePrivacyConfig
+): void {
+  const redactionText = resolveLangfuseContentRedactionText(privacy);
+  const attributes = span.attributes;
+  const contentKeys = [
+    LangfuseOtelSpanAttributes.OBSERVATION_INPUT,
+    LangfuseOtelSpanAttributes.TRACE_INPUT,
+    LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT,
+    LangfuseOtelSpanAttributes.TRACE_OUTPUT,
+  ];
+  const metadataKeys = [
+    LangfuseOtelSpanAttributes.OBSERVATION_METADATA,
+    LangfuseOtelSpanAttributes.TRACE_METADATA,
+  ];
+  try {
+    for (const key of contentKeys) {
+      if (key in attributes) {
+        attributes[key] = redactionText;
+      }
+    }
+    for (const key of metadataKeys) {
+      if (key in attributes) {
+        attributes[key] = preserveTraceIdentity(attributes[key], redactionText);
+      }
+    }
+    redactLangfuseSpanStatusContent(span, redactionText);
+  } catch {
+    for (const key of [...contentKeys, ...metadataKeys]) {
+      if (key in attributes) {
+        attributes[key] = redactionText;
+      }
+    }
+    try {
+      redactLangfuseSpanStatusContent(span, redactionText);
+    } catch {
+      // Status redaction is best-effort; content attributes above are the
+      // values that must never export verbatim.
+    }
+  }
+}
+
+/**
+ * Redacts content that rides outside the masked attribute families: the
+ * OTel status message and exception events. Error strings routinely embed
+ * request data (a tool reporting an invalid user value, an upstream
+ * response body). The status code stays: error vs. ok is operational data.
  */
 function redactLangfuseSpanStatusContent(
   span: ReadableSpan,
@@ -927,10 +1029,7 @@ export function prepareLangfuseSpanForExport(
   }
   shapeLangfuseSpan(span);
   if (privacy?.mode === 'metricsOnly') {
-    redactLangfuseSpanStatusContent(
-      span,
-      resolveLangfuseContentRedactionText(privacy)
-    );
+    redactLangfuseSpanContent(span, privacy);
   }
 }
 
@@ -995,7 +1094,7 @@ export function createLangfuseSpanProcessor(
   return new ToolOutputRedactingLangfuseSpanProcessor(
     params,
     fallbackConfig,
-    resolveLangfusePrivacyConfig(runLangfuse, agentLangfuse)
+    resolveLangfusePrivacyConfig(runLangfuse)
   );
 }
 
