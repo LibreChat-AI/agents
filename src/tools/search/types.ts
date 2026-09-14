@@ -32,7 +32,13 @@ export type ScraperProvider =
   | 'tavily'
   | 'crw'
   | 'keenable';
-export type RerankerType = 'infinity' | 'jina' | 'cohere' | 'rag-api' | 'none';
+export type RerankerType =
+  | 'infinity'
+  | 'jina'
+  | 'cohere'
+  | 'rag-api'
+  | 'custom'
+  | 'none';
 
 export interface Highlight {
   score: number;
@@ -529,6 +535,9 @@ export interface SearchToolConfig
   ragApiTokenSupplier?: RagApiTokenSupplier;
   /** rag_api rerank profile. Defaults to `'fast-v1'`. */
   ragApiProfile?: string;
+  customRerankerApiUrl?: string;
+  customRerankerApiKey?: string;
+  customRerankerModel?: string;
   rerankerType?: RerankerType;
   /** Timeout (ms) for rerank API requests. Defaults to 10,000. */
   rerankerTimeout?: number;
