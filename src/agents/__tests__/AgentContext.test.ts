@@ -361,6 +361,62 @@ describe('AgentContext', () => {
       );
     });
 
+    it.each([Providers.OPENAI, Providers.AZURE])(
+      'moves the dynamic tail behind stable history for %s explicit caching',
+      async (provider) => {
+        const ctx = createBasicContext({
+          agentConfig: {
+            provider,
+            clientOptions: {
+              model: 'gpt-5.6',
+              promptCacheExplicit: true,
+            } as t.OpenAIClientOptions,
+            instructions: 'Stable instructions',
+            additional_instructions: 'Dynamic instructions',
+          },
+        });
+
+        const result = await ctx.systemRunnable!.invoke([
+          new HumanMessage('Hello'),
+          new AIMessage('Hi'),
+          new HumanMessage('Second'),
+        ]);
+
+        /** Plain text: the breakpoint is attached to the request, not the content. */
+        expect(result[0].content).toBe('Stable instructions');
+        expect(result[1].content).toBe('Hello');
+        expect(result[2].content).toBe('Hi');
+        expect(result[3].content).toBe('Dynamic instructions');
+        expect(result[4].content).toBe('Second');
+        for (const message of result) {
+          expect(JSON.stringify(message.content)).not.toContain(
+            'cache_control'
+          );
+        }
+      }
+    );
+
+    it('keeps dynamic-only instructions in the system message under explicit caching', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.OPENAI,
+          clientOptions: {
+            model: 'gpt-5.6',
+            promptCacheExplicit: true,
+          } as t.OpenAIClientOptions,
+          instructions: undefined,
+          additional_instructions: 'Dynamic only',
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([
+        new HumanMessage('Hello'),
+      ]);
+
+      expect(result[0].content).toBe('Dynamic only');
+      expect(result).toHaveLength(2);
+    });
+
     it('moves OpenRouter dynamic instructions behind stable history', async () => {
       const ctx = createBasicContext({
         agentConfig: {
