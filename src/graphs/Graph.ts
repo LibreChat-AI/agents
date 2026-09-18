@@ -329,6 +329,16 @@ function isTextMessageContentPart(
   );
 }
 
+function isNativeMediaContentPart(
+  contentPart: MessageContent[number] | t.MessageContentComplex
+): boolean {
+  return (
+    typeof contentPart === 'object' &&
+    (contentPart.type === ContentTypes.IMAGE_FILE ||
+      contentPart.native_media != null)
+  );
+}
+
 function isGoogleServerSideToolMessageContentPart(
   contentPart: MessageContent[number] | t.MessageContentComplex
 ): boolean {
@@ -346,8 +356,10 @@ function hasGoogleServerSideToolDeltaContent(
   return (
     isGoogleLike(provider) &&
     Array.isArray(content) &&
-    content.some((contentPart) =>
-      isGoogleServerSideToolMessageContentPart(contentPart)
+    content.some(
+      (contentPart) =>
+        isGoogleServerSideToolMessageContentPart(contentPart) ||
+        isNativeMediaContentPart(contentPart)
     )
   );
 }
@@ -370,8 +382,10 @@ function getMessageDeltaContent(
 
   const hasGoogleServerSideToolPart =
     isGoogleLike(provider) &&
-    content.some((contentPart) =>
-      isGoogleServerSideToolMessageContentPart(contentPart)
+    content.some(
+      (contentPart) =>
+        isGoogleServerSideToolMessageContentPart(contentPart) ||
+        isNativeMediaContentPart(contentPart)
     );
   if (content.every((contentPart) => isTextMessageContentPart(contentPart))) {
     return content as t.MessageDelta['content'];
@@ -382,7 +396,8 @@ function getMessageDeltaContent(
   const messageContent = content.filter(
     (contentPart) =>
       isTextMessageContentPart(contentPart) ||
-      isGoogleServerSideToolMessageContentPart(contentPart)
+      isGoogleServerSideToolMessageContentPart(contentPart) ||
+      isNativeMediaContentPart(contentPart)
   );
   return messageContent.length > 0
     ? (messageContent as t.MessageDelta['content'])

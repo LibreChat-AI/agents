@@ -12,6 +12,7 @@ import type Anthropic from '@anthropic-ai/sdk';
 import type { AnthropicContentBlock } from '@/llm/anthropic/types';
 import type { AssistantTextPhase } from '@/types/assistantPhase';
 import type { SummarizeCompleteEvent } from '@/types/summarize';
+import type { NativeMediaReference } from '@/llm/google/native';
 import type { ToolEndEvent } from '@/types/tools';
 import { StepTypes, ContentTypes, GraphEvents } from '@/common/enum';
 
@@ -356,6 +357,7 @@ export interface ReasoningDelta {
 }
 
 export type MessageDeltaUpdate = {
+  native_media?: NativeMediaReference;
   type: ContentTypes.TEXT;
   text: string;
   tool_call_ids?: string[];
@@ -496,6 +498,7 @@ export type MessageContentComplex = (
       type?: never;
     })
 ) & {
+  native_media?: NativeMediaReference;
   /** Open Responses-compatible semantic phase for assistant text. */
   phase?: AssistantTextPhase;
   /** LangChain standard-content form of provider-specific block fields. */

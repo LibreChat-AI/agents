@@ -391,7 +391,13 @@ function _convertLangChainContentToPart(
 
   if (content.type === 'text') {
     return typeof content.text === 'string' && content.text !== ''
-      ? { text: content.text }
+      ? {
+        text: content.text,
+        ...('thoughtSignature' in content &&
+          typeof content.thoughtSignature === 'string'
+          ? { thoughtSignature: content.thoughtSignature }
+          : {}),
+      }
       : undefined;
   } else if (content.type === 'executableCode') {
     return { executableCode: content.executableCode };
@@ -423,10 +429,11 @@ function _convertLangChainContentToPart(
     }
 
     return {
-      inlineData: {
-        data,
-        mimeType,
-      },
+      inlineData: { data, mimeType },
+      ...('thoughtSignature' in content &&
+      typeof content.thoughtSignature === 'string'
+        ? { thoughtSignature: content.thoughtSignature }
+        : {}),
     };
   } else if (content.type === 'media') {
     return messageContentMedia(content);
@@ -778,7 +785,9 @@ export function convertResponseContentToChatGenerationChunk(
   if (
     candidateContent != null &&
     Array.isArray(candidateContent.parts) &&
-    candidateContent.parts.every((p) => 'text' in p)
+    candidateContent.parts.every(
+      (p) => 'text' in p && !('thoughtSignature' in p)
+    )
   ) {
     // content = candidateContent.parts.map((p) => p.text).join('');
     const textParts: string[] = [];
@@ -801,6 +810,9 @@ export function convertResponseContentToChatGenerationChunk(
             return {
               type: 'text',
               text: p.text,
+              ...('thoughtSignature' in p
+                ? { thoughtSignature: p.thoughtSignature }
+                : {}),
             };
           } else if ('executableCode' in p) {
             return {
@@ -953,6 +965,7 @@ export function mapGenerateContentResultToChatResult(
   if (
     Array.isArray(candidateContent?.parts) &&
     candidateContent.parts.length === 1 &&
+    !('thoughtSignature' in candidateContent.parts[0]) &&
     (candidateContent.parts[0].text ?? '') !== '' &&
     !(
       'thought' in candidateContent.parts[0] &&
@@ -974,6 +987,9 @@ export function mapGenerateContentResultToChatResult(
             return {
               type: 'text',
               text: p.text,
+              ...('thoughtSignature' in p
+                ? { thoughtSignature: p.thoughtSignature }
+                : {}),
             };
           } else if ('executableCode' in p) {
             return {

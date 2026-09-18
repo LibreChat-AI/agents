@@ -24,6 +24,7 @@ import type { OpenAI as OpenAIClient } from 'openai';
 import type { ChatXAIInput } from '@langchain/xai';
 import type { CustomProviderOptionsMap } from '../provider-registration';
 import type { ChatOpenRouterCallOptions } from '@/llm/openrouter';
+import type { NativeMediaPort } from '@/llm/google/native';
 import type { PromptCacheTtl } from '@/messages/cache';
 import {
   AzureChatOpenAI,
@@ -38,6 +39,13 @@ import { CustomAnthropic } from '@/llm/anthropic';
 import { ChatOpenRouter } from '@/llm/openrouter';
 import { ChatVertexAI } from '@/llm/vertexai';
 import { Providers } from '@/common';
+
+export type {
+  NativeMediaPort,
+  NativeMediaPart,
+  NativeMediaContent,
+  NativeMediaReference,
+} from '@/llm/google/native';
 
 export type AzureClientOptions = Partial<OpenAIChatInput> &
   Partial<AzureOpenAIInput> & {
@@ -155,6 +163,8 @@ export type BedrockConverseClientOptions = BedrockAnthropicInput;
 export type BedrockAnthropicClientOptions = BedrockAnthropicInput;
 export type GoogleClientOptions = GoogleGenerativeAIChatInput &
   StreamSmoothingOptions & {
+    nativeMedia?: NativeMediaPort;
+    responseModalities?: string[];
     customHeaders?: RequestOptions['customHeaders'];
     thinkingConfig?: GoogleThinkingConfig;
     includeServerSideToolInvocations?: boolean;

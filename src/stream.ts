@@ -453,6 +453,15 @@ function isGoogleServerSideToolContentPart(
   return contentPart.type === 'toolCall' || contentPart.type === 'toolResponse';
 }
 
+function isNativeMediaContentPart(
+  contentPart: t.MessageContentComplex
+): boolean {
+  return (
+    contentPart.type === ContentTypes.IMAGE_FILE ||
+    contentPart.native_media != null
+  );
+}
+
 function isTextContentPart(contentPart: t.MessageContentComplex): boolean {
   return contentPart.type?.startsWith(ContentTypes.TEXT) ?? false;
 }
@@ -575,7 +584,10 @@ async function dispatchMessageContentParts({
       content: [contentPart],
       metadata,
     });
-    if (isGoogleServerSideToolContentPart(contentPart)) {
+    if (
+      isGoogleServerSideToolContentPart(contentPart) ||
+      isNativeMediaContentPart(contentPart)
+    ) {
       markGoogleServerSideToolMessageStep(graph, currentStepId);
     }
     await graph.dispatchMessageDelta(
@@ -660,7 +672,8 @@ async function dispatchGoogleServerSideToolStreamContent({
   const messageContent = content.filter(
     (contentPart) =>
       isTextContentPart(contentPart) ||
-      isGoogleServerSideToolContentPart(contentPart)
+      isGoogleServerSideToolContentPart(contentPart) ||
+      isNativeMediaContentPart(contentPart)
   );
   await dispatchMessageContentParts({
     graph,
@@ -1408,7 +1421,9 @@ export function getChunkContent({
   if (
     isGoogleLike(provider) &&
     Array.isArray(chunk?.content) &&
-    chunk.content.some((c) => isGoogleServerSideToolContentPart(c))
+    chunk.content.some(
+      (c) => isGoogleServerSideToolContentPart(c) || isNativeMediaContentPart(c)
+    )
   ) {
     return chunk.content;
   }
@@ -1792,7 +1807,10 @@ export class ChatModelStreamHandler implements t.EventHandler {
     const hasGoogleServerSideToolContent =
       isGoogleLike(agentContext.provider) &&
       Array.isArray(content) &&
-      content.some((c) => isGoogleServerSideToolContentPart(c));
+      content.some(
+        (c) =>
+          isGoogleServerSideToolContentPart(c) || isNativeMediaContentPart(c)
+      );
     if (hasGoogleServerSideToolContent && Array.isArray(content)) {
       await dispatchGoogleServerSideToolStreamContent({
         graph,
@@ -2446,6 +2464,9 @@ export function createContentAggregator(): t.ContentAggregatorResult {
       } else if (currentContent.citations !== undefined) {
         update.citations = currentContent.citations;
       }
+      if (contentPart.native_media != null) {
+        update.native_media = contentPart.native_media;
+      }
       contentParts[index] = update;
     } else if (
       partType.startsWith(ContentTypes.THINK) &&
@@ -2469,6 +2490,11 @@ export function createContentAggregator(): t.ContentAggregatorResult {
       };
 
       contentParts[index] = update;
+    } else if (
+      partType === ContentTypes.IMAGE_FILE &&
+      'image_file' in contentPart
+    ) {
+      contentParts[index] = { ...contentPart };
     } else if (partType === 'toolCall' || partType === 'toolResponse') {
       contentParts[index] = contentPart;
     } else if (partType === ContentTypes.SUMMARY) {

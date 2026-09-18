@@ -16,14 +16,16 @@ import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager
 import type { BaseMessage, UsageMetadata } from '@langchain/core/messages';
 import type { GeminiApiUsageMetadata, InputTokenDetails } from './types';
 import type { GoogleClientOptions, GoogleThinkingConfig } from '@/types';
-import { smoothGenerationChunks } from '@/llm/stream/chunkAdapters';
-import { resolveStreamDelay } from '@/llm/stream/smoother';
+import type { NativeMediaPort } from './native';
 import {
   convertResponseContentToChatGenerationChunk,
   convertBaseMessagesToContent,
   dropUnsupportedModelTurnPrefill,
   mapGenerateContentResultToChatResult,
 } from './utils/common';
+import { smoothGenerationChunks } from '@/llm/stream/chunkAdapters';
+import { resolveStreamDelay } from '@/llm/stream/smoother';
+import { NativeMediaSession } from './native';
 
 type GoogleToolConfigWithServerSideInvocations = ToolConfig & {
   includeServerSideToolInvocations?: boolean;
@@ -38,6 +40,8 @@ type GoogleToolConfigWithServerSideInvocations = ToolConfig & {
 };
 
 export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
+  static readonly nativeMediaProtocolVersion = 1;
+  nativeMedia?: NativeMediaPort;
   _lc_stream_delay: number;
   thinkingConfig?: GoogleThinkingConfig;
   includeServerSideToolInvocations?: boolean;
@@ -57,6 +61,7 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
 
   constructor(fields: GoogleClientOptions) {
     super(fields);
+    this.nativeMedia = fields.nativeMedia;
 
     this._lc_stream_delay = resolveStreamDelay(fields._lc_stream_delay);
     this.model = fields.model.replace(/^models\//, '');
@@ -127,6 +132,9 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
         model: this.model,
         safetySettings: this.safetySettings as SafetySetting[],
         generationConfig: {
+          ...(this.nativeMedia && fields.responseModalities
+            ? { responseModalities: fields.responseModalities }
+            : {}),
           stopSequences: this.stopSequences,
           maxOutputTokens: this.maxOutputTokens,
           temperature: this.temperature,
@@ -170,7 +178,8 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
       total_tokens: usageMetadata.totalTokenCount ?? 0,
     };
 
-    if (usageMetadata.cachedContentTokenCount) {
+    const hasCachedInput = Boolean(usageMetadata.cachedContentTokenCount);
+    if (hasCachedInput) {
       output.input_token_details ??= {};
       output.input_token_details.cache_read =
         usageMetadata.cachedContentTokenCount;
@@ -246,54 +255,80 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
     options: this['ParsedCallOptions'],
     runManager?: CallbackManagerForLLMRun
   ): Promise<import('@langchain/core/outputs').ChatResult> {
-    const prompt = convertBaseMessagesToContent(
-      messages,
-      this._isMultimodalModel,
-      this.useSystemInstruction,
-      this.model
+    const native = new NativeMediaSession(
+      this.nativeMedia,
+      this.model,
+      runManager?.runId,
+      options.signal
     );
-    let actualPrompt = prompt;
-    if (prompt?.[0].role === 'system') {
-      const [systemInstruction] = prompt;
-      /** @ts-ignore */
-      this.client.systemInstruction = systemInstruction;
-      actualPrompt = prompt.slice(1);
-    }
-    actualPrompt = dropUnsupportedModelTurnPrefill(actualPrompt, this.model);
-    const parameters = this.invocationParams(options);
-    const request = {
-      ...parameters,
-      contents: actualPrompt,
-    };
-
-    const res = await this.caller.callWithOptions(
-      { signal: options.signal },
-      async () =>
+    try {
+      const admitted = await native.start();
+      if (admitted?.responseModalities) {
+        /** @ts-ignore Google types predate responseModalities. */
+        this.client.generationConfig.responseModalities =
+          admitted.responseModalities;
+      }
+      const prompt = convertBaseMessagesToContent(
+        await native.messages(messages),
+        this._isMultimodalModel,
+        this.useSystemInstruction,
+        this.model
+      );
+      let actualPrompt = prompt;
+      if (prompt?.[0].role === 'system') {
+        const [systemInstruction] = prompt;
         /** @ts-ignore */
-        this.client.generateContent(request)
-    );
+        this.client.systemInstruction = systemInstruction;
+        actualPrompt = prompt.slice(1);
+      }
+      actualPrompt = dropUnsupportedModelTurnPrefill(actualPrompt, this.model);
+      const parameters = this.invocationParams(options);
+      const request = {
+        ...parameters,
+        contents: actualPrompt,
+      };
 
-    const response = res.response;
-    const usageMetadata = this._convertToUsageMetadata(
+      const res = await this.caller.callWithOptions(
+        { signal: options.signal },
+        async () =>
+          /** @ts-ignore */
+          this.client.generateContent(request)
+      );
+
+      const response = res.response;
+      const usageMetadata = this._convertToUsageMetadata(
+        /** @ts-ignore */
+        response.usageMetadata,
+        this.model
+      );
+
       /** @ts-ignore */
-      response.usageMetadata,
-      this.model
-    );
+      const generationResult = mapGenerateContentResultToChatResult(response, {
+        usageMetadata,
+      });
 
-    /** @ts-ignore */
-    const generationResult = mapGenerateContentResultToChatResult(response, {
-      usageMetadata,
-    });
-
-    await runManager?.handleLLMNewToken(
-      generationResult.generations[0].text || '',
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined
-    );
-    return generationResult;
+      const generation = generationResult.generations.at(0);
+      if (generation != null) {
+        generation.message.content = await native.content(
+          generation.message.content,
+          0
+        );
+        generation.message.lc_kwargs.content = generation.message.content;
+      }
+      await native.complete();
+      await runManager?.handleLLMNewToken(
+        generationResult.generations[0].text || '',
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined
+      );
+      return generationResult;
+    } catch (error) {
+      await native.fail();
+      throw error;
+    }
   }
 
   async *_streamResponseChunks(
@@ -301,20 +336,38 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
     options: this['ParsedCallOptions'],
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
-    yield* smoothGenerationChunks({
-      chunks: this._streamProviderChunks(messages, options),
-      delayMs: this._lc_stream_delay,
-      signal: options.signal,
-      runManager,
-    });
+    const native = new NativeMediaSession(
+      this.nativeMedia,
+      this.model,
+      runManager?.runId,
+      options.signal
+    );
+    try {
+      const admitted = await native.start();
+      if (admitted?.responseModalities) {
+        /** @ts-ignore Google types predate responseModalities. */
+        this.client.generationConfig.responseModalities =
+          admitted.responseModalities;
+      }
+      yield* smoothGenerationChunks({
+        chunks: this._streamProviderChunks(messages, options, native),
+        delayMs: this._lc_stream_delay,
+        signal: options.signal,
+        runManager,
+      });
+      await native.complete();
+    } finally {
+      await native.fail();
+    }
   }
 
   private async *_streamProviderChunks(
     messages: BaseMessage[],
-    options: this['ParsedCallOptions']
+    options: this['ParsedCallOptions'],
+    native: NativeMediaSession
   ): AsyncGenerator<ChatGenerationChunk> {
     const prompt = convertBaseMessagesToContent(
-      messages,
+      await native.messages(messages),
       this._isMultimodalModel,
       this.useSystemInstruction,
       this.model
@@ -364,6 +417,11 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
         continue;
       }
 
+      chunk.message.content = await native.content(
+        chunk.message.content,
+        index - 1
+      );
+      chunk.message.lc_kwargs.content = chunk.message.content;
       yield chunk;
     }
 
