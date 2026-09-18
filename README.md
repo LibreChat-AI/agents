@@ -9,6 +9,7 @@ TypeScript utilities for building LibreChat agent workflows. The package provide
 - Tool calling, tool search, subagent handoffs, and programmatic tool execution
 - Provider adapters for Anthropic, Bedrock, Vertex AI, OpenAI-compatible providers, Google, Mistral, DeepSeek, and xAI
 - Message formatting, context pruning, summarization, and cache-control helpers
+- Native Google image output through a [host-supplied media port](docs/native-media.md)
 
 ## Installation
 
