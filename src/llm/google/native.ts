@@ -97,7 +97,11 @@ export class NativeMediaSession {
         throw new Error('Native media requires configured storage');
       }
       return Array.isArray(content)
-        ? content.map(({ thoughtSignature: _signature, ...part }) => part)
+        ? content.map((part) => {
+          if (part.type !== 'text') return part;
+          const { thoughtSignature: _signature, ...visible } = part;
+          return visible;
+        })
         : content;
     }
     const parts =

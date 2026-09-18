@@ -3,6 +3,7 @@ import { AIMessageChunk } from '@langchain/core/messages';
 import { ChatGenerationChunk } from '@langchain/core/outputs';
 import { ChatGoogleGenerativeAI } from '@langchain/google-genai';
 import { getEnvironmentVariable } from '@langchain/core/utils/env';
+import { convertChunksToEvents } from '@langchain/core/language_models/compat';
 import {
   FunctionCallingMode,
   GoogleGenerativeAI as GenerativeAI,
@@ -13,6 +14,7 @@ import type {
   ToolConfig,
 } from '@google/generative-ai';
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
+import type { ChatModelStreamEvent } from '@langchain/core/language_models/event';
 import type { BaseMessage, UsageMetadata } from '@langchain/core/messages';
 import type { GeminiApiUsageMetadata, InputTokenDetails } from './types';
 import type { GoogleClientOptions, GoogleThinkingConfig } from '@/types';
@@ -45,6 +47,7 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
   _lc_stream_delay: number;
   thinkingConfig?: GoogleThinkingConfig;
   includeServerSideToolInvocations?: boolean;
+  private readonly responseModalities?: string[];
 
   /**
    * Override to add gemini-3 model support for multimodal and function calling thought signatures
@@ -62,6 +65,7 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
   constructor(fields: GoogleClientOptions) {
     super(fields);
     this.nativeMedia = fields.nativeMedia;
+    this.responseModalities = fields.responseModalities?.slice();
 
     this._lc_stream_delay = resolveStreamDelay(fields._lc_stream_delay);
     this.model = fields.model.replace(/^models\//, '');
@@ -132,9 +136,6 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
         model: this.model,
         safetySettings: this.safetySettings as SafetySetting[],
         generationConfig: {
-          ...(this.nativeMedia && fields.responseModalities
-            ? { responseModalities: fields.responseModalities }
-            : {}),
           stopSequences: this.stopSequences,
           maxOutputTokens: this.maxOutputTokens,
           temperature: this.temperature,
@@ -250,6 +251,40 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
     return params;
   }
 
+  private async prepareRequest(
+    messages: BaseMessage[],
+    options: this['ParsedCallOptions'],
+    native: NativeMediaSession
+  ): Promise<GenerateContentRequest> {
+    const admitted = await native.start();
+    const prompt =
+      convertBaseMessagesToContent(
+        await native.messages(messages),
+        this._isMultimodalModel,
+        this.useSystemInstruction,
+        this.model
+      ) ?? [];
+    const systemInstruction =
+      prompt[0]?.role === 'system' ? prompt[0] : undefined;
+    const contents = systemInstruction == null ? prompt : prompt.slice(1);
+    const parameters = this.invocationParams(options);
+    const responseModalities =
+      this.nativeMedia == null
+        ? undefined
+        : (admitted?.responseModalities ?? this.responseModalities);
+    return {
+      ...parameters,
+      generationConfig: {
+        ...parameters.generationConfig,
+        ...(responseModalities == null
+          ? {}
+          : { responseModalities: [...responseModalities] }),
+      },
+      ...(systemInstruction == null ? {} : { systemInstruction }),
+      contents: dropUnsupportedModelTurnPrefill(contents, this.model) ?? [],
+    };
+  }
+
   async _generate(
     messages: BaseMessage[],
     options: this['ParsedCallOptions'],
@@ -262,31 +297,7 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
       options.signal
     );
     try {
-      const admitted = await native.start();
-      if (admitted?.responseModalities) {
-        /** @ts-ignore Google types predate responseModalities. */
-        this.client.generationConfig.responseModalities =
-          admitted.responseModalities;
-      }
-      const prompt = convertBaseMessagesToContent(
-        await native.messages(messages),
-        this._isMultimodalModel,
-        this.useSystemInstruction,
-        this.model
-      );
-      let actualPrompt = prompt;
-      if (prompt?.[0].role === 'system') {
-        const [systemInstruction] = prompt;
-        /** @ts-ignore */
-        this.client.systemInstruction = systemInstruction;
-        actualPrompt = prompt.slice(1);
-      }
-      actualPrompt = dropUnsupportedModelTurnPrefill(actualPrompt, this.model);
-      const parameters = this.invocationParams(options);
-      const request = {
-        ...parameters,
-        contents: actualPrompt,
-      };
+      const request = await this.prepareRequest(messages, options, native);
 
       const res = await this.caller.callWithOptions(
         { signal: options.signal },
@@ -331,6 +342,49 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
     }
   }
 
+  async *_streamChatModelEvents(
+    messages: BaseMessage[],
+    options: this['ParsedCallOptions'],
+    runManager?: CallbackManagerForLLMRun
+  ): AsyncGenerator<ChatModelStreamEvent> {
+    if (this.nativeMedia == null) {
+      await new NativeMediaSession(undefined, this.model).messages(messages);
+      yield* super._streamChatModelEvents(messages, options, runManager);
+      return;
+    }
+    yield* convertChunksToEvents(
+      this._streamNativeEventChunks(messages, options, runManager),
+      { signal: options.signal }
+    );
+  }
+
+  /** The event bridge merges string chunks into block zero, even across images. */
+  private async *_streamNativeEventChunks(
+    messages: BaseMessage[],
+    options: this['ParsedCallOptions'],
+    runManager?: CallbackManagerForLLMRun
+  ): AsyncGenerator<ChatGenerationChunk> {
+    for await (const chunk of this._streamResponseChunks(
+      messages,
+      options,
+      runManager
+    )) {
+      const content = chunk.message.content;
+      if (typeof content !== 'string' || content === '') {
+        yield chunk;
+        continue;
+      }
+      yield new ChatGenerationChunk({
+        text: chunk.text,
+        generationInfo: chunk.generationInfo,
+        message: new AIMessageChunk({
+          ...chunk.message,
+          content: [{ type: 'text', text: content }],
+        }),
+      });
+    }
+  }
+
   async *_streamResponseChunks(
     messages: BaseMessage[],
     options: this['ParsedCallOptions'],
@@ -343,14 +397,9 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
       options.signal
     );
     try {
-      const admitted = await native.start();
-      if (admitted?.responseModalities) {
-        /** @ts-ignore Google types predate responseModalities. */
-        this.client.generationConfig.responseModalities =
-          admitted.responseModalities;
-      }
+      const request = await this.prepareRequest(messages, options, native);
       yield* smoothGenerationChunks({
-        chunks: this._streamProviderChunks(messages, options, native),
+        chunks: this._streamProviderChunks(request, options, native),
         delayMs: this._lc_stream_delay,
         signal: options.signal,
         runManager,
@@ -362,29 +411,10 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
   }
 
   private async *_streamProviderChunks(
-    messages: BaseMessage[],
+    request: GenerateContentRequest,
     options: this['ParsedCallOptions'],
     native: NativeMediaSession
   ): AsyncGenerator<ChatGenerationChunk> {
-    const prompt = convertBaseMessagesToContent(
-      await native.messages(messages),
-      this._isMultimodalModel,
-      this.useSystemInstruction,
-      this.model
-    );
-    let actualPrompt = prompt;
-    if (prompt?.[0].role === 'system') {
-      const [systemInstruction] = prompt;
-      /** @ts-ignore */
-      this.client.systemInstruction = systemInstruction;
-      actualPrompt = prompt.slice(1);
-    }
-    actualPrompt = dropUnsupportedModelTurnPrefill(actualPrompt, this.model);
-    const parameters = this.invocationParams(options);
-    const request = {
-      ...parameters,
-      contents: actualPrompt,
-    };
     const stream = await this.caller.callWithOptions(
       { signal: options.signal },
       async () => {

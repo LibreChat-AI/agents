@@ -2,7 +2,8 @@
 
 `CustomChatGoogleGenerativeAI` accepts a `NativeMediaPort` for models that return
 images alongside text. The SDK calls the provider through its normal invocation
-and streaming paths. The host supplies authorization, durable storage and replay.
+and streaming paths, including `streamEvents()` when the port is configured.
+The host supplies authorization, durable storage and replay.
 
 ```typescript
 import { CustomChatGoogleGenerativeAI } from '@librechat/agents/llm/google';
@@ -34,19 +35,26 @@ and `partIndex`. The host can use these to identify writes. Its continuation
 references must survive later invocations and process restarts if conversations
 can be resumed. Scope reference lookup to the current user and conversation.
 
+The host's `responseModalities` applies only to that invocation. If `start`
+returns no selection, the constructor's `responseModalities` is used when a port
+is configured; otherwise the provider chooses its defaults. Concurrent calls
+keep their selections separate.
+
 Text and images retain provider order through graph dispatch and aggregation.
 Image content becomes an `image_file` with a file ID and stored-file metadata.
 Private image bytes and thought signatures stay behind the host port; visible
 content may carry an opaque `native_media.continuationRef`. Preserve that marker
 and the content order when saving and restoring assistant messages.
 
-Before a continuation request, the SDK restores signed provider parts without
-mutating the caller's stored messages. It rejects native continuation references
+Before a continuation request, the SDK restores signed provider parts, including
+empty text carrying a signature, without mutating the caller's stored messages.
+It rejects native continuation references
 when no host port is configured. Existing tool-generated image files without a
 native continuation marker continue through the ordinary message conversion path.
 
-Without a port, ordinary text invocation remains available. Inline image output
-requires configured storage and is rejected before it can be emitted. The host
+Without a port, ordinary text invocation and existing Google server-tool
+signatures are preserved. Inline image output requires configured storage and is
+rejected before it can be emitted. The host
 controls supported models, file access, retention, accounting and recovery; an
 aborted local stream does not establish that a remote generation stopped.
 
