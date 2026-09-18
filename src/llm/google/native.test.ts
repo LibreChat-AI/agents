@@ -1,19 +1,15 @@
 import { describe, it, expect, jest } from '@jest/globals';
 import { AIMessage, HumanMessage } from '@langchain/core/messages';
 import type { GenerateContentRequest, Part } from '@google/generative-ai';
-import type {
-  NativeMediaPart,
-  NativeMediaPort,
-  NativeMediaContent,
-} from '@/index';
+import type { NativeMediaPort, NativeMediaContent } from '@/index';
+import {
+  fixturePort,
+  imagePart,
+  imageData,
+} from './__tests__/nativeMediaFixtures';
 import { Run, StandardGraph, Providers, createHandlers } from '@/index';
 import { CustomChatGoogleGenerativeAI } from './index';
 
-const imageData = 'aW1tdXRhYmxlLWltYWdlLWJ5dGVz';
-const imagePart = {
-  inlineData: { mimeType: 'image/png', data: imageData },
-  thoughtSignature: 'private-signature',
-};
 type FixturePart = Part & { thoughtSignature?: string };
 function response(parts: FixturePart[]) {
   return {
@@ -21,50 +17,6 @@ function response(parts: FixturePart[]) {
     text: () => '',
     functionCalls: () => undefined,
   };
-}
-function fixturePort(overrides: Partial<NativeMediaPort> = {}) {
-  const parts = new Map<string, NativeMediaPart>();
-  const port: NativeMediaPort = {
-    start: jest.fn(async () => ({ responseModalities: ['TEXT', 'IMAGE'] })),
-    part: jest.fn(
-      async ({
-        part,
-        chunkIndex,
-        partIndex,
-      }: Parameters<
-        NativeMediaPort['part']
-      >[0]): Promise<NativeMediaContent> => {
-        const continuationRef = `ref-${chunkIndex}-${partIndex}`;
-        parts.set(continuationRef, part);
-        if (part.kind === 'text')
-          return {
-            type: 'text',
-            text: part.text,
-            native_media: { continuationRef },
-          };
-        return {
-          type: 'image_file',
-          image_file: {
-            file_id: continuationRef,
-            filepath: `/images/owner/${continuationRef}.png`,
-            filename: `${continuationRef}.png`,
-            type: part.mimeType,
-            bytes: 21,
-          },
-          native_media: { continuationRef },
-        };
-      }
-    ),
-    complete: jest.fn(async () => undefined),
-    fail: jest.fn(async () => undefined),
-    restore: jest.fn(async ({ continuationRef }) => {
-      const part = parts.get(continuationRef ?? '');
-      if (!part) throw new Error('Missing continuation');
-      return part;
-    }),
-    ...overrides,
-  };
-  return port;
 }
 function fixtureModel(
   nativeMedia?: NativeMediaPort,
@@ -170,7 +122,13 @@ describe('native Google media port', () => {
     const { model, client } = fixtureModel(port, [[{ text: 'Text only' }]]);
     const result = await model._generate([new HumanMessage('Hello')], {});
     expect(result.generations[0].text).toBe('Text only');
-    expect(client.generationConfig.responseModalities).toEqual(['TEXT']);
+    expect(client.generateContent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        generationConfig: expect.objectContaining({
+          responseModalities: ['TEXT'],
+        }),
+      })
+    );
     expect(port.complete).toHaveBeenCalledTimes(1);
     expect(port.fail).not.toHaveBeenCalled();
   });
@@ -242,10 +200,13 @@ describe('native Google media port', () => {
     );
     expect(port.complete).toHaveBeenCalledTimes(1);
     expect(port.fail).not.toHaveBeenCalled();
-    expect(client.generationConfig.responseModalities).toEqual([
-      'TEXT',
-      'IMAGE',
-    ]);
+    expect(client.generateContentStream).toHaveBeenCalledWith(
+      expect.objectContaining({
+        generationConfig: expect.objectContaining({
+          responseModalities: ['TEXT', 'IMAGE'],
+        }),
+      })
+    );
     expect(JSON.stringify({ content, messages })).not.toContain(imageData);
     expect(JSON.stringify({ content, messages })).not.toContain(
       'private-signature'

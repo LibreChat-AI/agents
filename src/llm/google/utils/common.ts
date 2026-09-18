@@ -390,15 +390,21 @@ function _convertLangChainContentToPart(
   }
 
   if (content.type === 'text') {
-    return typeof content.text === 'string' && content.text !== ''
-      ? {
-        text: content.text,
-        ...('thoughtSignature' in content &&
-          typeof content.thoughtSignature === 'string'
-          ? { thoughtSignature: content.thoughtSignature }
-          : {}),
-      }
-      : undefined;
+    const thoughtSignature =
+      'thoughtSignature' in content &&
+      typeof content.thoughtSignature === 'string'
+        ? content.thoughtSignature
+        : undefined;
+    if (
+      typeof content.text !== 'string' ||
+      (content.text === '' && thoughtSignature == null)
+    ) {
+      return undefined;
+    }
+    return {
+      text: content.text,
+      ...(thoughtSignature == null ? {} : { thoughtSignature }),
+    };
   } else if (content.type === 'executableCode') {
     return { executableCode: content.executableCode };
   } else if (content.type === 'codeExecutionResult') {
