@@ -9,6 +9,29 @@ import {
 } from './index';
 
 describe('managed GPT-5.6 request fields', () => {
+  it('marks the stable instruction message, not the relocated tail behind it', () => {
+    /**
+     * The tail is a second system message so it keeps its instruction role.
+     * Marking the last one would put the breakpoint behind content that turns
+     * over every turn, which is the invalidation the breakpoint exists to
+     * avoid.
+     */
+    const messages = addChatCacheBreakpoints([
+      { role: 'system', content: 'Stable instructions.' },
+      { role: 'user', content: 'First question.' },
+      { role: 'assistant', content: 'First answer.' },
+      { role: 'system', content: 'Dynamic tail.' },
+      { role: 'user', content: 'Current question.' },
+    ]);
+
+    /**
+     * The instruction breakpoint is the one under test. The tail also carries
+     * one here, from the separate rule that marks the history prefix before
+     * the current turn; that marker is not this selection.
+     */
+    expect(JSON.stringify(messages[0])).toContain('prompt_cache_breakpoint');
+  });
+
   it('places cache breakpoints after instructions and the prior history prefix', () => {
     const messages = addChatCacheBreakpoints([
       { role: 'system', content: 'Stable instructions.' },

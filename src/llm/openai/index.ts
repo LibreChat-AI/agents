@@ -368,7 +368,18 @@ function selectCacheBreakpointIndexes(
   let latestUserIndex = -1;
   for (let index = 0; index < roles.length; index++) {
     const role = roles[index];
-    if ((role === 'system' || role === 'developer') && cacheable[index]) {
+    /**
+     * The first instruction message, not the last. The stable prefix is built
+     * first and the volatile tail follows it in its own system message, so
+     * marking the last one would put the breakpoint behind content that turns
+     * over every turn — the invalidation this breakpoint exists to avoid.
+     * With a single system message the two are the same message.
+     */
+    if (
+      (role === 'system' || role === 'developer') &&
+      cacheable[index] &&
+      instructionIndex === -1
+    ) {
       instructionIndex = index;
     }
     if (role === 'user') {
@@ -1058,7 +1069,10 @@ type ResponsesAnnotationsBoundaryEvent = {
 export function ensureResponsesOutputAnnotations(
   event: ResponsesAnnotationsBoundaryEvent
 ): void {
-  if (event.type !== 'response.completed' && event.type !== 'response.incomplete') {
+  if (
+    event.type !== 'response.completed' &&
+    event.type !== 'response.incomplete'
+  ) {
     return;
   }
   const output = event.response?.output;
@@ -2344,7 +2358,9 @@ class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
         cache_control: cacheControl,
       }),
     };
-    if (shouldIncludeEncryptedReasoning(this.model, params, this.astraRulesApply)) {
+    if (
+      shouldIncludeEncryptedReasoning(this.model, params, this.astraRulesApply)
+    ) {
       params.include = [
         ...new Set([
           ...(params.include ?? []),
@@ -2627,7 +2643,9 @@ class LibreChatAzureOpenAIResponses extends OriginalAzureChatOpenAIResponses {
       promptCacheExplicit: this.promptCacheExplicit,
       safetyIdentifier: this.safetyIdentifier,
     });
-    if (shouldIncludeEncryptedReasoning(this.model, params, this.astraRulesApply)) {
+    if (
+      shouldIncludeEncryptedReasoning(this.model, params, this.astraRulesApply)
+    ) {
       params.include = [
         ...new Set([
           ...(params.include ?? []),

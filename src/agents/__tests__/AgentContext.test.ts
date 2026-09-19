@@ -408,6 +408,69 @@ describe('AgentContext', () => {
       }
     );
 
+    it.each([Providers.OPENAI, Providers.AZURE])(
+      'keeps the relocated tail in an instruction role for %s explicit caching',
+      async (provider) => {
+        /**
+         * `additional_instructions` is declared a system tail and carries host
+         * constraints and cross-run summary context. A user message ranks below
+         * a system one on these providers, so emitting the relocated tail as a
+         * HumanMessage would let later user content override those constraints
+         * because caching was switched on.
+         */
+        const ctx = createBasicContext({
+          agentConfig: {
+            provider,
+            clientOptions: {
+              model: 'gpt-5.6',
+              promptCacheExplicit: true,
+            } as t.OpenAIClientOptions,
+            instructions: 'Stable instructions',
+            additional_instructions: 'Dynamic instructions',
+          },
+        });
+
+        const result = await ctx.systemRunnable!.invoke([
+          new HumanMessage('Hello'),
+          new AIMessage('Hi'),
+          new HumanMessage('Second'),
+        ]);
+
+        const tail = result[3];
+        expect(tail.content).toBe('Dynamic instructions');
+        expect(tail.getType()).toBe('system');
+        expect(result[0].getType()).toBe('system');
+      }
+    );
+
+    it('leaves the Anthropic relocated tail on the role it already shipped with', async () => {
+      /** Not this change's to alter: Anthropic relocated to a HumanMessage before it. */
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.ANTHROPIC,
+          clientOptions: {
+            model: 'claude-3-5-sonnet',
+            promptCache: true,
+          } as t.OpenAIClientOptions,
+          instructions: 'Stable instructions',
+          additional_instructions: 'Dynamic instructions',
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([
+        new HumanMessage('Hello'),
+        new AIMessage('Hi'),
+        new HumanMessage('Second'),
+      ]);
+
+      /** Anthropic wraps content in cache_control blocks, so match on the text. */
+      const tail = result.find((m) =>
+        JSON.stringify(m.content).includes('Dynamic instructions')
+      );
+      expect(tail).toBeDefined();
+      expect(tail!.getType()).toBe('human');
+    });
+
     it('keeps dynamic-only instructions in the system message under explicit caching', async () => {
       const ctx = createBasicContext({
         agentConfig: {

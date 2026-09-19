@@ -990,6 +990,8 @@ export class AgentContext {
         hasSummaryBody,
         splitsDynamicInstructions,
         shouldMoveDynamicInstructions,
+        keepsInstructionRole:
+          openAIExplicitCache && promptCacheProvider == null,
       });
       let body = this.buildBodyWithPromptCacheDynamicTail(
         bodyWithSummary,
@@ -1038,18 +1040,33 @@ export class AgentContext {
     hasSummaryBody,
     splitsDynamicInstructions,
     shouldMoveDynamicInstructions,
+    keepsInstructionRole,
   }: {
     dynamicInstructions: string;
     hasSummaryBody: boolean;
     splitsDynamicInstructions: boolean;
     shouldMoveDynamicInstructions: boolean;
+    keepsInstructionRole: boolean;
   }): BaseMessage[] {
     if (!splitsDynamicInstructions) {
       return [];
     }
 
+    /**
+     * The tail keeps its role where relocating it is this library's own idea.
+     * `additional_instructions` is declared a system tail and carries host
+     * constraints and cross-run summary context; on OpenAI and Azure a user
+     * message ranks below a system one, so emitting it as a `HumanMessage`
+     * would let later user content override those constraints, changing how
+     * an agent behaves because caching was switched on. Anthropic and
+     * OpenRouter keep the `HumanMessage` they already shipped with.
+     */
     const dynamicTail = shouldMoveDynamicInstructions
-      ? [new HumanMessage(dynamicInstructions)]
+      ? [
+        keepsInstructionRole
+          ? new SystemMessage(dynamicInstructions)
+          : new HumanMessage(dynamicInstructions),
+      ]
       : [];
 
     if (!hasSummaryBody) {
