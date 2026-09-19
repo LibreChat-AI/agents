@@ -3,6 +3,7 @@ import { AIMessageChunk } from '@langchain/core/messages';
 import { ChatGenerationChunk } from '@langchain/core/outputs';
 import { ChatGoogleGenerativeAI } from '@langchain/google-genai';
 import { getEnvironmentVariable } from '@langchain/core/utils/env';
+import { ChatModelStream } from '@langchain/core/language_models/stream';
 import { convertChunksToEvents } from '@langchain/core/language_models/compat';
 import {
   FunctionCallingMode,
@@ -13,9 +14,11 @@ import type {
   SafetySetting,
   ToolConfig,
 } from '@google/generative-ai';
+import type { BaseLanguageModelInput } from '@langchain/core/language_models/base';
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
 import type { ChatModelStreamEvent } from '@langchain/core/language_models/event';
 import type { BaseMessage, UsageMetadata } from '@langchain/core/messages';
+import type { Runnable } from '@langchain/core/runnables';
 import type { GeminiApiUsageMetadata, InputTokenDetails } from './types';
 import type { GoogleClientOptions, GoogleThinkingConfig } from '@/types';
 import type { NativeMediaPort } from './native';
@@ -40,6 +43,9 @@ type GoogleToolConfigWithServerSideInvocations = ToolConfig & {
       | 'VALIDATED';
   };
 };
+type GoogleCallOptions = NonNullable<
+  Parameters<ChatGoogleGenerativeAI['invoke']>[1]
+>;
 
 export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
   static readonly nativeMediaProtocolVersion = 1;
@@ -312,6 +318,7 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
         response.usageMetadata,
         this.model
       );
+      native.observeResponse(response, usageMetadata);
 
       /** @ts-ignore */
       const generationResult = mapGenerateContentResultToChatResult(response, {
@@ -325,10 +332,14 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
           0
         );
         generation.message.lc_kwargs.content = generation.message.content;
+        Object.assign(
+          generation.message.additional_kwargs,
+          native.usageIdentity()
+        );
       }
       await native.complete();
       await runManager?.handleLLMNewToken(
-        generationResult.generations[0].text || '',
+        generation?.text ?? '',
         undefined,
         undefined,
         undefined,
@@ -337,8 +348,7 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
       );
       return generationResult;
     } catch (error) {
-      await native.fail();
-      throw error;
+      throw await native.reportFailure(error);
     }
   }
 
@@ -358,6 +368,58 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
     );
   }
 
+  /** Keep the native typed API on the same callback lifecycle as public stream(). */
+  override streamEvents = ((
+    input: BaseLanguageModelInput,
+    options?: GoogleCallOptions & {
+      version?: 'v1' | 'v2';
+      encoding?: 'text/event-stream';
+    },
+    streamOptions?: Parameters<Runnable['streamEvents']>[2]
+  ) => {
+    if (options?.version != null) {
+      return super.streamEvents(
+        input,
+        { ...options, version: options.version },
+        streamOptions
+      );
+    }
+    if (this.nativeMedia == null) return super.streamEvents(input, options);
+    return new ChatModelStream(
+      convertChunksToEvents(this._streamTypedNativeChunks(input, options), {
+        signal: options?.signal,
+      })
+    );
+  }) as ChatGoogleGenerativeAI['streamEvents'];
+
+  private async *_streamTypedNativeChunks(
+    input: BaseLanguageModelInput,
+    options?: GoogleCallOptions
+  ): AsyncGenerator<ChatGenerationChunk> {
+    for await (const message of super._streamIterator(input, options)) {
+      yield this.nativeEventChunk(
+        new ChatGenerationChunk({
+          text: message.text,
+          message,
+          generationInfo: message.response_metadata,
+        })
+      );
+    }
+  }
+
+  private nativeEventChunk(chunk: ChatGenerationChunk): ChatGenerationChunk {
+    const content = chunk.message.content;
+    if (typeof content !== 'string' || content === '') return chunk;
+    return new ChatGenerationChunk({
+      text: chunk.text,
+      generationInfo: chunk.generationInfo,
+      message: new AIMessageChunk({
+        ...chunk.message,
+        content: [{ type: 'text', text: content }],
+      }),
+    });
+  }
+
   /** The event bridge merges string chunks into block zero, even across images. */
   private async *_streamNativeEventChunks(
     messages: BaseMessage[],
@@ -369,19 +431,7 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
       options,
       runManager
     )) {
-      const content = chunk.message.content;
-      if (typeof content !== 'string' || content === '') {
-        yield chunk;
-        continue;
-      }
-      yield new ChatGenerationChunk({
-        text: chunk.text,
-        generationInfo: chunk.generationInfo,
-        message: new AIMessageChunk({
-          ...chunk.message,
-          content: [{ type: 'text', text: content }],
-        }),
-      });
+      yield this.nativeEventChunk(chunk);
     }
   }
 
@@ -405,6 +455,8 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
         runManager,
       });
       await native.complete();
+    } catch (error) {
+      throw await native.reportFailure(error);
     } finally {
       await native.fail();
     }
@@ -427,15 +479,17 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
     let index = 0;
     let lastUsageMetadata: UsageMetadata | undefined;
     for await (const response of stream) {
+      const usageMetadata = this._convertToUsageMetadata(
+        response.usageMetadata as GeminiApiUsageMetadata | undefined,
+        this.model
+      );
+      native.observeResponse(response, usageMetadata);
       if (
         'usageMetadata' in response &&
         this.streamUsage !== false &&
         options.streamUsage !== false
       ) {
-        lastUsageMetadata = this._convertToUsageMetadata(
-          response.usageMetadata as GeminiApiUsageMetadata | undefined,
-          this.model
-        );
+        lastUsageMetadata = usageMetadata;
       }
 
       const chunk = convertResponseContentToChatGenerationChunk(response, {
@@ -461,6 +515,7 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
         message: new AIMessageChunk({
           content: '',
           usage_metadata: lastUsageMetadata,
+          additional_kwargs: native.usageIdentity(),
         }),
       });
     }

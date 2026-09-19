@@ -11,6 +11,7 @@ import { context as otelContext, trace as otelTrace } from '@opentelemetry/api';
 import {
   getLangfuseTracerProvider,
   propagateAttributes,
+  LangfuseOtelSpanAttributes,
 } from '@langfuse/tracing';
 import type {
   AIMessageChunkFields,
@@ -22,9 +23,9 @@ import type {
   Generation,
   LLMResult,
 } from '@langchain/core/outputs';
+import type { Context, SpanContext, Span } from '@opentelemetry/api';
 import type { PropagateAttributesParams } from '@langfuse/tracing';
 import type { RunnableConfig } from '@langchain/core/runnables';
-import type { Context, SpanContext } from '@opentelemetry/api';
 import type { ResolvedLangfuseToolOutputTracingConfig } from '@/langfuseRuntimeContext';
 import type * as t from '@/types';
 import {
@@ -35,16 +36,17 @@ import {
   withLangfuseRuntimeScope,
 } from '@/langfuseRuntimeScope';
 import {
+  getLangfuseManagedSpanDestination,
+  registerLangfuseManagedSpan,
+  resolveLangfuseDestinationKey,
+  withLangfuseSpanCapture,
+} from '@/langfuseSpanRegistry';
+import {
   hasLangfuseConfigCredentials,
   hasLangfuseEnvCredentials,
   resolveToolOutputTracingConfig,
   hasLangfuseEnvConfig,
 } from '@/langfuseConfig';
-import {
-  getLangfuseManagedSpanDestination,
-  registerLangfuseManagedSpan,
-  resolveLangfuseDestinationKey,
-} from '@/langfuseSpanRegistry';
 import {
   getToolObservationMetadata,
   LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT,
@@ -55,6 +57,7 @@ import {
 } from '@/llm/preempt';
 import { filterCallbacks, findCallback } from '@/utils/callbacks';
 import { isPresent, parseBooleanEnv } from '@/utils/misc';
+import { NativeMediaError } from '@/llm/google/native';
 
 export {
   hasLangfuseConfigCredentials,
@@ -311,6 +314,7 @@ function detachForeignAmbientSpan(
 }
 
 class ScopedLangfuseCallbackHandler extends CallbackHandler {
+  private readonly generationSpans = new Map<string, Span>();
   private readonly langfuse?: t.LangfuseConfig;
   private readonly traceIdSeed?: string;
   private readonly traceAnchor?: object;
@@ -714,7 +718,10 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
       ]);
     }
     return this.withRuntimeContext(
-      () => super.handleChatModelStart(...args),
+      () =>
+        this.captureGenerationSpan(args[2], () =>
+          super.handleChatModelStart(...args)
+        ),
       this.startsDetachedRun(args[2], args[3]),
       args[6]
     );
@@ -728,7 +735,10 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
       args[1] = args[1].map(() => mask.input);
     }
     return this.withRuntimeContext(
-      () => super.handleLLMStart(...args),
+      () =>
+        this.captureGenerationSpan(args[2], () =>
+          super.handleLLMStart(...args)
+        ),
       this.startsDetachedRun(args[2], args[3]),
       args[6]
     );
@@ -739,6 +749,7 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
     runId: string,
     parentRunId?: string
   ): Promise<void> {
+    this.generationSpans.delete(runId);
     return super.handleLLMEnd(
       this.maskGenerations(normalizeBedrockUsageForLangfuse(output)),
       runId,
@@ -761,7 +772,35 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
   override handleLLMError(
     ...args: Parameters<CallbackHandler['handleLLMError']>
   ): ReturnType<CallbackHandler['handleLLMError']> {
-    const [, runId, parentRunId] = args;
+    const [error, runId, parentRunId] = args;
+    const span = this.generationSpans.get(runId);
+    this.generationSpans.delete(runId);
+    if (
+      span != null &&
+      error instanceof NativeMediaError &&
+      error.usage != null
+    ) {
+      const usage = error.usage;
+      const details: Record<string, number> = {
+        input: usage.input_tokens,
+        output: usage.output_tokens,
+        total: usage.total_tokens,
+      };
+      for (const [direction, tokens] of [
+        ['input', usage.input_token_details],
+        ['output', usage.output_token_details],
+      ] as const) {
+        for (const [key, value] of Object.entries(tokens ?? {})) {
+          if (typeof value !== 'number') continue;
+          details[`${direction}_${key}`] = value;
+          details[direction] = Math.max(0, details[direction] - value);
+        }
+      }
+      span.setAttributes({
+        [LangfuseOtelSpanAttributes.OBSERVATION_USAGE_DETAILS]:
+          JSON.stringify(details),
+      });
+    }
     const restarted = readPreemptRestartedRun(runId);
     if (restarted != null) {
       /**
@@ -793,6 +832,13 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
       );
     }
     return super.handleLLMError(...args);
+  }
+
+  private captureGenerationSpan<T>(runId: string, action: () => T): T {
+    return withLangfuseSpanCapture((span) => {
+      if (!this.generationSpans.has(runId))
+        this.generationSpans.set(runId, span);
+    }, action);
   }
 
   override handleToolStart(

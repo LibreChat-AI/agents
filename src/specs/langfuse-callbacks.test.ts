@@ -20,7 +20,10 @@ import {
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type * as t from '@/types';
 import { handleConverseStreamMetadata } from '@/llm/bedrock/utils/message_outputs';
+import { initializeLangfuseTracing } from '@/instrumentation';
 import { traceIdFromSeed } from '@/langfuseRuntimeContext';
+import { NativeMediaError } from '@/llm/google/native';
+import { createLangfuseHandler } from '@/langfuse';
 import { Constants, Providers } from '@/common';
 import { ToolNode } from '@/tools/ToolNode';
 import { askUserQuestion } from '@/hitl';
@@ -140,6 +143,71 @@ describe('Langfuse callback composition', () => {
     delete process.env.LANGFUSE_BASE_URL;
     delete process.env.LANGFUSE_BASEURL;
     delete process.env.LANGFUSE_FORCE_FLUSH_ON_DISPOSE;
+  });
+
+  it('keeps native failure usage on each tenant generation without reporting successful output', async () => {
+    const failures = [
+      { tenant: 'native-a', input: 11, output: 1290 },
+      { tenant: 'native-b', input: 22, output: 2580 },
+    ];
+    const handlers = failures.map(({ tenant }) => {
+      const langfuse = {
+        publicKey: `pk-${tenant}`,
+        secretKey: `sk-${tenant}`,
+        deterministicTraceId: true,
+      };
+      initializeLangfuseTracing(langfuse);
+      return createLangfuseHandler({
+        langfuse,
+        runId: tenant,
+        traceIdSeed: tenant,
+      });
+    });
+    await Promise.all(
+      handlers.map((handler, index) =>
+        handler?.handleChatModelStart(
+          { lc: 1, type: 'constructor', id: ['NativeGoogle'], kwargs: {} },
+          [[new HumanMessage(failures[index].tenant)]],
+          'model-run'
+        )
+      )
+    );
+    for (let index = handlers.length - 1; index >= 0; index--) {
+      const failure = failures[index];
+      await handlers[index]?.handleLLMError(
+        new NativeMediaError(new Error('Storage unavailable'), {
+          input_tokens: failure.input,
+          output_tokens: failure.output,
+          total_tokens: failure.input + failure.output,
+          input_token_details: { cache_read: 3 },
+        }),
+        'model-run'
+      );
+    }
+    expect(mockSpansStarted).toBe(2);
+    expect(mockSpansEnded).toBe(2);
+    expect(mockEndedSpanAttributes).toEqual(
+      failures.toReversed().map((failure) =>
+        expect.objectContaining({
+          [LangfuseOtelSpanAttributes.OBSERVATION_LEVEL]: 'ERROR',
+          [LangfuseOtelSpanAttributes.OBSERVATION_STATUS_MESSAGE]:
+            'Error: Storage unavailable',
+          [LangfuseOtelSpanAttributes.OBSERVATION_USAGE_DETAILS]:
+            JSON.stringify({
+              input: failure.input - 3,
+              output: failure.output,
+              total: failure.input + failure.output,
+              input_cache_read: 3,
+            }),
+        })
+      )
+    );
+    expect(
+      mockEndedSpanAttributes.every(
+        (attributes) =>
+          attributes[LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT] == null
+      )
+    ).toBe(true);
   });
 
   it('runs explicit per-agent tracing when callbacks is a CallbackManager', async () => {

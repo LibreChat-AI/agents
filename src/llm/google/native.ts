@@ -1,6 +1,22 @@
 import { v4 } from 'uuid';
 import { AIMessage, HumanMessage } from '@langchain/core/messages';
-import type { BaseMessage, MessageContent } from '@langchain/core/messages';
+import type {
+  GenerateContentResponse,
+  GenerateContentCandidate,
+} from '@google/generative-ai';
+import type {
+  BaseMessage,
+  MessageContent,
+  UsageMetadata,
+} from '@langchain/core/messages';
+
+type NativeResponse = Omit<GenerateContentResponse, 'candidates'> & {
+  candidates?: Array<
+    Pick<GenerateContentCandidate, 'finishReason'> & {
+      content?: Partial<GenerateContentCandidate['content']>;
+    }
+  >;
+};
 
 export type NativeMediaPart =
   | { kind: 'text'; text: string; thoughtSignature?: string }
@@ -11,6 +27,26 @@ export type NativeMediaPart =
       thoughtSignature?: string;
     };
 export type NativeMediaReference = { continuationRef: string };
+export type NativeMediaRestoreInput = {
+  file_id?: string;
+  continuationRef?: string;
+};
+export type NativeMediaProviderOutcome = {
+  kind: 'blocked' | 'invalid';
+  code: string;
+};
+
+/** Provider consumption survives a failed persistence or cancellation outcome. */
+export class NativeMediaError extends Error {
+  constructor(
+    cause: Error,
+    readonly usage?: UsageMetadata,
+    readonly providerOutcome?: NativeMediaProviderOutcome
+  ) {
+    super(cause.message, { cause });
+    this.name = cause.name;
+  }
+}
 export type NativeMediaContent =
   | { type: 'text'; text: string; native_media?: NativeMediaReference }
   | {
@@ -44,18 +80,29 @@ export interface NativeMediaPort {
   fail(input: {
     modelRunId: string;
     reason: 'aborted' | 'provider' | 'storage';
+    /** Failure-only usage; successful calls use the normal model-end callback. */
+    usage?: UsageMetadata;
+    providerOutcome?: NativeMediaProviderOutcome;
   }): Promise<void>;
   /** Authorize and restore the exact signed provider part for a continuation. */
-  restore(input: {
-    file_id?: string;
-    continuationRef?: string;
-  }): Promise<NativeMediaPart>;
+  restore(input: NativeMediaRestoreInput): Promise<NativeMediaPart>;
+  /**
+   * Restore all references in order, or reject the entire invocation. Hosts must
+   * bound database batches and concurrent asset reads using their own limits.
+   */
+  restoreBatch?(input: {
+    parts: readonly NativeMediaRestoreInput[];
+    signal?: AbortSignal;
+  }): Promise<NativeMediaPart[]>;
 }
 
 /** All durable storage and authorization belongs to the injected host port. */
 export class NativeMediaSession {
   private finished = false;
   private storageFailure = false;
+  private receivedContent = false;
+  private usage?: UsageMetadata;
+  private providerOutcome?: NativeMediaProviderOutcome;
   private readonly modelRunId: string;
   constructor(
     private readonly port: NativeMediaPort | undefined,
@@ -72,9 +119,77 @@ export class NativeMediaSession {
       signal: this.signal,
     });
   }
+  /** Added once to the usage chunk, so stream aggregation preserves call identity. */
+  usageIdentity(): { native_media_model_run_id: string } | undefined {
+    return this.port == null
+      ? undefined
+      : { native_media_model_run_id: this.modelRunId };
+  }
   async complete(): Promise<void> {
-    await this.port?.complete({ modelRunId: this.modelRunId });
+    if (this.port != null && !this.receivedContent) {
+      this.rejectResponse({ kind: 'invalid', code: 'EMPTY_RESPONSE' });
+    }
+    this.signal?.throwIfAborted();
+    try {
+      await this.port?.complete({ modelRunId: this.modelRunId });
+    } catch (error) {
+      this.storageFailure = true;
+      throw error;
+    }
     this.finished = true;
+  }
+  observeResponse(response: NativeResponse, usage?: UsageMetadata): void {
+    if (usage != null) this.usage = usage;
+    if (this.port == null) return;
+    const blockReason: string | undefined =
+      response.promptFeedback?.blockReason;
+    if (blockReason != null && blockReason !== 'BLOCK_REASON_UNSPECIFIED') {
+      this.rejectResponse({
+        kind: 'blocked',
+        code: /^[A-Z_]{1,64}$/.test(blockReason)
+          ? blockReason
+          : 'BLOCKED_RESPONSE',
+      });
+    }
+    const candidate = response.candidates?.[0];
+    const finishReason: string | undefined = candidate?.finishReason;
+    if (
+      finishReason != null &&
+      finishReason !== 'STOP' &&
+      finishReason !== 'MAX_TOKENS' &&
+      finishReason !== 'FINISH_REASON_UNSPECIFIED'
+    ) {
+      this.rejectResponse({
+        kind: /SAFETY|RECITATION|BLOCKLIST|PROHIBITED|SPII/.test(finishReason)
+          ? 'blocked'
+          : 'invalid',
+        code: /^[A-Z_]{1,64}$/.test(finishReason)
+          ? finishReason
+          : 'INVALID_RESPONSE',
+      });
+    }
+    this.receivedContent ||= (candidate?.content?.parts?.length ?? 0) > 0;
+  }
+  private rejectResponse(outcome: NativeMediaProviderOutcome): never {
+    this.providerOutcome = outcome;
+    throw new Error(`Native media provider ${outcome.kind}: ${outcome.code}`);
+  }
+  error(cause: unknown): Error {
+    const error = cause instanceof Error ? cause : new Error(String(cause));
+    return this.usage == null && this.providerOutcome == null
+      ? error
+      : new NativeMediaError(error, this.usage, this.providerOutcome);
+  }
+  async reportFailure(cause: unknown): Promise<Error> {
+    try {
+      await this.fail();
+    } catch (recordingError) {
+      const error = cause instanceof Error ? cause : new Error(String(cause));
+      return this.error(
+        new AggregateError([error, recordingError], error.message)
+      );
+    }
+    return this.error(cause);
   }
   async fail(): Promise<void> {
     if (this.finished) return;
@@ -83,6 +198,10 @@ export class NativeMediaSession {
     await this.port?.fail({
       modelRunId: this.modelRunId,
       reason: this.signal?.aborted === true ? 'aborted' : failure,
+      ...(this.usage == null ? {} : { usage: this.usage }),
+      ...(this.providerOutcome == null
+        ? {}
+        : { providerOutcome: this.providerOutcome }),
     });
   }
   async content(
@@ -187,6 +306,11 @@ export class NativeMediaSession {
       return messages;
     }
     const result: BaseMessage[] = [];
+    const pending: Array<{
+      input: NativeMediaRestoreInput;
+      content: Exclude<MessageContent, string>;
+      index: number;
+    }> = [];
     for (const message of messages) {
       if (!Array.isArray(message.content)) {
         result.push(message);
@@ -219,22 +343,13 @@ export class NativeMediaSession {
           content.push(part);
           continue;
         }
-        const restored = await this.port.restore({ file_id, continuationRef });
         changed = true;
-        if (restored.kind === 'text')
-          content.push({
-            type: 'text',
-            text: restored.text,
-            thoughtSignature: restored.thoughtSignature,
-          });
-        else
-          content.push({
-            type: 'image_url',
-            image_url: {
-              url: `data:${restored.mimeType};base64,${restored.data}`,
-            },
-            thoughtSignature: restored.thoughtSignature,
-          });
+        pending.push({
+          input: { file_id, continuationRef },
+          content,
+          index: content.length,
+        });
+        content.push(part);
       }
       if (!changed) result.push(message);
       else if (message._getType() === 'ai')
@@ -243,6 +358,55 @@ export class NativeMediaSession {
         result.push(new HumanMessage({ ...message, content }));
       else
         throw new Error('Native media reference in unsupported message role');
+    }
+    if (pending.length === 0) return result;
+    this.signal?.throwIfAborted();
+    const restored =
+      this.port.restoreBatch == null
+        ? await this.restoreLegacy(pending.map(({ input }) => input))
+        : await this.port.restoreBatch({
+          parts: pending.map(({ input }) => input),
+          signal: this.signal,
+        });
+    this.signal?.throwIfAborted();
+    if (restored.length !== pending.length) {
+      throw new Error(
+        'Native media port returned incomplete continuation batch'
+      );
+    }
+    for (let index = 0; index < pending.length; index++) {
+      const target = pending[index];
+      const part = restored.at(index);
+      const visible = target.content[target.index];
+      if (part?.kind === 'text' && visible.type === 'text') {
+        const {
+          native_media: _reference,
+          thoughtSignature: _signature,
+          ...text
+        } = visible;
+        target.content[target.index] =
+          part.text === visible.text
+            ? { ...text, thoughtSignature: part.thoughtSignature }
+            : text;
+      } else if (part?.kind === 'image' && visible.type === 'image_file') {
+        target.content[target.index] = {
+          type: 'image_url',
+          image_url: { url: `data:${part.mimeType};base64,${part.data}` },
+          thoughtSignature: part.thoughtSignature,
+        };
+      } else {
+        throw new Error('Native media port returned incompatible continuation');
+      }
+    }
+    return result;
+  }
+  private async restoreLegacy(
+    parts: NativeMediaRestoreInput[]
+  ): Promise<NativeMediaPart[]> {
+    const result: NativeMediaPart[] = [];
+    for (const part of parts) {
+      this.signal?.throwIfAborted();
+      result.push(await this.port!.restore(part));
     }
     return result;
   }
