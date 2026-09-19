@@ -4,8 +4,12 @@ import {
   HumanMessage,
   SystemMessage,
 } from '@langchain/core/messages';
+import type {
+  GenerateContentRequest,
+  GenerateContentResponse,
+} from '@google/generative-ai';
 import type { BaseMessage, BaseMessageChunk } from '@langchain/core/messages';
-import type { GenerateContentRequest } from '@google/generative-ai';
+import type { LLMResult, ChatGeneration } from '@langchain/core/outputs';
 import type { GoogleClientOptions, NativeMediaPort } from '@/index';
 import {
   fixturePort,
@@ -13,11 +17,15 @@ import {
   imageData,
 } from './__tests__/nativeMediaFixtures';
 import { CustomChatGoogleGenerativeAI } from './index';
+import { NativeMediaError } from './native';
 
-type Mode = 'invoke' | 'stream' | 'streamEvents';
+type Mode = 'invoke' | 'stream' | 'streamEvents' | 'legacyEvents';
 type CallOptions = Parameters<CustomChatGoogleGenerativeAI['invoke']>[1];
 
-function fixtureHttp(chunks: object[][] = [[{ text: 'Hello' }]]) {
+function fixtureHttp(
+  chunks: object[][] = [[{ text: 'Hello' }]],
+  overrides: Partial<GenerateContentResponse> = {}
+) {
   const requests: GenerateContentRequest[] = [];
   const fetch = jest
     .spyOn(globalThis, 'fetch')
@@ -31,6 +39,7 @@ function fixtureHttp(chunks: object[][] = [[{ text: 'Hello' }]]) {
           candidatesTokenCount: 5,
           totalTokenCount: 10,
         },
+        ...overrides,
       });
       const streaming = request.url.includes(':streamGenerateContent');
       return new Response(
@@ -73,6 +82,18 @@ async function runModel(
 ): Promise<BaseMessage> {
   if (mode === 'invoke') return model.invoke(messages, options);
   if (mode === 'streamEvents') return model.streamEvents(messages, options);
+  if (mode === 'legacyEvents') {
+    let output: BaseMessage | undefined;
+    for await (const event of model.streamEvents(messages, {
+      ...options,
+      version: 'v2',
+    })) {
+      if (event.event === 'on_chat_model_end')
+        output = event.data.output as BaseMessage;
+    }
+    if (output == null) throw new Error('Expected model output');
+    return output;
+  }
   let answer: BaseMessageChunk | undefined;
   for await (const chunk of await model.stream(messages, options)) {
     answer = answer == null ? chunk : answer.concat(chunk);
@@ -85,7 +106,7 @@ afterEach(() => {
   jest.restoreAllMocks();
 });
 
-describe.each<Mode>(['invoke', 'stream', 'streamEvents'])(
+describe.each<Mode>(['invoke', 'stream', 'streamEvents', 'legacyEvents'])(
   'native media HTTP requests through %s',
   (mode) => {
     it('rejects native continuation references before HTTP when no port is configured', async () => {
@@ -254,6 +275,230 @@ describe.each<Mode>(['invoke', 'stream', 'streamEvents'])(
       );
     });
 
+    it.each([
+      { promptFeedback: { blockReason: 'SAFETY' }, candidates: [] },
+      { candidates: [{ index: 0, finishReason: 'SAFETY' }] },
+      { candidates: [] },
+    ])(
+      'rejects blocked or invalid responses before completing storage: %j',
+      async (response) => {
+        fixtureHttp(undefined, response as GenerateContentResponse);
+        const port = fixturePort();
+        await expect(runModel(fixtureModel(port), mode)).rejects.toThrow(
+          'Native media provider'
+        );
+        expect(port.part).not.toHaveBeenCalled();
+        expect(port.complete).not.toHaveBeenCalled();
+        expect(port.fail).toHaveBeenCalledTimes(1);
+        expect(port.fail).toHaveBeenCalledWith(
+          expect.objectContaining({
+            reason: 'provider',
+            providerOutcome: expect.objectContaining({
+              kind:
+                response.candidates.length === 0 &&
+                !('promptFeedback' in response)
+                  ? 'invalid'
+                  : 'blocked',
+            }),
+            usage: { input_tokens: 5, output_tokens: 5, total_tokens: 10 },
+          })
+        );
+      }
+    );
+
+    it.each(['part', 'complete'] as const)(
+      'preserves known usage once when %s persistence fails, then records retry usage independently',
+      async (method) => {
+        const { fetch } = fixtureHttp([[imagePart]], {
+          usageMetadata: {
+            promptTokenCount: 11,
+            candidatesTokenCount: 1290,
+            totalTokenCount: 1301,
+            cachedContentTokenCount: 3,
+          },
+        });
+        const port = fixturePort();
+        jest
+          .spyOn(port, method)
+          .mockRejectedValueOnce(new Error('Storage unavailable'));
+        const errors: Error[] = [];
+        const ended = jest.fn<(output: LLMResult) => void>();
+        const model = fixtureModel(port);
+        const options: CallOptions = {
+          callbacks: [
+            {
+              handleLLMError: (error: Error) => {
+                errors.push(error);
+              },
+              handleLLMEnd: ended,
+            },
+          ],
+        };
+        await expect(runModel(model, mode, undefined, options)).rejects.toThrow(
+          'Storage unavailable'
+        );
+        expect(ended).not.toHaveBeenCalled();
+        expect(errors).toHaveLength(1);
+        expect(errors[0]).toBeInstanceOf(NativeMediaError);
+        const usage = {
+          input_tokens: 11,
+          output_tokens: 1290,
+          total_tokens: 1301,
+          input_token_details: { cache_read: 3 },
+        };
+        expect(errors[0]).toMatchObject({ usage });
+        expect(port.fail).toHaveBeenCalledTimes(1);
+        expect(port.fail).toHaveBeenCalledWith(
+          expect.objectContaining({
+            reason: 'storage',
+            usage: expect.objectContaining(usage),
+          })
+        );
+        const failure = jest.mocked(port.fail).mock.calls[0][0];
+        const output = await runModel(model, mode, undefined, options);
+        const completed = (
+          ended.mock.calls[0][0].generations[0][0] as ChatGeneration
+        ).message;
+        expect(completed.additional_kwargs).toMatchObject({
+          native_media_model_run_id: expect.any(String),
+        });
+        expect(completed.additional_kwargs.native_media_model_run_id).not.toBe(
+          failure.modelRunId
+        );
+        expect(output).toMatchObject({ usage_metadata: usage });
+        expect(ended).toHaveBeenCalledTimes(1);
+        expect(port.fail).toHaveBeenCalledTimes(1);
+        expect(fetch).toHaveBeenCalledTimes(2);
+      }
+    );
+
+    it.each([{ text: '' }, { text: '', thoughtSignature: 'empty-signature' }])(
+      'accepts valid empty text content: %j',
+      async (part) => {
+        fixtureHttp([[part]]);
+        const port = fixturePort();
+        await runModel(fixtureModel(port), mode);
+        expect(port.complete).toHaveBeenCalledTimes(1);
+        expect(port.fail).not.toHaveBeenCalled();
+      }
+    );
+
+    it('retains failure usage when normal stream usage is disabled and failure recording also throws', async () => {
+      fixtureHttp([[imagePart]]);
+      const port = fixturePort({
+        part: jest.fn(async () => {
+          throw new Error('Original persistence error');
+        }),
+        fail: jest.fn(async () => {
+          throw new Error('Failure recording unavailable');
+        }),
+      });
+      await expect(
+        runModel(fixtureModel(port, { streamUsage: false }), mode)
+      ).rejects.toMatchObject({
+        message: 'Original persistence error',
+        usage: { input_tokens: 5, output_tokens: 5, total_tokens: 10 },
+      });
+      expect(port.fail).toHaveBeenCalledTimes(1);
+    });
+
+    it('restores batches in transcript order, detaches edited text, and preserves signed empty text', async () => {
+      const { requests } = fixtureHttp();
+      const port = fixturePort({
+        restoreBatch: jest.fn<NonNullable<NativeMediaPort['restoreBatch']>>(
+          async () => [
+            {
+              kind: 'text',
+              text: 'Original',
+              thoughtSignature: 'original-signature',
+            },
+            {
+              kind: 'image',
+              ...imagePart.inlineData,
+              thoughtSignature: imagePart.thoughtSignature,
+            },
+            { kind: 'text', text: '', thoughtSignature: 'empty-signature' },
+          ]
+        ),
+      });
+      const previous = new AIMessage({
+        content: [
+          {
+            type: 'text',
+            text: 'Corrected',
+            native_media: { continuationRef: 'text' },
+          },
+          {
+            type: 'image_file',
+            image_file: { file_id: 'image-file' },
+            native_media: { continuationRef: 'image' },
+          },
+          {
+            type: 'text',
+            text: '',
+            native_media: { continuationRef: 'empty' },
+          },
+        ],
+      });
+      const saved = JSON.stringify(previous);
+      await runModel(fixtureModel(port), mode, [
+        new HumanMessage('Draw'),
+        previous,
+        new HumanMessage('Continue'),
+      ]);
+      expect(port.restoreBatch).toHaveBeenCalledTimes(1);
+      expect(port.restoreBatch).toHaveBeenCalledWith(
+        expect.objectContaining({
+          parts: [
+            { continuationRef: 'text' },
+            { file_id: 'image-file', continuationRef: 'image' },
+            { continuationRef: 'empty' },
+          ],
+        })
+      );
+      expect(port.restore).not.toHaveBeenCalled();
+      expect(requests[0].contents[1].parts).toEqual([
+        { text: 'Corrected' },
+        imagePart,
+        { text: '', thoughtSignature: 'empty-signature' },
+      ]);
+      expect(JSON.stringify(previous)).toBe(saved);
+    });
+
+    it.each(['incomplete', 'incompatible', 'unauthorized'] as const)(
+      'rejects %s batches before provider HTTP',
+      async (failure) => {
+        const { fetch } = fixtureHttp();
+        const port = fixturePort({
+          restoreBatch: jest.fn<NonNullable<NativeMediaPort['restoreBatch']>>(
+            async () => {
+              if (failure === 'unauthorized')
+                throw new Error('Unauthorized continuation');
+              return failure === 'incomplete'
+                ? []
+                : [{ kind: 'image', ...imagePart.inlineData }];
+            }
+          ),
+        });
+        await expect(
+          runModel(fixtureModel(port), mode, [
+            new AIMessage({
+              content: [
+                {
+                  type: 'text',
+                  text: 'Previous',
+                  native_media: { continuationRef: 'text' },
+                },
+              ],
+            }),
+            new HumanMessage('Continue'),
+          ])
+        ).rejects.toThrow();
+        expect(fetch).not.toHaveBeenCalled();
+        expect(port.complete).not.toHaveBeenCalled();
+      }
+    );
+
     it('reports cancellation while storage is pending', async () => {
       fixtureHttp([[imagePart]]);
       const controller = new AbortController();
@@ -272,7 +517,10 @@ describe.each<Mode>(['invoke', 'stream', 'streamEvents'])(
       ).rejects.toThrow();
       expect(port.complete).not.toHaveBeenCalled();
       expect(port.fail).toHaveBeenCalledWith(
-        expect.objectContaining({ reason: 'aborted' })
+        expect.objectContaining({
+          reason: 'aborted',
+          usage: { input_tokens: 5, output_tokens: 5, total_tokens: 10 },
+        })
       );
     });
   }

@@ -45,6 +45,8 @@ export type {
   NativeMediaPart,
   NativeMediaContent,
   NativeMediaReference,
+  NativeMediaRestoreInput,
+  NativeMediaProviderOutcome,
 } from '@/llm/google/native';
 
 export type AzureClientOptions = Partial<OpenAIChatInput> &

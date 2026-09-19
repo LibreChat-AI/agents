@@ -274,6 +274,10 @@ describe('Graph subagent integration', () => {
     );
 
     expect(usageEvents).toHaveLength(3);
+    expect(new Set(usageEvents.map((event) => event.modelRunId)).size).toBe(3);
+    expect(
+      usageEvents.every((event) => typeof event.modelRunId === 'string')
+    ).toBe(true);
     expect(
       usageEvents.map((event) => ({
         memberAgentId: event.memberAgentId,
