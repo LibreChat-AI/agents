@@ -5,11 +5,8 @@ export * from './events';
 export * from './messages';
 export { LANGFUSE_OBSERVATION_METADATA_ARTIFACT_KEY } from './langfuseToolOutputTracing';
 export { initializeLangfuseTracing } from './instrumentation';
-export {
-  createLangfuseHandler,
-  withLangfuseAttributes,
-  disposeLangfuseHandler,
-} from './langfuse';
+export { traceModelInvocation } from './tracing';
+export type { ModelInvocationTrace } from './tracing';
 
 /* Graphs */
 export * from './graphs';
@@ -103,7 +100,7 @@ export {
 export type { SmoothItem, SmoothPiece } from './llm/stream/smoother';
 export { FakeChatModel, createFakeStreamingLLM } from './llm/fake';
 export { initializeModel } from './llm/init';
-export { NativeMediaError } from './llm/google/native';
+export { UsageBearingError, NativeMediaError } from './llm/errors';
 export { attemptInvoke, tryFallbackProviders } from './llm/invoke';
 export { prepareProviderRequest } from './llm/prepareProviderRequest';
 export type {

@@ -174,7 +174,6 @@
     "node": ">=24.0.0"
   },
   "files": [
-    "config/native-media-contract.test.mjs",
     "dist",
     "src/**/*.ts",
     "!src/**/*.test.ts",

@@ -5,6 +5,9 @@ images alongside text. The SDK calls the provider through its normal invocation
 and streaming paths, including `streamEvents()` when the port is configured.
 The host supplies authorization, durable storage and replay.
 
+This port supports the Gemini Developer API. Vertex-backed chat keeps its existing
+behavior; Studio's Vertex image adapters do not imply native chat support.
+
 ```typescript
 import { CustomChatGoogleGenerativeAI } from '@librechat/agents/llm/google';
 import type { NativeMediaPort } from '@librechat/agents';
@@ -39,6 +42,12 @@ The host's `responseModalities` applies only to that invocation. If `start`
 returns no selection, the constructor's `responseModalities` is used when a port
 is configured; otherwise the provider chooses its defaults. Concurrent calls
 keep their selections separate.
+
+Only an explicit IMAGE admission enables rejection of empty, blocked or invalid
+image responses. Ordinary text sessions can restore history through a port
+without changing the provider's default modalities or text-response behavior.
+See [the persistence boundary decision](adr/0010-persist-native-media-before-model-output.md)
+for why durable references must exist before model output is emitted.
 
 Text and images retain provider order through graph dispatch and aggregation.
 Image content becomes an `image_file` with a file ID and stored-file metadata.

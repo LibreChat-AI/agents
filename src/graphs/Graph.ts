@@ -1,3 +1,4 @@
+import { isStructuredGoogleContentPart } from '@/messages/structuredGoogle';
 /* eslint-disable no-console */
 import { v4 } from 'uuid';
 import { nanoid } from 'nanoid';
@@ -329,38 +330,14 @@ function isTextMessageContentPart(
   );
 }
 
-function isNativeMediaContentPart(
-  contentPart: MessageContent[number] | t.MessageContentComplex
-): boolean {
-  return (
-    typeof contentPart === 'object' &&
-    (contentPart.type === ContentTypes.IMAGE_FILE ||
-      contentPart.native_media != null)
-  );
-}
-
-function isGoogleServerSideToolMessageContentPart(
-  contentPart: MessageContent[number] | t.MessageContentComplex
-): boolean {
-  return (
-    typeof contentPart === 'object' &&
-    'type' in contentPart &&
-    (contentPart.type === 'toolCall' || contentPart.type === 'toolResponse')
-  );
-}
-
-function hasGoogleServerSideToolDeltaContent(
+function hasStructuredGoogleDeltaContent(
   provider: t.ProviderName | undefined,
   content: t.MessageDelta['content']
 ): content is t.MessageContentComplex[] {
   return (
     isGoogleLike(provider) &&
     Array.isArray(content) &&
-    content.some(
-      (contentPart) =>
-        isGoogleServerSideToolMessageContentPart(contentPart) ||
-        isNativeMediaContentPart(contentPart)
-    )
+    content.some((contentPart) => isStructuredGoogleContentPart(contentPart))
   );
 }
 
@@ -380,24 +357,19 @@ function getMessageDeltaContent(
     return undefined;
   }
 
-  const hasGoogleServerSideToolPart =
+  const hasStructuredGooglePart =
     isGoogleLike(provider) &&
-    content.some(
-      (contentPart) =>
-        isGoogleServerSideToolMessageContentPart(contentPart) ||
-        isNativeMediaContentPart(contentPart)
-    );
+    content.some((contentPart) => isStructuredGoogleContentPart(contentPart));
   if (content.every((contentPart) => isTextMessageContentPart(contentPart))) {
     return content as t.MessageDelta['content'];
   }
-  if (!hasGoogleServerSideToolPart) {
+  if (!hasStructuredGooglePart) {
     return undefined;
   }
   const messageContent = content.filter(
     (contentPart) =>
       isTextMessageContentPart(contentPart) ||
-      isGoogleServerSideToolMessageContentPart(contentPart) ||
-      isNativeMediaContentPart(contentPart)
+      isStructuredGoogleContentPart(contentPart)
   );
   return messageContent.length > 0
     ? (messageContent as t.MessageDelta['content'])
@@ -589,7 +561,7 @@ async function dispatchTextMessageContent({
   if (!messageId) {
     return false;
   }
-  if (hasGoogleServerSideToolDeltaContent(provider, content)) {
+  if (hasStructuredGoogleDeltaContent(provider, content)) {
     for (const contentPart of content) {
       const stepId = await dispatchMessageCreationStep({
         graph,

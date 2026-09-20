@@ -193,6 +193,24 @@ describe.each<Mode>(['invoke', 'stream', 'streamEvents', 'legacyEvents'])(
       );
     });
 
+    it.each(['SAFETY', 'MALFORMED_FUNCTION_CALL'])(
+      'preserves ordinary text behavior for %s without image admission',
+      async (finishReason) => {
+        const { requests } = fixtureHttp([[]], {
+          candidates: [
+            { index: 0, finishReason, content: { role: 'model', parts: [] } },
+          ],
+        } as Partial<GenerateContentResponse>);
+        const port = fixturePort({ start: jest.fn(async () => undefined) });
+        await runModel(fixtureModel(port, { model: 'gemini-text' }), mode);
+        expect(requests[0].generationConfig).not.toHaveProperty(
+          'responseModalities'
+        );
+        expect(port.complete).toHaveBeenCalledTimes(1);
+        expect(port.fail).not.toHaveBeenCalled();
+      }
+    );
+
     it('isolates modalities and system instructions between concurrent requests', async () => {
       const { requests } = fixtureHttp();
       const start = jest
