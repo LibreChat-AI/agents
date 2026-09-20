@@ -55,6 +55,27 @@ async function invoke(model, mode, messages, options) {
 
 for (const format of ['cjs', 'esm']) {
   const sdk = await loadFormat(format);
+  test(`${format}: public tracing lifecycle hides handler internals`, async () => {
+    assert.equal(typeof sdk.traceModelInvocation, 'function');
+    assert.equal(sdk.createLangfuseHandler, undefined);
+    assert.equal(sdk.disposeLangfuseHandler, undefined);
+    assert.equal(sdk.withLangfuseAttributes, undefined);
+    let calls = 0;
+    const result = await sdk.traceModelInvocation(
+      {
+        langfuse: { enabled: false },
+        runId: 'contract',
+        provider: 'fixture',
+        model: 'fixture',
+      },
+      async () => {
+        calls++;
+        return 'result';
+      }
+    );
+    assert.equal(result, 'result');
+    assert.equal(calls, 1);
+  });
   for (const mode of ['invoke', 'stream', 'legacy', 'typed']) {
     for (const scenario of ['admission', 'success', 'blocked', 'storage']) {
       test(`${format} ${mode}: ${scenario}`, async (t) => {

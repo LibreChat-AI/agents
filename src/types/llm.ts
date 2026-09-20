@@ -24,7 +24,7 @@ import type { OpenAI as OpenAIClient } from 'openai';
 import type { ChatXAIInput } from '@langchain/xai';
 import type { CustomProviderOptionsMap } from '../provider-registration';
 import type { ChatOpenRouterCallOptions } from '@/llm/openrouter';
-import type { NativeMediaPort } from '@/llm/google/native';
+import type { NativeMediaPort } from '@/types/nativeMedia';
 import type { PromptCacheTtl } from '@/messages/cache';
 import {
   AzureChatOpenAI,
@@ -47,7 +47,7 @@ export type {
   NativeMediaReference,
   NativeMediaRestoreInput,
   NativeMediaProviderOutcome,
-} from '@/llm/google/native';
+} from '@/types/nativeMedia';
 
 export type AzureClientOptions = Partial<OpenAIChatInput> &
   Partial<AzureOpenAIInput> & {

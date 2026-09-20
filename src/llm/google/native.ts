@@ -9,6 +9,13 @@ import type {
   MessageContent,
   UsageMetadata,
 } from '@langchain/core/messages';
+import type {
+  NativeMediaPart,
+  NativeMediaRestoreInput,
+  NativeMediaProviderOutcome,
+  NativeMediaPort,
+} from '@/types/nativeMedia';
+import { NativeMediaError } from '@/llm/errors';
 
 type NativeResponse = Omit<GenerateContentResponse, 'candidates'> & {
   candidates?: Array<
@@ -18,89 +25,22 @@ type NativeResponse = Omit<GenerateContentResponse, 'candidates'> & {
   >;
 };
 
-export type NativeMediaPart =
-  | { kind: 'text'; text: string; thoughtSignature?: string }
-  | {
-      kind: 'image';
-      mimeType: string;
-      data: string;
-      thoughtSignature?: string;
-    };
-export type NativeMediaReference = { continuationRef: string };
-export type NativeMediaRestoreInput = {
-  file_id?: string;
-  continuationRef?: string;
-};
-export type NativeMediaProviderOutcome = {
-  kind: 'blocked' | 'invalid';
-  code: string;
-};
-
-/** Provider consumption survives a failed persistence or cancellation outcome. */
-export class NativeMediaError extends Error {
-  constructor(
-    cause: Error,
-    readonly usage?: UsageMetadata,
-    readonly providerOutcome?: NativeMediaProviderOutcome
-  ) {
-    super(cause.message, { cause });
-    this.name = cause.name;
-  }
-}
-export type NativeMediaContent =
-  | { type: 'text'; text: string; native_media?: NativeMediaReference }
-  | {
-      type: 'image_file';
-      image_file: {
-        file_id: string;
-        filepath: string;
-        filename: string;
-        type: string;
-        bytes: number;
-        width?: number;
-        height?: number;
-      };
-      native_media?: NativeMediaReference;
-    };
-export interface NativeMediaPort {
-  /** Authorize the invocation before the provider request and select its modalities. */
-  start(input: {
-    modelRunId: string;
-    model: string;
-    signal?: AbortSignal;
-  }): Promise<void | { responseModalities: string[] }>;
-  /** Persist the original part before returning content safe to stream and serialize. */
-  part(input: {
-    modelRunId: string;
-    chunkIndex: number;
-    partIndex: number;
-    part: NativeMediaPart;
-  }): Promise<NativeMediaContent>;
-  complete(input: { modelRunId: string }): Promise<void>;
-  fail(input: {
-    modelRunId: string;
-    reason: 'aborted' | 'provider' | 'storage';
-    /** Failure-only usage; successful calls use the normal model-end callback. */
-    usage?: UsageMetadata;
-    providerOutcome?: NativeMediaProviderOutcome;
-  }): Promise<void>;
-  /** Authorize and restore the exact signed provider part for a continuation. */
-  restore(input: NativeMediaRestoreInput): Promise<NativeMediaPart>;
-  /**
-   * Restore all references in order, or reject the entire invocation. Hosts must
-   * bound database batches and concurrent asset reads using their own limits.
-   */
-  restoreBatch?(input: {
-    parts: readonly NativeMediaRestoreInput[];
-    signal?: AbortSignal;
-  }): Promise<NativeMediaPart[]>;
-}
+export type {
+  NativeMediaPart,
+  NativeMediaReference,
+  NativeMediaRestoreInput,
+  NativeMediaProviderOutcome,
+  NativeMediaContent,
+  NativeMediaPort,
+} from '@/types/nativeMedia';
+export { NativeMediaError } from '@/llm/errors';
 
 /** All durable storage and authorization belongs to the injected host port. */
 export class NativeMediaSession {
   private finished = false;
   private storageFailure = false;
   private receivedContent = false;
+  private imageAdmission = false;
   private usage?: UsageMetadata;
   private providerOutcome?: NativeMediaProviderOutcome;
   private readonly modelRunId: string;
@@ -113,11 +53,16 @@ export class NativeMediaSession {
     this.modelRunId = modelRunId ?? v4();
   }
   async start(): Promise<void | { responseModalities: string[] }> {
-    return this.port?.start({
+    const admitted = await this.port?.start({
       modelRunId: this.modelRunId,
       model: this.model,
       signal: this.signal,
     });
+    this.imageAdmission =
+      admitted?.responseModalities.some(
+        (modality) => modality.toUpperCase() === 'IMAGE'
+      ) === true;
+    return admitted;
   }
   /** Added once to the usage chunk, so stream aggregation preserves call identity. */
   usageIdentity(): { native_media_model_run_id: string } | undefined {
@@ -126,7 +71,7 @@ export class NativeMediaSession {
       : { native_media_model_run_id: this.modelRunId };
   }
   async complete(): Promise<void> {
-    if (this.port != null && !this.receivedContent) {
+    if (this.imageAdmission && !this.receivedContent) {
       this.rejectResponse({ kind: 'invalid', code: 'EMPTY_RESPONSE' });
     }
     this.signal?.throwIfAborted();
@@ -140,7 +85,7 @@ export class NativeMediaSession {
   }
   observeResponse(response: NativeResponse, usage?: UsageMetadata): void {
     if (usage != null) this.usage = usage;
-    if (this.port == null) return;
+    if (!this.imageAdmission) return;
     const blockReason: string | undefined =
       response.promptFeedback?.blockReason;
     if (blockReason != null && blockReason !== 'BLOCK_REASON_UNSPECIFIED') {

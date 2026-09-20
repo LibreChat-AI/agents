@@ -57,7 +57,7 @@ import {
 } from '@/llm/preempt';
 import { filterCallbacks, findCallback } from '@/utils/callbacks';
 import { isPresent, parseBooleanEnv } from '@/utils/misc';
-import { NativeMediaError } from '@/llm/google/native';
+import { UsageBearingError } from '@/llm/errors';
 
 export {
   hasLangfuseConfigCredentials,
@@ -777,7 +777,7 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
     this.generationSpans.delete(runId);
     if (
       span != null &&
-      error instanceof NativeMediaError &&
+      error instanceof UsageBearingError &&
       error.usage != null
     ) {
       const usage = error.usage;
