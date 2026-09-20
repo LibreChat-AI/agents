@@ -40,7 +40,10 @@ type TestGoogleGenAIClient = {
   generateContentStream: (
     request: GenerateContentRequest,
     options?: unknown
-  ) => Promise<{ stream: AsyncIterable<GeminiStreamChunk> }>;
+  ) => Promise<{
+    stream: AsyncIterable<GeminiStreamChunk>;
+    response: Promise<GeminiStreamChunk>;
+  }>;
 };
 
 type StreamEventsModel = {
@@ -79,7 +82,7 @@ function mockGoogleGenAI(
   const model = newModel();
   jest
     .spyOn(getTestClient(model), 'generateContentStream')
-    .mockResolvedValue({ stream });
+    .mockResolvedValue({ stream, response: Promise.resolve({}) });
   return model;
 }
 
@@ -291,7 +294,10 @@ describe('CustomChatGoogleGenerativeAI.streamEvents (sub-stream assertions)', ()
     const model = newModel();
     const generateContentStream = jest
       .spyOn(getTestClient(model), 'generateContentStream')
-      .mockResolvedValue({ stream: geminiTextStream() });
+      .mockResolvedValue({
+        stream: geminiTextStream(),
+        response: Promise.resolve({}),
+      });
 
     const stream = new ChatModelStream(
       streamEvents(model, [
@@ -316,7 +322,10 @@ describe('CustomChatGoogleGenerativeAI.streamEvents (sub-stream assertions)', ()
     const model = newModel();
     const generateContentStream = jest
       .spyOn(getTestClient(model), 'generateContentStream')
-      .mockResolvedValue({ stream: geminiTextStream() });
+      .mockResolvedValue({
+        stream: geminiTextStream(),
+        response: Promise.resolve({}),
+      });
 
     const stream = await model.stream([
       new SystemMessage('Stream system instruction'),

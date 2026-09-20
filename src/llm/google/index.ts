@@ -471,7 +471,14 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
       { signal: options.signal },
       async () => {
         /** @ts-ignore */
-        const { stream } = await this.client.generateContentStream(request);
+        const { stream, response } = await this.client.generateContentStream(
+          request,
+          {
+            signal: options.signal,
+          }
+        );
+        /** The aggregate branch rejects too; the consumed stream owns error reporting. */
+        void response.catch(() => undefined);
         return stream;
       }
     );

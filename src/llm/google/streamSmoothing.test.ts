@@ -34,6 +34,7 @@ describe('Google stream smoothing', () => {
         client: { generateContentStream: unknown };
       }
     ).client.generateContentStream = jest.fn(async () => ({
+      response: Promise.resolve(responses[responses.length - 1]),
       stream: (async function* () {
         yield* responses;
       })(),
