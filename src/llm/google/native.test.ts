@@ -35,7 +35,8 @@ function fixtureModel(
   const client = Reflect.get(model, 'client') as {
     generationConfig: { responseModalities?: string[] };
     generateContentStream: (
-      request: GenerateContentRequest
+      request: GenerateContentRequest,
+      requestOptions?: { signal?: AbortSignal }
     ) => Promise<{ stream: AsyncGenerator<ReturnType<typeof response>> }>;
     generateContent: (
       request: GenerateContentRequest
