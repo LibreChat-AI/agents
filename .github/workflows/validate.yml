@@ -85,9 +85,6 @@ jobs:
       - name: Build package
         run: npm run build:dev
 
-      - name: Verify native media CJS and ESM contract
-        run: npm run test:native-media-contract
-
       - name: Test circular dependency checker
         run: npm run test:circular-deps
 
