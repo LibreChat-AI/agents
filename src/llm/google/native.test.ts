@@ -42,6 +42,7 @@ function fixtureModel(
     ) => Promise<{ response: ReturnType<typeof response> }>;
   };
   client.generateContentStream = jest.fn(async () => ({
+    response: Promise.resolve(response(chunks.flat())),
     stream: (async function* () {
       for (const parts of chunks) yield response(parts);
     })(),
@@ -205,7 +206,8 @@ describe('native Google media port', () => {
         generationConfig: expect.objectContaining({
           responseModalities: ['TEXT', 'IMAGE'],
         }),
-      })
+      }),
+      expect.objectContaining({ signal: expect.any(AbortSignal) })
     );
     expect(JSON.stringify({ content, messages })).not.toContain(imageData);
     expect(JSON.stringify({ content, messages })).not.toContain(
