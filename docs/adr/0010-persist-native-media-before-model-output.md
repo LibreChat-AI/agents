@@ -1,27 +1,41 @@
-# Persist native media before model output
+# ADR 0010: Persist Native Media Before Model Output
 
-Status: accepted for the native-media port proposal.
+## Status
 
-Native image bytes and thought signatures arrive in provider response parts. The
-Google adapter calls the injected host port before returning each persisted part.
-Only text and durable file references enter graph state, in-run replay, Langfuse,
-SSE, or subagent results. Moving persistence after model output would expose raw
-bytes or a file reference that another consumer can observe before it exists.
+Accepted
 
-The port owns authorization, storage and continuation restoration; the adapter
-owns provider parsing and ordered emission. Waiting for one part at a time
-provides bounded backpressure without a queue of unpersisted image bytes. Hosts
-should skip persistence for unsigned text and bound every storage operation.
-Cancellation can leave a persisted image, so hosts reconcile incomplete writes;
-an aborted stream does not prove the provider stopped generating or billing.
+## Context
 
-Response policing is tied to the invocation's explicit IMAGE admission. An
-attached port can restore history for a text model without changing ordinary
-empty, blocked, or malformed-function-call response behavior or adding a modality
-selection. Usage-bearing failures use a provider-neutral error contract consumed
-by shared tracing; provider details remain optional native-media metadata.
+Gemini image models return inline image bytes and thought signatures as ordinary
+response parts. Anything the Google adapter yields enters graph state, in-run
+replay, Langfuse observations, SSE output and subagent results. Raw bytes must not
+reach those consumers, and a file reference must not be visible before the file
+exists. The host, not the SDK, owns authorization, storage, retention, accounting
+and recovery for generated media.
 
-Vertex native output remains a separate extension. It requires raw-part
-interception at the Vertex connection boundary and a host binding scoped to the
-service account, project and location. The current port supports the Gemini
-Developer API; Studio Vertex adapters are independent of this SDK port.
+## Decision
+
+`CustomChatGoogleGenerativeAI` accepts an injected `NativeMediaPort`. The adapter
+calls `port.part` for each text or image part and waits for a durable reference
+before yielding it, so only text and file references enter the stream. Waiting on
+one part at a time gives bounded backpressure without a queue of unpersisted
+bytes. The port owns authorization (`start`), persistence (`part`), completion and
+failure recording (`complete`, `fail`) and continuation restoration (`restore`,
+`restoreBatch`); the adapter owns provider parsing and ordered emission.
+
+Response policing is tied to the invocation's explicit `IMAGE` admission. A port
+attached to a text model can restore history without changing empty, blocked or
+malformed-function-call handling and without adding a modality selection.
+Failures that already consumed provider tokens raise a provider-neutral
+`UsageBearingError` so shared tracing and the host can account for them.
+
+## Consequences
+
+Hosts must bound every storage operation, skip persistence for unsigned text, and
+reconcile incomplete writes after cancellation: an aborted local stream does not
+prove the provider stopped generating or billing. Continuation references must
+survive later invocations and process restarts when conversations can be resumed.
+
+Vertex native output is a separate extension. It needs raw-part interception at
+the Vertex connection boundary and a host binding scoped to the service account,
+project and location. This port supports the Gemini Developer API.

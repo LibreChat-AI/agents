@@ -6,7 +6,7 @@ and streaming paths, including `streamEvents()` when the port is configured.
 The host supplies authorization, durable storage and replay.
 
 This port supports the Gemini Developer API. Vertex-backed chat keeps its existing
-behavior; Studio's Vertex image adapters do not imply native chat support.
+behavior.
 
 ```typescript
 import { CustomChatGoogleGenerativeAI } from '@librechat/agents/llm/google';

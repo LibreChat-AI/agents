@@ -4,7 +4,6 @@ export * from './stream';
 export * from './events';
 export * from './messages';
 export { LANGFUSE_OBSERVATION_METADATA_ARTIFACT_KEY } from './langfuseToolOutputTracing';
-export { initializeLangfuseTracing } from './instrumentation';
 export { traceModelInvocation } from './tracing';
 export type { ModelInvocationTrace } from './tracing';
 
