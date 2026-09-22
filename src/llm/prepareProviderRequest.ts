@@ -6,8 +6,8 @@ import type {
 } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
-import type * as t from '@/types';
 import type { ToolHistoryPreparation } from '@/messages/toolHistoryProjection';
+import type * as t from '@/types';
 import {
   projectCacheControlledToolOutputsToText,
   projectComputerCallOutputsToText,
@@ -21,6 +21,7 @@ import {
 import {
   coalesceAdjacentUserTurns,
   appendPredecessorHandoffCue,
+  appendInstructionlessHandoffCue,
   removePredecessorHandoffCue,
 } from '@/messages';
 import {
@@ -28,12 +29,12 @@ import {
   stripBedrockCacheControl,
   cloneMessage,
 } from '@/messages/cache';
+import { createToolHistoryPreparation } from '@/messages/toolHistoryProjection';
 import { isAnthropicLike, isGoogleLike, isOpenAILike } from '@/utils/llm';
 import { annotateMessagesForLLM } from '@/tools/toolOutputReferences';
 import { providerRequiresStrictAlternation } from '@/llm/providers';
 import { getProviderFamily } from '@/llm/providerRegistry';
 import { Providers } from '@/common';
-import { createToolHistoryPreparation } from '@/messages/toolHistoryProjection';
 
 const preparedProviderRequestBrand = Symbol('PreparedProviderRequest');
 const OMITTED_ATTACHMENT_TEXT =
@@ -555,16 +556,17 @@ export function prepareProviderRequest({
   const annotated = annotateMessagesForLLM(projected, registry, runId);
   const isRunProduced = context?.isRunProducedMessage;
   const modelId = resolveServingModelId(model);
+  const handoffGrounded = appendInstructionlessHandoffCue(annotated, config);
   const cued = isAnthropicLike(provider, {
     model: modelId,
   })
     ? appendPredecessorHandoffCue(
-      annotated,
+      handoffGrounded,
       isRunProduced == null
         ? undefined
         : (message): boolean => isRunProduced.call(context, message)
     )
-    : removePredecessorHandoffCue(annotated);
+    : removePredecessorHandoffCue(handoffGrounded);
   const preparedMessages = providerRequiresStrictAlternation(provider)
     ? coalesceAdjacentUserTurns(cued)
     : cued;

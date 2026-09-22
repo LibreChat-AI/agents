@@ -28,12 +28,13 @@ import {
   setProviderMessageProvenance,
   stampSyntheticProviderMessage,
 } from '@/messages/provenance';
-import { serializeToolContentBounded } from '@/utils/toolContent';
-import { Constants, MULTI_AGENT_GRAPH_RUN_NAME } from '@/common';
 import {
   calculateMaxToolResultChars,
   HARD_MAX_TOOL_RESULT_CHARS,
 } from '@/utils/truncation';
+import { withInstructionlessHandoffCue } from '@/messages/handoffCue';
+import { serializeToolContentBounded } from '@/utils/toolContent';
+import { Constants, MULTI_AGENT_GRAPH_RUN_NAME } from '@/common';
 import { StandardGraph } from './Graph';
 
 /** Pattern to extract instructions from transfer ToolMessage content */
@@ -1354,12 +1355,6 @@ export class MultiAgentGraph extends StandardGraph {
           this.memberRecursionLimit == null
             ? config
             : { ...config, recursionLimit: this.memberRecursionLimit };
-        const memberConfig = withActiveAgentMetadata(
-          recursionLimitedConfig,
-          agentId,
-          agentContext?.name
-        );
-
         /**
          * Check if this agent is receiving a handoff.
          * If so, filter out the transfer messages and inject instructions as preamble.
@@ -1369,6 +1364,19 @@ export class MultiAgentGraph extends StandardGraph {
         const handoffContext = this.processHandoffReception(
           state.messages,
           agentId
+        );
+
+        const memberConfig = withInstructionlessHandoffCue(
+          withActiveAgentMetadata(
+            recursionLimitedConfig,
+            agentId,
+            agentContext?.name
+          ),
+          handoffContext != null &&
+            (handoffContext.instructions == null ||
+              handoffContext.instructions === '')
+            ? handoffContext.filteredMessages.at(-1)
+            : undefined
         );
 
         if (
@@ -1582,7 +1590,9 @@ export class MultiAgentGraph extends StandardGraph {
     }
 
     const startingNodes =
-      summarizeOnlyAgentId != null ? [summarizeOnlyAgentId] : this.startingNodes;
+      summarizeOnlyAgentId != null
+        ? [summarizeOnlyAgentId]
+        : this.startingNodes;
     for (const startNode of startingNodes) {
       // eslint-disable-next-line @typescript-eslint/ban-ts-comment
       /** @ts-ignore */
@@ -1634,7 +1644,10 @@ export class MultiAgentGraph extends StandardGraph {
             this.resolveMaxRoutingPromptChars(destination);
 
           if (typeof prompt === 'function') {
-            const resolvedPrompt = await prompt(state.messages, this.startIndex);
+            const resolvedPrompt = await prompt(
+              state.messages,
+              this.startIndex
+            );
             promptText =
               resolvedPrompt == null
                 ? undefined

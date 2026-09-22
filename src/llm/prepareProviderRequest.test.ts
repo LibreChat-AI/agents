@@ -6,17 +6,21 @@ import {
   assertPreparedProviderRequestFor,
   prepareProviderRequest,
 } from '@/llm/prepareProviderRequest';
-import { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
-import { _convertMessagesToOpenAIParams } from '@/llm/openai/utils';
-import { attemptInvoke } from '@/llm/invoke';
-import { Providers } from '@/common';
-import { foldToolBlocksForToollessAgent } from '@/messages/format';
-import { createToolHistoryPreparation } from '@/messages/toolHistoryProjection';
-import { createContextPressureMeter } from './contextPressureMeter';
+import {
+  INSTRUCTIONLESS_HANDOFF_CUE,
+  withInstructionlessHandoffCue,
+} from '@/messages/handoffCue';
 import {
   getProviderMessageProvenance,
   getProviderSourceMessageIds,
 } from '@/messages/provenance';
+import { createToolHistoryPreparation } from '@/messages/toolHistoryProjection';
+import { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
+import { _convertMessagesToOpenAIParams } from '@/llm/openai/utils';
+import { createContextPressureMeter } from './contextPressureMeter';
+import { foldToolBlocksForToollessAgent } from '@/messages/format';
+import { attemptInvoke } from '@/llm/invoke';
+import { Providers } from '@/common';
 
 type StubModel = {
   model?: string;
@@ -44,6 +48,57 @@ function createCapturingModel(): CapturingModel {
 }
 
 describe('prepareProviderRequest', () => {
+  it.each([Providers.OPENAI, Providers.ANTHROPIC, Providers.BEDROCK])(
+    'measures the instructionless handoff cue for %s without modifying its source',
+    (provider) => {
+      const { model } = createCapturingModel();
+      const tail = new AIMessage({
+        content: 'Transferring',
+        id: 'handoff-tail',
+      });
+      const messages = [new HumanMessage('Analyze this'), tail];
+      const config = withInstructionlessHandoffCue(undefined, tail);
+      const measured = jest.fn((prepared: BaseMessage[]) => ({
+        fits: prepared.length <= messages.length,
+      }));
+      const request = prepareProviderRequest({
+        model: model as t.ChatModel,
+        messages,
+        provider,
+        config,
+        measure: measured,
+      });
+      expect(request.messages.at(-1)?.content).toBe(
+        INSTRUCTIONLESS_HANDOFF_CUE
+      );
+      expect(measured).toHaveBeenCalledWith(request.messages);
+      expect(request.measurement?.fits).toBe(false);
+      expect(messages).toHaveLength(2);
+      expect(tail.additional_kwargs).toEqual({});
+
+      const fallback = prepareProviderRequest({
+        model: model as t.ChatModel,
+        messages: request.messages,
+        provider: Providers.OPENAI,
+        config,
+      });
+      expect(
+        fallback.messages.filter(
+          (message) => message.content === INSTRUCTIONLESS_HANDOFF_CUE
+        )
+      ).toHaveLength(1);
+      const freshFallback = prepareProviderRequest({
+        model: model as t.ChatModel,
+        messages,
+        provider: Providers.OPENAI,
+        config,
+      });
+      expect(freshFallback.messages.at(-1)?.content).toBe(
+        INSTRUCTIONLESS_HANDOFF_CUE
+      );
+    }
+  );
+
   it('honors an explicit Chat override over Responses model defaults', () => {
     const { model } = createCapturingModel();
     model._useResponsesApi = (options?: unknown): boolean =>

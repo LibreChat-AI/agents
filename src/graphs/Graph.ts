@@ -70,6 +70,7 @@ import {
   convertInjectedMessages,
   coalesceAdjacentUserTurns,
   appendPredecessorHandoffCue,
+  appendInstructionlessHandoffCue,
   stampSyntheticProviderMessage,
 } from '@/messages';
 import {
@@ -3721,11 +3722,16 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
          * Applied HERE for the primary so the cue is part of the MEASURED
          * payload — the pre-invoke projection and overflow guard run on this
          * stage's output, and a post-measure append could push a just-fits
-         * prompt over budget unreported (#346 round 2). The attemptInvoke
-         * funnel re-keys per SERVING provider: it strips this cue for a
-         * tolerant fallback and adds it for a Claude fallback behind a
-         * tolerant primary.
+         * prompt over budget unreported (#346 round 2). Instructionless tool
+         * handoffs are grounded for every transport. Only the direct-edge
+         * predecessor cue is re-keyed per SERVING provider: tolerant
+         * fallbacks strip it, while Claude fallbacks add it.
          */
+        const beforeHandoffCue = transformed;
+        transformed = trackProviderMessageOrigins(
+          beforeHandoffCue,
+          appendInstructionlessHandoffCue(beforeHandoffCue, callConfig)
+        );
         if (isAnthropicLike(provider, clientOptions as { model?: string })) {
           const before = transformed;
           transformed = trackProviderMessageOrigins(
