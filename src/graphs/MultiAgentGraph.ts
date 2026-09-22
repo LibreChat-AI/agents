@@ -28,12 +28,12 @@ import {
   setProviderMessageProvenance,
   stampSyntheticProviderMessage,
 } from '@/messages/provenance';
-import { serializeToolContentBounded } from '@/utils/toolContent';
-import { Constants, MULTI_AGENT_GRAPH_RUN_NAME } from '@/common';
 import {
   calculateMaxToolResultChars,
   HARD_MAX_TOOL_RESULT_CHARS,
 } from '@/utils/truncation';
+import { serializeToolContentBounded } from '@/utils/toolContent';
+import { Constants, MULTI_AGENT_GRAPH_RUN_NAME } from '@/common';
 import { StandardGraph } from './Graph';
 
 /** Pattern to extract instructions from transfer ToolMessage content */
@@ -1431,10 +1431,21 @@ export class MultiAgentGraph extends StandardGraph {
                 buildRoutingPrompt(boundedInstructions),
               ];
             }
+          } else if (filteredMessages.at(-1)?.getType() === 'ai') {
+            /** Gateways can reject assistant prefill regardless of transport provider. */
+            messagesForAgent = [
+              ...filteredMessages,
+              buildRoutingPrompt(
+                'Continue as the receiving agent using the preceding user request and context.'
+              ),
+            ];
           }
 
           /** Update token map if we have a token counter */
-          if (agentContext?.tokenCounter && hasInstructions) {
+          if (
+            agentContext?.tokenCounter &&
+            messagesForAgent.length > filteredMessages.length
+          ) {
             const freshTokenMap: Record<string, number> = {};
             for (
               let i = 0;
@@ -1446,7 +1457,7 @@ export class MultiAgentGraph extends StandardGraph {
                 freshTokenMap[i] = tokenCount;
               }
             }
-            /** Add tokens for the bridge AIMessage + instructions HumanMessage */
+            /** Account for injected routing messages, including a handoff cue. */
             for (
               let i = filteredMessages.length;
               i < messagesForAgent.length;
@@ -1582,7 +1593,9 @@ export class MultiAgentGraph extends StandardGraph {
     }
 
     const startingNodes =
-      summarizeOnlyAgentId != null ? [summarizeOnlyAgentId] : this.startingNodes;
+      summarizeOnlyAgentId != null
+        ? [summarizeOnlyAgentId]
+        : this.startingNodes;
     for (const startNode of startingNodes) {
       // eslint-disable-next-line @typescript-eslint/ban-ts-comment
       /** @ts-ignore */
@@ -1634,7 +1647,10 @@ export class MultiAgentGraph extends StandardGraph {
             this.resolveMaxRoutingPromptChars(destination);
 
           if (typeof prompt === 'function') {
-            const resolvedPrompt = await prompt(state.messages, this.startIndex);
+            const resolvedPrompt = await prompt(
+              state.messages,
+              this.startIndex
+            );
             promptText =
               resolvedPrompt == null
                 ? undefined
