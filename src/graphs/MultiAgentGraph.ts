@@ -32,6 +32,7 @@ import {
   calculateMaxToolResultChars,
   HARD_MAX_TOOL_RESULT_CHARS,
 } from '@/utils/truncation';
+import { withInstructionlessHandoffCue } from '@/messages/handoffCue';
 import { serializeToolContentBounded } from '@/utils/toolContent';
 import { Constants, MULTI_AGENT_GRAPH_RUN_NAME } from '@/common';
 import { StandardGraph } from './Graph';
@@ -1354,12 +1355,6 @@ export class MultiAgentGraph extends StandardGraph {
           this.memberRecursionLimit == null
             ? config
             : { ...config, recursionLimit: this.memberRecursionLimit };
-        const memberConfig = withActiveAgentMetadata(
-          recursionLimitedConfig,
-          agentId,
-          agentContext?.name
-        );
-
         /**
          * Check if this agent is receiving a handoff.
          * If so, filter out the transfer messages and inject instructions as preamble.
@@ -1369,6 +1364,19 @@ export class MultiAgentGraph extends StandardGraph {
         const handoffContext = this.processHandoffReception(
           state.messages,
           agentId
+        );
+
+        const memberConfig = withInstructionlessHandoffCue(
+          withActiveAgentMetadata(
+            recursionLimitedConfig,
+            agentId,
+            agentContext?.name
+          ),
+          handoffContext != null &&
+            (handoffContext.instructions == null ||
+              handoffContext.instructions === '')
+            ? handoffContext.filteredMessages.at(-1)
+            : undefined
         );
 
         if (
@@ -1431,21 +1439,10 @@ export class MultiAgentGraph extends StandardGraph {
                 buildRoutingPrompt(boundedInstructions),
               ];
             }
-          } else if (filteredMessages.at(-1)?.getType() === 'ai') {
-            /** Gateways can reject assistant prefill regardless of transport provider. */
-            messagesForAgent = [
-              ...filteredMessages,
-              buildRoutingPrompt(
-                'Continue as the receiving agent using the preceding user request and context.'
-              ),
-            ];
           }
 
           /** Update token map if we have a token counter */
-          if (
-            agentContext?.tokenCounter &&
-            messagesForAgent.length > filteredMessages.length
-          ) {
+          if (agentContext?.tokenCounter && hasInstructions) {
             const freshTokenMap: Record<string, number> = {};
             for (
               let i = 0;
@@ -1457,7 +1454,7 @@ export class MultiAgentGraph extends StandardGraph {
                 freshTokenMap[i] = tokenCount;
               }
             }
-            /** Account for injected routing messages, including a handoff cue. */
+            /** Add tokens for the bridge AIMessage + instructions HumanMessage */
             for (
               let i = filteredMessages.length;
               i < messagesForAgent.length;

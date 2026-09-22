@@ -1,3 +1,6 @@
+import { join } from 'node:path';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { Command, MemorySaver } from '@langchain/langgraph';
 import { DynamicStructuredTool } from '@langchain/core/tools';
 import {
   AIMessage,
@@ -5,11 +8,15 @@ import {
   ToolMessage,
   getBufferString,
 } from '@langchain/core/messages';
+import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
+import type { ChatGenerationChunk } from '@langchain/core/outputs';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type { BaseMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
 import { inspectProviderMessageProvenance } from '@/messages/provenance';
 import { Constants, Providers } from '@/common';
+import { createAgentSession } from '@/session';
+import * as providers from '@/llm/providers';
 import { FakeChatModel } from '@/llm/fake';
 import { Run } from '@/run';
 
@@ -38,21 +45,29 @@ async function executeHandoff({
   ],
   preamble = PREAMBLE,
   messages = [new HumanMessage(USER_REQUEST)],
+  overrideModel,
 }: {
   agents?: t.AgentInputs[];
   edges?: t.GraphEdge[];
   toolCalls?: ToolCall[];
   preamble?: string;
   messages?: BaseMessage[];
+  overrideModel?: FakeChatModel;
 } = {}): Promise<{
   requests: BaseMessage[][];
   run: Run<t.BaseGraphState>;
   countedMessages: BaseMessage[];
 }> {
   const countedMessages: BaseMessage[] = [];
+  const checkpointer = new MemorySaver();
   const run = await Run.create({
     runId: `handoff-tail-${Math.random()}`,
-    graphConfig: { type: 'multi-agent', agents, edges },
+    graphConfig: {
+      type: 'multi-agent',
+      agents,
+      edges,
+      compileOptions: { checkpointer },
+    },
     tokenCounter: (message) => {
       countedMessages.push(message);
       return getBufferString([message]).length;
@@ -63,16 +78,36 @@ async function executeHandoff({
   if (run.Graph == null) {
     throw new Error('Expected a multi-agent graph');
   }
-  const model = new FakeChatModel({
-    responses: [preamble, 'Analysis complete', 'Second analysis complete'],
-    toolCalls,
-  });
+  const model =
+    overrideModel ??
+    new FakeChatModel({
+      responses: [preamble, 'Analysis complete', 'Second analysis complete'],
+      toolCalls,
+    });
   const streamSpy = jest.spyOn(model, '_streamResponseChunks');
   run.Graph.overrideModel = model;
   await run.processStream(
     { messages },
-    { configurable: { thread_id: 'handoff-tail-thread' }, version: 'v2' }
+    {
+      configurable: { thread_id: 'handoff-tail-thread' },
+      version: 'v2',
+      durability: 'sync',
+    }
   );
+  expect(getBufferString(run.getRunMessages() ?? [])).not.toContain(
+    HANDOFF_CUE
+  );
+  let checkpointCount = 0;
+  for await (const tuple of checkpointer.list({
+    configurable: { thread_id: 'handoff-tail-thread' },
+  })) {
+    checkpointCount++;
+    expect(JSON.stringify(tuple.checkpoint.channel_values)).not.toContain(
+      HANDOFF_CUE
+    );
+    expect(JSON.stringify(tuple.pendingWrites)).not.toContain(HANDOFF_CUE);
+  }
+  expect(checkpointCount).toBeGreaterThan(0);
   return {
     requests: streamSpy.mock.calls.map(([messages]) => messages),
     run,
@@ -81,6 +116,89 @@ async function executeHandoff({
 }
 
 describe('Handoff message tails', () => {
+  it.each([false, true])(
+    'does not persist or replay transport cues in JSONL sessions (parallel=%s)',
+    async (parallel) => {
+      const requests: BaseMessage[][] = [];
+      const destinations = parallel ? ['left', 'right'] : ['recipient'];
+      class SessionModel extends FakeChatModel {
+        constructor() {
+          super({ responses: ['Analysis complete'] });
+        }
+
+        override bindTools(): this {
+          return this;
+        }
+
+        override async *_streamResponseChunks(
+          messages: BaseMessage[],
+          options: this['ParsedCallOptions'],
+          runManager?: CallbackManagerForLLMRun
+        ): AsyncGenerator<ChatGenerationChunk> {
+          requests.push(messages);
+          const transferring = messages.at(-1)?.content === USER_REQUEST;
+          const scripted = new FakeChatModel({
+            responses: [transferring ? PREAMBLE : 'Analysis complete'],
+            toolCalls: transferring
+              ? destinations.map((destination) => ({
+                id: `transfer-${destination}`,
+                name: `${Constants.LC_TRANSFER_TO_}${destination}`,
+                args: {},
+              }))
+              : [],
+          });
+          yield* scripted._streamResponseChunks(messages, options, runManager);
+        }
+      }
+      const modelSpy = jest
+        .spyOn(providers, 'getChatModelClass')
+        .mockReturnValue(SessionModel as never);
+      const dir = await mkdtemp(join(process.cwd(), '.handoff-session-'));
+      try {
+        const config = {
+          cwd: dir,
+          sessionPath: join(dir, 'history.jsonl'),
+          checkpointing: false as const,
+          graphConfig: {
+            type: 'multi-agent' as const,
+            agents: [
+              createAgent('router'),
+              ...destinations.map((id) => createAgent(id)),
+            ],
+            edges: destinations.map(
+              (to): t.GraphEdge => ({ from: 'router', to, edgeType: 'handoff' })
+            ),
+          },
+        };
+        const session = await createAgentSession(config);
+        const result = await session.run(USER_REQUEST);
+        expect(requests).toHaveLength(destinations.length + 1);
+        for (const request of requests.slice(1)) {
+          expect(request.at(-1)?.content).toBe(HANDOFF_CUE);
+        }
+        expect(getBufferString(result.messages)).not.toContain(HANDOFF_CUE);
+        expect(await readFile(config.sessionPath, 'utf8')).not.toContain(
+          HANDOFF_CUE
+        );
+
+        const reopened = await createAgentSession(config);
+        const count = requests.length;
+        await reopened.run('What should we do next?');
+        expect(requests).toHaveLength(count + 1);
+        expect(getBufferString(requests.at(-1)!)).toContain(
+          'Analysis complete'
+        );
+        expect(getBufferString(requests.at(-1)!)).not.toContain(HANDOFF_CUE);
+        expect(await readFile(config.sessionPath, 'utf8')).not.toContain(
+          HANDOFF_CUE
+        );
+      } finally {
+        modelSpy.mockRestore();
+        await rm(dir, { recursive: true, force: true });
+      }
+    }
+  );
+
   it.each([
     [
       'Claude behind an OpenAI-compatible gateway',
@@ -233,6 +351,142 @@ describe('Handoff message tails', () => {
       }
     }
   );
+
+  it('reconstructs the wire cue when a fresh Run resumes a checkpointed handoff', async () => {
+    const checkpointer = new MemorySaver();
+    const graphConfig: t.RunConfig['graphConfig'] = {
+      type: 'multi-agent',
+      agents: [createAgent('router'), createAgent('recipient')],
+      edges: [{ from: 'router', to: 'recipient', edgeType: 'handoff' }],
+      compileOptions: { checkpointer, interruptBefore: ['recipient'] },
+    };
+    const config = {
+      configurable: { thread_id: 'paused-handoff' },
+      version: 'v2' as const,
+      durability: 'sync' as const,
+    };
+    const first = await Run.create({
+      runId: 'paused-handoff',
+      graphConfig,
+      skipCleanup: true,
+    });
+    first.Graph?.overrideTestModel([PREAMBLE], 0, [
+      {
+        id: 'paused-transfer',
+        name: `${Constants.LC_TRANSFER_TO_}recipient`,
+        args: {},
+      },
+    ]);
+    await first.processStream(
+      { messages: [new HumanMessage(USER_REQUEST)] },
+      config
+    );
+    const paused = await checkpointer.getTuple(config);
+    expect(JSON.stringify(paused?.checkpoint.channel_values)).toContain(
+      'paused-transfer'
+    );
+    expect(JSON.stringify(paused?.checkpoint.channel_values)).not.toContain(
+      HANDOFF_CUE
+    );
+
+    const resumed = await Run.create({
+      runId: 'resumed-handoff',
+      skipCleanup: true,
+      graphConfig: { ...graphConfig, compileOptions: { checkpointer } },
+    });
+    if (resumed.Graph == null) {
+      throw new Error('Expected graph');
+    }
+    const model = new FakeChatModel({ responses: ['Analysis complete'] });
+    const spy = jest.spyOn(model, '_streamResponseChunks');
+    resumed.Graph.overrideModel = model;
+    await resumed.processStream(new Command({ resume: true }), config);
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy.mock.calls[0][0].at(-1)?.content).toBe(HANDOFF_CUE);
+    expect(getBufferString(resumed.getRunMessages() ?? [])).not.toContain(
+      HANDOFF_CUE
+    );
+    const completed = await checkpointer.getTuple(config);
+    expect(JSON.stringify(completed?.checkpoint.channel_values)).toContain(
+      'Analysis complete'
+    );
+    expect(JSON.stringify(completed?.checkpoint.channel_values)).not.toContain(
+      HANDOFF_CUE
+    );
+  });
+
+  it('does not carry the handoff cue into a later direct re-entry', async () => {
+    const { requests } = await executeHandoff({
+      edges: [
+        { from: 'router', to: 'recipient', edgeType: 'handoff' },
+        { from: 'recipient', to: 'router', edgeType: 'direct' },
+      ],
+    });
+    expect(requests).toHaveLength(3);
+    expect(requests[1].at(-1)?.content).toBe(HANDOFF_CUE);
+    expect(requests[2].at(-1)?.getType()).toBe('ai');
+    expect(getBufferString(requests[2])).not.toContain(HANDOFF_CUE);
+  });
+
+  it('keeps cues transient through another handoff and a recipient tool iteration', async () => {
+    const lookup = new DynamicStructuredTool({
+      name: 'lookup',
+      description: 'Look up usage',
+      schema: { type: 'object', properties: {}, required: [] },
+      func: async (): Promise<string> => 'Usage: 42',
+    });
+    class ChainedModel extends FakeChatModel {
+      private turn = 0;
+      override async *_streamResponseChunks(
+        messages: BaseMessage[],
+        options: this['ParsedCallOptions'],
+        runManager?: CallbackManagerForLLMRun
+      ): AsyncGenerator<ChatGenerationChunk> {
+        const scripts = [
+          { text: PREAMBLE, name: `${Constants.LC_TRANSFER_TO_}middle` },
+          {
+            text: 'Delegating the analysis',
+            name: `${Constants.LC_TRANSFER_TO_}recipient`,
+          },
+          { text: 'Looking up usage', name: 'lookup' },
+          { text: 'Analysis complete', name: undefined },
+        ];
+        const script = scripts.at(this.turn++);
+        if (script == null) {
+          throw new Error('Unexpected extra model turn');
+        }
+        const scripted = new FakeChatModel({
+          responses: [script.text],
+          toolCalls:
+            script.name == null
+              ? []
+              : [{ id: `call-${this.turn}`, name: script.name, args: {} }],
+        });
+        yield* scripted._streamResponseChunks(messages, options, runManager);
+      }
+    }
+    const { requests } = await executeHandoff({
+      agents: [
+        createAgent('router'),
+        createAgent('middle'),
+        { ...createAgent('recipient'), tools: [lookup] },
+      ],
+      edges: [
+        { from: 'router', to: 'middle', edgeType: 'handoff' },
+        { from: 'middle', to: 'recipient', edgeType: 'handoff' },
+      ],
+      overrideModel: new ChainedModel({ responses: [] }),
+    });
+    expect(requests).toHaveLength(4);
+    for (const request of requests.slice(1, 3)) {
+      expect(request.at(-1)?.content).toBe(HANDOFF_CUE);
+      expect(
+        request.filter((message) => message.content === HANDOFF_CUE)
+      ).toHaveLength(1);
+    }
+    expect(requests[3].at(-1)?.getType()).toBe('tool');
+    expect(getBufferString(requests[3])).not.toContain(HANDOFF_CUE);
+  });
 
   it('grounds an instructionless conditional handoff', async () => {
     const { requests } = await executeHandoff({

@@ -1,7 +1,58 @@
 // src/messages/handoffCue.ts
 import { HumanMessage } from '@langchain/core/messages';
+import type { RunnableConfig } from '@langchain/core/runnables';
 import type { BaseMessage } from '@langchain/core/messages';
 import { stampSyntheticProviderMessage } from './provenance';
+
+const HANDOFF_CUE_MESSAGE_ID = '__handoff_cue_message_id';
+export const INSTRUCTIONLESS_HANDOFF_CUE =
+  'Continue as the receiving agent using the preceding user request and context.';
+
+/** Scope transport-only grounding to this recipient's incoming assistant turn.
+ * Every agent entry resets the marker, including direct edges and cycles. The
+ * reducer has already assigned the source message's id, including on replay. */
+export function withInstructionlessHandoffCue(
+  config: RunnableConfig | undefined,
+  tail?: BaseMessage
+): RunnableConfig {
+  return {
+    ...config,
+    metadata: {
+      ...config?.metadata,
+      [HANDOFF_CUE_MESSAGE_ID]:
+        tail?.getType() === 'ai' ? (tail.id ?? null) : null,
+    },
+  };
+}
+
+/** Only provider projections get this cue. Matching the incoming turn's id
+ * prevents it leaking into later tool iterations or deliberate assistant
+ * prefill. It is independent of transport provider and run-produced ids, so
+ * gateways and checkpoint replays follow the same handoff contract. */
+export function appendInstructionlessHandoffCue(
+  messages: BaseMessage[],
+  config?: RunnableConfig
+): BaseMessage[] {
+  const tail = messages.at(-1);
+  const sourceId = config?.metadata?.[HANDOFF_CUE_MESSAGE_ID];
+  if (
+    typeof sourceId !== 'string' ||
+    sourceId === '' ||
+    tail?.getType() !== 'ai' ||
+    tail.id !== sourceId
+  ) {
+    return messages;
+  }
+  return [
+    ...messages,
+    stampSyntheticProviderMessage(
+      new HumanMessage({
+        content: INSTRUCTIONLESS_HANDOFF_CUE,
+        additional_kwargs: { role: 'user', isMeta: true, source: 'routing' },
+      })
+    ),
+  ];
+}
 
 /**
  * Bracketed-meta convention, like the handoff path's

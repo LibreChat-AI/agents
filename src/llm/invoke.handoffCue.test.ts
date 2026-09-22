@@ -7,15 +7,20 @@
  * cue stripped; and the serving model id must be read through the wrapper
  * stack, or a wrapped Bedrock-Nova model would default to Claude.
  */
+import { RunnableBinding } from '@langchain/core/runnables';
 import { AIMessage, HumanMessage } from '@langchain/core/messages';
-import type { BaseMessage } from '@langchain/core/messages';
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
 import type { ChatGenerationChunk } from '@langchain/core/outputs';
-import { RunnableBinding } from '@langchain/core/runnables';
-import { Providers } from '@/common';
-import { PREDECESSOR_HANDOFF_CUE } from '@/messages/handoffCue';
+import type { BaseMessage } from '@langchain/core/messages';
+import type { InvokeContext } from './invoke';
+import {
+  PREDECESSOR_HANDOFF_CUE,
+  INSTRUCTIONLESS_HANDOFF_CUE,
+  withInstructionlessHandoffCue,
+} from '@/messages/handoffCue';
 import { FakeChatModel } from '@/llm/fake';
-import { attemptInvoke, type InvokeContext } from './invoke';
+import { attemptInvoke } from './invoke';
+import { Providers } from '@/common';
 
 class CapturingChatModel extends FakeChatModel {
   readonly invocations: BaseMessage[][] = [];
@@ -70,6 +75,46 @@ async function sentBy(
 }
 
 describe('attemptInvoke handoff-cue funnel', () => {
+  it('grounds repeated gateway attempts without mutating their replay source', async () => {
+    const model = new CapturingChatModel('analytics-gateway');
+    const messages = [new HumanMessage('go'), runTail];
+    const config = withInstructionlessHandoffCue(undefined, runTail);
+    const stream = model._streamResponseChunks.bind(model);
+    let failed = false;
+    jest
+      .spyOn(model, '_streamResponseChunks')
+      .mockImplementation(async function* (payload, options, runManager) {
+        if (!failed) {
+          failed = true;
+          model.invocations.push(payload);
+          throw new Error('Transient gateway failure');
+        }
+        yield* stream(payload, options, runManager);
+      });
+    const invoke = (): ReturnType<typeof attemptInvoke> =>
+      attemptInvoke(
+        {
+          model,
+          messages,
+          provider: Providers.OPENAI,
+          onChunk: async () => undefined,
+        },
+        config
+      );
+    await expect(invoke()).rejects.toThrow('Transient gateway failure');
+    await invoke();
+    expect(model.invocations).toHaveLength(2);
+    for (const request of model.invocations) {
+      expect(request.at(-1)?.content).toBe(INSTRUCTIONLESS_HANDOFF_CUE);
+      expect(
+        request.filter(
+          (message) => message.content === INSTRUCTIONLESS_HANDOFF_CUE
+        )
+      ).toHaveLength(1);
+    }
+    expect(messages).toEqual([new HumanMessage('go'), runTail]);
+  });
+
   it('applies the cue when the serving provider is Anthropic', async () => {
     const sent = await sentBy(Providers.ANTHROPIC);
     expect(sent.at(-1)?.content).toBe(PREDECESSOR_HANDOFF_CUE);
@@ -96,9 +141,7 @@ describe('attemptInvoke handoff-cue funnel', () => {
       messages: [new HumanMessage('go'), runTail, bakedCue()],
     });
     expect(sent.at(-1)?.getType()).toBe('ai');
-    expect(sent.some((m) => m.content === PREDECESSOR_HANDOFF_CUE)).toBe(
-      false
-    );
+    expect(sent.some((m) => m.content === PREDECESSOR_HANDOFF_CUE)).toBe(false);
   });
 
   it('is idempotent when the primary already baked the cue', async () => {
