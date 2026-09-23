@@ -14,6 +14,7 @@ import type { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import type { LangfuseConfig, SubagentExecutionContext } from './graph';
 import type { PreparedSubagents } from '@/tools/preparedSubagents';
 import type { RunBreakerScope } from '@/llm/streamLimits';
+import type { HandoffRouting } from '@/graphs/handoff';
 import type { HumanInTheLoopConfig } from './hitl';
 import type { HookRegistry } from '@/hooks';
 
@@ -117,6 +118,8 @@ export type EagerEventToolCallChunkState = {
 };
 
 export type ToolNodeOptions = {
+  /** @internal Admission shared by tool nodes belonging to one multi-agent graph. */
+  handoffRouting?: Pick<HandoffRouting, 'finalize'>;
   name?: string;
   tags?: string[];
   /** Enables LangChain/LangGraph tracing for this ToolNode. Defaults to false. */

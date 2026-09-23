@@ -38,6 +38,7 @@ import type {
 } from '@/graphs/graphFactory';
 import type { OverflowRecoveryPlan } from '@/llm/contextOverflowRecovery';
 import type { FallbackErrorContext } from '@/llm/invoke';
+import type { HandoffRouting } from './handoff';
 import type { HookRegistry } from '@/hooks';
 import type * as t from '@/types';
 import {
@@ -185,6 +186,7 @@ import { getTruncationStopReason } from '@/llm/truncation';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { AgentContext } from '@/agents/AgentContext';
 import { createFakeStreamingLLM } from '@/llm/fake';
+import { handoffStateAnnotation } from './handoff';
 import { handleToolCalls } from '@/tools/handlers';
 import { isThinkingEnabled } from '@/llm/request';
 import { resolveMaxSeals } from '@/llm/preempt';
@@ -1354,6 +1356,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   subagentUsageSink?: t.SubagentUsageSink;
   /** See {@link t.StandardGraphInput.subagentScope}. */
   subagentScope: boolean;
+  handoffRouting?: HandoffRouting;
   /** See {@link t.StandardGraphInput.subagentTasks}. */
   subagentTasks: t.SubagentTaskConfig | undefined;
   /** See {@link t.StandardGraphInput.subagentExecutionContext}. */
@@ -2871,6 +2874,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       }
 
       const node = new CustomToolNode<t.BaseGraphState>({
+        handoffRouting: this.handoffRouting,
         tools: allTools,
         toolMap: allToolMap,
         trace: traceToolNode,
@@ -2960,6 +2964,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         : currentToolMap;
 
     const node = new CustomToolNode<t.BaseGraphState>({
+      handoffRouting: this.handoffRouting,
       tools: allTraditionalTools,
       toolMap: traditionalToolMap,
       trace: traceToolNode,
@@ -5434,6 +5439,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     ): Promise<Partial<t.AgentSubgraphState>> => {
       this.config = config;
       this.restoreRunStepResumeState(state.runStepState);
+      this.handoffRouting?.restore(state.handoffState);
       const result = await invoke();
       /** An ordinary run on a checkpointed thread inherits the last
        *  compaction's summary in state; it is not this run's output. */
@@ -5512,6 +5518,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         default: () => undefined,
       }),
       runStepState: this.createRunStepStateAnnotation(),
+      handoffState: handoffStateAnnotation(),
     });
 
     const readChargeCredits = ():
@@ -5727,6 +5734,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         default: () => undefined,
       }),
       runStepState: this.createRunStepStateAnnotation(),
+      handoffState: handoffStateAnnotation(),
     });
     const compactingAgentNode = async (
       state: t.AgentSubgraphState,

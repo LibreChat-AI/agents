@@ -78,9 +78,45 @@ export type SystemCallbacks = {
     : never;
 };
 
+/** An executed, SDK-generated handoff, identified independently of stream events. */
+export interface HandoffTransition {
+  id: string;
+  sourceAgentId: string;
+  targetAgentId: string;
+  toolCallId: string;
+  scope: 'turn' | 'conversation';
+  /** Causal order: number of handoffs visible at this batch's input. */
+  depth: number;
+}
+
+/** Versioned graph checkpoint payload, scoped to one logical user turn. */
+export interface HandoffState {
+  version: 1;
+  executionId: string;
+  entryAgentId: string;
+  maxHandoffs?: number;
+  transitions: HandoffTransition[];
+  parallel: boolean;
+  /** False when resuming an older checkpoint without complete routing provenance. */
+  historyComplete?: boolean;
+}
+
+/** Only a candidate from a completed top-level run may be promoted by a host. */
+export type HandoffOutcome = {
+  executionId: string;
+  entryAgentId: string;
+  transitions: readonly HandoffTransition[];
+} & (
+  | { status: 'candidate'; agentId: string; transitionId: string }
+  | { status: 'unchanged' | 'ambiguous' }
+  | { status: 'incomplete'; reason: string }
+);
+
 export type BaseGraphState = {
   messages: BaseMessage[];
   runStepState?: RunStepResumeState;
+  /** SDK-owned routing state; hosts must not synthesize it from messages. */
+  handoffState?: HandoffState;
   /**
    * The summary a summarize-only run produced. Kept in state because such a
    * run has no assistant reply: trace roots report it as the run's output
@@ -434,6 +470,8 @@ export type GraphEdge = {
   condition?: (state: BaseGraphState) => boolean | string | string[];
   /** 'handoff' creates tools for dynamic routing, 'direct' creates direct edges, which also allow parallel execution */
   edgeType?: 'handoff' | 'direct';
+  /** Host may promote the destination after successful top-level completion. */
+  handoffScope?: 'turn' | 'conversation';
   /**
    * For direct edges: Optional prompt to add when transitioning through this edge.
    * String prompts can include variables like {results} which will be replaced with
@@ -463,15 +501,20 @@ export type GraphEdge = {
 
 export type GraphSubagentEdge = Omit<
   GraphEdge,
-  'edgeType' | 'condition' | 'promptKey'
+  'edgeType' | 'condition' | 'promptKey' | 'handoffScope'
 > & {
   edgeType: 'direct';
   condition?: never;
   promptKey?: never;
+  handoffScope?: never;
 };
 
 export type MultiAgentGraphInput = StandardGraphInput & {
   edges: GraphEdge[];
+  /** Explicit fresh-turn entry; absent preserves topology-inferred entry points. */
+  entryAgentId?: string;
+  /** Shared logical-turn handoff cap. Zero forbids handoffs; absent uses only recursion limits. */
+  maxHandoffs?: number;
   /** Captures the designated member's final AI turn in graph state. */
   resultAgentId?: string;
   /** Optional per-member Pregel budget when the outer graph has its own topology budget. */

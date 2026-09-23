@@ -111,6 +111,7 @@ import { initializeLangfuseTracing } from './instrumentation';
 import { seedRunInitialSessions } from '@/utils/toolSessions';
 import { getTraceIdSeed } from '@/langfuseRuntimeContext';
 import { resolveClientOptionsModel } from '@/llm/request';
+import { HandoffLimitError } from '@/graphs/handoff';
 import { createGraph } from '@/graphs/createGraph';
 import { isFadingTier } from '@/messages/fading';
 import { resolveMaxSeals } from '@/llm/preempt';
@@ -291,6 +292,7 @@ function getInterruptHookSessionId(payload: unknown): string | undefined {
 type InterruptStateSnapshot = {
   config?: RunnableConfig;
   values?: {
+    handoffState?: t.HandoffState;
     messages?: BaseMessage[];
     runStepState?: t.RunStepResumeState;
   };
@@ -512,6 +514,7 @@ export class Run<_T extends t.BaseGraphState> {
   /** Distinguishes sibling forks started from the same explicit checkpoint. */
   private checkpointForkSeq = 0;
   private _haltedReason: string | undefined;
+  private _handoffOutcome?: t.HandoffOutcome;
 
   private constructor(config: Partial<t.RunConfig>) {
     const runId = config.runId ?? '';
@@ -683,7 +686,7 @@ export class Run<_T extends t.BaseGraphState> {
   private createMultiAgentGraph(
     config: t.MultiAgentGraphConfig
   ): t.CompiledStateWorkflow {
-    const { agents, edges, compileOptions } = config;
+    const { agents, edges, compileOptions, entryAgentId, maxHandoffs } = config;
 
     const multiAgentGraph = createGraph({
       kind: 'multi-agent',
@@ -691,6 +694,8 @@ export class Run<_T extends t.BaseGraphState> {
         runId: this.id,
         agents,
         edges,
+        entryAgentId,
+        maxHandoffs,
         langfuse: this.langfuse,
         tokenCounter: this.tokenCounter,
         indexTokenCountMap: this.indexTokenCountMap,
@@ -1237,6 +1242,7 @@ export class Run<_T extends t.BaseGraphState> {
     }
     const graphRunnable = this.graphRunnable;
     const graph = this.Graph;
+    this._handoffOutcome = undefined;
 
     /**
      * `Command` inputs (`Command({ resume, update?, goto? })`) are
@@ -1347,6 +1353,7 @@ export class Run<_T extends t.BaseGraphState> {
             checkpointId === '' ? 0 : ++this.checkpointForkSeq,
           ]);
       graph.resetValues(streamOptions?.keepContent, checkpointScope);
+      graph.handoffRouting?.start();
       graph.startStopContinuationExecution(nanoid());
     }
     this._interrupt = undefined;
@@ -1482,9 +1489,18 @@ export class Run<_T extends t.BaseGraphState> {
 
     const consumeStream = async (): Promise<void> => {
       let streamInputs: t.IState | Command = inputs;
-      if (!isResume && this.hasCheckpointer) {
+      if (!isResume && graph.handoffRouting != null) {
         streamInputs = {
           ...(inputs as t.IState),
+          handoffState: graph.handoffRouting.snapshot(),
+        };
+      }
+      if (!isResume && this.hasCheckpointer) {
+        streamInputs = {
+          ...(streamInputs as t.IState),
+          ...(graph.handoffRouting == null
+            ? {}
+            : { handoffState: new Overwrite(graph.handoffRouting.snapshot()) }),
           runStepState: new Overwrite(graph.createRunStepResumeState()),
         } as unknown as t.IState;
       } else if (overwriteLegacyResumeState) {
@@ -1679,6 +1695,7 @@ export class Run<_T extends t.BaseGraphState> {
                 ? injected
                 : [...graph.messages, ...injected],
               runStepState: graph.createRunStepResumeState(),
+              handoffState: graph.handoffRouting?.snapshot(),
             };
             streamConfig = completedSegmentConfig;
             continue;
@@ -1716,6 +1733,8 @@ export class Run<_T extends t.BaseGraphState> {
     } catch (err) {
       terminalAt = Date.now();
       streamThrew = true;
+      if (err instanceof HandoffLimitError)
+        this._haltedReason = 'handoff_limit';
       await langfuseHandler?.handleChainError(
         err instanceof Error ? err : new Error(String(err)),
         this.id
@@ -1860,6 +1879,13 @@ export class Run<_T extends t.BaseGraphState> {
        * `HumanInTheLoopConfig` JSDoc.
        */
       const awaitingResume = this.isAwaitingResume(streamThrew);
+      this._handoffOutcome = graph.handoffRouting?.outcome(
+        this.getHandoffIncompleteReason(
+          streamThrew,
+          awaitingResume,
+          config.signal
+        )
+      );
       if (!this.skipCleanup && !awaitingResume) {
         this.Graph.clearHeavyState();
       }
@@ -1919,6 +1945,31 @@ export class Run<_T extends t.BaseGraphState> {
    */
   getHaltReason(): string | undefined {
     return this._haltedReason;
+  }
+
+  private getHandoffIncompleteReason(
+    streamThrew: boolean,
+    awaitingResume: boolean,
+    signal?: AbortSignal
+  ): string | undefined {
+    if (this._haltedReason != null) return this._haltedReason;
+    if (signal?.aborted === true || this.Graph?.signal?.aborted === true) {
+      return 'aborted';
+    }
+    if (streamThrew) return 'error';
+    if (awaitingResume) return 'interrupted';
+    if (this.Graph?.subagentScope === true) return 'subagent';
+    return undefined;
+  }
+
+  /** Execution evidence only. The host must authorize and durably commit a candidate. */
+  getHandoffOutcome(): t.HandoffOutcome | undefined {
+    const outcome = this._handoffOutcome;
+    if (outcome == null) return undefined;
+    return {
+      ...outcome,
+      transitions: outcome.transitions.map((item) => ({ ...item })),
+    };
   }
 
   /**
@@ -2134,6 +2185,7 @@ export class Run<_T extends t.BaseGraphState> {
     const snapshot = await workflow.getState(callerConfig as RunnableConfig, {
       subgraphs: true,
     });
+    this.Graph?.handoffRouting?.resume(snapshot.values?.handoffState);
     const persistedInterrupt = getFirstPersistedInterrupt(snapshot);
     if (persistedInterrupt == null) {
       return;

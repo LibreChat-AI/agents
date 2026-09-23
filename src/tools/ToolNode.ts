@@ -974,8 +974,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
    * other's in-flight state.
    */
   private anonBatchCounter: number = 0;
+  private handoffRouting?: t.ToolNodeOptions['handoffRouting'];
 
   constructor({
+    handoffRouting,
     tools,
     toolMap,
     name,
@@ -1219,6 +1221,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     this.runLangfuse = runLangfuse;
     this.agentLangfuse = agentLangfuse;
     this.toolMap = toolMap ?? new Map(tools.map((tool) => [tool.name, tool]));
+    this.handoffRouting = handoffRouting;
     this.toolCallStepIds = toolCallStepIds;
     this.handleToolErrors = handleToolErrors ?? this.handleToolErrors;
     this.loadRuntimeTools = loadRuntimeTools;
@@ -3221,10 +3224,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
   private retainCodeSessionInputsFromRequests(
     requests: Iterable<t.ToolCallRequest>,
-    baselineByRequestId: ReadonlyMap<
-      string,
-      ReadonlyMap<string, string>
-    >
+    baselineByRequestId: ReadonlyMap<string, ReadonlyMap<string, string>>
   ): void {
     if (!this.sessions) {
       return;
@@ -5140,8 +5140,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         call.id == null
           ? undefined
           : baseContext.resolvedArgsByCallId?.get(call.id);
-      const codeSessionBaseline =
-        baseContext.codeSessionBaselineByCallId?.get(call.id ?? '');
+      const codeSessionBaseline = baseContext.codeSessionBaselineByCallId?.get(
+        call.id ?? ''
+      );
       const result: SettledDirectToolResult = {
         proposal: structuredClone({
           name: call.name,
@@ -6072,6 +6073,13 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
     if (replayBatchKey != null) {
       this.settledDirectResultsByBatch.delete(replayBatchKey);
+    }
+    if (!Array.isArray(input) && !this.isSendInput(input)) {
+      this.handoffRouting?.finalize(
+        combinedOutputs.filter(isCommand),
+        input as t.BaseGraphState,
+        config
+      );
     }
     return combinedOutputs as T;
   }

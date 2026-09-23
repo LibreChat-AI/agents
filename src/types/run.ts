@@ -115,11 +115,13 @@ export type MultiAgentGraphConfig = {
   compileOptions?: g.CompileOptions;
   agents: g.AgentInputs[];
   edges: g.GraphEdge[];
+  entryAgentId?: string;
+  maxHandoffs?: number;
 };
 
 export type StandardGraphConfig = Omit<
   MultiAgentGraphConfig,
-  'edges' | 'type'
+  'edges' | 'type' | 'entryAgentId' | 'maxHandoffs'
 > & { type?: 'standard'; signal?: AbortSignal };
 
 /**
