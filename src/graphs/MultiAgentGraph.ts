@@ -33,6 +33,7 @@ import {
   HARD_MAX_TOOL_RESULT_CHARS,
 } from '@/utils/truncation';
 import { withInstructionlessHandoffCue } from '@/messages/handoffCue';
+import { HandoffRouting, handoffStateAnnotation } from './handoff';
 import { serializeToolContentBounded } from '@/utils/toolContent';
 import { Constants, MULTI_AGENT_GRAPH_RUN_NAME } from '@/common';
 import { StandardGraph } from './Graph';
@@ -337,6 +338,7 @@ export class MultiAgentGraph extends StandardGraph {
   private handoffSourceIds = new Set<string>();
   private readonly resultAgentId?: string;
   private readonly memberRecursionLimit?: number;
+  private reachableAgentIds?: Set<string>;
   private handoffPromptLabels: Map<string, Set<string>> = new Map();
   /**
    * Map of agentId to parallel group info.
@@ -379,7 +381,113 @@ export class MultiAgentGraph extends StandardGraph {
     this.categorizeEdges();
     this.validateCommandRoutedDirectEdges();
     this.analyzeGraph();
+    if (input.entryAgentId != null) {
+      if (!this.agentContexts.has(input.entryAgentId)) {
+        throw new Error(
+          `MultiAgentGraph: unknown entryAgentId "${input.entryAgentId}"`
+        );
+      }
+      this.startingNodes = new Set([input.entryAgentId]);
+      this.defaultAgentId = input.entryAgentId;
+      this.computeParallelCapability();
+      this.reachableAgentIds = this.resolveEntryReachability(
+        input.entryAgentId
+      );
+    }
+    if (
+      input.maxHandoffs != null &&
+      (!Number.isSafeInteger(input.maxHandoffs) || input.maxHandoffs < 0)
+    ) {
+      throw new Error(
+        'MultiAgentGraph: maxHandoffs must be a non-negative safe integer'
+      );
+    }
+    const directDestinations = new Map<string, Set<string>>();
+    for (const edge of this.directEdges) {
+      if (edge.handoffScope != null)
+        throw new Error('handoffScope is only valid on handoff edges');
+      for (const source of Array.isArray(edge.from) ? edge.from : [edge.from]) {
+        const targets = directDestinations.get(source) ?? new Set<string>();
+        for (const target of Array.isArray(edge.to) ? edge.to : [edge.to])
+          targets.add(target);
+        directDestinations.set(source, targets);
+      }
+    }
+    this.handoffRouting = new HandoffRouting(
+      this.startingNodes.values().next().value ?? this.defaultAgentId,
+      input.maxHandoffs,
+      this.startingNodes.size > 1 ||
+        [...directDestinations.values()].some((targets) => targets.size > 1)
+    );
+    this.validateHandoffScopes();
     this.createHandoffTools();
+  }
+
+  private validateHandoffScopes(): void {
+    const scopes = new Map<string, string>();
+    for (const edge of this.handoffEdges) {
+      const scope = edge.handoffScope ?? 'turn';
+      if (!['turn', 'conversation'].includes(scope))
+        throw new Error('Invalid handoffScope');
+      for (const source of Array.isArray(edge.from) ? edge.from : [edge.from]) {
+        const destinations = Array.isArray(edge.to) ? edge.to : [edge.to];
+        const targets =
+          edge.condition != null ? ['conditional_transfer'] : destinations;
+        for (const target of targets) {
+          const key = JSON.stringify([source, target]);
+          const previous = scopes.get(key);
+          if (previous != null && previous !== scope)
+            throw new Error(
+              'Conflicting handoffScope for the same transfer tool'
+            );
+          scopes.set(key, scope);
+        }
+      }
+    }
+  }
+
+  private resolveEntryReachability(entryAgentId: string): Set<string> {
+    const reachable = new Set([entryAgentId]);
+    const direct = new Set(this.directEdges);
+    const outgoing = new Map<string, t.GraphEdge[]>();
+    const remaining = new Map<t.GraphEdge, number>();
+    for (const edge of this.edges) {
+      const sources = new Set(
+        Array.isArray(edge.from) ? edge.from : [edge.from]
+      );
+      remaining.set(edge, direct.has(edge) ? sources.size : 1);
+      for (const source of sources) {
+        const edges = outgoing.get(source) ?? [];
+        edges.push(edge);
+        outgoing.set(source, edges);
+      }
+    }
+    const queue = [entryAgentId];
+    for (let i = 0; i < queue.length; i++) {
+      for (const edge of outgoing.get(queue[i]) ?? []) {
+        const pending = remaining.get(edge) ?? 0;
+        if (pending === 0) continue;
+        remaining.set(edge, pending - 1);
+        if (pending > 1) continue;
+        for (const target of Array.isArray(edge.to) ? edge.to : [edge.to]) {
+          if (reachable.has(target)) continue;
+          reachable.add(target);
+          queue.push(target);
+        }
+      }
+    }
+    for (const edge of this.directEdges) {
+      const sources = Array.isArray(edge.from) ? edge.from : [edge.from];
+      if (
+        sources.some((source) => reachable.has(source)) &&
+        !sources.every((source) => reachable.has(source))
+      ) {
+        throw new Error(
+          'entryAgentId cannot satisfy a grouped direct edge prerequisite'
+        );
+      }
+    }
+    return reachable;
   }
 
   /**
@@ -762,6 +870,11 @@ export class MultiAgentGraph extends StandardGraph {
               destination = Array.isArray(result) ? result[0] : destinations[0];
             }
 
+            if (!destinations.includes(destination)) {
+              throw new Error(
+                `Conditional handoff selected undeclared destination "${destination}"`
+              );
+            }
             const handoffInstructions = getHandoffInstructions(
               input,
               promptKey,
@@ -789,7 +902,15 @@ export class MultiAgentGraph extends StandardGraph {
 
             return new Command({
               goto: destination,
-              update: { messages: state.messages.concat(toolMessage) },
+              update: {
+                messages: state.messages.concat(toolMessage),
+                handoffRequest: {
+                  sourceAgentId,
+                  targetAgentId: destination,
+                  toolCallId,
+                  scope: edge.handoffScope ?? 'turn',
+                },
+              },
               graph: Command.PARENT,
             });
           },
@@ -926,7 +1047,15 @@ export class MultiAgentGraph extends StandardGraph {
 
               return new Command({
                 goto: destination,
-                update: { messages: filteredMessages },
+                update: {
+                  messages: filteredMessages,
+                  handoffRequest: {
+                    sourceAgentId,
+                    targetAgentId: destination,
+                    toolCallId,
+                    scope: edge.handoffScope ?? 'turn',
+                  },
+                },
                 graph: Command.PARENT,
               });
             },
@@ -1274,6 +1403,7 @@ export class MultiAgentGraph extends StandardGraph {
         default: () => undefined,
       }),
       runStepState: this.createRunStepStateAnnotation(),
+      handoffState: handoffStateAnnotation(),
     });
 
     const builder = new StateGraph(StateAnnotation);
@@ -1298,9 +1428,16 @@ export class MultiAgentGraph extends StandardGraph {
     const agentIds =
       summarizeOnlyAgentId != null
         ? [summarizeOnlyAgentId]
-        : [...this.agentContexts.keys()];
+        : [...(this.reachableAgentIds ?? this.agentContexts.keys())];
     const handoffEdges = summarizeOnlyAgentId != null ? [] : this.handoffEdges;
-    const directEdges = summarizeOnlyAgentId != null ? [] : this.directEdges;
+    const directEdges =
+      summarizeOnlyAgentId != null
+        ? []
+        : this.directEdges.filter((edge) => {
+          if (this.reachableAgentIds == null) return true;
+          const sources = Array.isArray(edge.from) ? edge.from : [edge.from];
+          return sources.every((id) => this.reachableAgentIds!.has(id));
+        });
 
     // Add all agents as complete subgraphs
     for (const agentId of agentIds) {
@@ -1348,6 +1485,7 @@ export class MultiAgentGraph extends StandardGraph {
         state: t.MultiAgentGraphState,
         config?: LangGraphRunnableConfig
       ): Promise<t.MultiAgentGraphState | Command> => {
+        this.handoffRouting?.restore(state.handoffState);
         let result: t.MultiAgentGraphState;
         let inputMessages = state.messages;
         const agentContext = this.agentContexts.get(agentId);
