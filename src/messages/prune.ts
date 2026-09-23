@@ -19,6 +19,7 @@ import {
   HARD_MAX_TOOL_CALL_INPUT_CHARS,
   HARD_MAX_TOOL_RESULT_CHARS,
   MIN_JSON_VALUE_CHARS,
+  sliceWithoutSplittingSurrogates,
   calculateMaxToolCallInputChars,
   calculateMaxToolResultChars,
 } from '@/utils/truncation';
@@ -1591,7 +1592,8 @@ function createBoundedTruncationValue(
     const next = Math.ceil((low + high) / 2);
     const candidate = {
       _truncated:
-        TOOL_INPUT_TRUNCATION_MARKER + canonicalPrefix.slice(0, next),
+        TOOL_INPUT_TRUNCATION_MARKER +
+        sliceWithoutSplittingSurrogates(canonicalPrefix, 0, next),
       _originalChars: originalChars,
     };
     if (JSON.stringify(candidate).length <= normalizedMaxChars) {
@@ -1604,7 +1606,8 @@ function createBoundedTruncationValue(
     // Keep the marker separate from a pure canonical prefix so another,
     // slightly smaller cap can be derived without nesting the envelope.
     _truncated:
-      TOOL_INPUT_TRUNCATION_MARKER + canonicalPrefix.slice(0, low),
+      TOOL_INPUT_TRUNCATION_MARKER +
+      sliceWithoutSplittingSurrogates(canonicalPrefix, 0, low),
     _originalChars: originalChars,
   };
 }
@@ -1847,8 +1850,12 @@ function projectStringInputWithinLimit(
   return {
     value:
       marker.length >= normalizedMaxChars
-        ? prefix.slice(0, normalizedMaxChars)
-        : prefix.slice(0, normalizedMaxChars - marker.length) + marker,
+        ? sliceWithoutSplittingSurrogates(prefix, 0, normalizedMaxChars)
+        : sliceWithoutSplittingSurrogates(
+          prefix,
+          0,
+          normalizedMaxChars - marker.length
+        ) + marker,
     changed: true,
   };
 }
@@ -2366,7 +2373,9 @@ function applyToolCallInputCaps(params: {
         additionalKwargsChanges
       );
     }
-    if (capped.response_metadata.output !== canonical.response_metadata.output) {
+    if (
+      capped.response_metadata.output !== canonical.response_metadata.output
+    ) {
       changes.response_metadata = cloneWithProjectedProperties(
         current.response_metadata,
         { output: capped.response_metadata.output }
@@ -2523,11 +2532,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       originalToolContent.clear();
       originalToolContentSize = 0;
     }
-    for (
-      let i = toolExchangeWidthThrough;
-      i < canonicalMessages.length;
-      i++
-    ) {
+    for (let i = toolExchangeWidthThrough; i < canonicalMessages.length; i++) {
       maxToolExchangeWidth = Math.max(
         maxToolExchangeWidth,
         getToolCallIds(canonicalMessages[i]).size

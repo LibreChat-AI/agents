@@ -4,9 +4,45 @@ import {
   HARD_MAX_TOTAL_TOOL_OUTPUT_SIZE,
   calculateMaxToolResultChars,
   calculateMaxTotalToolOutputSize,
+  sliceWithoutSplittingSurrogates,
 } from '@/utils/truncation';
 
 describe('truncation helpers', () => {
+  describe('sliceWithoutSplittingSurrogates', () => {
+    it.each([
+      [0, 1, 'a'],
+      [0, 2, 'a'],
+      [0, 3, 'a🧠'],
+      [1, 3, '🧠'],
+      [1, 2, ''],
+      [2, 3, ''],
+      [2, 4, 'b'],
+      [2, 6, 'b🍱'],
+      [2, 5, 'b'],
+      [3, 3, ''],
+      [5, 2, ''],
+      [-2, undefined, 'c'],
+      [-3, undefined, '🍱c'],
+      [0, 100, 'a🧠b🍱c'],
+    ])('slices [%i, %s) without splitting a pair', (start, end, expected) => {
+      expect(sliceWithoutSplittingSurrogates('a🧠b🍱c', start, end)).toBe(
+        expected
+      );
+    });
+
+    it('leaves BMP text and intact compound emoji unchanged', () => {
+      const text = 'ASCII 漢字 café ✈️ 👩🏽‍💻';
+      expect(sliceWithoutSplittingSurrogates(text, 0)).toBe(text);
+      expect(sliceWithoutSplittingSurrogates(text, 0, 5)).toBe('ASCII');
+      expect(sliceWithoutSplittingSurrogates('', 0, 1)).toBe('');
+    });
+
+    it('drops orphaned edges in already-clipped collector buffers', () => {
+      expect(sliceWithoutSplittingSurrogates('a\ud83e', 0)).toBe('a');
+      expect(sliceWithoutSplittingSurrogates('\udde0b', 0)).toBe('b');
+    });
+  });
+
   describe('calculateMaxToolResultChars', () => {
     it('returns the hard cap when context tokens are missing', () => {
       expect(calculateMaxToolResultChars()).toBe(HARD_MAX_TOOL_RESULT_CHARS);
