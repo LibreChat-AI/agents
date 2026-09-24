@@ -2,91 +2,36 @@
 
 ## Status
 
-Proposed in Agents SDK PR #560. Implemented on that branch, not released or adopted by LibreChat.
+Proposed in SDK PR #560. Not released or adopted by LibreChat.
 
 ## Context
 
-The first opt-in OpenAI projector copied LibreChat's UI run-step reconstruction.
-It attempted to infer identity, delta versus snapshot semantics, successful model
-attempts and completion. Review found two classes of P1 that local stream tests
-could not rule out: complete snapshots lost to buffered partial data, and
-invoke-only final results lost because their run-step metadata lacked an attempt
-stamp. An API formatter cannot recover information that its input events omit.
-
-LangChain.js's newer content-block event contract distinguishes deltas from
-finished content. Its legacy AIMessageChunk.concat is not a generic normalizer of
-arbitrary cumulative snapshots. This change adopts the explicit acceptance
-boundary, not a wholesale migration to a different provider API.
+Run-step events mix partial data, snapshots and failed attempts. They cannot
+reliably identify the accepted result across streaming, invoke-only and fallback
+paths. More formatter heuristics cannot recover missing execution information.
 
 ## Decision
 
-The graph emits a registry-only ON_MODEL_RESPONSE event from its common accepted
-result path. Failed primary/fallback attempts and overflow detours emit none.
-Invoke-only and streaming results converge here after usage accounting. The
-payload contains finalized native ToolCalls and invalid_tool_calls; a graph-made
-acceptance ID avoids treating provider IDs or UI indexes as invocation identity.
+The graph emits an awaited, registry-only `ON_MODEL_RESPONSE` after acceptance,
+fallback/overflow recovery and usage accounting. It validates original argument
+descriptors before copying; composed observers receive isolated snapshots.
+Provider/tool custom callbacks cannot impersonate acceptance. Handler errors
+propagate outside provider retry logic.
 
-The event is awaited. Exceptions propagate outside the provider fallback block,
-so projection failure cannot rerun a provider or tools. The graph validates
-original argument descriptors and JSON values before copying the model result,
-so `structuredClone` cannot run getters or erase non-JSON object identity before
-the check. It bounds each accepted result snapshot at 1,024 calls and 4 MiB.
-Composed observers each receive a copy of this validated snapshot, isolating
-the projector from observer ordering and tool execution. Copy work grows
-linearly with observers, not quadratically through nested wrappers.
-Generic provider/tool custom events cannot impersonate this graph-only event.
-Child graphs retain existing narrow handler forwarding; the parent projector is
-not inherited as a child output sink.
+The opt-in OpenAI projector buffers finalized calls, reserves provider IDs, and
+formats output after host-confirmed natural completion. Terminal state follows
+accepted-response order, not deferred flush order. Fresh output state and bounded
+call count, encoded bytes and depth prevent cross-response mixing and unbounded
+retention. See the [README](../../README.md#accepted-tool-call-projection-opt-in)
+for registration, limits and failure handling.
 
-The OpenAI projector accepts only this event, serializes valid calls once, and
-assigns outward indexes. No fragments, attempts, merge heuristics, or missing-ID
-fallbacks remain. Identity lookup is set-based; provider IDs are reserved across all accepted
-responses before synthetic ID generation uses a monotonic counter. Generated
-ID bytes are charged before emitting any frames. Text-only responses retain no delivery-ID state. Retention is
-O(accepted calls + output bytes), with limits on both calls and encoded bytes.
-Snapshotting an accepted result and each composed observer copy cost
-O(finalized result size); protocol encoding is another linear pass. The graph
-only performs this work when the accepted-result handler is registered. Argument encoding
-accepts only JSON data, without executing serialization hooks or getters. It rejects
-exotic objects rather than silently converting them, supports cross-realm plain
-objects, and bounds both nesting and encoded bytes during traversal. The per-run
-byte bound includes the expansion of repeated references; cycles fail.
+## Trade-offs and verification
 
-Streaming projection and the public OpenAI finalizer share one tracker. Terminal
-state comes from accepted-response chronology, not the deferred tool-history
-flush. A final text response therefore stays `stop`; it must not become a request
-to execute historical tools again. The initial assistant role is emitted once.
-Later assistant text can still restore a stop finish reason. Each projector owns
-an initially empty result map; mixed writers and stale maps fail closed. Invalid
-model diagnostics are rejected before copying so they cannot bypass snapshot
-limits or execute getters. Map-only collection
-remains available for non-streaming/custom finalization. Hosts must not also attach
-legacy raw tool handlers to this path.
+This removes fragment/attempt reconstruction but delays tool-call output. It does
+not replace provider normalization, sandbox callbacks, roll back eager tools or
+provide durable delivery. Existing default handlers remain unchanged; LibreChat
+integration and release are separate gates.
 
-Output waits for host-confirmed natural run completion. The host must abort on
-interrupt, halt, disconnect or exception, not equate promise resolution with
-success. Emission checks cancellation around every synchronous callback and
-cannot retry after partial publication. The helper is per-response and is not a
-checkpoint delivery log. Existing eager tools can have side effects before
-acceptance; no rollback or exactly-once execution is promised.
-
-## Alternatives and trade-offs
-
-- More string/snapshot/attempt reconciliation adds guesses, not evidence. Rejected.
-- Replacing every provider with LangChain's native event API is a separate migration
-  and still requires a graph-level accepted-attempt boundary. Deferred.
-- Finalized accepted results fit complete-before-publish behavior, at the cost of
-  not providing incremental tool arguments. Existing default handlers remain intact.
-
-Only this PR's unreleased opt-in API changes. No published entry point is removed,
-no storage schema changes, and no dependency version bump occurs here. LibreChat
-must integrate a released SDK and compare its HTTP/JSON contracts separately.
-
-## Verification obligations
-
-Use real Run.processStream, attemptInvoke, graph tool execution and LangChain
-callbacks, replacing only provider transport. Cover streaming/invoke-only, partial
-primary then tools/text fallback, overflow retry, cancellation, invalid final
-results, observer errors and mutations, callback spoofing, concurrent runs, usage
-accounting and limits. Preserve existing default OpenAI/Responses and graph lifecycle
-suites. Check TypeScript, lint, build, CJS/ESM exports and the public declarations.
+Verify through real `Run.processStream` and the public finalizer: streaming/invoke,
+fallback/overflow, final-answer ordering, observer isolation, cancellation,
+malformed arguments, output limits, subagents, usage and tracing.

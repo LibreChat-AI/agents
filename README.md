@@ -156,76 +156,31 @@ const customHandlers = composeEventHandlers(
 );
 ```
 
-For hosts that need stable OpenAI-compatible tool calls across graph invocations,
-`createOpenAIToolCallStream` is an **opt-in** accepted-result projector. Pass its
-`handlers` to `Run.create({ customHandlers })` (compose with other host handlers
-using `composeEventHandlers`). Streaming hosts pass `{ tracker, emit }`, sharing
-`createOpenAIStreamTracker()` with `sendOpenAIFinalChunk`. The projector emits the
-initial assistant role if needed. Terminal state follows accepted model-response
-order, not the deferred tool-chunk flush: a tool → tool-result → final-answer run
-ends with `stop`, even though buffered tool history is emitted last. A last
-accepted response requesting tools ends with `tool_calls`. Assistant text emitted
-after projection can still change the finish reason back to `stop`.
-Map-only `{ toolCalls }` is for non-streaming collection or custom finalization;
-never compose the legacy raw tool-call handlers with this accepted-result handler,
-which would publish the same tools twice. The graph delivers `ON_MODEL_RESPONSE`
-once per accepted AI result, after primary/fallback selection, overflow recovery
-and usage accounting. Both streaming and invoke-only paths use this boundary.
+### Accepted tool-call projection (opt-in)
 
-This event carries detached, finalized tool calls. It is not a provider callback,
-a UI run step, or a parseable JSON fragment. The projector never reconstructs raw
-chunks or infers attempt identity. Generic callback echoes of the event are
-ignored. The existing `createOpenAIHandlers` and `/responses` outputs are unchanged.
+`createOpenAIToolCallStream` from `@librechat/agents/openai` formats finalized
+calls accepted by the graph, not provider fragments. Existing handlers are unchanged.
 
-Call `finish()` only after confirming **natural run completion**: `processStream`
-must not have thrown, the caller/graph signals must not be aborted, and
-`getInterrupt()` / `getHaltReason()` must be empty. A resolved `processStream()`
-alone does not promise successful completion. On failure, disconnect, halt or
-interrupt, call `abort()` and discard this projector. Checkpoint resume requires a
-fresh projector; this helper is not a durable delivery/replay protocol. A new
-projector is required for each API response, including reuse of a `Run` instance.
+- Register `projection.handlers` in `Run.create({ customHandlers })`.
+- For streaming, share `{ tracker, emit }` with the text/reasoning handlers and
+  `sendOpenAIFinalChunk`. Do not also register legacy raw tool-call handlers.
+  Map-only `{ toolCalls }` supports JSON/custom finalization. Use fresh output state.
+- Call `finish()` only after natural completion: no error, aborted signal,
+  `getInterrupt()` or `getHaltReason()`. Otherwise call `abort()` and discard it.
+  A resolved `processStream()` alone does not mean success.
+- Finish state follows accepted-response order: a final answer ends with `stop`;
+  a final tool request ends with `tool_calls`, regardless of deferred history.
+- `emit` is synchronous. Failed/partial writes cannot be retried; the host owns
+  HTTP backpressure. This helper does not provide durable resume or undo tool effects.
 
-Each projector must own a fresh, empty output map (including a tracker's map).
-Reusing nonempty output is rejected without clearing the old response. A second
-writer during collection aborts projection rather than mixing response histories.
+Arguments must be JSON data: primitives, plain objects and dense arrays. Getters,
+custom objects, cycles and nesting beyond 64 levels are rejected before copying.
+Observers receive isolated snapshots; provider IDs are reserved before synthetic IDs.
+Graph snapshots cap each response at **1,024 calls / 4 MiB**. Projection defaults to
+those limits across the run, configurable via `maxToolCalls` / `maxBufferedBytes`.
+These are output limits, not bounds on provider memory or tool execution.
 
-The accepted-result graph boundary inspects original tool-call descriptors and
-validates argument trees **before** cloning can invoke getters or flatten class
-instances. The graph snapshot is capped at 1,024 calls and 4 MiB per accepted
-model response. Invalid-tool diagnostics are rejected before copying their
-contents; malformed/accessor-backed tool arrays cannot bypass snapshot limits. Composed observers receive independent copies of that validated
-snapshot, so their ordering cannot change what the projector publishes or the
-arguments tools execute. Copy work is linear in the number of observers and
-bounded snapshot bytes. Synthetic IDs are assigned only at completion, after
-all provider IDs have been reserved, and their bytes count toward the projector's
-limit.
-
-At acceptance, tool arguments are validated and copied into a detached graph
-snapshot; the protocol formatter subsequently encodes them for output and
-buffers only completed calls until successful run completion. Argument
-trees must contain only JSON primitives, plain objects and dense arrays. Map,
-Set, Date, RegExp, boxed primitives, typed arrays, custom instances, proxies,
-accessors, symbol properties and sparse arrays are rejected rather than silently
-changing the accepted values. Encoding does not invoke `toJSON` or getters and
-preserves negative zero. Plain objects from another realm and null-prototype
-objects are supported. Nesting is capped at 64 levels, and cycles are rejected.
-Repeated references serialize by value, with every expansion charged to the byte
-budget so small alias graphs cannot generate unbounded output. Default
-limits are **1024 tool calls** and **4 MiB of serialized argument, name and ID
-UTF-8 bytes**, configurable with positive `maxToolCalls` / `maxBufferedBytes`.
-Exceeding a limit aborts projection without publishing a partial batch. There are
-no fragment buffers or per-attempt maps. These limits bound retained projection
-state and encoder output, not provider buffers or the earlier graph-owned
-`structuredClone` of an accepted model result. The encoder itself checks size while
-traversing, before allocating an unbounded serialized string. They do not limit
-agent execution globally.
-
-The emitter remains synchronous. Errors or cancellation during emission are
-terminal; bytes already sent cannot be retracted and `finish()` cannot retry a
-partial write. The host owns HTTP connection lifecycle and async backpressure.
-Tool execution, including existing eager execution, is unchanged: projection
-failure cannot roll back tool side effects. No provider fallback is initiated by
-an acceptance-handler error.
+See [the design decision](docs/adr/0010-project-accepted-model-results.md).
 
 ## Development
 
