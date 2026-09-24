@@ -38,7 +38,17 @@ assigns outward indexes. No fragments, attempts, merge heuristics, or missing-ID
 fallbacks remain. Identity lookup is set-based; synthetic ID generation uses a
 monotonic counter. Text-only responses retain no delivery-ID state. Retention is
 O(accepted calls + output bytes), with limits on both calls and encoded bytes.
-The event clone and one serialization still cost O(finalized result size).
+The graph event clone still costs O(finalized result size). Argument encoding
+accepts only JSON data, without executing serialization hooks or getters. It rejects
+exotic objects rather than silently converting them, supports cross-realm plain
+objects, and bounds both nesting and encoded bytes during traversal. The per-run
+byte bound includes the expansion of repeated references; cycles fail.
+
+Streaming projection and the public OpenAI finalizer share one tracker. Projected
+tool chunks update its last-chunk state and initialize the assistant role once.
+Later assistant text can still restore a stop finish reason. Map-only collection
+remains available for non-streaming/custom finalization. Hosts must not also attach
+legacy raw tool handlers to this path.
 
 Output waits for host-confirmed natural run completion. The host must abort on
 interrupt, halt, disconnect or exception, not equate promise resolution with

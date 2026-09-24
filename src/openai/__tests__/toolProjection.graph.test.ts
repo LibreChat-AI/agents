@@ -8,9 +8,14 @@ import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager
 import { AIMessageChunk, HumanMessage } from '@langchain/core/messages';
 import type { BaseMessage, UsageMetadata } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
-import type { OpenAIToolCall, OpenAIChatCompletionChunkChoice } from '@/openai';
+import type { OpenAIChatCompletionChunkChoice } from '@/openai';
 import type * as t from '@/types';
-import { createOpenAIToolCallStream } from '@/openai';
+import {
+  createOpenAIToolCallStream,
+  createOpenAIStreamTracker,
+  createChatCompletionChunk,
+  sendOpenAIFinalChunk,
+} from '@/openai';
 import { composeEventHandlers, ModelEndHandler } from '@/events';
 import { GraphEvents, Providers } from '@/common';
 import * as init from '@/llm/init';
@@ -140,15 +145,29 @@ async function setup(
     usage?: t.EventHandler;
   } = {}
 ) {
-  const projected = new Map<number, OpenAIToolCall>();
+  const tracker = createOpenAIStreamTracker();
+  const projected = tracker.toolCalls;
+  const writes: string[] = [];
+  const wireConfig = {
+    tracker,
+    context: { requestId: 'parity', model: 'agent', created: 1 },
+    writer: {
+      write: (frame: string): void => {
+        writes.push(frame);
+      },
+    },
+  };
   const frames: OpenAIChatCompletionChunkChoice['delta'][] = [];
   const accepted: t.ModelResponseEvent[] = [];
   const executed: string[] = [];
   const projection = createOpenAIToolCallStream({
-    toolCalls: projected,
+    tracker,
     signal: options.signal,
     emit: (delta) => {
       frames.push(delta);
+      wireConfig.writer.write(
+        `data: ${JSON.stringify(createChatCompletionChunk(wireConfig.context, delta))}\n\n`
+      );
     },
   });
   const run = await Run.create<t.IState>({
@@ -218,17 +237,46 @@ async function setup(
         throw new Error('Run did not complete naturally');
       }
       projection.finish();
+      await sendOpenAIFinalChunk(wireConfig);
     } catch (error) {
       projection.abort();
       throw error;
     }
   };
-  return { run, execute, projection, projected, frames, accepted, executed };
+  return {
+    run,
+    execute,
+    projection,
+    projected,
+    frames,
+    accepted,
+    executed,
+    writes,
+  };
 }
 
 afterEach(() => jest.restoreAllMocks());
 
 describe('accepted tool calls through the real execution boundary', () => {
+  it.each([
+    new Map([['x', 1]]),
+    new Set([1]),
+    new Date('2026-01-01'),
+    /x/,
+    new Uint8Array([1]),
+  ])(
+    'rejects structured-cloneable non-JSON arguments before tool execution (%s)',
+    async (value) => {
+      const reply = toolsReply();
+      reply.tool_calls![0].args = { city: 'Paris', value };
+      const fixture = await setup(new InvokeModel(reply));
+      await expect(fixture.execute()).rejects.toThrow('not JSON serializable');
+      expect(fixture.executed).toHaveLength(0);
+      expect(fixture.frames).toHaveLength(0);
+      expect(fixture.writes).toHaveLength(0);
+    }
+  );
+
   it('sanitizes clone errors without leaking malformed argument contents', async () => {
     const reply = toolsReply();
     reply.tool_calls![0].args = { credential: () => 'SENSITIVE' };
@@ -337,6 +385,12 @@ describe('accepted tool calls through the real execution boundary', () => {
         },
       ]);
       expect(fixture.executed.sort()).toEqual(['Madrid', 'Paris']);
+      const terminal = fixture.writes
+        .slice(0, -1)
+        .map((frame) => JSON.parse(frame.slice(6)))
+        .find((chunk) => chunk.choices[0]?.finish_reason != null);
+      expect(terminal.choices[0].finish_reason).toBe('tool_calls');
+      expect(fixture.writes.at(-1)).toBe('data: [DONE]\n\n');
       expect(fixture.accepted).toHaveLength(2); // tools, then the final answer
       expect(new Set(fixture.accepted.map((result) => result.id)).size).toBe(2);
     }

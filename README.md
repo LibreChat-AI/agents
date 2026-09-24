@@ -159,9 +159,16 @@ const customHandlers = composeEventHandlers(
 For hosts that need stable OpenAI-compatible tool calls across graph invocations,
 `createOpenAIToolCallStream` is an **opt-in** accepted-result projector. Pass its
 `handlers` to `Run.create({ customHandlers })` (compose with other host handlers
-using `composeEventHandlers`). The graph delivers `ON_MODEL_RESPONSE` once per
-accepted AI result, after primary/fallback selection, overflow recovery and
-usage accounting. Both streaming and invoke-only paths use this boundary.
+using `composeEventHandlers`). Streaming hosts pass `{ tracker, emit }`, sharing
+`createOpenAIStreamTracker()` with `sendOpenAIFinalChunk`. The projector emits the
+initial assistant role if needed and marks successfully projected tool chunks in
+that tracker, so the standard finalizer emits `tool_calls`, not `stop`. Assistant
+text emitted afterward can still change the finish reason back to `stop`.
+Map-only `{ toolCalls }` is for non-streaming collection or custom finalization;
+never compose the legacy raw tool-call handlers with this accepted-result handler,
+which would publish the same tools twice. The graph delivers `ON_MODEL_RESPONSE`
+once per accepted AI result, after primary/fallback selection, overflow recovery
+and usage accounting. Both streaming and invoke-only paths use this boundary.
 
 This event carries detached, finalized tool calls. It is not a provider callback,
 a UI run step, or a parseable JSON fragment. The projector never reconstructs raw
@@ -176,13 +183,23 @@ interrupt, call `abort()` and discard this projector. Checkpoint resume requires
 fresh projector; this helper is not a durable delivery/replay protocol. A new
 projector is required for each API response, including reuse of a `Run` instance.
 
-Tool calls are serialized once and buffered until successful completion. Default
+Tool calls are serialized once and buffered until successful completion. Argument
+trees must contain only JSON primitives, plain objects and dense arrays. Map,
+Set, Date, RegExp, boxed primitives, typed arrays, custom instances, proxies,
+accessors, symbol properties and sparse arrays are rejected rather than silently
+changing the accepted values. Encoding does not invoke `toJSON` or getters and
+preserves negative zero. Plain objects from another realm and null-prototype
+objects are supported. Nesting is capped at 64 levels, and cycles are rejected.
+Repeated references serialize by value, with every expansion charged to the byte
+budget so small alias graphs cannot generate unbounded output. Default
 limits are **1024 tool calls** and **4 MiB of serialized argument, name and ID
 UTF-8 bytes**, configurable with positive `maxToolCalls` / `maxBufferedBytes`.
 Exceeding a limit aborts projection without publishing a partial batch. There are
 no fragment buffers or per-attempt maps. These limits bound retained projection
-state, not provider buffers or the transient size of cloning/serializing one
-accepted model result. They do not limit agent execution globally.
+state and encoder output, not provider buffers or the earlier graph-owned
+`structuredClone` of an accepted model result. The encoder itself checks size while
+traversing, before allocating an unbounded serialized string. They do not limit
+agent execution globally.
 
 The emitter remains synchronous. Errors or cancellation during emission are
 terminal; bytes already sent cannot be retracted and `finish()` cannot retry a

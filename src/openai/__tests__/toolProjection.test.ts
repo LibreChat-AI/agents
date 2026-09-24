@@ -8,7 +8,11 @@ import type { ModelResponseEvent } from '@/types';
 import { createOpenAIToolCallStream } from '@/openai';
 import { GraphEvents } from '@/common';
 
-function setup(options: Partial<OpenAIToolCallStreamConfig> = {}) {
+function setup(
+  options: Partial<
+    Omit<OpenAIToolCallStreamConfig, 'tracker' | 'toolCalls'>
+  > = {}
+) {
   const toolCalls = new Map<number, OpenAIToolCall>();
   const deltas: OpenAIChatCompletionChunkChoice['delta'][] = [];
   const stream = createOpenAIToolCallStream({
@@ -37,6 +41,34 @@ function setup(options: Partial<OpenAIToolCallStreamConfig> = {}) {
 }
 
 describe('accepted tool-call projection', () => {
+  it('rejects invalid runtime IDs without leaking the value', () => {
+    const { accept, stream } = setup();
+    // @ts-expect-error Custom JS models can violate the native tool-call contract.
+    expect(() => accept([{ id: 42, name: 'lookup', args: {} }])).toThrow(
+      'ID must be a string'
+    );
+    expect(() => stream.finish()).toThrow('aborted');
+  });
+
+  it.each([
+    ['Map', new Map([['x', 1]])],
+    ['Set', new Set([1])],
+    ['Date', new Date('2026-01-01')],
+    ['RegExp', /pattern/],
+    ['typed array', new Uint8Array([1, 2])],
+    ['boxed number', Object(4)],
+  ])(
+    'rejects nested %s without silently changing executed arguments',
+    (_name, value) => {
+      const { stream, accept, deltas } = setup();
+      expect(() => accept([{ name: 'lookup', args: { value } }])).toThrow(
+        'not JSON serializable'
+      );
+      expect(() => stream.finish()).toThrow('aborted');
+      expect(deltas).toHaveLength(0);
+    }
+  );
+
   it('rejects an async emitter and observes its rejection instead of reporting completion', async () => {
     const { accept, stream, toolCalls } = setup({
       emit: async () => {

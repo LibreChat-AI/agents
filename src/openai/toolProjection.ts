@@ -1,9 +1,13 @@
-import type { OpenAIChatCompletionChunkChoice, OpenAIToolCall } from './index';
+import type {
+  OpenAIChatCompletionChunkChoice,
+  OpenAIToolCall,
+  OpenAIStreamTracker,
+} from './index';
 import type { EventHandler, ModelResponseEvent } from '@/types';
 import { GraphEvents } from '@/common';
+import { serializeToolArguments } from './arguments';
 
-export interface OpenAIToolCallStreamConfig {
-  toolCalls: Map<number, OpenAIToolCall>;
+interface OpenAIToolCallStreamOptions {
   /** Synchronous framing only. Async transport/backpressure is a separate boundary. */
   emit?: (delta: OpenAIChatCompletionChunkChoice['delta']) => void;
   signal?: AbortSignal;
@@ -12,6 +16,17 @@ export interface OpenAIToolCallStreamConfig {
   /** UTF-8 bytes of serialized arguments, names and IDs retained across accepted responses. Default: 4 MiB. */
   maxBufferedBytes?: number;
 }
+
+/** Streaming hosts share the finalizer's tracker; map-only hosts collect JSON output. */
+export type OpenAIToolCallStreamConfig = OpenAIToolCallStreamOptions &
+  (
+    | {
+        tracker: OpenAIStreamTracker;
+        toolCalls?: never;
+        emit: NonNullable<OpenAIToolCallStreamOptions['emit']>;
+      }
+    | { toolCalls: Map<number, OpenAIToolCall>; tracker?: never }
+  );
 
 export interface OpenAIToolCallStream {
   /** Pass directly to Run.create({ customHandlers: stream.handlers }). */
@@ -33,7 +48,19 @@ function positiveLimit(value: number | undefined, fallback: number): number {
 export function createOpenAIToolCallStream(
   config: OpenAIToolCallStreamConfig
 ): OpenAIToolCallStream {
-  const { toolCalls, emit, signal } = config;
+  const { emit, signal, tracker } = config;
+  const suppliedMap: unknown = config.toolCalls;
+  const suppliedEmitter: unknown = emit;
+  if (tracker != null && typeof suppliedEmitter !== 'function') {
+    throw new Error('A streaming tracker requires an emitter');
+  }
+  if (tracker != null && suppliedMap != null) {
+    throw new Error('Provide a tracker or a tool-call map, not both');
+  }
+  const toolCalls = tracker?.toolCalls ?? config.toolCalls;
+  if (toolCalls == null)
+    throw new Error('Provide a tracker or a tool-call map');
+  let previousChunkKind: OpenAIStreamTracker['lastChunkKind'];
   const maxCalls = positiveLimit(config.maxToolCalls, 1024);
   const maxBytes = positiveLimit(config.maxBufferedBytes, 4 * 1024 * 1024);
   const calls: OpenAIToolCall[] = [];
@@ -50,9 +77,12 @@ export function createOpenAIToolCallStream(
     bufferedBytes = 0;
   };
   const abort = (): void => {
+    const phaseBeforeAbort = phase;
     if (phase !== 'finished') {
       phase = 'aborted';
       toolCalls.clear();
+      if (tracker != null && phaseBeforeAbort === 'emitting')
+        tracker.lastChunkKind = previousChunkKind;
     }
     release();
   };
@@ -97,53 +127,22 @@ export function createOpenAIToolCallStream(
         if (typeof call.name !== 'string' || call.name.trim() === '') {
           throw new Error('Accepted tool call is missing its name');
         }
-        const finalArgs: unknown = call.args;
-        if (
-          finalArgs == null ||
-          typeof finalArgs !== 'object' ||
-          Array.isArray(finalArgs)
-        ) {
-          throw new Error('Accepted tool call arguments must be an object');
-        }
-        let args: string;
-        try {
-          const encoded: unknown = JSON.stringify(
-            finalArgs,
-            (_key, value: unknown): unknown => {
-              // Do not silently change executed arguments (e.g. NaN to null, or omit undefined).
-              if (
-                value === undefined ||
-                typeof value === 'function' ||
-                typeof value === 'symbol' ||
-                typeof value === 'bigint' ||
-                (typeof value === 'number' && !Number.isFinite(value))
-              ) {
-                throw new Error();
-              }
-              return value;
-            }
-          );
-          if (typeof encoded !== 'string' || encoded[0] !== '{')
-            throw new Error();
-          args = encoded;
-        } catch {
-          throw new Error(
-            'Accepted tool call arguments are not JSON serializable'
-          );
-        }
         let id = call.id ?? '';
+        if (typeof id !== 'string')
+          throw new Error('Accepted tool call ID must be a string');
         if (id === '' || outwardIds.has(id)) {
           // Each collision allocates at most one new candidate per existing ID.
           do {
             id = `call_${nextSyntheticId++}`;
           } while (outwardIds.has(id));
         }
-        bufferedBytes +=
-          Buffer.byteLength(args, 'utf8') +
-          Buffer.byteLength(id, 'utf8') +
-          Buffer.byteLength(call.name, 'utf8');
-        if (bufferedBytes > maxBytes)
-          throw new Error('Tool projection buffer limit exceeded');
+        const identityBytes =
+          Buffer.byteLength(id, 'utf8') + Buffer.byteLength(call.name, 'utf8');
+        const args = serializeToolArguments(
+          call.args,
+          maxBytes - bufferedBytes - identityBytes
+        );
+        bufferedBytes += identityBytes + Buffer.byteLength(args, 'utf8');
         outwardIds.add(id);
         calls.push(
           Object.freeze({
@@ -178,12 +177,19 @@ export function createOpenAIToolCallStream(
     finish: (): void => {
       if (phase === 'finished' || phase === 'emitting') return;
       checkCancellation();
+      previousChunkKind = tracker?.lastChunkKind;
       phase = 'emitting';
       try {
+        if (tracker != null && calls.length > 0 && !tracker.hasRole) {
+          tracker.hasRole = true;
+          emitDelta({ role: 'assistant' });
+          checkCancellation();
+        }
         for (let index = 0; index < calls.length; index++) {
           checkCancellation();
           const call = calls[index];
           toolCalls.set(index, call);
+          if (tracker != null) tracker.lastChunkKind = 'tool_call';
           emitDelta({
             tool_calls: [
               {
