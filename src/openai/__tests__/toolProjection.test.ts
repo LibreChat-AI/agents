@@ -34,6 +34,7 @@ function setup(
         id,
         agentId: 'agent',
         toolCalls: calls,
+        toolCallDispositions: calls.map(() => 'client' as const),
         invalidToolCalls: invalid,
       }
     );
@@ -432,6 +433,7 @@ describe('graph tool ownership', () => {
           messageId,
           id,
           toolCalls: calls,
+          toolCallDispositions: calls.map(() => 'client' as const),
           invalidToolCalls: [],
         }
       );
@@ -470,6 +472,7 @@ describe('graph tool ownership', () => {
           messageId: String(i),
           agentId: 'a',
           toolCalls: [{ id: 'x', name: 'lookup', args: {} }],
+          toolCallDispositions: ['client'],
           invalidToolCalls: [],
         }
       );
@@ -478,6 +481,78 @@ describe('graph tool ownership', () => {
         { type: 'model_tools_claimed', messageId: String(i), agentId: 'a' }
       );
     }
+    f.stream.finish();
+    expect(f.toolCalls.size).toBe(0);
+    expect(f.deltas).toHaveLength(0);
+  });
+});
+
+describe('explicit call disposition', () => {
+  const deliver = (
+    f: ReturnType<typeof setup>,
+    calls: ToolCall[],
+    dispositions?: Array<'client' | 'sdk' | 'provider'>
+  ) =>
+    f.stream.handlers[GraphEvents.ON_MODEL_RESPONSE].handle(
+      GraphEvents.ON_MODEL_RESPONSE,
+      {
+        type: 'model_response',
+        id: 'decision',
+        agentId: 'agent',
+        toolCalls: calls,
+        ...(dispositions === undefined
+          ? {}
+          : { toolCallDispositions: dispositions }),
+        invalidToolCalls: [],
+      } as ModelResponseEvent
+    );
+
+  it('fails closed on missing, mismatched, and unknown disposition', async () => {
+    for (const ownership of [
+      undefined,
+      [],
+      ['unknown'] as unknown as Array<'client'>,
+    ]) {
+      const f = setup();
+      expect(() =>
+        deliver(f, [{ id: 'one', name: 'lookup', args: {} }], ownership)
+      ).toThrow('trusted execution ownership');
+      expect(f.toolCalls.size).toBe(0);
+      expect(f.deltas).toHaveLength(0);
+      expect(() => f.stream.finish()).toThrow('aborted');
+    }
+  });
+
+  it('includes only explicit client delegation in a mixed accepted result', async () => {
+    const f = setup();
+    await deliver(
+      f,
+      [
+        { id: 'server', name: 'web_search', args: {} },
+        { id: 'internal', name: 'lookup', args: {} },
+        { id: 'client', name: 'external', args: { x: 1 } },
+      ],
+      ['provider', 'sdk', 'client']
+    );
+    f.stream.finish();
+    expect([...f.toolCalls.values()].map((call) => call.id)).toEqual([
+      'client',
+    ]);
+    expect(f.deltas.filter((delta) => delta.tool_calls != null)).toHaveLength(
+      2
+    );
+  });
+
+  it('never projects internal or provider calls without a later tool claim', async () => {
+    const f = setup();
+    await deliver(
+      f,
+      [
+        { id: 'provider', name: 'web_search', args: {} },
+        { id: 'sdk', name: 'lookup', args: {} },
+      ],
+      ['provider', 'sdk']
+    );
     f.stream.finish();
     expect(f.toolCalls.size).toBe(0);
     expect(f.deltas).toHaveLength(0);

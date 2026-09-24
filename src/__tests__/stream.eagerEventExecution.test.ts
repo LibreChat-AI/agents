@@ -1,3 +1,4 @@
+import { AIMessageChunk } from '@langchain/core/messages';
 import { describe, it, expect, jest, afterEach } from '@jest/globals';
 import type { AgentContext } from '@/agents/AgentContext';
 import type { StandardGraph } from '@/graphs';
@@ -5178,5 +5179,67 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
     expect(toolExecuteCalls).toHaveLength(0);
     expect(graph.eagerEventToolExecutions.has('call_weather')).toBe(false);
     expect(graph.eagerEventToolExecutions.has('call_edit')).toBe(false);
+  });
+});
+
+describe('executable argument readiness', () => {
+  it('prevents eager host execution for string-valued parsed calls even with a final seal', async () => {
+    const graph = createGraph();
+    const requests: t.ToolExecuteBatchRequest[] = [];
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data): Promise<void> => {
+        if (event !== GraphEvents.ON_TOOL_EXECUTE) return;
+        const request = data as t.ToolExecuteBatchRequest;
+        requests.push(request);
+        request.resolve([
+          { toolCallId: 'call_weather', status: 'success', content: 'sunny' },
+        ]);
+      });
+    const raw = new AIMessageChunk({
+      content: '',
+      tool_calls: [
+        {
+          id: 'call_weather',
+          name: 'weather',
+          args: '{"city":"NYC"}' as unknown as Record<string, unknown>,
+        },
+      ],
+      response_metadata: finalToolCallResponseMetadata,
+    });
+    await new ChatModelStreamHandler().handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      { chunk: raw },
+      { langgraph_node: 'agent' },
+      graph
+    );
+    expect(requests).toHaveLength(0);
+  });
+});
+
+describe('client delegation batch barrier', () => {
+  it('does not pre-execute an SDK call before a possible client-owned call arrives', async () => {
+    const graph = createGraph();
+    graph.clientDelegatedToolNames = new Set(['client_tool']);
+    const requests: t.ToolExecuteBatchRequest[] = [];
+    jest.spyOn(events, 'safeDispatchCustomEvent').mockImplementation(
+      async (event, data): Promise<void> => {
+        if (event !== GraphEvents.ON_TOOL_EXECUTE) return;
+        const request = data as t.ToolExecuteBatchRequest;
+        requests.push(request);
+        request.resolve([{ toolCallId: 'call_weather', status: 'success', content: 'sunny' }]);
+      }
+    );
+    await new ChatModelStreamHandler().handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      { chunk: new AIMessageChunk({
+        content: '',
+        tool_calls: [{ id: 'call_weather', name: 'weather', args: { city: 'NYC' } }],
+        response_metadata: finalToolCallResponseMetadata,
+      }) },
+      { langgraph_node: 'agent' },
+      graph
+    );
+    expect(requests).toHaveLength(0);
   });
 });

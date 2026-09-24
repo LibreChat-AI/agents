@@ -26,6 +26,9 @@ export interface ModelResponseEvent {
   /** Graph-state message identity used to correlate ToolNode ownership. */
   messageId?: string;
   toolCalls: ReadonlyArray<ToolCall>;
+  /** Same index as toolCalls. Only a trusted graph decision of 'client'
+   * permits this call on the OpenAI client wire; absence fails closed. */
+  toolCallDispositions: ReadonlyArray<'sdk' | 'provider' | 'client'>;
   invalidToolCalls: ReadonlyArray<
     NonNullable<AIMessageChunk['invalid_tool_calls']>[number]
   >;

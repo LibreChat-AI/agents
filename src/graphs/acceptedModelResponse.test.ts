@@ -1,7 +1,9 @@
 import { AIMessageChunk } from '@langchain/core/messages';
-import { snapshotValidatedModelChunk,
+import {
+  snapshotValidatedModelChunk,
   detachValidatedModelToolCalls,
-  snapshotAcceptedModelResponse } from './acceptedModelResponse';
+  snapshotAcceptedModelResponse,
+} from './acceptedModelResponse';
 import { cloneToolArguments } from '@/utils/acceptedToolArguments';
 import { claimStreamLimitCharge } from '@/llm/streamLimits';
 
@@ -71,6 +73,24 @@ describe('graph-accepted tool snapshot', () => {
     });
     event.toolCalls[0].args.city = 'changed';
     expect(message.tool_calls?.[0].args).toEqual({ city: 'Paris' });
+  });
+
+  it('classifies individual provider-executed IDs without treating prefixes as proof', () => {
+    const message = new AIMessageChunk({
+      content: '',
+      tool_calls: [
+        { id: 'srvtoolu_unconfirmed', name: 'web_search', args: {} },
+        { id: 'executed', name: 'web_search', args: {} },
+        { id: 'local', name: 'lookup', args: {} },
+      ],
+    });
+    const accepted = snapshotAcceptedModelResponse(
+      message,
+      'response',
+      'agent',
+      new Set(['executed'])
+    );
+    expect(accepted.toolCallDispositions).toEqual(['sdk', 'provider', 'sdk']);
   });
 
   it('does not invoke argument, name or ID getters on an accepted call', () => {

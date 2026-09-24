@@ -835,6 +835,8 @@ export abstract class Graph<
   callerSignal?: AbortSignal;
   /** Set of invoked tool call IDs from non-message run steps completed mid-run, if any */
   invokedToolIds?: Set<string>;
+  /** Explicit host policy. Never inferred from missing ToolNode claims. */
+  clientDelegatedToolNames?: ReadonlySet<string>;
   handlerRegistry: HandlerRegistry | undefined;
   /** Host registry retained only for forwarding tools from nested child graphs. */
   protected parentToolHandlerRegistry: HandlerRegistry | undefined;
@@ -1547,6 +1549,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       preemption,
       streamLimits,
       toolExecution,
+      clientDelegatedToolNames,
     }: t.StandardGraphInput,
     dependencies?: GraphFactoryDependencies
   ) {
@@ -1574,6 +1577,15 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     this.preemption = preemption;
     this.streamLimits = resolveStreamLimits(streamLimits);
     this.toolExecution = toolExecution;
+    if (clientDelegatedToolNames != null && clientDelegatedToolNames.length > 0) {
+      if (agents.length !== 1) {
+        throw new Error('Client tool delegation requires a single-agent graph');
+      }
+      if (clientDelegatedToolNames.some((name) => !name.trim())) {
+        throw new Error('Client delegated tool names must be nonempty');
+      }
+      this.clientDelegatedToolNames = new Set(clientDelegatedToolNames);
+    }
 
     if (agents.length === 0) {
       throw new Error('At least one agent configuration is required');
@@ -5049,7 +5061,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           const accepted = snapshotAcceptedModelResponse(
             responseMessage as AIMessageChunk,
             v4(),
-            agentId
+            agentId,
+            this.invokedToolIds,
+            this.clientDelegatedToolNames
           );
           // Awaited, registry-only: no trace replay, usage recording or side effects.
           // Detached calls prevent a consumer from changing tools about to execute.
@@ -5533,6 +5547,28 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
        *  summary has nothing to route: the summary itself is the result. */
       if (this.summarizeOnlyAgentId != null) {
         return END;
+      }
+      const delegatedNames = this.clientDelegatedToolNames;
+      if (delegatedNames != null && delegatedNames.size > 0) {
+        const { messages } = state as t.BaseGraphState;
+        const last = messages[messages.length - 1] as AIMessageChunk | undefined;
+        const calls = last?.getType() === 'ai' ? last.tool_calls ?? [] : [];
+        if (calls.some((call) => delegatedNames.has(call.name))) {
+          if (
+            calls.some(
+              (call) =>
+                !delegatedNames.has(call.name) ||
+                (call.id != null && this.invokedToolIds?.has(call.id) === true)
+            ) ||
+            (last?.invalid_tool_calls?.length ?? 0) > 0 ||
+            getTruncationStopReason(last) != null
+          ) {
+            throw new InvalidModelToolCallError(
+              'Mixed client and graph-owned tool calls require separate model turns'
+            );
+          }
+          return END;
+        }
       }
       const decision = toolsCondition(
         state as t.BaseGraphState,

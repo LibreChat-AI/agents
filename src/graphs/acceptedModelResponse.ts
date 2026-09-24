@@ -172,14 +172,39 @@ function snapshotToolCalls(
 export function snapshotAcceptedModelResponse(
   finalResponse: AIMessageChunk,
   id: string,
-  agentId: string
+  agentId: string,
+  providerExecutedIds?: ReadonlySet<string>,
+  clientDelegatedToolNames?: ReadonlySet<string>
 ): ModelResponseEvent {
+  const toolCalls = snapshotToolCalls(finalResponse, false);
+  const hasClientCall = toolCalls.some(
+    (call) => clientDelegatedToolNames?.has(call.name) === true
+  );
+  if (
+    hasClientCall &&
+    (toolCalls.some(
+      (call) =>
+        clientDelegatedToolNames?.has(call.name) !== true ||
+        (call.id != null && providerExecutedIds?.has(call.id) === true)
+    ) ||
+      (finalResponse.invalid_tool_calls?.length ?? 0) > 0)
+  ) {
+    throw new InvalidModelToolCallError(
+      'Mixed client and graph-owned tool calls require separate model turns'
+    );
+  }
   return {
     type: 'model_response',
     id,
     agentId,
     ...(finalResponse.id != null ? { messageId: finalResponse.id } : {}),
-    toolCalls: snapshotToolCalls(finalResponse, false),
+    toolCalls,
+    toolCallDispositions: toolCalls.map((call) => {
+      if (hasClientCall) return 'client';
+      return call.id != null && providerExecutedIds?.has(call.id) === true
+        ? 'provider'
+        : 'sdk';
+    }),
     invalidToolCalls: [],
   };
 }
@@ -241,7 +266,8 @@ function snapshotToolRecords(
  * leaving their originals intact, but keep producer/consumer charge identity.
  */
 export function snapshotValidatedModelChunk(
-  message: AIMessageChunk
+  message: AIMessageChunk,
+  partial = true
 ): AIMessageChunk {
   if (types.isProxy(message)) {
     throw new InvalidModelToolCallError(
@@ -249,18 +275,33 @@ export function snapshotValidatedModelChunk(
     );
   }
   const descriptors = Object.getOwnPropertyDescriptors(message);
-  for (const field of [
-    'tool_calls',
-    'tool_call_chunks',
-    'invalid_tool_calls',
-  ]) {
-    if (Object.hasOwn(descriptors, field)) descriptors[field].configurable = true;
+  // Object.freeze on the provider result must not freeze the SDK's own
+  // envelope. LangChain updates IDs, lc_kwargs and response metadata later.
+  for (const descriptor of Object.values(descriptors)) {
+    descriptor.configurable = true;
+    if ('value' in descriptor) descriptor.writable = true;
+  }
+  const kwargs = descriptors.lc_kwargs;
+  if (Object.hasOwn(descriptors, 'lc_kwargs') && 'value' in kwargs) {
+    const value: unknown = kwargs.value;
+    if (value === null || typeof value !== 'object' || types.isProxy(value)) {
+      throw new InvalidModelToolCallError('Invalid model response metadata');
+    }
+    const fields = Object.getOwnPropertyDescriptors(value);
+    for (const field of Object.values(fields)) {
+      if (!('value' in field)) {
+        throw new InvalidModelToolCallError('Invalid model response metadata');
+      }
+      field.configurable = true;
+      field.writable = true;
+    }
+    kwargs.value = Object.create(Object.getPrototypeOf(value), fields);
   }
   const copy = Object.create(
     Object.getPrototypeOf(message),
     descriptors
   ) as AIMessageChunk;
-  detachValidatedModelToolCalls(copy, true);
-  linkStreamLimitCanonical(copy, message);
+  detachValidatedModelToolCalls(copy, partial);
+  if (partial) linkStreamLimitCanonical(copy, message);
   return copy;
 }

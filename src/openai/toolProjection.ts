@@ -144,20 +144,34 @@ export function createOpenAIToolCallStream(
       if (result.invalidToolCalls.length > 0) {
         throw new Error('Accepted model response contains invalid tool calls');
       }
-      if (result.toolCalls.length === 0) {
-        // A text response supersedes this agent's request, never a sibling's.
-        // ToolNode claims also retire calls when no final model response follows.
+      const ownership = result.toolCallDispositions;
+      if (
+        !Array.isArray(ownership) ||
+        ownership.length !== result.toolCalls.length ||
+        ownership.some(
+          (value) =>
+            value !== 'sdk' && value !== 'provider' && value !== 'client'
+        )
+      ) {
+        throw new Error('Accepted tool calls lack trusted execution ownership');
+      }
+      const delegated = result.toolCalls.filter(
+        (_call, index) => ownership[index] === 'client'
+      );
+      if (delegated.length === 0) {
+        // A text or internal-only response supersedes this agent's request,
+        // never a sibling's. Neither 'sdk' nor 'provider' enters the wire.
         discard(result.agentId);
         return;
       }
       if (result.id.trim() === '' || acceptedIds.has(result.id)) {
         throw new Error('Missing or repeated accepted model response identity');
       }
-      if (calls.length + result.toolCalls.length > maxCalls) {
+      if (calls.length + delegated.length > maxCalls) {
         throw new Error('Tool projection call limit exceeded');
       }
       acceptedIds.add(result.id);
-      for (const call of result.toolCalls) {
+      for (const call of delegated) {
         if (typeof call.name !== 'string' || call.name.trim() === '') {
           throw new Error('Accepted tool call is missing its name');
         }

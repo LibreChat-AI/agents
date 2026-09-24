@@ -410,6 +410,8 @@ export type StandardGraphInput = {
   agents: AgentInputs[];
   /** Execution backend used to resolve the effective tool registry. */
   toolExecution?: ToolExecutionConfig;
+  /** Trusted single-agent client delegation policy; mixed batches fail closed. */
+  clientDelegatedToolNames?: readonly string[];
   langfuse?: LangfuseConfig;
   tokenCounter?: TokenCounter;
   indexTokenCountMap?: Record<string, number>;

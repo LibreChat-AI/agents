@@ -41,6 +41,7 @@ function setup(mode?: 'throw' | 'abort') {
         id: `accepted-${++acceptedSequence}`,
         agentId: 'agent',
         toolCalls,
+        toolCallDispositions: toolCalls.map(() => 'client' as const),
         invalidToolCalls: [],
       }
     );

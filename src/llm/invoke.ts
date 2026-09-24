@@ -1477,11 +1477,10 @@ async function attemptInvokeBody(
     return { messages: [finalChunk as AIMessageChunk] };
   }
 
-  const finalMessage = await model.invoke(
-    messagesForProvider,
-    invocationConfig
+  const finalMessage = snapshotValidatedModelChunk(
+    await model.invoke(messagesForProvider, invocationConfig),
+    false
   );
-  detachValidatedModelToolCalls(finalMessage);
   if ((finalMessage.tool_calls?.length ?? 0) > 0) {
     finalMessage.tool_calls = finalMessage.tool_calls?.filter(
       (tool_call: ToolCall) => !!tool_call.name

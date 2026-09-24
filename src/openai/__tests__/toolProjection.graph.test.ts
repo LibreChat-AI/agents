@@ -159,6 +159,7 @@ async function setup(
     failTool?: boolean;
     toolEnd?: boolean;
     noProjection?: boolean;
+    clientDelegatedToolNames?: readonly string[];
     usage?: t.EventHandler;
   } = {}
 ) {
@@ -195,6 +196,7 @@ async function setup(
     runId: 'accepted-projection',
     skipCleanup: true,
     tokenCounter: () => 1,
+    clientDelegatedToolNames: options.clientDelegatedToolNames,
     graphConfig: {
       type: 'standard',
       toolEnd: options.toolEnd,
@@ -457,6 +459,7 @@ describe('accepted tool calls through the real execution boundary', () => {
             toolCalls: [
               { id: 'spoof', name: 'lookup', args: { city: 'injected' } },
             ],
+            toolCallDispositions: ['client'],
             invalidToolCalls: [],
           },
           config
@@ -839,4 +842,150 @@ describe('reused provider chunk compatibility', () => {
     expect(fixture.executed).toEqual(['Paris']);
     expect(fixture.projected.size).toBe(0);
   });
+});
+
+describe('graph ownership across provider and invoke boundaries', () => {
+  it('never delegates externally completed calls when the router bypasses ToolNode', async () => {
+    const reply = new AIMessageChunk({
+      id: 'server-answer',
+      content: '',
+      tool_calls: [
+        { id: 'srvtoolu_1', name: 'web_search', args: { q: 'weather' } },
+      ],
+    });
+    class ServerExecutedModel extends InvokeModel {
+      async invoke(
+        messages: BaseMessage[],
+        config?: RunnableConfig
+      ): Promise<AIMessageChunk> {
+        const result = await super.invoke(messages, config);
+        if (result === reply)
+          fixture.run.Graph!.invokedToolIds = new Set(['srvtoolu_1']);
+        return result;
+      }
+    }
+    const fixture = await setup(new ServerExecutedModel(reply));
+    await fixture.execute();
+    expect(fixture.accepted).toHaveLength(1);
+    expect(fixture.claimed).toHaveLength(0); // no ToolNode on this path
+    expect(fixture.projected.size).toBe(0);
+    expect(fixture.frames.every((delta) => delta.tool_calls == null)).toBe(
+      true
+    );
+  });
+
+  it.each(['invoke', 'stream'] as const)(
+    'emits only an explicitly delegated terminal %s tool call',
+    async (mode) => {
+      const reply = new AIMessageChunk({
+        content: '',
+        tool_calls: [
+          { id: 'for-client', name: 'lookup', args: { city: 'Paris' } },
+        ],
+      });
+      const fixture = await setup(
+        mode === 'stream' ? new OneChunkModel(reply) : new InvokeModel(reply),
+        { clientDelegatedToolNames: ['lookup'] }
+      );
+      await fixture.execute();
+      expect(fixture.executed).toHaveLength(0);
+      expect(fixture.accepted[0].toolCallDispositions).toEqual(['client']);
+      expect([...fixture.projected.values()].map((call) => call.id)).toEqual([
+        'for-client',
+      ]);
+      expect(fixture.frames.some((delta) => delta.tool_calls != null)).toBe(
+        true
+      );
+      const finish = fixture.writes
+        .filter((frame) => frame.startsWith('data: {'))
+        .flatMap((frame) => JSON.parse(frame.slice(6)).choices)
+        .find((choice) => choice.finish_reason != null);
+      expect(finish.finish_reason).toBe('tool_calls');
+    }
+  );
+
+  it('fails a mixed client/SDK batch before either side executes', async () => {
+    const reply = new AIMessageChunk({
+      content: '',
+      tool_calls: [
+        { id: 'for-client', name: 'lookup', args: { city: 'Paris' } },
+        { id: 'other', name: 'unregistered', args: {} },
+      ],
+    });
+    const fixture = await setup(new InvokeModel(reply), {
+      clientDelegatedToolNames: ['lookup'],
+    });
+    await expect(fixture.execute()).rejects.toThrow(
+      'Mixed client and graph-owned tool calls'
+    );
+    expect(fixture.executed).toHaveLength(0);
+    expect(fixture.projected.size).toBe(0);
+  });
+
+  it('keeps a provider-owned server call and an SDK tool call off the client wire', async () => {
+    const reply = new AIMessageChunk({
+      content: '',
+      tool_calls: [
+        { id: 'srvtoolu_2', name: 'web_search', args: { q: 'weather' } },
+        { id: 'local', name: 'lookup', args: { city: 'Paris' } },
+      ],
+    });
+    class MixedModel extends InvokeModel {
+      async invoke(
+        messages: BaseMessage[],
+        config?: RunnableConfig
+      ): Promise<AIMessageChunk> {
+        const result = await super.invoke(messages, config);
+        if (result === reply)
+          fixture.run.Graph!.invokedToolIds = new Set(['srvtoolu_2']);
+        return result;
+      }
+    }
+    const fixture = await setup(new MixedModel(reply), { toolEnd: true });
+    await fixture.execute();
+    expect(fixture.accepted[0].toolCallDispositions).toEqual([
+      'provider',
+      'sdk',
+    ]);
+    expect(fixture.executed).toEqual(['Paris']);
+    expect(fixture.projected.size).toBe(0);
+    expect(fixture.frames.every((delta) => delta.tool_calls == null)).toBe(
+      true
+    );
+  });
+
+  it('assigns SDK message identity without mutating a frozen model response or its kwargs', async () => {
+    const reply = new AIMessageChunk('hello');
+    Object.freeze(reply.lc_kwargs);
+    Object.freeze(reply);
+    const fixture = await setup(new InvokeModel(reply));
+    await fixture.execute();
+    expect(reply.id).toBeUndefined();
+    expect(fixture.accepted[0].messageId).toBeTruthy();
+    expect(fixture.projected.size).toBe(0);
+  });
+
+  it.each([true, false])(
+    'accepts immutable invoke responses with tool calls=%s without changing provider data',
+    async (withTools) => {
+      const reply = new AIMessageChunk(
+        withTools
+          ? {
+            id: 'immutable',
+            content: '',
+            tool_calls: [
+              { id: 'a', name: 'lookup', args: { city: 'Paris' } },
+            ],
+          }
+          : { id: 'immutable', content: 'hello' }
+      );
+      const originalToolCalls = reply.tool_calls;
+      Object.freeze(reply);
+      const fixture = await setup(new InvokeModel(reply));
+      await fixture.execute();
+      expect(reply.tool_calls).toBe(originalToolCalls);
+      expect(fixture.executed).toEqual(withTools ? ['Paris'] : []);
+      expect(fixture.projected.size).toBe(0);
+    }
+  );
 });

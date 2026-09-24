@@ -19,12 +19,14 @@ without imposing projection budgets on ordinary runs. Composed observers receive
 isolated snapshots. Provider/tool custom callbacks cannot impersonate acceptance. Handler errors
 propagate outside provider retry logic.
 
-The opt-in OpenAI projector buffers finalized calls, reserves provider IDs, and
-formats output after host-confirmed natural completion. A registry-only ToolNode
-claim retires graph-owned batches by agent and message identity, including
-terminal tool runs. Only unclaimed calls appear as client `tool_calls`. Fresh
-output state and bounded pending call count, encoded bytes and depth prevent
-unbounded retention. See the
+The opt-in OpenAI projector buffers only calls explicitly marked client-owned
+by the trusted graph, and formats after host-confirmed natural completion.
+Provider/SDK calls never reach the client, even if ToolNode is bypassed; ToolNode
+claims are a secondary guard. Single-agent `clientDelegatedToolNames` routes
+pure client batches to END, while mixed client/graph batches fail closed.
+Partial string arguments are not executable, even with an eager seal. Stream
+and invoke use SDK-owned snapshots so frozen provider messages remain intact.
+Bounded pending call count, encoded bytes and depth prevent unbounded retention. See the
 [README](../../README.md#accepted-tool-call-projection-opt-in) for registration,
 limits and failure handling.
 

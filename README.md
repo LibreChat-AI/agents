@@ -168,13 +168,17 @@ calls accepted by the graph, not provider fragments. Existing handlers are uncha
 - Call `finish()` only after natural completion: no error, aborted signal,
   `getInterrupt()` or `getHaltReason()`. Otherwise call `abort()` and discard it.
   A resolved `processStream()` alone does not mean success.
-- ToolNode claims retire graph-owned calls, including terminal tool runs without
-  a final model answer. Only calls not claimed by the graph appear as `tool_calls`.
+- Calls execute in the graph by default. To hand a complete call to the OpenAI
+  client instead, set `clientDelegatedToolNames: ['my_tool']` in `Run.create`
+  for a single-agent run and register its model-facing schema. The graph ends
+  without executing that call. Batches mixing delegated and graph/provider
+  tools fail closed; make separate model turns. ToolNode claims remain an
+  additional guard, never proof that an unclaimed call belongs to the client.
 - `emit` is synchronous. Failed/partial writes cannot be retried; the host owns
   HTTP backpressure. This helper does not provide durable resume or undo tool effects.
 
-Arguments must be JSON data: primitives, plain objects and dense arrays. Getters,
-custom objects, cycles and nesting beyond 64 levels are rejected before copying.
+Projected arguments must be JSON data: primitives, plain objects and dense arrays.
+Getters, custom objects, cycles and nesting beyond 64 levels are rejected before projection.
 Observers receive isolated snapshots; provider IDs are reserved before synthetic IDs.
 Accepted-event snapshots cap each response at **1,024 calls / 4 MiB**. Projection
 uses those defaults for pending calls (`maxToolCalls` / `maxBufferedBytes`). These
