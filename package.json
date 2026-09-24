@@ -302,7 +302,7 @@
     "@langchain/google-gauth": "2.2.0",
     "@langchain/google-genai": "2.2.0",
     "@langchain/google-vertexai": "2.2.0",
-    "@langchain/langgraph": "1.4.8",
+    "@langchain/langgraph": "1.4.11",
     "@langchain/mistralai": "^1.2.0",
     "@langchain/openai": "1.5.8",
     "@langchain/textsplitters": "^1.0.1",
