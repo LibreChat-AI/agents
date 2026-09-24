@@ -156,6 +156,15 @@ const customHandlers = composeEventHandlers(
 );
 ```
 
+For hosts that need stable OpenAI-compatible tool-call IDs across graph run steps,
+`createOpenAIToolCallStream` from `@librechat/agents/openai` is an opt-in,
+transport-independent projection. Feed it `onRunStep` and `onRunStepDelta`
+events, then call `finish()` only after successful execution: it validates
+and publishes complete tool calls with response-wide indices. Call `abort()`
+on failure or disconnect. The existing `createOpenAIHandlers` output and
+usage framing are unchanged; host integration and async transport handling
+remain separate steps.
+
 ## Development
 
 ```bash
