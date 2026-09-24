@@ -11,6 +11,16 @@ import type { RunnableConfig, Runnable } from '@langchain/core/runnables';
 import type { ChatGenerationChunk } from '@langchain/core/outputs';
 import type { GoogleAIToolType } from '@langchain/google-common';
 import type {
+  RunStep,
+  ModelResponseEvent,
+  ModelToolsClaimedEvent,
+  RunStepDeltaEvent,
+  RunStepResumeState,
+  RunStepClosedEvent,
+  MessageDeltaEvent,
+  ReasoningDeltaEvent,
+} from '@/types/stream';
+import type {
   SummarizationNodeInput,
   SummarizeCompleteEvent,
   CompactionSemanticIndex,
@@ -18,14 +28,6 @@ import type {
   SummarizeStartEvent,
   SummarizeDeltaEvent,
 } from '@/types/summarize';
-import type {
-  RunStep,
-  RunStepDeltaEvent,
-  RunStepResumeState,
-  RunStepClosedEvent,
-  MessageDeltaEvent,
-  ReasoningDeltaEvent,
-} from '@/types/stream';
 import type {
   ToolMap,
   ToolSessionMap,
@@ -202,6 +204,8 @@ export interface EventHandler {
     data:
       | StreamEventData
       | ModelEndData
+      | ModelResponseEvent
+      | ModelToolsClaimedEvent
       | RunStep
       | RunStepDeltaEvent
       | RunStepClosedEvent
@@ -406,6 +410,8 @@ export type StandardGraphInput = {
   agents: AgentInputs[];
   /** Execution backend used to resolve the effective tool registry. */
   toolExecution?: ToolExecutionConfig;
+  /** Trusted single-agent client delegation policy; mixed batches fail closed. */
+  clientDelegatedToolNames?: readonly string[];
   langfuse?: LangfuseConfig;
   tokenCounter?: TokenCounter;
   indexTokenCountMap?: Record<string, number>;

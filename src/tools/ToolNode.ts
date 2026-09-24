@@ -1021,6 +1021,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     preparedSubagents,
     restoreRunStepResumeState,
     createRunStepResumeState,
+    onToolCallsClaimed,
   }: t.ToolNodeConstructorParams) {
     super({
       name: name ?? TOOL_NODE_RUN_NAME,
@@ -1155,6 +1156,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         }
         const state = input as T & Pick<t.BaseGraphState, 'runStepState'>;
         restoreRunStepResumeState?.(state.runStepState, config);
+        // Freeze replay authority before observers can yield to sibling tasks.
+        if (onToolCallsClaimed != null && assistantBatch?.message.id != null) {
+          await onToolCallsClaimed(assistantBatch.message.id, config);
+        }
         let result: T;
         try {
           result = await this.run(input, config, referenceReplay);

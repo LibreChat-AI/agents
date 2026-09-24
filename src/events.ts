@@ -8,7 +8,7 @@ import type { Logger } from 'winston';
 import type { MultiAgentGraph, StandardGraph } from '@/graphs';
 import type * as t from '@/types';
 import { dispatchesChatModelStream, SDK_STREAM_DISPATCH } from '@/stream';
-import { Constants } from '@/common';
+import { Constants, GraphEvents } from '@/common';
 
 export class HandlerRegistry {
   private handlers: Map<string, t.EventHandler> = new Map();
@@ -26,12 +26,23 @@ export function composeEventHandlers(
   ...handlerSets: Array<Record<string, t.EventHandler> | undefined>
 ): Record<string, t.EventHandler> {
   const composed: Partial<Record<string, t.EventHandler>> = {};
+  const acceptedObservers = new Map<string, t.EventHandler[]>();
 
   for (const handlerSet of handlerSets) {
     if (!handlerSet) {
       continue;
     }
     for (const [eventType, handler] of Object.entries(handlerSet)) {
+      if (
+        eventType === GraphEvents.ON_MODEL_RESPONSE ||
+        eventType === GraphEvents.ON_MODEL_TOOLS_CLAIMED
+      ) {
+        const observers = acceptedObservers.get(eventType) ?? [];
+        observers.push(handler);
+        acceptedObservers.set(eventType, observers);
+        composed[eventType] = handler;
+        continue;
+      }
       const previous = composed[eventType];
       if (previous === undefined) {
         composed[eventType] = handler;
@@ -59,6 +70,18 @@ export function composeEventHandlers(
       }
       composed[eventType] = wrapper;
     }
+  }
+
+  for (const [eventType, observers] of acceptedObservers) {
+    composed[eventType] = {
+      handle: async (event, data, metadata, graph): Promise<void> => {
+        // Clone from the graph-owned snapshot, not from any preceding observer's
+        // possibly mutated argument tree. One bounded copy per observer.
+        for (const observer of observers) {
+          await observer.handle(event, structuredClone(data), metadata, graph);
+        }
+      },
+    };
   }
 
   return composed as Record<string, t.EventHandler>;

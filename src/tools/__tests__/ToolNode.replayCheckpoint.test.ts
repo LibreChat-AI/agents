@@ -1,17 +1,17 @@
 import { z } from 'zod';
 import { tool } from '@langchain/core/tools';
-import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import { GraphInterrupt } from '@langchain/langgraph';
+import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
-import { HookRegistry } from '@/hooks';
-import { ToolNode } from '../ToolNode';
-import { restoreToolReplayConfig } from '../toolBatchReplay';
-import * as events from '@/utils/events';
-import { GraphEvents } from '@/common';
 import {
   ToolOutputReferenceRegistry,
   annotateMessagesForLLM,
 } from '../toolOutputReferences';
+import { restoreToolReplayConfig } from '../toolBatchReplay';
+import * as events from '@/utils/events';
+import { HookRegistry } from '@/hooks';
+import { ToolNode } from '../ToolNode';
+import { GraphEvents } from '@/common';
 
 afterEach(() => jest.restoreAllMocks());
 
@@ -38,7 +38,7 @@ function replayConfig(payload: unknown): RunnableConfig {
 }
 
 describe('ToolNode checkpoint authority', () => {
-  it('keeps concurrently checkpointed references while replaying its frozen inputs', async () => {
+  it.each([false, true])('keeps concurrently checkpointed references while replaying its frozen inputs (claimed=%s)', async (claimed) => {
     let release: () => void = () => { throw new Error('not initialized'); };
     const barrier = new Promise<void>((resolve) => { release = resolve; });
     let shouldPause = true;
@@ -68,7 +68,7 @@ describe('ToolNode checkpoint authority', () => {
     const resume = replayConfig(checkpoint);
     resume.configurable = { ...resume.configurable, run_id: 'shared' };
     shouldPause = false;
-    const result = await new ToolNode({ tools: [work], toolOutputRegistry: restoredRegistry }).invoke(input, resume) as { messages: ToolMessage[] };
+    const result = await new ToolNode({ tools: [work], toolOutputRegistry: restoredRegistry, onToolCallsClaimed: claimed ? async () => { await Promise.resolve(); } : undefined }).invoke(input, resume) as { messages: ToolMessage[] };
     expect(result.messages[0].content).toBe('{{tool0turn1}}');
     expect(restoredRegistry.get('shared', 'tool0turn1')).toBe('sibling-result');
     expect(restoredRegistry.nextTurn('shared')).toBe(2);

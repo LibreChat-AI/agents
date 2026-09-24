@@ -468,6 +468,7 @@ export class Run<_T extends t.BaseGraphState> {
   private langfuse?: t.LangfuseConfig;
   private toolOutputReferences?: t.ToolOutputReferencesConfig;
   private eagerEventToolExecution?: t.EagerEventToolExecutionConfig;
+  private clientDelegatedToolNames?: readonly string[];
   private codeSessionToolNames?: string[];
   private interruptingToolNames?: string[];
   private toolExecution?: t.ToolExecutionConfig;
@@ -549,12 +550,19 @@ export class Run<_T extends t.BaseGraphState> {
       }
     }
 
+    if (
+      (config.clientDelegatedToolNames?.length ?? 0) > 0 &&
+      handlerRegistry.getHandler(GraphEvents.ON_MODEL_RESPONSE) == null
+    ) {
+      throw new Error('Client tool delegation requires an accepted-result handler');
+    }
     this.handlerRegistry = handlerRegistry;
     this.hookRegistry = config.hooks;
     this.humanInTheLoop = config.humanInTheLoop;
     this.langfuse = config.langfuse;
     this.toolOutputReferences = config.toolOutputReferences;
     this.eagerEventToolExecution = config.eagerEventToolExecution;
+    this.clientDelegatedToolNames = config.clientDelegatedToolNames;
     this.codeSessionToolNames = config.codeSessionToolNames;
     this.interruptingToolNames = config.interruptingToolNames;
     this.toolExecution = config.toolExecution;
@@ -573,6 +581,9 @@ export class Run<_T extends t.BaseGraphState> {
 
     /** Handle different graph types */
     if (config.graphConfig.type === 'multi-agent') {
+      if (this.clientDelegatedToolNames != null && this.clientDelegatedToolNames.length > 0) {
+        throw new Error('Client tool delegation requires a single-agent graph');
+      }
       this.graphRunnable = this.createMultiAgentGraph(config.graphConfig);
       if (this.Graph) {
         this.Graph.handlerRegistry = handlerRegistry;
@@ -663,6 +674,7 @@ export class Run<_T extends t.BaseGraphState> {
         preemption: this.preemption,
         streamLimits: this.streamLimits,
         toolExecution: this.toolExecution,
+        clientDelegatedToolNames: this.clientDelegatedToolNames,
       },
     });
     /** Propagate compile options from graph config */
@@ -1058,6 +1070,11 @@ export class Run<_T extends t.BaseGraphState> {
       ) {
         return;
       }
+      // Accepted results are graph-owned, never inferred from provider/tool callbacks.
+      if (
+        eventName === GraphEvents.ON_MODEL_RESPONSE ||
+        eventName === GraphEvents.ON_MODEL_TOOLS_CLAIMED
+      ) return;
       const handler = this.handlerRegistry?.getHandler(eventName);
       /**
        * Tool completions arriving over the custom-event channel are the only
@@ -1554,6 +1571,10 @@ export class Run<_T extends t.BaseGraphState> {
 
           const modelEndAt =
             eventName === GraphEvents.CHAT_MODEL_END ? Date.now() : undefined;
+          if (
+            eventName === GraphEvents.ON_MODEL_RESPONSE ||
+            eventName === GraphEvents.ON_MODEL_TOOLS_CLAIMED
+          ) continue;
           const handler = this.handlerRegistry?.getHandler(eventName);
           if (handler) {
             await handler.handle(eventName, data, metadata, this.Graph);

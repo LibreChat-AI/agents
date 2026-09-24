@@ -56,6 +56,7 @@ import {
   truncateToolResultContent,
 } from '@/utils/truncation';
 import { resolveToolOutcome, outcomeFieldsFromResult } from '@/tools/intentArg';
+import { snapshotValidatedModelChunk } from '@/graphs/acceptedModelResponse';
 import { TOOL_OUTPUT_REF_PATTERN } from '@/tools/toolOutputReferences';
 import { PreparedSubagentError } from '@/tools/preparedSubagents';
 import { isReasoningContentBlock } from '@/messages/core';
@@ -746,6 +747,10 @@ function createEagerToolExecutionPlan(args: {
         toolCall.id == null ||
         toolCall.id === '' ||
         toolCall.name === '' ||
+        // A serialized parsed call is not a prepared executable object;
+        // parsing is permitted only on sealed raw tool_call_chunks.
+        typeof toolCall.args === 'string' ||
+        graph.clientDelegatedToolNames?.has(toolCall.name) === true ||
         (!skipExisting && graph.eagerEventToolExecutions.has(toolCall.id))
     )
   ) {
@@ -794,6 +799,9 @@ function startEagerToolExecutions(args: {
   skipExisting?: boolean;
 }): void {
   const { graph, metadata, agentContext, toolCalls, skipExisting } = args;
+  // A later call in the same model turn may be client-delegated. Do not
+  // pre-execute an earlier SDK call in a run that rejects mixed batches.
+  if ((graph.clientDelegatedToolNames?.size ?? 0) > 0) return;
   const entries = createEagerToolExecutionPlan({
     graph,
     metadata,
@@ -1345,6 +1353,10 @@ function startPreparedSubagents(
   metadata?: Record<string, unknown>
 ): void {
   const attempt = resolveGenerationKey(metadata);
+  if ((graph.clientDelegatedToolNames?.size ?? 0) > 0) return;
+  // A parsed string call is not executable even if the same event carries
+  // sealed raw fragments. Wait for a separately validated complete call.
+  if (chunk.tool_calls?.some((call) => typeof call.args === 'string') === true) return;
   if (
     (graph as Partial<StandardGraph>).canPrestartSubagents?.(agentContext) !==
       true ||
@@ -1389,6 +1401,9 @@ function startPreparedSubagents(
   for (const call of calls) {
     if (
       call.name === Constants.SUBAGENT &&
+      graph.clientDelegatedToolNames?.has(call.name) !== true &&
+      typeof call.args === 'object' &&
+      !Array.isArray(call.args) &&
       !hasToolOutputReference(call.args)
     ) {
       graph.prestartSubagent(call, attempt, agentContext);
@@ -1643,7 +1658,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
       return;
     }
 
-    const chunk = data.chunk as Partial<AIMessageChunk>;
+    let chunk = data.chunk as Partial<AIMessageChunk>;
 
     /** Attempts stamp their breaker epoch into event metadata; a mismatch
      * marks a straggling chunk from a failed run that outlived
@@ -1680,6 +1695,10 @@ export class ChatModelStreamHandler implements t.EventHandler {
         throw eventBreaker.signal.reason;
       }
     };
+
+    // Callback delivery can beat the producer's iterator. Validate before
+    // accounting, run steps, or eager dispatch reads raw tool descriptors.
+    chunk = snapshotValidatedModelChunk(chunk as AIMessageChunk);
 
     /**
      * Enforced before every content-specific early return below
@@ -1885,6 +1904,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
           chunk.response_metadata as Record<string, unknown> | undefined
         );
       const canStreamEager =
+        chunk.tool_calls?.some((call) => typeof call.args === 'string') !== true &&
         (allowSequentialSeal || hasExplicitStreamedToolCallSeals(chunk)) &&
         !hasPotentialDirectToolInStreamContext({ graph, agentContext }) &&
         isEagerToolExecutionEnabledForBatch({ graph, metadata, agentContext });
