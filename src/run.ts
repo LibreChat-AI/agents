@@ -1059,7 +1059,10 @@ export class Run<_T extends t.BaseGraphState> {
         return;
       }
       // Accepted results are graph-owned, never inferred from provider/tool callbacks.
-      if (eventName === GraphEvents.ON_MODEL_RESPONSE) return;
+      if (
+        eventName === GraphEvents.ON_MODEL_RESPONSE ||
+        eventName === GraphEvents.ON_MODEL_TOOLS_CLAIMED
+      ) return;
       const handler = this.handlerRegistry?.getHandler(eventName);
       /**
        * Tool completions arriving over the custom-event channel are the only
@@ -1556,7 +1559,10 @@ export class Run<_T extends t.BaseGraphState> {
 
           const modelEndAt =
             eventName === GraphEvents.CHAT_MODEL_END ? Date.now() : undefined;
-          if (eventName === GraphEvents.ON_MODEL_RESPONSE) continue;
+          if (
+            eventName === GraphEvents.ON_MODEL_RESPONSE ||
+            eventName === GraphEvents.ON_MODEL_TOOLS_CLAIMED
+          ) continue;
           const handler = this.handlerRegistry?.getHandler(eventName);
           if (handler) {
             await handler.handle(eventName, data, metadata, this.Graph);

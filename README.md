@@ -168,16 +168,18 @@ calls accepted by the graph, not provider fragments. Existing handlers are uncha
 - Call `finish()` only after natural completion: no error, aborted signal,
   `getInterrupt()` or `getHaltReason()`. Otherwise call `abort()` and discard it.
   A resolved `processStream()` alone does not mean success.
-- A final text answer omits calls already executed inside the graph. Only calls
-  still pending after the last accepted text response can appear as `tool_calls`.
+- ToolNode claims retire graph-owned calls, including terminal tool runs without
+  a final model answer. Only calls not claimed by the graph appear as `tool_calls`.
 - `emit` is synchronous. Failed/partial writes cannot be retried; the host owns
   HTTP backpressure. This helper does not provide durable resume or undo tool effects.
 
 Arguments must be JSON data: primitives, plain objects and dense arrays. Getters,
 custom objects, cycles and nesting beyond 64 levels are rejected before copying.
 Observers receive isolated snapshots; provider IDs are reserved before synthetic IDs.
-Graph snapshots cap each response at **1,024 calls / 4 MiB**. Projection defaults to
-those limits for pending calls, configurable via `maxToolCalls` / `maxBufferedBytes`.
+Accepted-event snapshots cap each response at **1,024 calls / 4 MiB**. Projection
+uses those defaults for pending calls (`maxToolCalls` / `maxBufferedBytes`). These
+formatting limits do not apply to ordinary runs without accepted-event handlers;
+descriptor safety checks still apply before stream accounting and dispatch.
 These are output limits, not bounds on provider memory or tool execution.
 
 See [the design decision](docs/adr/0010-project-accepted-model-results.md).

@@ -23,6 +23,8 @@ export interface ModelResponseEvent {
   /** Graph-generated acceptance ID, not a provider ID or run-step index. */
   id: string;
   agentId: string;
+  /** Graph-state message identity used to correlate ToolNode ownership. */
+  messageId?: string;
   toolCalls: ReadonlyArray<ToolCall>;
   invalidToolCalls: ReadonlyArray<
     NonNullable<AIMessageChunk['invalid_tool_calls']>[number]
@@ -556,3 +558,10 @@ export type ContentAggregatorResult = {
   contentParts: Array<MessageContentComplex | undefined>;
   aggregateContent: ContentAggregator;
 };
+
+/** Ownership, not successful completion. Interrupted/failed batches remain graph-owned. */
+export interface ModelToolsClaimedEvent {
+  type: 'model_tools_claimed';
+  agentId: string;
+  messageId: string;
+}

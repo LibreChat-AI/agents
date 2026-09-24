@@ -66,7 +66,15 @@ export function createOpenAIToolCallStream(
   let acceptedTerminalKind: OpenAIStreamTracker['lastChunkKind'];
   const maxCalls = positiveLimit(config.maxToolCalls, 1024);
   const maxBytes = positiveLimit(config.maxBufferedBytes, 4 * 1024 * 1024);
-  const calls: Array<{ id: string; name: string; arguments: string }> = [];
+  const calls: Array<{
+    id: string;
+    name: string;
+    arguments: string;
+    agentId: string;
+    messageId?: string;
+    acceptedId: string;
+    bytes: number;
+  }> = [];
   const providerIds = new Set<string>();
   const acceptedIds = new Set<string>();
   let bufferedBytes = 0;
@@ -77,6 +85,25 @@ export function createOpenAIToolCallStream(
     acceptedIds.clear();
     providerIds.clear();
     bufferedBytes = 0;
+  };
+  const discard = (agentId: string, messageId?: string): void => {
+    for (let i = calls.length - 1; i >= 0; i--) {
+      const call = calls[i];
+      if (
+        call.agentId !== agentId ||
+        (messageId != null && call.messageId !== messageId)
+      )
+        continue;
+      bufferedBytes -= call.bytes;
+      calls.splice(i, 1);
+    }
+    acceptedIds.clear();
+    providerIds.clear();
+    for (const call of calls) {
+      acceptedIds.add(call.acceptedId);
+      if (call.id !== '') providerIds.add(call.id);
+    }
+    acceptedTerminalKind = calls.length > 0 ? 'tool_call' : 'text';
   };
   const abort = (): void => {
     const phaseBeforeAbort = phase;
@@ -118,10 +145,9 @@ export function createOpenAIToolCallStream(
         throw new Error('Accepted model response contains invalid tool calls');
       }
       if (result.toolCalls.length === 0) {
-        // Earlier tool requests were handled inside the graph. They are not
-        // instructions for the client to execute again with the final answer.
-        release();
-        acceptedTerminalKind = 'text';
+        // A text response supersedes this agent's request, never a sibling's.
+        // ToolNode claims also retire calls when no final model response follows.
+        discard(result.agentId);
         return;
       }
       if (result.id.trim() === '' || acceptedIds.has(result.id)) {
@@ -145,8 +171,17 @@ export function createOpenAIToolCallStream(
           call.args,
           maxBytes - bufferedBytes - identityBytes
         );
-        bufferedBytes += identityBytes + Buffer.byteLength(args, 'utf8');
-        calls.push({ id, name: call.name, arguments: args });
+        const bytes = identityBytes + Buffer.byteLength(args, 'utf8');
+        bufferedBytes += bytes;
+        calls.push({
+          id,
+          name: call.name,
+          arguments: args,
+          bytes,
+          agentId: result.agentId,
+          messageId: result.messageId,
+          acceptedId: result.id,
+        });
       }
       acceptedTerminalKind = 'tool_call';
     } catch (error) {
@@ -157,6 +192,21 @@ export function createOpenAIToolCallStream(
 
   return {
     handlers: {
+      [GraphEvents.ON_MODEL_TOOLS_CLAIMED]: {
+        handle: (event, data): void => {
+          if (
+            event !== GraphEvents.ON_MODEL_TOOLS_CLAIMED ||
+            data == null ||
+            !('type' in data) ||
+            data.type !== 'model_tools_claimed'
+          )
+            return;
+          if (phase !== 'open')
+            throw new Error('Tool projection is already finalized');
+          checkCancellation();
+          discard(data.agentId, data.messageId);
+        },
+      },
       [GraphEvents.ON_MODEL_RESPONSE]: {
         handle: (event, data): void => {
           if (
@@ -238,6 +288,9 @@ export function createOpenAIToolCallStream(
             ],
           });
           checkCancellation();
+        }
+        if (tracker != null && acceptedTerminalKind != null) {
+          tracker.lastChunkKind = acceptedTerminalKind;
         }
         phase = 'finished';
       } catch (error) {

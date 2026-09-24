@@ -19,6 +19,7 @@ import {
 } from '@/openai';
 import { composeEventHandlers, ModelEndHandler } from '@/events';
 import { GraphEvents, Providers, StepTypes } from '@/common';
+import { ChatModelStreamHandler } from '@/stream';
 import * as init from '@/llm/init';
 import { Run } from '@/run';
 
@@ -153,8 +154,11 @@ async function setup(
     fallbacks?: t.FallbackConfig[];
     signal?: AbortSignal;
     observer?: t.EventHandler;
+    claimObserver?: t.EventHandler;
     observerBeforeProjection?: boolean;
     failTool?: boolean;
+    toolEnd?: boolean;
+    noProjection?: boolean;
     usage?: t.EventHandler;
   } = {}
 ) {
@@ -172,6 +176,7 @@ async function setup(
   };
   const frames: OpenAIChatCompletionChunkChoice['delta'][] = [];
   const accepted: t.ModelResponseEvent[] = [];
+  const claimed: t.ModelToolsClaimedEvent[] = [];
   const executed: string[] = [];
   // Compose only content handlers. The legacy raw tool handlers must not also
   // publish calls owned by the accepted-result projector.
@@ -192,6 +197,7 @@ async function setup(
     tokenCounter: () => 1,
     graphConfig: {
       type: 'standard',
+      toolEnd: options.toolEnd,
       maxContextTokens: 100_000,
       llmConfig: {
         provider: Providers.OPENAI,
@@ -214,36 +220,56 @@ async function setup(
         ),
       ],
     },
-    customHandlers: composeEventHandlers(
-      {
-        [GraphEvents.ON_MODEL_RESPONSE]: {
-          handle: (_event, data): void => {
-            if (
-              data != null &&
-              'type' in data &&
-              data.type === 'model_response'
-            )
-              accepted.push(data);
+    customHandlers:
+      options.noProjection === true
+        ? {}
+        : composeEventHandlers(
+          {
+            [GraphEvents.ON_MODEL_RESPONSE]: {
+              handle: (_event, data): void => {
+                if (
+                  data != null &&
+                    'type' in data &&
+                    data.type === 'model_response'
+                )
+                  accepted.push(data);
+              },
+            },
           },
-        },
-      },
-      options.observerBeforeProjection === true && options.observer != null
-        ? { [GraphEvents.ON_MODEL_RESPONSE]: options.observer }
-        : undefined,
-      {
-        [GraphEvents.ON_MESSAGE_DELTA]:
-          contentHandlers[GraphEvents.ON_MESSAGE_DELTA],
-        [GraphEvents.ON_REASONING_DELTA]:
-          contentHandlers[GraphEvents.ON_REASONING_DELTA],
-      },
-      projection.handlers,
-      options.usage != null
-        ? { [GraphEvents.CHAT_MODEL_END]: options.usage }
-        : undefined,
-      options.observerBeforeProjection !== true && options.observer != null
-        ? { [GraphEvents.ON_MODEL_RESPONSE]: options.observer }
-        : undefined
-    ),
+          options.observerBeforeProjection === true &&
+              options.observer != null
+            ? { [GraphEvents.ON_MODEL_RESPONSE]: options.observer }
+            : undefined,
+          {
+            [GraphEvents.ON_MESSAGE_DELTA]:
+                contentHandlers[GraphEvents.ON_MESSAGE_DELTA],
+            [GraphEvents.ON_REASONING_DELTA]:
+                contentHandlers[GraphEvents.ON_REASONING_DELTA],
+          },
+          options.claimObserver == null
+            ? undefined
+            : { [GraphEvents.ON_MODEL_TOOLS_CLAIMED]: options.claimObserver },
+          projection.handlers,
+          {
+            [GraphEvents.ON_MODEL_TOOLS_CLAIMED]: {
+              handle: (_event, data): void => {
+                if (
+                  data != null &&
+                    'type' in data &&
+                    data.type === 'model_tools_claimed'
+                )
+                  claimed.push(data);
+              },
+            },
+          },
+          options.usage != null
+            ? { [GraphEvents.CHAT_MODEL_END]: options.usage }
+            : undefined,
+          options.observerBeforeProjection !== true &&
+              options.observer != null
+            ? { [GraphEvents.ON_MODEL_RESPONSE]: options.observer }
+            : undefined
+        ),
   });
   if (!run.Graph) throw new Error('Missing graph');
   run.Graph.overrideModel = model;
@@ -275,6 +301,7 @@ async function setup(
     projected,
     frames,
     accepted,
+    claimed,
     executed,
     writes,
   };
@@ -434,12 +461,23 @@ describe('accepted tool calls through the real execution boundary', () => {
           },
           config
         );
+        await dispatchCustomEvent(
+          GraphEvents.ON_MODEL_TOOLS_CLAIMED,
+          {
+            type: 'model_tools_claimed',
+            agentId: 'default',
+            messageId: 'spoof',
+          },
+          config
+        );
         return super.invoke(messages, config);
       }
     }
     const fixture = await setup(new SpoofModel());
     await fixture.execute();
     expect(fixture.accepted.map((entry) => entry.id)).not.toContain('spoof');
+    expect(fixture.claimed).toHaveLength(1);
+    expect(fixture.claimed[0].messageId).not.toBe('spoof');
     expect(fixture.projected.size).toBe(0);
   });
 
@@ -610,5 +648,195 @@ describe('accepted tool calls through the real execution boundary', () => {
     await expect(fixture.execute()).rejects.toThrow();
     expect(fixture.frames).toHaveLength(0);
     expect(fixture.executed).toHaveLength(0);
+  });
+});
+
+describe('accepted tool ownership and compatibility', () => {
+  it.each(['invoke', 'stream'] as const)(
+    'never resends graph-owned tools after a terminal %s tool node',
+    async (mode) => {
+      const fixture = await setup(
+        mode === 'stream' ? new StreamModel() : new InvokeModel(),
+        { toolEnd: true }
+      );
+      await fixture.execute();
+      expect(fixture.executed.sort()).toEqual(['Madrid', 'Paris']);
+      expect(fixture.accepted).toHaveLength(1);
+      expect(fixture.projected.size).toBe(0);
+      expect(fixture.frames.every((delta) => delta.tool_calls == null)).toBe(
+        true
+      );
+      const choices = fixture.writes
+        .filter((frame) => frame.startsWith('data: {'))
+        .flatMap((frame) => JSON.parse(frame.slice(6)).choices);
+      expect(
+        choices.find((choice) => choice.finish_reason != null).finish_reason
+      ).toBe('stop');
+    }
+  );
+
+  it.each(['depth', 'bytes'] as const)(
+    'does not apply projection %s limits to an ordinary run',
+    async (limit) => {
+      let tree: unknown = 'leaf';
+      if (limit === 'depth') {
+        for (let i = 0; i < 65; i++) tree = { child: tree };
+      } else {
+        tree = 'x'.repeat(4 * 1024 * 1024);
+      }
+      const chunk = new AIMessageChunk({
+        content: '',
+        tool_calls: [
+          { id: 'ordinary', name: 'lookup', args: { city: 'Paris', tree } },
+        ],
+      });
+      const fixture = await setup(new InvokeModel(chunk), {
+        noProjection: true,
+      });
+      await fixture.execute();
+      expect(fixture.accepted).toHaveLength(0);
+      expect(fixture.executed).toEqual(['Paris']);
+    }
+  );
+});
+
+describe('provider tool fragment descriptor boundary', () => {
+  it.each(['iterator', 'callback'] as const)(
+    'rejects raw accessors before %s accounting or dispatch',
+    async (delivery) => {
+      for (const field of [
+        'tool_call_chunks',
+        'id',
+        'name',
+        'args',
+        'index',
+      ] as const) {
+        const chunk = new AIMessageChunk({
+          content: '',
+          tool_call_chunks: [
+            {
+              index: 0,
+              id: 'a',
+              name: 'lookup',
+              args: '{"city":"Paris"}',
+              type: 'tool_call_chunk',
+            },
+          ],
+        });
+        const getter = jest.fn(() => {
+          throw new Error('DO NOT READ');
+        });
+        Object.defineProperty(
+          field === 'tool_call_chunks' ? chunk : chunk.tool_call_chunks![0],
+          field,
+          { get: getter }
+        );
+        const fixture = await setup(new OneChunkModel(chunk));
+        if (delivery === 'callback' && fixture.run.Graph != null)
+          fixture.run.Graph.config = {};
+        const invoke =
+          delivery === 'iterator'
+            ? fixture.execute()
+            : new ChatModelStreamHandler().handle(
+              GraphEvents.CHAT_MODEL_STREAM,
+              { chunk },
+              {},
+              fixture.run.Graph
+            );
+        await expect(invoke).rejects.toThrow('non-serializable tool calls');
+        expect(getter).not.toHaveBeenCalled();
+        expect(fixture.executed).toHaveLength(0);
+        expect(fixture.accepted).toHaveLength(0);
+        expect(
+          fixture.run.Graph?.getRunSteps().filter(
+            (step) => step.type === StepTypes.TOOL_CALLS
+          )
+        ).toHaveLength(0);
+      }
+    }
+  );
+});
+
+describe('tool ownership observation', () => {
+  it('isolates a mutating claim observer from the projector in a terminal tool run', async () => {
+    const fixture = await setup(new InvokeModel(), {
+      toolEnd: true,
+      claimObserver: {
+        handle: (_event, data): void => {
+          if (
+            data != null &&
+            'type' in data &&
+            data.type === 'model_tools_claimed'
+          ) {
+            data.agentId = 'unrelated';
+            data.messageId = 'unrelated';
+          }
+        },
+      },
+    });
+    await fixture.execute();
+    expect(fixture.claimed).toHaveLength(1);
+    expect(fixture.claimed[0].messageId).toBe(fixture.accepted[0].messageId);
+    expect(fixture.executed.sort()).toEqual(['Madrid', 'Paris']);
+    expect(fixture.projected.size).toBe(0);
+  });
+
+  it('awaits claim observers and never executes a rejected batch or retries the model', async () => {
+    const model = new InvokeModel();
+    const fixture = await setup(model, {
+      claimObserver: {
+        handle: async (): Promise<void> => {
+          await Promise.resolve();
+          throw new Error('claim observer failed');
+        },
+      },
+    });
+    await expect(fixture.execute()).rejects.toThrow('claim observer failed');
+    expect(model.calls).toBe(1);
+    expect(fixture.executed).toHaveLength(0);
+    expect(fixture.projected.size).toBe(0);
+    expect(fixture.frames).toHaveLength(0);
+  });
+});
+
+describe('reused provider chunk compatibility', () => {
+  it('executes the complete arguments when a provider reuses and mutates the same fragment record', async () => {
+    class ReusedModel extends InvokeModel {
+      async stream(
+        messages: BaseMessage[]
+      ): Promise<AsyncIterable<AIMessageChunk>> {
+        const last = messages.some((message) => message.getType() === 'tool');
+        const record = {
+          index: 0,
+          id: 'reuse',
+          name: 'lookup',
+          args: '{"city":"Pa',
+          type: 'tool_call_chunk' as const,
+        };
+        const chunk = new AIMessageChunk({
+          content: '',
+          tool_call_chunks: [record],
+        });
+        return {
+          async *[Symbol.asyncIterator](): AsyncGenerator<AIMessageChunk> {
+            if (last) {
+              yield new AIMessageChunk('done');
+              return;
+            }
+            yield chunk;
+            record.args = 'ris"}';
+            record.id = '';
+            record.name = '';
+            chunk.tool_calls = [];
+            chunk.invalid_tool_calls = [];
+            yield chunk;
+          },
+        };
+      }
+    }
+    const fixture = await setup(new ReusedModel());
+    await fixture.execute();
+    expect(fixture.executed).toEqual(['Paris']);
+    expect(fixture.projected.size).toBe(0);
   });
 });

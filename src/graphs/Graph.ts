@@ -2837,6 +2837,25 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     currentToolMap?: t.ToolMap;
     agentContext?: AgentContext;
   }): CustomToolNode<t.BaseGraphState> | ToolNode<t.BaseGraphState> {
+    const onToolCallsClaimed = async (
+      messageId: string,
+      config: RunnableConfig
+    ): Promise<void> => {
+      const handler = this.handlerRegistry?.getHandler(
+        GraphEvents.ON_MODEL_TOOLS_CLAIMED
+      );
+      if (handler == null) return;
+      await handler.handle(
+        GraphEvents.ON_MODEL_TOOLS_CLAIMED,
+        {
+          type: 'model_tools_claimed',
+          agentId: agentContext?.agentId ?? this.defaultAgentId,
+          messageId,
+        },
+        config.metadata,
+        this
+      );
+    };
     const toolDefinitions = agentContext?.toolDefinitions;
     const eventDrivenMode =
       toolDefinitions != null && toolDefinitions.length > 0;
@@ -2924,6 +2943,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           this.config = config;
           this.restoreRunStepResumeState(state);
         },
+        onToolCallsClaimed,
         createRunStepResumeState: (): t.RunStepResumeState =>
           this.createRunStepResumeState(),
         errorHandler: (data, metadata): Promise<boolean> =>
@@ -3006,6 +3026,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         this.config = config;
         this.restoreRunStepResumeState(state);
       },
+      onToolCallsClaimed,
       createRunStepResumeState: (): t.RunStepResumeState =>
         this.createRunStepResumeState(),
     });

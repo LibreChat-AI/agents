@@ -56,6 +56,7 @@ import {
   truncateToolResultContent,
 } from '@/utils/truncation';
 import { resolveToolOutcome, outcomeFieldsFromResult } from '@/tools/intentArg';
+import { snapshotValidatedModelChunk } from '@/graphs/acceptedModelResponse';
 import { TOOL_OUTPUT_REF_PATTERN } from '@/tools/toolOutputReferences';
 import { PreparedSubagentError } from '@/tools/preparedSubagents';
 import { isReasoningContentBlock } from '@/messages/core';
@@ -1643,7 +1644,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
       return;
     }
 
-    const chunk = data.chunk as Partial<AIMessageChunk>;
+    let chunk = data.chunk as Partial<AIMessageChunk>;
 
     /** Attempts stamp their breaker epoch into event metadata; a mismatch
      * marks a straggling chunk from a failed run that outlived
@@ -1680,6 +1681,10 @@ export class ChatModelStreamHandler implements t.EventHandler {
         throw eventBreaker.signal.reason;
       }
     };
+
+    // Callback delivery can beat the producer's iterator. Validate before
+    // accounting, run steps, or eager dispatch reads raw tool descriptors.
+    chunk = snapshotValidatedModelChunk(chunk as AIMessageChunk);
 
     /**
      * Enforced before every content-specific early return below

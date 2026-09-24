@@ -1,5 +1,9 @@
 import { AIMessageChunk } from '@langchain/core/messages';
-import { snapshotAcceptedModelResponse } from './acceptedModelResponse';
+import { snapshotValidatedModelChunk,
+  detachValidatedModelToolCalls,
+  snapshotAcceptedModelResponse } from './acceptedModelResponse';
+import { cloneToolArguments } from '@/utils/acceptedToolArguments';
+import { claimStreamLimitCharge } from '@/llm/streamLimits';
 
 function response(): AIMessageChunk {
   return new AIMessageChunk({
@@ -121,5 +125,93 @@ describe('graph-accepted tool snapshot', () => {
     expect(() =>
       snapshotAcceptedModelResponse(message, 'accepted', 'agent')
     ).toThrow('not JSON serializable');
+  });
+});
+
+describe('execution descriptor validation without projection budgets', () => {
+  it('clones deep JSON iteratively and preserves shared references without expanding them', () => {
+    let tree: Record<string, unknown> = { leaf: true };
+    for (let i = 0; i < 5000; i++) tree = { left: tree, right: tree };
+    const copy = cloneToolArguments(tree);
+    expect(copy).not.toBe(tree);
+    let cursor = copy;
+    for (let i = 0; i < 5000; i++) {
+      expect(cursor.left).toBe(cursor.right);
+      cursor = cursor.left as Record<string, unknown>;
+    }
+    expect(cursor).toEqual({ leaf: true });
+  });
+
+  it('still rejects cycles, sparse arrays, accessors, and proxy traps without reading them', () => {
+    const cycle: Record<string, unknown> = {};
+    cycle.self = cycle;
+    const getter = jest.fn();
+    const get = jest.fn();
+    const accessor = Object.defineProperty({}, 'field', {
+      get: getter,
+      enumerable: true,
+    });
+    for (const value of [
+      cycle,
+      { sparse: new Array(2) },
+      accessor,
+      new Proxy({}, { get }),
+    ]) {
+      expect(() => cloneToolArguments(value)).toThrow('not JSON serializable');
+    }
+    expect(getter).not.toHaveBeenCalled();
+    expect(get).not.toHaveBeenCalled();
+  });
+
+  it.each(['tool_call_chunks', 'invalid_tool_calls'] as const)(
+    'detaches %s from provider-owned records',
+    (field) => {
+      const record = { id: 'a', name: 'lookup', args: '{' };
+      const message = new AIMessageChunk('');
+      Object.defineProperty(message, field, {
+        value: [record],
+        configurable: true,
+      });
+      detachValidatedModelToolCalls(message);
+      record.id = 'changed';
+      expect(message[field]![0].id).toBe('a');
+    }
+  );
+
+  it.each(['tool_call_chunks', 'invalid_tool_calls'] as const)(
+    'rejects indexed accessors and proxy records in %s',
+    (field) => {
+      const get = jest.fn();
+      const list = [{}];
+      Object.defineProperty(list, '0', { get });
+      for (const source of [
+        list,
+        [new Proxy({}, { get })],
+        new Proxy([], { get }),
+      ]) {
+        const message = new AIMessageChunk('');
+        Object.defineProperty(message, field, {
+          value: source,
+          configurable: true,
+        });
+        expect(() => detachValidatedModelToolCalls(message)).toThrow(
+          'non-serializable tool calls'
+        );
+      }
+      expect(get).not.toHaveBeenCalled();
+    }
+  );
+});
+
+describe('snapshot emission identity', () => {
+  it('keeps nested copies on the original producer/consumer charge identity', () => {
+    const original = new AIMessageChunk('');
+    const first = snapshotValidatedModelChunk(original);
+    const second = snapshotValidatedModelChunk(first);
+    const graph = {};
+    expect(claimStreamLimitCharge(graph, original, 'producer', {})).toBe(true);
+    expect(claimStreamLimitCharge(graph, second, 'consumer', {})).toBe(false);
+    expect(claimStreamLimitCharge(graph, first, 'consumer', {})).toBe(true);
+    expect(claimStreamLimitCharge(graph, original, 'producer', {})).toBe(false);
   });
 });

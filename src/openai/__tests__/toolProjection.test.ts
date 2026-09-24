@@ -360,6 +360,7 @@ describe('accepted tool-call projection', () => {
   it('does not infer acceptance from a run-step or model-end callback', () => {
     const { stream, deltas } = setup();
     expect(Object.keys(stream.handlers)).toEqual([
+      GraphEvents.ON_MODEL_TOOLS_CLAIMED,
       GraphEvents.ON_MODEL_RESPONSE,
     ]);
     stream.finish();
@@ -411,5 +412,74 @@ describe('accepted tool-call projection', () => {
   it.each([0, -1, NaN, Infinity, 1.5])('rejects invalid limit %s', (limit) => {
     expect(() => setup({ maxToolCalls: limit })).toThrow('positive safe');
     expect(() => setup({ maxBufferedBytes: limit })).toThrow('positive safe');
+  });
+});
+
+describe('graph tool ownership', () => {
+  it('retires only the claimed agent/message, even when sibling provider IDs collide', async () => {
+    const f = setup();
+    const accept = (
+      agentId: string,
+      messageId: string,
+      id: string,
+      calls: ToolCall[]
+    ) =>
+      f.stream.handlers[GraphEvents.ON_MODEL_RESPONSE].handle(
+        GraphEvents.ON_MODEL_RESPONSE,
+        {
+          type: 'model_response',
+          agentId,
+          messageId,
+          id,
+          toolCalls: calls,
+          invalidToolCalls: [],
+        }
+      );
+    const claim = (agentId: string, messageId: string) =>
+      f.stream.handlers[GraphEvents.ON_MODEL_TOOLS_CLAIMED].handle(
+        GraphEvents.ON_MODEL_TOOLS_CLAIMED,
+        { type: 'model_tools_claimed', agentId, messageId }
+      );
+    await accept('a', 'shared', 'a1', [
+      { id: 'same', name: 'lookup', args: { city: 'Paris' } },
+    ]);
+    await accept('b', 'shared', 'b1', [
+      { id: 'same', name: 'lookup', args: { city: 'Madrid' } },
+    ]);
+    await accept('b', 'next', 'b2', [
+      { id: 'next', name: 'lookup', args: { city: 'Rome' } },
+    ]);
+    await claim('b', 'missing');
+    await claim('b', 'shared');
+    await claim('b', 'shared'); // duplicate delivery is harmless
+    await accept('a', 'answer', 'a2', []);
+    f.stream.finish();
+    expect(
+      [...f.toolCalls.values()].map((call) => call.function.arguments)
+    ).toEqual(['{"city":"Rome"}']);
+  });
+
+  it('releases both byte and call budgets after each graph-owned batch', async () => {
+    const f = setup({ maxToolCalls: 1, maxBufferedBytes: 14 });
+    for (let i = 0; i < 1100; i++) {
+      await f.stream.handlers[GraphEvents.ON_MODEL_RESPONSE].handle(
+        GraphEvents.ON_MODEL_RESPONSE,
+        {
+          type: 'model_response',
+          id: String(i),
+          messageId: String(i),
+          agentId: 'a',
+          toolCalls: [{ id: 'x', name: 'lookup', args: {} }],
+          invalidToolCalls: [],
+        }
+      );
+      await f.stream.handlers[GraphEvents.ON_MODEL_TOOLS_CLAIMED].handle(
+        GraphEvents.ON_MODEL_TOOLS_CLAIMED,
+        { type: 'model_tools_claimed', messageId: String(i), agentId: 'a' }
+      );
+    }
+    f.stream.finish();
+    expect(f.toolCalls.size).toBe(0);
+    expect(f.deltas).toHaveLength(0);
   });
 });

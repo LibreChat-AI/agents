@@ -119,3 +119,86 @@ export function serializeToolArguments(
   encode(value, 0);
   return parts.join('');
 }
+
+/** Detach JSON data without encoding it. Unlike projection, invocation has no
+ * formatting budget: preserve shared references and traverse iteratively so a
+ * deep or alias-heavy object cannot expand exponentially during validation.
+ */
+export function cloneToolArguments(value: unknown): Record<string, unknown> {
+  const copies = new Map<object, object>();
+  const ancestors = new Set<object>();
+  const stack: Array<{
+    input: object;
+    output: object;
+    keys: (string | symbol)[];
+    index: number;
+  }> = [];
+  const copy = (input: unknown): unknown => {
+    if (
+      input === null ||
+      typeof input === 'string' ||
+      typeof input === 'boolean'
+    )
+      return input;
+    if (typeof input === 'number') {
+      if (!Number.isFinite(input)) invalid();
+      return input;
+    }
+    if (
+      typeof input !== 'object' ||
+      types.isProxy(input) ||
+      ancestors.has(input)
+    )
+      invalid();
+    const existing = copies.get(input);
+    if (existing != null) return existing;
+    const array = Array.isArray(input);
+    if (!hasJSONPrototype(input, array)) invalid();
+    const keys = Reflect.ownKeys(input);
+    if (array && keys.length !== input.length + 1) invalid();
+    const output: object = array ? [] : {};
+    copies.set(input, output);
+    ancestors.add(input);
+    stack.push({
+      input,
+      output,
+      keys: array ? keys.filter((key) => key !== 'length') : keys,
+      index: 0,
+    });
+    return output;
+  };
+  if (
+    value == null ||
+    typeof value !== 'object' ||
+    types.isProxy(value) ||
+    Array.isArray(value)
+  )
+    invalid();
+  const result = copy(value) as Record<string, unknown>;
+  while (stack.length > 0) {
+    const frame = stack[stack.length - 1];
+    if (frame.index === frame.keys.length) {
+      ancestors.delete(frame.input);
+      stack.pop();
+      continue;
+    }
+    const key = frame.keys[frame.index++];
+    if (typeof key !== 'string') invalid();
+    if (Array.isArray(frame.input) && key !== String(frame.index - 1))
+      invalid();
+    const descriptor = Object.getOwnPropertyDescriptor(frame.input, key);
+    if (
+      descriptor == null ||
+      !('value' in descriptor) ||
+      descriptor.enumerable !== true
+    )
+      invalid();
+    Object.defineProperty(frame.output, key, {
+      value: copy(descriptor.value),
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
+  }
+  return result;
+}

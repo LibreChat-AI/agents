@@ -43,6 +43,7 @@ import {
 } from '@/llm/preempt';
 import {
   detachValidatedModelToolCalls,
+  snapshotValidatedModelChunk,
   InvalidModelToolCallError,
 } from '@/graphs/acceptedModelResponse';
 import {
@@ -1110,9 +1111,9 @@ async function attemptInvokeBody(
           const attemptMetadata = config.metadata as
             | Record<string, unknown>
             | undefined;
-          for await (const chunk of stream) {
+          for await (const rawChunk of stream) {
             throwIfBreakerTripped();
-            detachValidatedModelToolCalls(chunk);
+            const chunk = snapshotValidatedModelChunk(rawChunk);
             /** An onChunk consumer replaces the stream handler entirely, so
              * stream limits are enforced here for every such caller — public
              * package consumers get no other accounting. The internal
@@ -1137,9 +1138,9 @@ async function attemptInvokeBody(
             | Record<string, unknown>
             | undefined;
           const streamHandler = new ChatModelStreamHandler();
-          for await (const chunk of stream) {
+          for await (const rawChunk of stream) {
             throwIfBreakerTripped();
-            detachValidatedModelToolCalls(chunk);
+            const chunk = snapshotValidatedModelChunk(rawChunk);
             /**
              * The decision is final, so stop consuming here rather than
              * trusting the adapter to honor the abort. An adapter that ignores
@@ -1259,9 +1260,9 @@ async function attemptInvokeBody(
            * once per attempt, only when a transformation occurs.
            */
           let redispatchMetadata: Record<string, unknown> | undefined;
-          for await (const chunk of stream) {
+          for await (const rawChunk of stream) {
             throwIfBreakerTripped();
-            detachValidatedModelToolCalls(chunk);
+            const chunk = snapshotValidatedModelChunk(rawChunk);
             /**
              * Charged synchronously, ahead of the decoupled `streamEvents`
              * reader that will echo this same chunk to the registered handler:

@@ -11,6 +11,16 @@ import type { RunnableConfig, Runnable } from '@langchain/core/runnables';
 import type { ChatGenerationChunk } from '@langchain/core/outputs';
 import type { GoogleAIToolType } from '@langchain/google-common';
 import type {
+  RunStep,
+  ModelResponseEvent,
+  ModelToolsClaimedEvent,
+  RunStepDeltaEvent,
+  RunStepResumeState,
+  RunStepClosedEvent,
+  MessageDeltaEvent,
+  ReasoningDeltaEvent,
+} from '@/types/stream';
+import type {
   SummarizationNodeInput,
   SummarizeCompleteEvent,
   CompactionSemanticIndex,
@@ -18,15 +28,6 @@ import type {
   SummarizeStartEvent,
   SummarizeDeltaEvent,
 } from '@/types/summarize';
-import type {
-  RunStep,
-  ModelResponseEvent,
-  RunStepDeltaEvent,
-  RunStepResumeState,
-  RunStepClosedEvent,
-  MessageDeltaEvent,
-  ReasoningDeltaEvent,
-} from '@/types/stream';
 import type {
   ToolMap,
   ToolSessionMap,
@@ -204,6 +205,7 @@ export interface EventHandler {
       | StreamEventData
       | ModelEndData
       | ModelResponseEvent
+      | ModelToolsClaimedEvent
       | RunStep
       | RunStepDeltaEvent
       | RunStepClosedEvent
