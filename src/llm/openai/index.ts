@@ -1300,12 +1300,19 @@ function getOpenAIChatCompletionChunk(
 async function* filterOpenAIChatCompletionStream(
   stream: AsyncIterable<OpenAIChatCompletionStreamItem>
 ): AsyncGenerator<OpenAIChatCompletionChunk> {
+  let sawFinishReason = false;
   for await (const item of stream) {
     const chunk = getOpenAIChatCompletionChunk(item);
     if (chunk == null) {
       continue;
     }
+    if (chunk.choices.some((choice) => choice.finish_reason != null)) {
+      sawFinishReason = true;
+    }
     yield chunk;
+  }
+  if (!sawFinishReason) {
+    throw new Error('OpenAI-compatible stream ended before completion');
   }
 }
 
