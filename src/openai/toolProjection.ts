@@ -60,7 +60,10 @@ export function createOpenAIToolCallStream(
   const toolCalls = tracker?.toolCalls ?? config.toolCalls;
   if (toolCalls == null)
     throw new Error('Provide a tracker or a tool-call map');
+  if (toolCalls.size !== 0)
+    throw new Error('Tool projection requires an empty output map');
   let previousChunkKind: OpenAIStreamTracker['lastChunkKind'];
+  let acceptedTerminalKind: OpenAIStreamTracker['lastChunkKind'];
   const maxCalls = positiveLimit(config.maxToolCalls, 1024);
   const maxBytes = positiveLimit(config.maxBufferedBytes, 4 * 1024 * 1024);
   const calls: Array<{ id: string; name: string; arguments: string }> = [];
@@ -114,7 +117,10 @@ export function createOpenAIToolCallStream(
       if (result.invalidToolCalls.length > 0) {
         throw new Error('Accepted model response contains invalid tool calls');
       }
-      if (result.toolCalls.length === 0) return;
+      if (result.toolCalls.length === 0) {
+        acceptedTerminalKind = 'text';
+        return;
+      }
       if (result.id.trim() === '' || acceptedIds.has(result.id)) {
         throw new Error('Missing or repeated accepted model response identity');
       }
@@ -139,6 +145,7 @@ export function createOpenAIToolCallStream(
         bufferedBytes += identityBytes + Buffer.byteLength(args, 'utf8');
         calls.push({ id, name: call.name, arguments: args });
       }
+      acceptedTerminalKind = 'tool_call';
     } catch (error) {
       abort();
       throw error;
@@ -167,6 +174,10 @@ export function createOpenAIToolCallStream(
       previousChunkKind = tracker?.lastChunkKind;
       phase = 'emitting';
       try {
+        if (toolCalls.size !== 0)
+          throw new Error(
+            'Tool projection output was modified during collection'
+          );
         // Do not allocate synthetic IDs until every accepted response has arrived.
         // This reserves provider IDs even when they occur in a later invocation.
         const usedIds = new Set<string>();
@@ -206,7 +217,11 @@ export function createOpenAIToolCallStream(
           checkCancellation();
           const call = ready[index];
           toolCalls.set(index, call);
-          if (tracker != null) tracker.lastChunkKind = 'tool_call';
+          if (tracker != null) {
+            // Tools are buffered history. Flushing them after a final answer must
+            // not turn that answer back into a request to execute the tools again.
+            tracker.lastChunkKind = acceptedTerminalKind;
+          }
           emitDelta({
             tool_calls: [
               {

@@ -161,9 +161,11 @@ For hosts that need stable OpenAI-compatible tool calls across graph invocations
 `handlers` to `Run.create({ customHandlers })` (compose with other host handlers
 using `composeEventHandlers`). Streaming hosts pass `{ tracker, emit }`, sharing
 `createOpenAIStreamTracker()` with `sendOpenAIFinalChunk`. The projector emits the
-initial assistant role if needed and marks successfully projected tool chunks in
-that tracker, so the standard finalizer emits `tool_calls`, not `stop`. Assistant
-text emitted afterward can still change the finish reason back to `stop`.
+initial assistant role if needed. Terminal state follows accepted model-response
+order, not the deferred tool-chunk flush: a tool → tool-result → final-answer run
+ends with `stop`, even though buffered tool history is emitted last. A last
+accepted response requesting tools ends with `tool_calls`. Assistant text emitted
+after projection can still change the finish reason back to `stop`.
 Map-only `{ toolCalls }` is for non-streaming collection or custom finalization;
 never compose the legacy raw tool-call handlers with this accepted-result handler,
 which would publish the same tools twice. The graph delivers `ON_MODEL_RESPONSE`
@@ -183,10 +185,15 @@ interrupt, call `abort()` and discard this projector. Checkpoint resume requires
 fresh projector; this helper is not a durable delivery/replay protocol. A new
 projector is required for each API response, including reuse of a `Run` instance.
 
+Each projector must own a fresh, empty output map (including a tracker's map).
+Reusing nonempty output is rejected without clearing the old response. A second
+writer during collection aborts projection rather than mixing response histories.
+
 The accepted-result graph boundary inspects original tool-call descriptors and
 validates argument trees **before** cloning can invoke getters or flatten class
 instances. The graph snapshot is capped at 1,024 calls and 4 MiB per accepted
-model response. Composed observers receive independent copies of that validated
+model response. Invalid-tool diagnostics are rejected before copying their
+contents; malformed/accessor-backed tool arrays cannot bypass snapshot limits. Composed observers receive independent copies of that validated
 snapshot, so their ordering cannot change what the projector publishes or the
 arguments tools execute. Copy work is linear in the number of observers and
 bounded snapshot bytes. Synthetic IDs are assigned only at completion, after

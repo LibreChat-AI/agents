@@ -41,6 +41,30 @@ function setup(
 }
 
 describe('accepted tool-call projection', () => {
+  it('rejects a reused nonempty result map without destroying prior output', () => {
+    const previous: OpenAIToolCall = {
+      id: 'old',
+      type: 'function',
+      function: { name: 'lookup', arguments: '{}' },
+    };
+    const toolCalls = new Map([[42, previous]]);
+    expect(() => createOpenAIToolCallStream({ toolCalls })).toThrow('empty');
+    expect(toolCalls.get(42)).toBe(previous);
+  });
+
+  it('fails closed if another writer populates the map during collection', () => {
+    const { stream, toolCalls, deltas } = setup();
+    toolCalls.set(42, {
+      id: 'other',
+      type: 'function',
+      function: { name: 'lookup', arguments: '{}' },
+    });
+    expect(() => stream.finish()).toThrow('modified');
+    expect(deltas).toHaveLength(0);
+    expect(toolCalls.size).toBe(0);
+    expect(() => stream.finish()).toThrow('aborted');
+  });
+
   it('rejects invalid runtime IDs without leaking the value', () => {
     const { accept, stream } = setup();
     // @ts-expect-error Custom JS models can violate the native tool-call contract.

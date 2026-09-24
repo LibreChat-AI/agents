@@ -14,8 +14,40 @@ export function snapshotAcceptedModelResponse(
   id: string,
   agentId: string
 ): ModelResponseEvent {
-  const source = finalResponse.tool_calls ?? [];
-  if (types.isProxy(source) || source.length > MAX_SNAPSHOT_CALLS) {
+  // Read own data descriptors, not accessors supplied by a custom model. Invalid
+  // diagnostics are rejected in O(1); cloning them can run getters and bypass
+  // the valid-call snapshot's byte/count limits.
+  if (types.isProxy(finalResponse)) {
+    throw new Error(
+      'Accepted model response contains non-serializable tool calls'
+    );
+  }
+  const calls = Object.getOwnPropertyDescriptor(finalResponse, 'tool_calls');
+  const diagnostics = Object.getOwnPropertyDescriptor(
+    finalResponse,
+    'invalid_tool_calls'
+  );
+  const readArray = (descriptor: PropertyDescriptor | undefined): unknown[] => {
+    if (descriptor === undefined) return [];
+    if (!('value' in descriptor)) {
+      throw new Error(
+        'Accepted model response contains non-serializable tool calls'
+      );
+    }
+    const value: unknown = descriptor.value;
+    if (value === undefined) return [];
+    if (types.isProxy(value) || !Array.isArray(value)) {
+      throw new Error(
+        'Accepted model response contains non-serializable tool calls'
+      );
+    }
+    return value;
+  };
+  if (readArray(diagnostics).length > 0) {
+    throw new Error('Accepted model response contains invalid tool calls');
+  }
+  const source = readArray(calls);
+  if (source.length > MAX_SNAPSHOT_CALLS) {
     throw new Error('Accepted model response exceeds snapshot limits');
   }
   const toolCalls: ToolCall[] = [];
@@ -70,13 +102,11 @@ export function snapshotAcceptedModelResponse(
       type: 'tool_call',
     });
   }
-  let invalidToolCalls: ModelResponseEvent['invalidToolCalls'];
-  try {
-    invalidToolCalls = structuredClone(finalResponse.invalid_tool_calls ?? []);
-  } catch {
-    throw new Error(
-      'Accepted model response contains non-serializable tool calls'
-    );
-  }
-  return { type: 'model_response', id, agentId, toolCalls, invalidToolCalls };
+  return {
+    type: 'model_response',
+    id,
+    agentId,
+    toolCalls,
+    invalidToolCalls: [],
+  };
 }

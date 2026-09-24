@@ -32,12 +32,13 @@ function setup(mode?: 'throw' | 'abort') {
       if (mode === 'abort') projection.abort();
     },
   });
+  let acceptedSequence = 0;
   const accept = (toolCalls: ModelResponseEvent['toolCalls']) =>
     projection.handlers[GraphEvents.ON_MODEL_RESPONSE].handle(
       GraphEvents.ON_MODEL_RESPONSE,
       {
         type: 'model_response',
-        id: 'accepted',
+        id: `accepted-${++acceptedSequence}`,
         agentId: 'agent',
         toolCalls,
         invalidToolCalls: [],
@@ -60,6 +61,26 @@ function terminal(writes: string[]) {
 }
 
 describe('accepted projector with public OpenAI finalizer', () => {
+  it('preserves text accepted after tool execution when tool history is emitted last', async () => {
+    const f = setup();
+    await f.accept([{ id: 'call', name: 'lookup', args: {} }]);
+    await f.text();
+    await f.accept([]); // final-answer acceptance, before processStream returns
+    f.projection.finish();
+    await sendOpenAIFinalChunk(f.config);
+    expect(terminal(f.writes).choices[0].finish_reason).toBe('stop');
+  });
+
+  it('retains tool_calls when the last accepted response requests a new tool', async () => {
+    const f = setup();
+    await f.text();
+    await f.accept([]);
+    await f.accept([{ id: 'call', name: 'lookup', args: {} }]);
+    f.projection.finish();
+    await sendOpenAIFinalChunk(f.config);
+    expect(terminal(f.writes).choices[0].finish_reason).toBe('tool_calls');
+  });
+
   it('requires a real sink before taking ownership of streaming tracker state', () => {
     const tracker = createOpenAIStreamTracker();
     expect(() =>

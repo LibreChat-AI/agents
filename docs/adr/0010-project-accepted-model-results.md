@@ -52,9 +52,14 @@ exotic objects rather than silently converting them, supports cross-realm plain
 objects, and bounds both nesting and encoded bytes during traversal. The per-run
 byte bound includes the expansion of repeated references; cycles fail.
 
-Streaming projection and the public OpenAI finalizer share one tracker. Projected
-tool chunks update its last-chunk state and initialize the assistant role once.
-Later assistant text can still restore a stop finish reason. Map-only collection
+Streaming projection and the public OpenAI finalizer share one tracker. Terminal
+state comes from accepted-response chronology, not the deferred tool-history
+flush. A final text response therefore stays `stop`; it must not become a request
+to execute historical tools again. The initial assistant role is emitted once.
+Later assistant text can still restore a stop finish reason. Each projector owns
+an initially empty result map; mixed writers and stale maps fail closed. Invalid
+model diagnostics are rejected before copying so they cannot bypass snapshot
+limits or execute getters. Map-only collection
 remains available for non-streaming/custom finalization. Hosts must not also attach
 legacy raw tool handlers to this path.
 

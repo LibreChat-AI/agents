@@ -13,6 +13,7 @@ import type * as t from '@/types';
 import {
   createOpenAIToolCallStream,
   createOpenAIStreamTracker,
+  createOpenAIHandlers,
   createChatCompletionChunk,
   sendOpenAIFinalChunk,
 } from '@/openai';
@@ -161,6 +162,9 @@ async function setup(
   const frames: OpenAIChatCompletionChunkChoice['delta'][] = [];
   const accepted: t.ModelResponseEvent[] = [];
   const executed: string[] = [];
+  // Compose only content handlers. The legacy raw tool handlers must not also
+  // publish calls owned by the accepted-result projector.
+  const contentHandlers = createOpenAIHandlers(wireConfig);
   const projection = createOpenAIToolCallStream({
     tracker,
     signal: options.signal,
@@ -215,6 +219,12 @@ async function setup(
       options.observerBeforeProjection === true && options.observer != null
         ? { [GraphEvents.ON_MODEL_RESPONSE]: options.observer }
         : undefined,
+      {
+        [GraphEvents.ON_MESSAGE_DELTA]:
+          contentHandlers[GraphEvents.ON_MESSAGE_DELTA],
+        [GraphEvents.ON_REASONING_DELTA]:
+          contentHandlers[GraphEvents.ON_REASONING_DELTA],
+      },
       projection.handlers,
       options.usage != null
         ? { [GraphEvents.CHAT_MODEL_END]: options.usage }
@@ -446,7 +456,11 @@ describe('accepted tool calls through the real execution boundary', () => {
         .slice(0, -1)
         .map((frame) => JSON.parse(frame.slice(6)))
         .find((chunk) => chunk.choices[0]?.finish_reason != null);
-      expect(terminal.choices[0].finish_reason).toBe('tool_calls');
+      // These tools already ran server-side; the accepted final response is text.
+      expect(terminal.choices[0].finish_reason).toBe('stop');
+      expect(
+        fixture.writes.some((frame) => frame.includes('"content":"done"'))
+      ).toBe(true);
       expect(fixture.writes.at(-1)).toBe('data: [DONE]\n\n');
       expect(fixture.accepted).toHaveLength(2); // tools, then the final answer
       expect(new Set(fixture.accepted.map((result) => result.id)).size).toBe(2);
