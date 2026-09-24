@@ -1112,7 +1112,7 @@ async function attemptInvokeBody(
             | undefined;
           for await (const chunk of stream) {
             throwIfBreakerTripped();
-            detachValidatedModelToolCalls(chunk, true);
+            detachValidatedModelToolCalls(chunk);
             /** An onChunk consumer replaces the stream handler entirely, so
              * stream limits are enforced here for every such caller — public
              * package consumers get no other accounting. The internal
@@ -1139,7 +1139,7 @@ async function attemptInvokeBody(
           const streamHandler = new ChatModelStreamHandler();
           for await (const chunk of stream) {
             throwIfBreakerTripped();
-            detachValidatedModelToolCalls(chunk, true);
+            detachValidatedModelToolCalls(chunk);
             /**
              * The decision is final, so stop consuming here rather than
              * trusting the adapter to honor the abort. An adapter that ignores
@@ -1261,7 +1261,7 @@ async function attemptInvokeBody(
           let redispatchMetadata: Record<string, unknown> | undefined;
           for await (const chunk of stream) {
             throwIfBreakerTripped();
-            detachValidatedModelToolCalls(chunk, true);
+            detachValidatedModelToolCalls(chunk);
             /**
              * Charged synchronously, ahead of the decoupled `streamEvents`
              * reader that will echo this same chunk to the registered handler:

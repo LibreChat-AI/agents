@@ -14,15 +14,12 @@ export class InvalidModelToolCallError extends Error {
   }
 }
 
-/** Detach calls before stream handlers, run-step dispatch, or prestarts read them.
- * Partial streams may carry invalid diagnostics that become valid in later chunks.
+/** Detach executable calls before dispatch. Invalid diagnostics remain available
+ * for ToolNode to synthesize paired error results; accepted projection rejects them.
  */
-export function detachValidatedModelToolCalls(
-  message: AIMessageChunk,
-  partial = false
-): void {
+export function detachValidatedModelToolCalls(message: AIMessageChunk): void {
   try {
-    message.tool_calls = snapshotToolCalls(message, partial);
+    message.tool_calls = snapshotToolCalls(message, true);
   } catch (error) {
     throw new InvalidModelToolCallError(
       error instanceof Error
@@ -37,7 +34,7 @@ export function detachValidatedModelToolCalls(
  */
 function snapshotToolCalls(
   finalResponse: AIMessageChunk,
-  partial: boolean
+  allowInvalidDiagnostics: boolean
 ): ToolCall[] {
   // Read own data descriptors, not accessors supplied by a custom model. Invalid
   // diagnostics are rejected in O(1); cloning them can run getters and bypass
@@ -68,7 +65,7 @@ function snapshotToolCalls(
     }
     return value;
   };
-  if (readArray(diagnostics).length > 0 && !partial) {
+  if (readArray(diagnostics).length > 0 && !allowInvalidDiagnostics) {
     throw new Error('Accepted model response contains invalid tool calls');
   }
   const source = readArray(calls);
