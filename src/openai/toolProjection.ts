@@ -4,8 +4,8 @@ import type {
   OpenAIStreamTracker,
 } from './index';
 import type { EventHandler, ModelResponseEvent } from '@/types';
-import { GraphEvents } from '@/common';
 import { serializeToolArguments } from './arguments';
+import { GraphEvents } from '@/common';
 
 interface OpenAIToolCallStreamOptions {
   /** Synchronous framing only. Async transport/backpressure is a separate boundary. */
@@ -118,6 +118,9 @@ export function createOpenAIToolCallStream(
         throw new Error('Accepted model response contains invalid tool calls');
       }
       if (result.toolCalls.length === 0) {
+        // Earlier tool requests were handled inside the graph. They are not
+        // instructions for the client to execute again with the final answer.
+        release();
         acceptedTerminalKind = 'text';
         return;
       }
@@ -217,11 +220,7 @@ export function createOpenAIToolCallStream(
           checkCancellation();
           const call = ready[index];
           toolCalls.set(index, call);
-          if (tracker != null) {
-            // Tools are buffered history. Flushing them after a final answer must
-            // not turn that answer back into a request to execute the tools again.
-            tracker.lastChunkKind = acceptedTerminalKind;
-          }
+          if (tracker != null) tracker.lastChunkKind = acceptedTerminalKind;
           emitDelta({
             tool_calls: [
               {

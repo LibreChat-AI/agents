@@ -1,11 +1,11 @@
 import { z } from 'zod';
 import { tool } from '@langchain/core/tools';
-import { dispatchCustomEvent } from '@langchain/core/callbacks/dispatch';
 import { RunnableLambda } from '@langchain/core/runnables';
-import { FakeListChatModel } from '@langchain/core/utils/testing';
 import { ChatGenerationChunk } from '@langchain/core/outputs';
-import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
+import { FakeListChatModel } from '@langchain/core/utils/testing';
 import { AIMessageChunk, HumanMessage } from '@langchain/core/messages';
+import { dispatchCustomEvent } from '@langchain/core/callbacks/dispatch';
+import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
 import type { BaseMessage, UsageMetadata } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { OpenAIChatCompletionChunkChoice } from '@/openai';
@@ -18,7 +18,7 @@ import {
   sendOpenAIFinalChunk,
 } from '@/openai';
 import { composeEventHandlers, ModelEndHandler } from '@/events';
-import { GraphEvents, Providers } from '@/common';
+import { GraphEvents, Providers, StepTypes } from '@/common';
 import * as init from '@/llm/init';
 import { Run } from '@/run';
 
@@ -43,6 +43,17 @@ class InvokeModel implements t.ChatModel {
     return messages.some((message) => message.getType() === 'tool')
       ? new AIMessageChunk('done')
       : this.response;
+  }
+}
+
+class OneChunkModel extends InvokeModel {
+  async stream(): Promise<AsyncIterable<AIMessageChunk>> {
+    const response = this.response;
+    return {
+      async *[Symbol.asyncIterator](): AsyncGenerator<AIMessageChunk> {
+        yield response;
+      },
+    };
   }
 }
 
@@ -302,6 +313,54 @@ describe('accepted tool calls through the real execution boundary', () => {
     expect(fixture.frames).toHaveLength(0);
   });
 
+  it.each(['invoke', 'stream'] as const)(
+    'rejects collection, ID and name accessors before %s run steps',
+    async (mode) => {
+      for (const field of ['tool_calls', 'id', 'name', 'args'] as const) {
+        const reply = toolsReply();
+        const getter = jest.fn(() => 'SENSITIVE');
+        const target = field === 'tool_calls' ? reply : reply.tool_calls![0];
+        Object.defineProperty(target, field, { get: getter });
+        const fixture = await setup(
+          mode === 'stream' ? new OneChunkModel(reply) : new InvokeModel(reply)
+        );
+        await expect(fixture.execute()).rejects.toThrow(
+          'non-serializable tool calls'
+        );
+        expect(getter).not.toHaveBeenCalled();
+        expect(
+          fixture.run.Graph?.getRunSteps().filter(
+            (step) => step.type === StepTypes.TOOL_CALLS
+          )
+        ).toHaveLength(0);
+        expect(fixture.executed).toHaveLength(0);
+        expect(fixture.accepted).toHaveLength(0);
+        expect(fixture.frames).toHaveLength(0);
+      }
+    }
+  );
+
+  it('does not retry invalid descriptors through a fallback provider', async () => {
+    const reply = toolsReply();
+    const getter = jest.fn(() => 'SENSITIVE');
+    Object.defineProperty(reply.tool_calls![0], 'id', { get: getter });
+    const fixture = await setup(new InvokeModel(reply), {
+      fallbacks: [{ provider: Providers.OPENAI, maxContextTokens: 100_000 }],
+    });
+    const fallback = jest.spyOn(init, 'initializeModel');
+    await expect(fixture.execute()).rejects.toThrow(
+      'non-serializable tool calls'
+    );
+    expect(fallback).not.toHaveBeenCalled();
+    expect(getter).not.toHaveBeenCalled();
+    expect(
+      fixture.run.Graph?.getRunSteps().filter(
+        (step) => step.type === StepTypes.TOOL_CALLS
+      )
+    ).toHaveLength(0);
+    expect(fixture.executed).toHaveLength(0);
+  });
+
   it('rejects accessor arguments before clone without executing a stateful getter', async () => {
     const getter = jest.fn(() => 'other');
     const reply = toolsReply();
@@ -350,9 +409,10 @@ describe('accepted tool calls through the real execution boundary', () => {
     });
     await fixture.execute();
     expect(fixture.executed.sort()).toEqual(['Madrid', 'Paris']);
-    expect(
-      [...fixture.projected.values()].map((call) => call.function.arguments)
-    ).toEqual(['{"city":"Paris"}', '{"city":"Madrid"}']);
+    expect(fixture.projected.size).toBe(0);
+    expect(fixture.frames.every((delta) => delta.tool_calls == null)).toBe(
+      true
+    );
   });
 
   it('does not accept provider/tool custom events as authoritative graph results', async () => {
@@ -380,10 +440,7 @@ describe('accepted tool calls through the real execution boundary', () => {
     const fixture = await setup(new SpoofModel());
     await fixture.execute();
     expect(fixture.accepted.map((entry) => entry.id)).not.toContain('spoof');
-    expect([...fixture.projected.values()].map((call) => call.id)).toEqual([
-      'a',
-      'b',
-    ]);
+    expect(fixture.projected.size).toBe(0);
   });
 
   it('rejects malformed finalized results before the tool node can run', async () => {
@@ -411,7 +468,7 @@ describe('accepted tool calls through the real execution boundary', () => {
       usage: new ModelEndHandler(usage),
     });
     await fixture.execute();
-    expect(fixture.projected.size).toBe(2);
+    expect(fixture.projected.size).toBe(0);
     expect(fixture.accepted).toHaveLength(2);
     expect(usage).toHaveLength(2);
     expect(usage.reduce((total, entry) => total + entry.total_tokens, 0)).toBe(
@@ -423,8 +480,8 @@ describe('accepted tool calls through the real execution boundary', () => {
     const a = await setup(new StreamModel());
     const b = await setup(new StreamModel());
     await Promise.all([a.execute(), b.execute()]);
-    expect(a.projected.size).toBe(2);
-    expect(b.projected.size).toBe(2);
+    expect(a.projected.size).toBe(0);
+    expect(b.projected.size).toBe(0);
     expect(
       a.accepted
         .map((event) => event.id)
@@ -433,24 +490,18 @@ describe('accepted tool calls through the real execution boundary', () => {
   });
 
   it.each(['stream', 'invoke'])(
-    'projects the final parallel calls through %s without manual event metadata',
+    'omits completed parallel %s tool calls from the final answer',
     async (mode) => {
       const fixture = await setup(
         mode === 'stream' ? new StreamModel() : new InvokeModel()
       );
       await fixture.execute();
-      expect([...fixture.projected.values()]).toEqual([
-        {
-          id: 'a',
-          type: 'function',
-          function: { name: 'lookup', arguments: '{"city":"Paris"}' },
-        },
-        {
-          id: 'b',
-          type: 'function',
-          function: { name: 'lookup', arguments: '{"city":"Madrid"}' },
-        },
-      ]);
+      // The SDK executed these calls before producing the text answer. Never
+      // reconstruct client-facing tool_calls, irrespective of finish_reason.
+      expect(fixture.projected.size).toBe(0);
+      expect(fixture.frames.every((delta) => delta.tool_calls == null)).toBe(
+        true
+      );
       expect(fixture.executed.sort()).toEqual(['Madrid', 'Paris']);
       const terminal = fixture.writes
         .slice(0, -1)
@@ -468,7 +519,7 @@ describe('accepted tool calls through the real execution boundary', () => {
   );
 
   it.each(['tools', 'text'])(
-    'projects only the successful %s fallback after a partial primary stream',
+    'publishes no completed tools after the successful %s fallback',
     async (kind) => {
       const fixture = await setup(new FailedStream(), {
         fallbacks: [
@@ -490,9 +541,7 @@ describe('accepted tool calls through the real execution boundary', () => {
         );
       await fixture.execute();
       expect(fallback.calls).toBeGreaterThan(0);
-      expect([...fixture.projected.values()].map((call) => call.id)).toEqual(
-        kind === 'tools' ? ['a', 'b'] : []
-      );
+      expect(fixture.projected.size).toBe(0);
       expect(
         fixture.accepted
           .flatMap((event) => event.toolCalls)
@@ -525,9 +574,7 @@ describe('accepted tool calls through the real execution boundary', () => {
     });
     await fixture.execute();
     expect(fixture.executed.sort()).toEqual(['Madrid', 'Paris']);
-    expect(fixture.projected.get(0)?.function.arguments).toBe(
-      '{"city":"Paris"}'
-    );
+    expect(fixture.projected.size).toBe(0);
   });
 
   it('awaits the accepted-result observer and propagates rejection before tool execution', async () => {

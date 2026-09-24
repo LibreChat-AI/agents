@@ -42,6 +42,10 @@ import {
   resolveRestartGraceMs,
 } from '@/llm/preempt';
 import {
+  detachValidatedModelToolCalls,
+  InvalidModelToolCallError,
+} from '@/graphs/acceptedModelResponse';
+import {
   assertPreparedProviderRequestFor,
   prepareProviderRequest,
 } from '@/llm/prepareProviderRequest';
@@ -1079,7 +1083,8 @@ async function attemptInvokeBody(
       const signal = config.signal;
       if (
         signal?.aborted === true &&
-        (signal.reason instanceof StreamLimitExceededError || signal.reason instanceof PreparedSubagentError)
+        (signal.reason instanceof StreamLimitExceededError ||
+          signal.reason instanceof PreparedSubagentError)
       ) {
         throw signal.reason;
       }
@@ -1107,6 +1112,7 @@ async function attemptInvokeBody(
             | undefined;
           for await (const chunk of stream) {
             throwIfBreakerTripped();
+            detachValidatedModelToolCalls(chunk, true);
             /** An onChunk consumer replaces the stream handler entirely, so
              * stream limits are enforced here for every such caller — public
              * package consumers get no other accounting. The internal
@@ -1127,10 +1133,13 @@ async function attemptInvokeBody(
             });
           }
         } else if (registeredStreamHandler == null) {
-          const metadata = config.metadata as Record<string, unknown> | undefined;
+          const metadata = config.metadata as
+            | Record<string, unknown>
+            | undefined;
           const streamHandler = new ChatModelStreamHandler();
           for await (const chunk of stream) {
             throwIfBreakerTripped();
+            detachValidatedModelToolCalls(chunk, true);
             /**
              * The decision is final, so stop consuming here rather than
              * trusting the adapter to honor the abort. An adapter that ignores
@@ -1239,7 +1248,9 @@ async function attemptInvokeBody(
             }
           }
         } else {
-          const metadata = config.metadata as Record<string, unknown> | undefined;
+          const metadata = config.metadata as
+            | Record<string, unknown>
+            | undefined;
           /**
            * The original wire chunk still reaches the registered handler through
            * `streamEvents` (where the late-reasoning skip discards it AFTER the
@@ -1250,6 +1261,7 @@ async function attemptInvokeBody(
           let redispatchMetadata: Record<string, unknown> | undefined;
           for await (const chunk of stream) {
             throwIfBreakerTripped();
+            detachValidatedModelToolCalls(chunk, true);
             /**
              * Charged synchronously, ahead of the decoupled `streamEvents`
              * reader that will echo this same chunk to the registered handler:
@@ -1258,7 +1270,11 @@ async function attemptInvokeBody(
              * throws. The chunk is marked so the echo skips accounting.
              */
             if (context != null) {
-              enforceStreamLimitsForWireChunk({ graph: context, metadata, chunk });
+              enforceStreamLimitsForWireChunk({
+                graph: context,
+                metadata,
+                chunk,
+              });
             }
             const handlingChunk = getStreamHandlingChunk({
               current: finalChunk,
@@ -1366,7 +1382,8 @@ async function attemptInvokeBody(
         );
       }
       if (finalChunk != null || sealedRunId != null) {
-        const discardedChunk = finalChunk ?? new AIMessageChunk({ content: '' });
+        const discardedChunk =
+          finalChunk ?? new AIMessageChunk({ content: '' });
         const responseMetadata = {
           ...discardedChunk.response_metadata,
           preempted: true,
@@ -1448,6 +1465,7 @@ async function attemptInvokeBody(
       );
     }
 
+    if (finalChunk != null) detachValidatedModelToolCalls(finalChunk);
     if ((finalChunk?.tool_calls?.length ?? 0) > 0) {
       finalChunk!.tool_calls = finalChunk!.tool_calls?.filter(
         (tool_call: ToolCall) => !!tool_call.name
@@ -1462,6 +1480,7 @@ async function attemptInvokeBody(
     messagesForProvider,
     invocationConfig
   );
+  detachValidatedModelToolCalls(finalMessage);
   if ((finalMessage.tool_calls?.length ?? 0) > 0) {
     finalMessage.tool_calls = finalMessage.tool_calls?.filter(
       (tool_call: ToolCall) => !!tool_call.name
@@ -1666,7 +1685,8 @@ export async function tryFallbackProviders({
        * a run that must reject. Check before every fallback invocation. */
       if (
         config?.signal?.aborted === true &&
-        (config.signal.reason instanceof StreamLimitExceededError || config.signal.reason instanceof PreparedSubagentError)
+        (config.signal.reason instanceof StreamLimitExceededError ||
+          config.signal.reason instanceof PreparedSubagentError)
       ) {
         throw config.signal.reason;
       }
@@ -1700,7 +1720,11 @@ export async function tryFallbackProviders({
        * provider failure. Continuing would try the remaining fallbacks and a
        * succeeding one would resolve a run that must reject.
        */
-      if (e instanceof StreamLimitExceededError || e instanceof PreparedSubagentError) {
+      if (
+        e instanceof StreamLimitExceededError ||
+        e instanceof PreparedSubagentError ||
+        e instanceof InvalidModelToolCallError
+      ) {
         throw e;
       }
       /** A parallel sibling's trip aborts this branch's composed signal, and
@@ -1709,7 +1733,8 @@ export async function tryFallbackProviders({
        * abort. Rethrow the breaker's own reason instead. */
       if (
         config?.signal?.aborted === true &&
-        (config.signal.reason instanceof StreamLimitExceededError || config.signal.reason instanceof PreparedSubagentError)
+        (config.signal.reason instanceof StreamLimitExceededError ||
+          config.signal.reason instanceof PreparedSubagentError)
       ) {
         throw config.signal.reason;
       }

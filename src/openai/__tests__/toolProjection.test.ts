@@ -207,6 +207,15 @@ describe('accepted tool-call projection', () => {
     expect([...toolCalls.keys()]).toEqual([0, 1]);
   });
 
+  it('drops pending calls and releases their budget when a later text answer is accepted', async () => {
+    const { stream, accept, toolCalls, deltas } = setup({ maxToolCalls: 1 });
+    await accept([{ id: 'already-run', name: 'lookup', args: {} }], 'first');
+    await accept([], 'answer');
+    stream.finish();
+    expect(toolCalls.size).toBe(0);
+    expect(deltas).toHaveLength(0);
+  });
+
   it.each([[[undefined, 'call_0']], [['dup', 'dup', 'call_1']]])(
     'reserves future provider IDs before allocating synthetic IDs (%j)',
     async (ids) => {

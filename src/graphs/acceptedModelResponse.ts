@@ -7,13 +7,38 @@ import { serializeToolArguments } from '@/utils/acceptedToolArguments';
 const MAX_SNAPSHOT_BYTES = 4 * 1024 * 1024;
 const MAX_SNAPSHOT_CALLS = 1024;
 
-/** Inspect the original descriptors before structuredClone can run a getter,
- * flatten an instance, or drop a symbol. Only graph-accepted calls are copied. */
-export function snapshotAcceptedModelResponse(
+export class InvalidModelToolCallError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'InvalidModelToolCallError';
+  }
+}
+
+/** Detach calls before stream handlers, run-step dispatch, or prestarts read them.
+ * Partial streams may carry invalid diagnostics that become valid in later chunks.
+ */
+export function detachValidatedModelToolCalls(
+  message: AIMessageChunk,
+  partial = false
+): void {
+  try {
+    message.tool_calls = snapshotToolCalls(message, partial);
+  } catch (error) {
+    throw new InvalidModelToolCallError(
+      error instanceof Error
+        ? error.message
+        : 'Accepted model response contains non-serializable tool calls'
+    );
+  }
+}
+
+/** Inspect original descriptors before a getter, proxy, or custom instance can
+ * be normalized away. The bound applies to each model message independently.
+ */
+function snapshotToolCalls(
   finalResponse: AIMessageChunk,
-  id: string,
-  agentId: string
-): ModelResponseEvent {
+  partial: boolean
+): ToolCall[] {
   // Read own data descriptors, not accessors supplied by a custom model. Invalid
   // diagnostics are rejected in O(1); cloning them can run getters and bypass
   // the valid-call snapshot's byte/count limits.
@@ -43,7 +68,7 @@ export function snapshotAcceptedModelResponse(
     }
     return value;
   };
-  if (readArray(diagnostics).length > 0) {
+  if (readArray(diagnostics).length > 0 && !partial) {
     throw new Error('Accepted model response contains invalid tool calls');
   }
   const source = readArray(calls);
@@ -102,11 +127,20 @@ export function snapshotAcceptedModelResponse(
       type: 'tool_call',
     });
   }
+  return toolCalls;
+}
+
+/** Only the accepted final response becomes a host-visible model result. */
+export function snapshotAcceptedModelResponse(
+  finalResponse: AIMessageChunk,
+  id: string,
+  agentId: string
+): ModelResponseEvent {
   return {
     type: 'model_response',
     id,
     agentId,
-    toolCalls,
+    toolCalls: snapshotToolCalls(finalResponse, false),
     invalidToolCalls: [],
   };
 }

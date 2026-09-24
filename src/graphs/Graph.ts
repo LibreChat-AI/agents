@@ -136,6 +136,10 @@ import {
   ToolOutputReferenceRegistry,
 } from '@/tools/toolOutputReferences';
 import {
+  InvalidModelToolCallError,
+  snapshotAcceptedModelResponse,
+} from './acceptedModelResponse';
+import {
   prepareProviderRequest,
   usesNativeOpenAIResponses,
 } from '@/llm/prepareProviderRequest';
@@ -188,7 +192,6 @@ import { AgentContext } from '@/agents/AgentContext';
 import { createFakeStreamingLLM } from '@/llm/fake';
 import { handoffStateAnnotation } from './handoff';
 import { handleToolCalls } from '@/tools/handlers';
-import { snapshotAcceptedModelResponse } from './acceptedModelResponse';
 import { isThinkingEnabled } from '@/llm/request';
 import { resolveMaxSeals } from '@/llm/preempt';
 import { initializeModel } from '@/llm/init';
@@ -4364,6 +4367,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
          * succeeding fallback would resolve a run the public contract says
          * must reject. Rethrow before any recovery path.
          */
+        if (primaryError instanceof InvalidModelToolCallError) {
+          throw primaryError;
+        }
         if (
           primaryError instanceof StreamLimitExceededError ||
           primaryError instanceof PreparedSubagentError
@@ -4704,6 +4710,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               })
           );
         } catch (fallbackError) {
+          if (fallbackError instanceof InvalidModelToolCallError) {
+            throw fallbackError;
+          }
           if (
             fallbackError instanceof StreamLimitExceededError ||
             fallbackError instanceof PreparedSubagentError
