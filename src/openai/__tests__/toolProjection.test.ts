@@ -1,345 +1,305 @@
-import type { OpenAIToolCall, OpenAIChatCompletionChunkChoice } from '@/openai';
-import type { RunStep, RunStepDeltaEvent } from '@/types';
+import type { ToolCall } from '@langchain/core/messages/tool';
+import type {
+  OpenAIChatCompletionChunkChoice,
+  OpenAIToolCall,
+  OpenAIToolCallStreamConfig,
+} from '@/openai';
+import type { ModelResponseEvent } from '@/types';
 import { createOpenAIToolCallStream } from '@/openai';
-import { StepTypes } from '@/common';
+import { GraphEvents } from '@/common';
 
-type Delta = OpenAIChatCompletionChunkChoice['delta'];
-
-function setup() {
+function setup(options: Partial<OpenAIToolCallStreamConfig> = {}) {
   const toolCalls = new Map<number, OpenAIToolCall>();
-  const deltas: Delta[] = [];
+  const deltas: OpenAIChatCompletionChunkChoice['delta'][] = [];
   const stream = createOpenAIToolCallStream({
     toolCalls,
     emit: (delta) => {
       deltas.push(delta);
     },
+    ...options,
   });
-  return { toolCalls, deltas, stream };
+  const accept = (
+    calls: ToolCall[],
+    id = 'accepted',
+    invalid: ModelResponseEvent['invalidToolCalls'] = []
+  ) =>
+    stream.handlers[GraphEvents.ON_MODEL_RESPONSE].handle(
+      GraphEvents.ON_MODEL_RESPONSE,
+      {
+        type: 'model_response',
+        id,
+        agentId: 'agent',
+        toolCalls: calls,
+        invalidToolCalls: invalid,
+      }
+    );
+  return { stream, toolCalls, deltas, accept };
 }
 
-describe('complete-before-publish Chat Completions tool projection', () => {
-  it.each(['explicit', 'signal'])(
-    'stops emission when the first callback aborts (%s)',
-    (mode) => {
-      const controller = new AbortController();
-      const deltas: Delta[] = [];
-      const stream = createOpenAIToolCallStream({
-        toolCalls: new Map(),
-        signal: controller.signal,
-        emit: (delta) => {
-          deltas.push(delta);
-          if (mode === 'explicit') stream.abort();
-          else controller.abort();
-        },
-      });
-      stream.onRunStep({
-        id: 'step',
-        stepDetails: {
-          type: 'tool_calls',
-          tool_calls: [
-            { name: 'first', args: {} },
-            { name: 'second', args: {} },
-          ],
-        },
-      });
-      expect(() => stream.finish()).toThrow('Agent response aborted');
-      expect(deltas).toHaveLength(1);
-      expect(() => stream.finish()).toThrow('Agent response aborted');
+describe('accepted tool-call projection', () => {
+  it('rejects an async emitter and observes its rejection instead of reporting completion', async () => {
+    const { accept, stream, toolCalls } = setup({
+      emit: async () => {
+        throw new Error('write failed');
+      },
+    });
+    await accept([{ name: 'lookup', args: {} }]);
+    expect(() => stream.finish()).toThrow('synchronous emitter');
+    await Promise.resolve();
+    expect(() => stream.finish()).toThrow('aborted');
+    expect(toolCalls.size).toBe(0);
+  });
+
+  it('ignores unrelated events rather than treating them as completed tool calls', async () => {
+    const { stream, deltas } = setup();
+    await stream.handlers[GraphEvents.ON_MODEL_RESPONSE].handle(
+      GraphEvents.ON_RUN_STEP,
+      { output: undefined }
+    );
+    stream.finish();
+    expect(deltas).toHaveLength(0);
+  });
+
+  it('rejects argument toJSON hooks that replace the required object', () => {
+    const { accept, stream } = setup();
+    expect(() =>
+      accept([{ name: 'lookup', args: { toJSON: () => 'SENSITIVE' } }])
+    ).toThrow('not JSON serializable');
+    expect(() => stream.finish()).toThrow('aborted');
+  });
+
+  it.each([NaN, Infinity, undefined, BigInt(1)])(
+    'rejects lossy JSON encoding of argument %s',
+    (value) => {
+      const { accept, stream } = setup();
+      expect(() => accept([{ name: 'lookup', args: { value } }])).toThrow(
+        'not JSON serializable'
+      );
+      expect(() => stream.finish()).toThrow('aborted');
     }
   );
 
-  it('rejects missing or empty step identity rather than merging unrelated events', () => {
-    const { stream, toolCalls } = setup();
-    expect(() =>
-      // @ts-expect-error The public API requires an ID; JS callers also receive a runtime error.
-      stream.onRunStep({
-        stepDetails: {
-          type: 'tool_calls',
-          tool_calls: [{ name: 'first', args: {} }],
-        },
-      })
-    ).toThrow('step ID');
-    expect(() => stream.finish()).toThrow('Agent response aborted');
-    expect(toolCalls.size).toBe(0);
-  });
-
-  it.each(['', '   '])('rejects blank delta step identity (%j)', (id) => {
-    const { stream } = setup();
-    expect(() =>
-      stream.onRunStepDelta({
-        id,
-        delta: { type: 'tool_calls', tool_calls: [{ index: 0, args: '{}' }] },
-      })
-    ).toThrow('step ID');
-    expect(() => stream.finish()).toThrow('Agent response aborted');
-  });
-
-  it('rejects unindexed arguments with no identity rather than guessing a call', () => {
-    const { stream, deltas, toolCalls } = setup();
-    stream.onRunStepDelta({
-      id: 'step',
-      delta: { type: 'tool_calls', tool_calls: [{ args: '{}' }] },
-    });
-    expect(() => stream.finish()).toThrow('Unattributable tool call arguments');
-    expect(toolCalls.size).toBe(0);
+  it('fails closed on unserializable arguments without exposing their contents', () => {
+    const { stream, accept, deltas } = setup();
+    const args: Record<string, unknown> = {};
+    args.self = args;
+    expect(() => accept([{ id: 'a', name: 'lookup', args }])).toThrow(
+      'Accepted tool call arguments are not JSON serializable'
+    );
+    expect(() => stream.finish()).toThrow('aborted');
     expect(deltas).toHaveLength(0);
   });
 
-  it('does not publish late events or repeat a successful finish', () => {
-    const { stream, deltas, toolCalls } = setup();
-    stream.onRunStep({
-      id: 'step',
-      stepDetails: {
-        type: 'tool_calls',
-        tool_calls: [{ id: 'kept', name: 'lookup', args: {} }],
-      },
-    });
+  it('rejects missing names on finalized calls rather than guessing from earlier deltas', () => {
+    const { accept, stream } = setup();
+    expect(() => accept([{ id: 'a', name: '', args: {} }])).toThrow(
+      'missing its name'
+    );
+    expect(() => stream.finish()).toThrow('aborted');
+  });
+
+  it('rejects non-object JSON arguments', () => {
+    const { accept } = setup();
+    expect(() => accept([{ id: 'a', name: 'lookup', args: [] }])).toThrow(
+      'must be an object'
+    );
+  });
+
+  it('formats final calls once with dense indexes across accepted responses', async () => {
+    const { stream, deltas, toolCalls, accept } = setup();
+    await accept(
+      [{ id: 'a', name: 'lookup', args: { city: 'Madrid' } }],
+      'first'
+    );
+    await accept(
+      [{ id: 'b', name: 'lookup', args: { city: 'Paris' } }],
+      'second'
+    );
+    expect(deltas).toHaveLength(0);
+    expect(toolCalls.size).toBe(0);
     stream.finish();
-    stream.onRunStep({
-      id: 'late',
-      stepDetails: {
-        type: 'tool_calls',
-        tool_calls: [{ id: 'late', name: 'lookup', args: {} }],
+    expect(deltas).toEqual([
+      {
+        tool_calls: [
+          {
+            index: 0,
+            id: 'a',
+            type: 'function',
+            function: { name: 'lookup', arguments: '' },
+          },
+        ],
       },
-    });
+      {
+        tool_calls: [
+          { index: 0, function: { arguments: '{"city":"Madrid"}' } },
+        ],
+      },
+      {
+        tool_calls: [
+          {
+            index: 1,
+            id: 'b',
+            type: 'function',
+            function: { name: 'lookup', arguments: '' },
+          },
+        ],
+      },
+      {
+        tool_calls: [{ index: 1, function: { arguments: '{"city":"Paris"}' } }],
+      },
+    ]);
+    expect([...toolCalls.keys()]).toEqual([0, 1]);
+  });
+
+  it('does not merge calls by repeated names, provider IDs or argument contents', async () => {
+    const { stream, toolCalls, accept } = setup();
+    await accept([
+      { id: 'call_0', name: 'x', args: { text: 'aaa' } },
+      { id: 'call_0', name: 'x', args: { text: 'aaa' } },
+      { name: 'x', args: {} },
+    ]);
+    stream.finish();
+    expect(new Set([...toolCalls.values()].map((call) => call.id)).size).toBe(
+      3
+    );
+    expect(toolCalls.get(1)?.function.arguments).toBe('{"text":"aaa"}');
+  });
+
+  it('detaches projected state from later mutations and makes published calls immutable', async () => {
+    const { stream, toolCalls, accept } = setup();
+    const args = { city: 'Paris' };
+    await accept([{ id: 'a', name: 'lookup', args }]);
+    args.city = 'unsafe';
+    stream.finish();
+    expect(toolCalls.get(0)?.function.arguments).toBe('{"city":"Paris"}');
+    expect(Object.isFrozen(toolCalls.get(0)?.function)).toBe(true);
+  });
+
+  it('rejects invalid final calls without publishing a previously accepted call or sensitive arguments', async () => {
+    const { stream, accept, deltas, toolCalls } = setup();
+    await accept([{ id: 'good', name: 'lookup', args: {} }]);
+    expect(() =>
+      accept([], 'bad', [
+        {
+          name: 'lookup',
+          args: 'SECRET',
+          error: 'SECRET',
+          type: 'invalid_tool_call',
+        },
+      ])
+    ).toThrow('Accepted model response contains invalid tool calls');
+    expect(() => stream.finish()).toThrow('Agent response aborted');
+    expect(deltas).toHaveLength(0);
+    expect(toolCalls.size).toBe(0);
+  });
+
+  it.each(['', '   '])('rejects malformed accepted identity %j', (id) => {
+    const { accept } = setup();
+    expect(() => accept([{ name: 'lookup', args: {} }], id)).toThrow(
+      'identity'
+    );
+  });
+
+  it('fails closed on duplicate delivery of an accepted response', async () => {
+    const { stream, accept, deltas } = setup();
+    await accept([{ name: 'lookup', args: {} }]);
+    expect(() => accept([{ name: 'lookup', args: {} }])).toThrow('identity');
+    expect(() => stream.finish()).toThrow('aborted');
+    expect(deltas).toHaveLength(0);
+  });
+
+  it.each(['explicit', 'signal', 'writer'])(
+    'stops output permanently on %s failure',
+    async (mode) => {
+      const controller = new AbortController();
+      const frames: OpenAIChatCompletionChunkChoice['delta'][] = [];
+      const { stream, accept, toolCalls } = setup({
+        signal: controller.signal,
+        emit: (delta) => {
+          frames.push(delta);
+          stream.finish();
+          if (mode === 'writer') throw new Error('write failed');
+          if (mode === 'signal') controller.abort();
+          else stream.abort();
+        },
+      });
+      await accept([
+        { name: 'a', args: {} },
+        { name: 'b', args: {} },
+      ]);
+      expect(() => stream.finish()).toThrow(
+        mode === 'writer' ? 'write failed' : 'aborted'
+      );
+      expect(frames).toHaveLength(1);
+      expect(() => stream.finish()).toThrow('aborted');
+      expect(toolCalls.size).toBe(0);
+    }
+  );
+
+  it('seals successfully, ignores late accepted results, and leaves results readable', async () => {
+    const { stream, accept, toolCalls, deltas } = setup();
+    await accept([{ id: 'a', name: 'lookup', args: {} }]);
+    stream.finish();
+    await accept([{ id: 'late', name: 'lookup', args: {} }], 'late');
     stream.finish();
     stream.abort();
     expect(deltas).toHaveLength(2);
-    expect([...toolCalls.values()].map((call) => call.id)).toEqual(['kept']);
+    expect(toolCalls.size).toBe(1);
   });
 
-  it('projects parallel calls from native SDK RunStep and RunStepDeltaEvent payloads', () => {
-    const { toolCalls, deltas, stream } = setup();
-    const step: RunStep = {
-      id: 'step',
-      index: 4,
-      type: StepTypes.TOOL_CALLS,
-      stepDetails: {
-        type: StepTypes.TOOL_CALLS,
-        tool_calls: [
-          { id: 'call_a', name: 'lookup', args: {} },
-          { id: 'call_b', name: 'lookup', args: {} },
-        ],
-      },
-    };
-    const fragments: RunStepDeltaEvent = {
-      id: 'step',
-      delta: {
-        type: StepTypes.TOOL_CALLS,
-        tool_calls: [
-          { index: 0, id: 'call_a', name: 'lookup', args: '{"city":"Madrid"}' },
-          { index: 1, id: 'call_b', name: 'lookup', args: '{"city":"Paris"}' },
-        ],
-      },
-    };
-    stream.onRunStep(step);
-    stream.onRunStepDelta(fragments);
-    expect(deltas).toHaveLength(0);
-    stream.finish();
-    expect(
-      [...toolCalls.values()].map((call) => call.function.arguments)
-    ).toEqual(['{"city":"Madrid"}', '{"city":"Paris"}']);
-    expect(
-      deltas
-        .filter((delta) => delta.tool_calls?.[0].id !== undefined)
-        .map((delta) => delta.tool_calls?.[0].index)
-    ).toEqual([0, 1]);
-  });
-
-  it('uses outward call ordinals after text and across later run steps, not step or provider indexes', () => {
-    const { toolCalls, deltas, stream } = setup();
-    stream.onRunStep({
-      id: 'step_one',
-      index: 3,
-      stepDetails: {
-        type: 'tool_calls',
-        tool_calls: [{ id: 'call_a', name: 'first', args: {}, index: 2 }],
-      },
-    });
-    stream.onRunStepDelta({
-      id: 'step_one',
-      delta: {
-        type: 'tool_calls',
-        tool_calls: [{ index: 2, id: 'call_a', args: '{}' }],
-      },
-    });
-    stream.onRunStep({
-      id: 'step_two',
-      index: 4,
-      stepDetails: {
-        type: 'tool_calls',
-        tool_calls: [{ id: 'call_b', name: 'second', args: {} }],
-      },
-    });
-    stream.onRunStepDelta({
-      id: 'step_two',
-      delta: {
-        type: 'tool_calls',
-        tool_calls: [{ index: 0, id: 'call_b', args: '{}' }],
-      },
-    });
-    expect(deltas).toHaveLength(0);
-    stream.finish();
-    expect([...toolCalls.keys()]).toEqual([0, 1]);
-    expect(
-      deltas
-        .flatMap((delta) => delta.tool_calls ?? [])
-        .map((call) => call.index)
-    ).toEqual([0, 0, 1, 1]);
-    expect(
-      deltas
-        .filter((delta) => (delta.tool_calls?.[0].id ?? '') !== '')
-        .map((delta) => delta.tool_calls?.[0].id)
-    ).toEqual(['call_a', 'call_b']);
-  });
-
-  it('scopes reused provider indexes to their model invocation', () => {
-    const { toolCalls, stream } = setup();
-    const graph = {
-      getStepBaseKey: (metadata: Record<string, unknown> | undefined): string =>
-        String(metadata?.run_id),
-    };
-    stream.onRunStepDelta(
-      {
-        id: 'a',
-        delta: {
-          type: 'tool_calls',
-          tool_calls: [{ index: 0, id: 'call_a', name: 'one', args: '{}' }],
-        },
-      },
-      { run_id: 'first' },
-      graph
-    );
-    stream.onRunStepDelta(
-      {
-        id: 'b',
-        delta: {
-          type: 'tool_calls',
-          tool_calls: [{ index: 0, id: 'call_b', name: 'two', args: '{}' }],
-        },
-      },
-      { run_id: 'second' },
-      graph
-    );
-    stream.finish();
-    expect([...toolCalls.values()].map((call) => call.id)).toEqual([
-      'call_a',
-      'call_b',
+  it('does not infer acceptance from a run-step or model-end callback', () => {
+    const { stream, deltas } = setup();
+    expect(Object.keys(stream.handlers)).toEqual([
+      GraphEvents.ON_MODEL_RESPONSE,
     ]);
-  });
-
-  it('assembles split IDs and names before any client can freeze them', () => {
-    const { toolCalls, deltas, stream } = setup();
-    for (const [id, name, args] of [
-      ['call_', 'get_', '{"city":'],
-      ['123', 'weather', '"Paris"}'],
-    ]) {
-      stream.onRunStepDelta({
-        id: 'step',
-        delta: {
-          type: 'tool_calls',
-          tool_calls: [{ index: 4, id, name, args }],
-        },
-      });
-    }
+    stream.finish();
     expect(deltas).toHaveLength(0);
-    stream.finish();
-    expect(toolCalls.get(0)).toEqual({
-      id: 'call_123',
-      type: 'function',
-      function: { name: 'get_weather', arguments: '{"city":"Paris"}' },
-    });
-    expect(deltas[0].tool_calls?.[0]).toMatchObject({
-      index: 0,
-      id: 'call_123',
-      function: { name: 'get_weather', arguments: '' },
-    });
-    expect(deltas[1].tool_calls?.[0].function?.arguments).toBe(
-      '{"city":"Paris"}'
-    );
   });
 
-  it('serializes object snapshots once and assigns unique IDs to id-less calls', () => {
-    const { toolCalls, stream } = setup();
-    stream.onRunStep({
-      id: 'step',
-      stepDetails: {
-        type: 'tool_calls',
-        tool_calls: [
-          { name: 'lookup', args: { city: 'Madrid' } },
-          { name: 'lookup', args: { city: 'Paris' } },
-        ],
-      },
-    });
+  it('bounds buffered call count across responses', async () => {
+    const { accept, stream, deltas } = setup({ maxToolCalls: 1 });
+    await accept([{ name: 'a', args: {} }]);
+    expect(() => accept([{ name: 'b', args: {} }], 'second')).toThrow(
+      'call limit'
+    );
+    expect(() => stream.finish()).toThrow('aborted');
+    expect(deltas).toHaveLength(0);
+  });
+
+  it('bounds retained UTF-8 bytes including names and IDs', () => {
+    const { accept, stream } = setup({ maxBufferedBytes: 20 });
+    expect(() =>
+      accept([{ name: 'x', id: 'id', args: { data: '🌍🌍🌍' } }])
+    ).toThrow('buffer limit');
+    expect(() => stream.finish()).toThrow('aborted');
+  });
+
+  it('does not retain text-only responses in its replay index', async () => {
+    const { accept, stream, toolCalls } = setup({ maxToolCalls: 1 });
+    for (let i = 0; i < 1000; i++) await accept([], 'text');
+    await accept([{ name: 'lookup', args: {} }], 'text');
     stream.finish();
-    expect(
-      [...toolCalls.values()].map((call) => call.function.arguments)
-    ).toEqual(['{"city":"Madrid"}', '{"city":"Paris"}']);
+    expect(toolCalls.size).toBe(1);
+  });
+
+  it('bounds id-collision work while processing many accepted calls', async () => {
+    const { accept, stream, toolCalls } = setup();
+    const calls = Array.from({ length: 500 }, (_, i) => ({
+      id: `call_${i}`,
+      name: 'lookup',
+      args: {},
+    }));
+    await accept(calls, 'first');
+    await accept(calls, 'second');
+    stream.finish();
+    expect(toolCalls.size).toBe(1000);
     expect(new Set([...toolCalls.values()].map((call) => call.id)).size).toBe(
-      2
+      1000
     );
   });
 
-  it('validates all calls before publishing any identity and refuses malformed arguments', () => {
-    const { toolCalls, deltas, stream } = setup();
-    stream.onRunStep({
-      id: 'step',
-      stepDetails: {
-        type: 'tool_calls',
-        tool_calls: [
-          { name: 'valid', args: {} },
-          { name: 'invalid', args: 'NOT_JSON' },
-        ],
-      },
-    });
-    expect(() => stream.finish()).toThrow('Invalid tool call arguments');
-    expect(deltas).toHaveLength(0);
-    expect(toolCalls.size).toBe(0);
-    stream.onRunStep({
-      id: 'late',
-      stepDetails: {
-        type: 'tool_calls',
-        tool_calls: [{ name: 'ignored', args: {} }],
-      },
-    });
-    expect(() => stream.finish()).toThrow('Agent response aborted');
-  });
-
-  it('seals before transport callbacks so reentrant finish or writer failure cannot duplicate calls', () => {
-    const toolCalls = new Map<number, OpenAIToolCall>();
-    const emitted: Delta[] = [];
-    const stream = createOpenAIToolCallStream({
-      toolCalls,
-      emit: (delta) => {
-        emitted.push(delta);
-        stream.finish();
-        throw new Error('transport failed');
-      },
-    });
-    stream.onRunStep({
-      id: 'step',
-      stepDetails: {
-        type: 'tool_calls',
-        tool_calls: [{ name: 'lookup', args: {} }],
-      },
-    });
-    expect(() => stream.finish()).toThrow('transport failed');
-    expect(() => stream.finish()).toThrow('Agent response aborted');
-    expect(emitted).toHaveLength(1);
-  });
-
-  it('aborts before output and does not emit on a later finish', () => {
-    const { toolCalls, deltas, stream } = setup();
-    stream.onRunStep({
-      id: 'step',
-      stepDetails: {
-        type: 'tool_calls',
-        tool_calls: [{ name: 'lookup', args: {} }],
-      },
-    });
-    stream.abort();
-    expect(() => stream.finish()).toThrow('Agent response aborted');
-    expect(toolCalls.size).toBe(0);
-    expect(deltas).toHaveLength(0);
+  it.each([0, -1, NaN, Infinity, 1.5])('rejects invalid limit %s', (limit) => {
+    expect(() => setup({ maxToolCalls: limit })).toThrow('positive safe');
+    expect(() => setup({ maxBufferedBytes: limit })).toThrow('positive safe');
   });
 });

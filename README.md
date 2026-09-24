@@ -156,22 +156,40 @@ const customHandlers = composeEventHandlers(
 );
 ```
 
-For hosts that need stable OpenAI-compatible tool-call IDs across graph run steps,
-`createOpenAIToolCallStream` from `@librechat/agents/openai` is an opt-in,
-transport-independent projection. Feed it `onRunStep` and `onRunStepDelta`
-events with nonempty step IDs and the original graph/metadata. Also call
-`observeModelAttempt(metadata, graph)` **before every model chunk and model-end
-event**, even for text-only or empty fallbacks. The SDK attempt stamp replaces
-failed-attempt state and ignores late fragments from superseded attempts;
-without observation a fallback that emits no tool events cannot be detected.
-Snapshots and incremental fragments reconcile into response-wide call indices.
-Call `finish()` only after successful execution: it validates every complete
-tool call before publication. Call `abort()` on failure or disconnect, including
-from an output callback; cancellation stops subsequent emissions. A writer
-failure is terminal and must not be retried with `finish()`. Tool chunks already
-written cannot be retracted. The existing `createOpenAIHandlers` output and usage
-framing are unchanged; host integration and async transport handling remain
-separate steps.
+For hosts that need stable OpenAI-compatible tool calls across graph invocations,
+`createOpenAIToolCallStream` is an **opt-in** accepted-result projector. Pass its
+`handlers` to `Run.create({ customHandlers })` (compose with other host handlers
+using `composeEventHandlers`). The graph delivers `ON_MODEL_RESPONSE` once per
+accepted AI result, after primary/fallback selection, overflow recovery and
+usage accounting. Both streaming and invoke-only paths use this boundary.
+
+This event carries detached, finalized tool calls. It is not a provider callback,
+a UI run step, or a parseable JSON fragment. The projector never reconstructs raw
+chunks or infers attempt identity. Generic callback echoes of the event are
+ignored. The existing `createOpenAIHandlers` and `/responses` outputs are unchanged.
+
+Call `finish()` only after confirming **natural run completion**: `processStream`
+must not have thrown, the caller/graph signals must not be aborted, and
+`getInterrupt()` / `getHaltReason()` must be empty. A resolved `processStream()`
+alone does not promise successful completion. On failure, disconnect, halt or
+interrupt, call `abort()` and discard this projector. Checkpoint resume requires a
+fresh projector; this helper is not a durable delivery/replay protocol. A new
+projector is required for each API response, including reuse of a `Run` instance.
+
+Tool calls are serialized once and buffered until successful completion. Default
+limits are **1024 tool calls** and **4 MiB of serialized argument, name and ID
+UTF-8 bytes**, configurable with positive `maxToolCalls` / `maxBufferedBytes`.
+Exceeding a limit aborts projection without publishing a partial batch. There are
+no fragment buffers or per-attempt maps. These limits bound retained projection
+state, not provider buffers or the transient size of cloning/serializing one
+accepted model result. They do not limit agent execution globally.
+
+The emitter remains synchronous. Errors or cancellation during emission are
+terminal; bytes already sent cannot be retracted and `finish()` cannot retry a
+partial write. The host owns HTTP connection lifecycle and async backpressure.
+Tool execution, including existing eager execution, is unchanged: projection
+failure cannot roll back tool side effects. No provider fallback is initiated by
+an acceptance-handler error.
 
 ## Development
 

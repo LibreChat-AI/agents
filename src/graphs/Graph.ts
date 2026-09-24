@@ -5007,6 +5007,46 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         this.preemptIncomplete = true;
       }
 
+      const responseHandler = this.handlerRegistry?.getHandler(
+        GraphEvents.ON_MODEL_RESPONSE
+      );
+      if (responseHandler != null && responseMessage?.getType() === 'ai') {
+        try {
+          // One graph-owned accepted result after all primary/fallback/overflow paths.
+          // No inference from provider chunks, run-step IDs, or attempt callback metadata.
+          invokeConfig.signal?.throwIfAborted();
+          const finalResponse = responseMessage as AIMessageChunk;
+          let snapshot: Pick<t.ModelResponseEvent, 'toolCalls' | 'invalidToolCalls'>;
+          try {
+            snapshot = structuredClone({
+              toolCalls: finalResponse.tool_calls ?? [],
+              invalidToolCalls: finalResponse.invalid_tool_calls ?? [],
+            });
+          } catch {
+            // DataCloneError may include source values. Never surface tool arguments.
+            throw new Error('Accepted model response contains non-serializable tool calls');
+          }
+          const accepted: t.ModelResponseEvent = {
+            type: 'model_response',
+            id: v4(),
+            agentId,
+            ...snapshot,
+          };
+          // Awaited, registry-only: no trace replay, usage recording or side effects.
+          // Detached calls prevent a consumer from changing tools about to execute.
+          await responseHandler.handle(
+            GraphEvents.ON_MODEL_RESPONSE,
+            accepted,
+            metadata,
+            this
+          );
+          invokeConfig.signal?.throwIfAborted();
+        } catch (error) {
+          this.cleanupSignalListener();
+          throw error;
+        }
+      }
+
       this.cleanupSignalListener();
       return result;
     };

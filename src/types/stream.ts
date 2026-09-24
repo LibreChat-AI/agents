@@ -1,5 +1,6 @@
 // src/types/stream.ts
 import type {
+  AIMessageChunk,
   MessageContentImageUrl,
   MessageContentText,
   ToolMessage,
@@ -14,6 +15,19 @@ import type { AssistantTextPhase } from '@/types/assistantPhase';
 import type { SummarizeCompleteEvent } from '@/types/summarize';
 import type { ToolEndEvent } from '@/types/tools';
 import { StepTypes, ContentTypes, GraphEvents } from '@/common/enum';
+
+/** One accepted model result, detached from execution state before host dispatch.
+ * Provider chunks, failed attempts and UI run-step events are not this contract. */
+export interface ModelResponseEvent {
+  type: 'model_response';
+  /** Graph-generated acceptance ID, not a provider ID or run-step index. */
+  id: string;
+  agentId: string;
+  toolCalls: ReadonlyArray<ToolCall>;
+  invalidToolCalls: ReadonlyArray<
+    NonNullable<AIMessageChunk['invalid_tool_calls']>[number]
+  >;
+}
 
 export type HandleLLMEnd = (
   output: LLMResult,

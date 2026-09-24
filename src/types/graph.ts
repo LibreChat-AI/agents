@@ -20,6 +20,7 @@ import type {
 } from '@/types/summarize';
 import type {
   RunStep,
+  ModelResponseEvent,
   RunStepDeltaEvent,
   RunStepResumeState,
   RunStepClosedEvent,
@@ -202,6 +203,7 @@ export interface EventHandler {
     data:
       | StreamEventData
       | ModelEndData
+      | ModelResponseEvent
       | RunStep
       | RunStepDeltaEvent
       | RunStepClosedEvent

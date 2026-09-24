@@ -407,6 +407,4 @@ export { createOpenAIToolCallStream } from './toolProjection';
 export type {
   OpenAIToolCallStream,
   OpenAIToolCallStreamConfig,
-  OpenAIRunStep,
-  OpenAIRunStepDelta,
 } from './toolProjection';
