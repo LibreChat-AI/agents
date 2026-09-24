@@ -159,11 +159,19 @@ const customHandlers = composeEventHandlers(
 For hosts that need stable OpenAI-compatible tool-call IDs across graph run steps,
 `createOpenAIToolCallStream` from `@librechat/agents/openai` is an opt-in,
 transport-independent projection. Feed it `onRunStep` and `onRunStepDelta`
-events, then call `finish()` only after successful execution: it validates
-and publishes complete tool calls with response-wide indices. Call `abort()`
-on failure or disconnect. The existing `createOpenAIHandlers` output and
-usage framing are unchanged; host integration and async transport handling
-remain separate steps.
+events with nonempty step IDs and the original graph/metadata. Also call
+`observeModelAttempt(metadata, graph)` **before every model chunk and model-end
+event**, even for text-only or empty fallbacks. The SDK attempt stamp replaces
+failed-attempt state and ignores late fragments from superseded attempts;
+without observation a fallback that emits no tool events cannot be detected.
+Snapshots and incremental fragments reconcile into response-wide call indices.
+Call `finish()` only after successful execution: it validates every complete
+tool call before publication. Call `abort()` on failure or disconnect, including
+from an output callback; cancellation stops subsequent emissions. A writer
+failure is terminal and must not be retried with `finish()`. Tool chunks already
+written cannot be retracted. The existing `createOpenAIHandlers` output and usage
+framing are unchanged; host integration and async transport handling remain
+separate steps.
 
 ## Development
 

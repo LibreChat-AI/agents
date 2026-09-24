@@ -18,6 +18,96 @@ function setup() {
 }
 
 describe('complete-before-publish Chat Completions tool projection', () => {
+  it.each(['explicit', 'signal'])(
+    'stops emission when the first callback aborts (%s)',
+    (mode) => {
+      const controller = new AbortController();
+      const deltas: Delta[] = [];
+      const stream = createOpenAIToolCallStream({
+        toolCalls: new Map(),
+        signal: controller.signal,
+        emit: (delta) => {
+          deltas.push(delta);
+          if (mode === 'explicit') stream.abort();
+          else controller.abort();
+        },
+      });
+      stream.onRunStep({
+        id: 'step',
+        stepDetails: {
+          type: 'tool_calls',
+          tool_calls: [
+            { name: 'first', args: {} },
+            { name: 'second', args: {} },
+          ],
+        },
+      });
+      expect(() => stream.finish()).toThrow('Agent response aborted');
+      expect(deltas).toHaveLength(1);
+      expect(() => stream.finish()).toThrow('Agent response aborted');
+    }
+  );
+
+  it('rejects missing or empty step identity rather than merging unrelated events', () => {
+    const { stream, toolCalls } = setup();
+    expect(() =>
+      // @ts-expect-error The public API requires an ID; JS callers also receive a runtime error.
+      stream.onRunStep({
+        stepDetails: {
+          type: 'tool_calls',
+          tool_calls: [{ name: 'first', args: {} }],
+        },
+      })
+    ).toThrow('step ID');
+    expect(() => stream.finish()).toThrow('Agent response aborted');
+    expect(toolCalls.size).toBe(0);
+  });
+
+  it.each(['', '   '])('rejects blank delta step identity (%j)', (id) => {
+    const { stream } = setup();
+    expect(() =>
+      stream.onRunStepDelta({
+        id,
+        delta: { type: 'tool_calls', tool_calls: [{ index: 0, args: '{}' }] },
+      })
+    ).toThrow('step ID');
+    expect(() => stream.finish()).toThrow('Agent response aborted');
+  });
+
+  it('rejects unindexed arguments with no identity rather than guessing a call', () => {
+    const { stream, deltas, toolCalls } = setup();
+    stream.onRunStepDelta({
+      id: 'step',
+      delta: { type: 'tool_calls', tool_calls: [{ args: '{}' }] },
+    });
+    expect(() => stream.finish()).toThrow('Unattributable tool call arguments');
+    expect(toolCalls.size).toBe(0);
+    expect(deltas).toHaveLength(0);
+  });
+
+  it('does not publish late events or repeat a successful finish', () => {
+    const { stream, deltas, toolCalls } = setup();
+    stream.onRunStep({
+      id: 'step',
+      stepDetails: {
+        type: 'tool_calls',
+        tool_calls: [{ id: 'kept', name: 'lookup', args: {} }],
+      },
+    });
+    stream.finish();
+    stream.onRunStep({
+      id: 'late',
+      stepDetails: {
+        type: 'tool_calls',
+        tool_calls: [{ id: 'late', name: 'lookup', args: {} }],
+      },
+    });
+    stream.finish();
+    stream.abort();
+    expect(deltas).toHaveLength(2);
+    expect([...toolCalls.values()].map((call) => call.id)).toEqual(['kept']);
+  });
+
   it('projects parallel calls from native SDK RunStep and RunStepDeltaEvent payloads', () => {
     const { toolCalls, deltas, stream } = setup();
     const step: RunStep = {
@@ -234,7 +324,7 @@ describe('complete-before-publish Chat Completions tool projection', () => {
       },
     });
     expect(() => stream.finish()).toThrow('transport failed');
-    expect(() => stream.finish()).not.toThrow();
+    expect(() => stream.finish()).toThrow('Agent response aborted');
     expect(emitted).toHaveLength(1);
   });
 
