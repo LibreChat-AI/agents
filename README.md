@@ -183,7 +183,19 @@ interrupt, call `abort()` and discard this projector. Checkpoint resume requires
 fresh projector; this helper is not a durable delivery/replay protocol. A new
 projector is required for each API response, including reuse of a `Run` instance.
 
-Tool calls are serialized once and buffered until successful completion. Argument
+The accepted-result graph boundary inspects original tool-call descriptors and
+validates argument trees **before** cloning can invoke getters or flatten class
+instances. The graph snapshot is capped at 1,024 calls and 4 MiB per accepted
+model response. Composed observers receive independent copies of that validated
+snapshot, so their ordering cannot change what the projector publishes or the
+arguments tools execute. Copy work is linear in the number of observers and
+bounded snapshot bytes. Synthetic IDs are assigned only at completion, after
+all provider IDs have been reserved, and their bytes count toward the projector's
+limit.
+
+At acceptance, tool arguments are validated and copied into a detached graph
+snapshot; the protocol formatter subsequently encodes them for output and
+buffers only completed calls until successful run completion. Argument
 trees must contain only JSON primitives, plain objects and dense arrays. Map,
 Set, Date, RegExp, boxed primitives, typed arrays, custom instances, proxies,
 accessors, symbol properties and sparse arrays are rejected rather than silently

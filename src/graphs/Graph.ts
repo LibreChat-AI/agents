@@ -188,6 +188,7 @@ import { AgentContext } from '@/agents/AgentContext';
 import { createFakeStreamingLLM } from '@/llm/fake';
 import { handoffStateAnnotation } from './handoff';
 import { handleToolCalls } from '@/tools/handlers';
+import { snapshotAcceptedModelResponse } from './acceptedModelResponse';
 import { isThinkingEnabled } from '@/llm/request';
 import { resolveMaxSeals } from '@/llm/preempt';
 import { initializeModel } from '@/llm/init';
@@ -5015,23 +5016,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           // One graph-owned accepted result after all primary/fallback/overflow paths.
           // No inference from provider chunks, run-step IDs, or attempt callback metadata.
           invokeConfig.signal?.throwIfAborted();
-          const finalResponse = responseMessage as AIMessageChunk;
-          let snapshot: Pick<t.ModelResponseEvent, 'toolCalls' | 'invalidToolCalls'>;
-          try {
-            snapshot = structuredClone({
-              toolCalls: finalResponse.tool_calls ?? [],
-              invalidToolCalls: finalResponse.invalid_tool_calls ?? [],
-            });
-          } catch {
-            // DataCloneError may include source values. Never surface tool arguments.
-            throw new Error('Accepted model response contains non-serializable tool calls');
-          }
-          const accepted: t.ModelResponseEvent = {
-            type: 'model_response',
-            id: v4(),
-            agentId,
-            ...snapshot,
-          };
+          const accepted = snapshotAcceptedModelResponse(
+            responseMessage as AIMessageChunk,
+            v4(),
+            agentId
+          );
           // Awaited, registry-only: no trace replay, usage recording or side effects.
           // Detached calls prevent a consumer from changing tools about to execute.
           await responseHandler.handle(

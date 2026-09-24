@@ -183,6 +183,51 @@ describe('accepted tool-call projection', () => {
     expect([...toolCalls.keys()]).toEqual([0, 1]);
   });
 
+  it.each([[[undefined, 'call_0']], [['dup', 'dup', 'call_1']]])(
+    'reserves future provider IDs before allocating synthetic IDs (%j)',
+    async (ids) => {
+      const { stream, accept, toolCalls } = setup();
+      for (let i = 0; i < ids.length; i++) {
+        await accept(
+          [{ id: ids[i], name: 'lookup', args: { i } }],
+          `accepted-${i}`
+        );
+      }
+      stream.finish();
+      const outputs = [...toolCalls.values()].map((call) => call.id);
+      expect(new Set(outputs).size).toBe(ids.length);
+      ids.forEach((id, index) => {
+        if (id != null && ids.indexOf(id) === index)
+          expect(outputs[index]).toBe(id);
+      });
+    }
+  );
+
+  it('preserves a later provider ID inside the same accepted response', async () => {
+    const { accept, stream, toolCalls } = setup();
+    await accept([
+      { name: 'lookup', args: { i: 0 } },
+      { id: 'call_0', name: 'lookup', args: { i: 1 } },
+      { id: 'call_1', name: 'lookup', args: { i: 2 } },
+    ]);
+    stream.finish();
+    expect([...toolCalls.values()].map((call) => call.id)).toEqual([
+      'call_2',
+      'call_0',
+      'call_1',
+    ]);
+  });
+
+  it('rejects a generated ID that would exceed the byte limit before emitting any frames', async () => {
+    const { accept, stream, toolCalls, deltas } = setup({
+      maxBufferedBytes: 8,
+    });
+    await accept([{ name: 'lookup', args: {} }]);
+    expect(() => stream.finish()).toThrow('buffer limit');
+    expect(deltas).toHaveLength(0);
+    expect(toolCalls.size).toBe(0);
+  });
+
   it('does not merge calls by repeated names, provider IDs or argument contents', async () => {
     const { stream, toolCalls, accept } = setup();
     await accept([

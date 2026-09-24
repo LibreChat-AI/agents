@@ -27,18 +27,26 @@ payload contains finalized native ToolCalls and invalid_tool_calls; a graph-made
 acceptance ID avoids treating provider IDs or UI indexes as invocation identity.
 
 The event is awaited. Exceptions propagate outside the provider fallback block,
-so projection failure cannot rerun a provider or tools. Calls are detached before
-host delivery so observers cannot mutate tool arguments awaiting execution.
+so projection failure cannot rerun a provider or tools. The graph validates
+original argument descriptors and JSON values before copying the model result,
+so `structuredClone` cannot run getters or erase non-JSON object identity before
+the check. It bounds each accepted result snapshot at 1,024 calls and 4 MiB.
+Composed observers each receive a copy of this validated snapshot, isolating
+the projector from observer ordering and tool execution. Copy work grows
+linearly with observers, not quadratically through nested wrappers.
 Generic provider/tool custom events cannot impersonate this graph-only event.
 Child graphs retain existing narrow handler forwarding; the parent projector is
 not inherited as a child output sink.
 
 The OpenAI projector accepts only this event, serializes valid calls once, and
 assigns outward indexes. No fragments, attempts, merge heuristics, or missing-ID
-fallbacks remain. Identity lookup is set-based; synthetic ID generation uses a
-monotonic counter. Text-only responses retain no delivery-ID state. Retention is
+fallbacks remain. Identity lookup is set-based; provider IDs are reserved across all accepted
+responses before synthetic ID generation uses a monotonic counter. Generated
+ID bytes are charged before emitting any frames. Text-only responses retain no delivery-ID state. Retention is
 O(accepted calls + output bytes), with limits on both calls and encoded bytes.
-The graph event clone still costs O(finalized result size). Argument encoding
+Snapshotting an accepted result and each composed observer copy cost
+O(finalized result size); protocol encoding is another linear pass. The graph
+only performs this work when the accepted-result handler is registered. Argument encoding
 accepts only JSON data, without executing serialization hooks or getters. It rejects
 exotic objects rather than silently converting them, supports cross-realm plain
 objects, and bounds both nesting and encoded bytes during traversal. The per-run

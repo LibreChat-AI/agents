@@ -63,17 +63,16 @@ export function createOpenAIToolCallStream(
   let previousChunkKind: OpenAIStreamTracker['lastChunkKind'];
   const maxCalls = positiveLimit(config.maxToolCalls, 1024);
   const maxBytes = positiveLimit(config.maxBufferedBytes, 4 * 1024 * 1024);
-  const calls: OpenAIToolCall[] = [];
+  const calls: Array<{ id: string; name: string; arguments: string }> = [];
+  const providerIds = new Set<string>();
   const acceptedIds = new Set<string>();
-  const outwardIds = new Set<string>();
   let bufferedBytes = 0;
-  let nextSyntheticId = 0;
   let phase: 'open' | 'emitting' | 'finished' | 'aborted' = 'open';
 
   const release = (): void => {
     calls.length = 0;
     acceptedIds.clear();
-    outwardIds.clear();
+    providerIds.clear();
     bufferedBytes = 0;
   };
   const abort = (): void => {
@@ -127,15 +126,10 @@ export function createOpenAIToolCallStream(
         if (typeof call.name !== 'string' || call.name.trim() === '') {
           throw new Error('Accepted tool call is missing its name');
         }
-        let id = call.id ?? '';
+        const id = call.id ?? '';
         if (typeof id !== 'string')
           throw new Error('Accepted tool call ID must be a string');
-        if (id === '' || outwardIds.has(id)) {
-          // Each collision allocates at most one new candidate per existing ID.
-          do {
-            id = `call_${nextSyntheticId++}`;
-          } while (outwardIds.has(id));
-        }
+        if (id !== '') providerIds.add(id);
         const identityBytes =
           Buffer.byteLength(id, 'utf8') + Buffer.byteLength(call.name, 'utf8');
         const args = serializeToolArguments(
@@ -143,14 +137,7 @@ export function createOpenAIToolCallStream(
           maxBytes - bufferedBytes - identityBytes
         );
         bufferedBytes += identityBytes + Buffer.byteLength(args, 'utf8');
-        outwardIds.add(id);
-        calls.push(
-          Object.freeze({
-            id,
-            type: 'function',
-            function: Object.freeze({ name: call.name, arguments: args }),
-          })
-        );
+        calls.push({ id, name: call.name, arguments: args });
       }
     } catch (error) {
       abort();
@@ -180,14 +167,44 @@ export function createOpenAIToolCallStream(
       previousChunkKind = tracker?.lastChunkKind;
       phase = 'emitting';
       try {
-        if (tracker != null && calls.length > 0 && !tracker.hasRole) {
+        // Do not allocate synthetic IDs until every accepted response has arrived.
+        // This reserves provider IDs even when they occur in a later invocation.
+        const usedIds = new Set<string>();
+        const ready: OpenAIToolCall[] = [];
+        let reservedBytes = bufferedBytes;
+        let nextSyntheticId = 0;
+        for (const call of calls) {
+          let id = call.id;
+          if (id === '' || usedIds.has(id)) {
+            do {
+              id = `call_${nextSyntheticId++}`;
+            } while (providerIds.has(id) || usedIds.has(id));
+            reservedBytes +=
+              Buffer.byteLength(id, 'utf8') -
+              Buffer.byteLength(call.id, 'utf8');
+            if (reservedBytes > maxBytes)
+              throw new Error('Tool projection buffer limit exceeded');
+          }
+          usedIds.add(id);
+          ready.push(
+            Object.freeze({
+              id,
+              type: 'function',
+              function: Object.freeze({
+                name: call.name,
+                arguments: call.arguments,
+              }),
+            })
+          );
+        }
+        if (tracker != null && ready.length > 0 && !tracker.hasRole) {
           tracker.hasRole = true;
           emitDelta({ role: 'assistant' });
           checkCancellation();
         }
-        for (let index = 0; index < calls.length; index++) {
+        for (let index = 0; index < ready.length; index++) {
           checkCancellation();
-          const call = calls[index];
+          const call = ready[index];
           toolCalls.set(index, call);
           if (tracker != null) tracker.lastChunkKind = 'tool_call';
           emitDelta({

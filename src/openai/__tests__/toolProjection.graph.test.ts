@@ -141,6 +141,7 @@ async function setup(
     fallbacks?: t.FallbackConfig[];
     signal?: AbortSignal;
     observer?: t.EventHandler;
+    observerBeforeProjection?: boolean;
     failTool?: boolean;
     usage?: t.EventHandler;
   } = {}
@@ -211,11 +212,14 @@ async function setup(
           },
         },
       },
+      options.observerBeforeProjection === true && options.observer != null
+        ? { [GraphEvents.ON_MODEL_RESPONSE]: options.observer }
+        : undefined,
       projection.handlers,
       options.usage != null
         ? { [GraphEvents.CHAT_MODEL_END]: options.usage }
         : undefined,
-      options.observer != null
+      options.observerBeforeProjection !== true && options.observer != null
         ? { [GraphEvents.ON_MODEL_RESPONSE]: options.observer }
         : undefined
     ),
@@ -282,10 +286,63 @@ describe('accepted tool calls through the real execution boundary', () => {
     reply.tool_calls![0].args = { credential: () => 'SENSITIVE' };
     const fixture = await setup(new InvokeModel(reply));
     await expect(fixture.execute()).rejects.toThrow(
-      'Accepted model response contains non-serializable tool calls'
+      'Accepted tool call arguments are not JSON serializable'
     );
     expect(fixture.executed).toHaveLength(0);
     expect(fixture.frames).toHaveLength(0);
+  });
+
+  it('rejects accessor arguments before clone without executing a stateful getter', async () => {
+    const getter = jest.fn(() => 'other');
+    const reply = toolsReply();
+    Object.defineProperty(reply.tool_calls![0].args, 'city', {
+      enumerable: true,
+      get: getter,
+    });
+    const fixture = await setup(new InvokeModel(reply));
+    await expect(fixture.execute()).rejects.toThrow('not JSON serializable');
+    expect(getter).not.toHaveBeenCalled();
+    expect(fixture.executed).toHaveLength(0);
+    expect(fixture.writes).toHaveLength(0);
+  });
+
+  it('rejects custom instances and hidden keys before clone normalizes them', async () => {
+    const reply = toolsReply();
+    reply.tool_calls![0].args = {
+      city: 'Paris',
+      custom: new (class {
+        secret = true;
+      })(),
+    };
+    const fixture = await setup(new InvokeModel(reply));
+    await expect(fixture.execute()).rejects.toThrow('not JSON serializable');
+    expect(fixture.executed).toHaveLength(0);
+    expect(fixture.writes).toHaveLength(0);
+  });
+
+  it('isolates an earlier mutating observer from the projector and tool execution', async () => {
+    const fixture = await setup(new InvokeModel(), {
+      observerBeforeProjection: true,
+      observer: {
+        handle: (_event, data): void => {
+          if (
+            data != null &&
+            'type' in data &&
+            data.type === 'model_response'
+          ) {
+            if (data.toolCalls.length > 1) {
+              data.toolCalls[0].args.city = 'changed';
+              delete data.toolCalls[1].args.city;
+            }
+          }
+        },
+      },
+    });
+    await fixture.execute();
+    expect(fixture.executed.sort()).toEqual(['Madrid', 'Paris']);
+    expect(
+      [...fixture.projected.values()].map((call) => call.function.arguments)
+    ).toEqual(['{"city":"Paris"}', '{"city":"Madrid"}']);
   });
 
   it('does not accept provider/tool custom events as authoritative graph results', async () => {
