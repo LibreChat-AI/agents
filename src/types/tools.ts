@@ -497,6 +497,21 @@ export type ArtifactDeliveryFailure = {
   failed: number;
 };
 
+export type ArtifactTruncationReason =
+  | 'max_files'
+  | 'depth'
+  | 'size'
+  | 'path'
+  | 'unreadable';
+
+export type ArtifactTruncation = {
+  code: 'artifact_truncated';
+  reasons: Partial<Record<ArtifactTruncationReason, number>>;
+  /** Up to 20 relative paths omitted from the response. */
+  skipped: string[];
+  skipped_count: number;
+};
+
 export type ExecuteResult = {
   /**
    * Execution session id — the (transient) sandbox run that produced
@@ -510,6 +525,7 @@ export type ExecuteResult = {
   /** Persisted input paths explicitly removed during this execution. */
   deleted_files?: string[];
   artifact_delivery?: ArtifactDeliveryFailure;
+  artifact_truncation?: ArtifactTruncation;
   /**
    * Durable runtime session id echoed by a stateful Code API backend
    * (hash of tenant+user+hint). Additive; absent on stateless servers.
@@ -1356,6 +1372,7 @@ export type ProgrammaticExecutionResponse = {
   /** Persisted input paths explicitly removed during this execution. */
   deleted_files?: string[];
   artifact_delivery?: ArtifactDeliveryFailure;
+  artifact_truncation?: ArtifactTruncation;
 
   /** Durable runtime session echo from a stateful backend (additive). */
   runtime_session_id?: string;
@@ -1375,6 +1392,7 @@ export type ProgrammaticExecutionArtifact = {
   /** Persisted input paths explicitly removed during this execution. */
   deleted_files?: string[];
   artifact_delivery?: ArtifactDeliveryFailure;
+  artifact_truncation?: ArtifactTruncation;
   /** Durable runtime session echo from a stateful backend (additive). */
   runtime_session_id?: string;
   runtime_status?: 'new' | 'reused';
@@ -1457,6 +1475,7 @@ export type CodeExecutionArtifact = {
   /** Persisted input paths explicitly removed during this execution. */
   deleted_files?: string[];
   artifact_delivery?: ArtifactDeliveryFailure;
+  artifact_truncation?: ArtifactTruncation;
   /** Durable runtime session echo from a stateful backend (additive). */
   runtime_session_id?: string;
   runtime_status?: 'new' | 'reused';

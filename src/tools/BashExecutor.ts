@@ -23,14 +23,18 @@ import {
   appendArtifactDeliveryWarning,
   normalizeArtifactDeliveryFailure,
 } from '@/tools/ArtifactDelivery';
-import { logCodeApiDiagnostic } from '@/tools/diagnostics';
+import {
+  appendArtifactTruncationWarning,
+  normalizeArtifactTruncation,
+} from '@/tools/ArtifactTruncation';
 import { appendExecutionArtifactFileSummary } from '@/tools/CodeSessionFileSummary';
 import { resolveAttachedWorkspaceInstanceId } from '@/tools/workspaceIdentity';
+import { prepareBashProgrammaticCode } from './BashProgrammaticToolCalling';
+import { logCodeApiDiagnostic } from '@/tools/diagnostics';
+import { makeRequest } from './ProgrammaticToolCalling';
 import { resolveFetchProxyAgent } from '@/utils/proxy';
 import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { Constants } from '@/common';
-import { prepareBashProgrammaticCode } from './BashProgrammaticToolCalling';
-import { makeRequest } from './ProgrammaticToolCalling';
 
 config();
 
@@ -407,6 +411,13 @@ function createBashExecutionTool(
           outputWithReminder,
           artifactDelivery
         );
+        const artifactTruncation = normalizeArtifactTruncation(
+          result.artifact_truncation
+        );
+        const outputWithWarnings = appendArtifactTruncationWarning(
+          outputWithDeliveryWarning,
+          artifactTruncation
+        );
         const hasFiles = result.files != null && result.files.length > 0;
         const deletionEcho =
           result.deleted_files != null
@@ -422,11 +433,11 @@ function createBashExecutionTool(
         return [
           hasWorkspace
             ? appendExecutionArtifactFileSummary(
-              outputWithDeliveryWarning,
+              outputWithWarnings,
               result.files
             )
             : appendCodeSessionFileSummary(
-              outputWithDeliveryWarning,
+              outputWithWarnings,
               result.files
             ),
           (hasFiles
@@ -436,6 +447,9 @@ function createBashExecutionTool(
               ...(artifactDelivery != null
                 ? { artifact_delivery: artifactDelivery }
                 : {}),
+              ...(artifactTruncation != null
+                ? { artifact_truncation: artifactTruncation }
+                : {}),
               ...deletionEcho,
               ...runtimeEcho,
             }
@@ -443,6 +457,9 @@ function createBashExecutionTool(
               session_id: result.session_id,
               ...(artifactDelivery != null
                 ? { artifact_delivery: artifactDelivery }
+                : {}),
+              ...(artifactTruncation != null
+                ? { artifact_truncation: artifactTruncation }
                 : {}),
               ...deletionEcho,
               ...runtimeEcho,
