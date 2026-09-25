@@ -64,7 +64,10 @@ export function createFadingTier(window: number): FadingTier {
   return { v: FADING_TIER_VERSION, budgetTokens: window, masked: false };
 }
 
-export function isFadingTier(value: unknown): value is FadingTier {
+/** Tier version before exchange width became turn-scoped. */
+const LEGACY_FADING_TIER_VERSION = 1;
+
+function isFadingTierOfVersion(value: unknown, version: number): boolean {
   if (typeof value !== 'object' || value === null) {
     return false;
   }
@@ -72,13 +75,27 @@ export function isFadingTier(value: unknown): value is FadingTier {
     Record<keyof FadingTier, unknown>
   >;
   return (
-    v === FADING_TIER_VERSION &&
+    v === version &&
     typeof budgetTokens === 'number' &&
     Number.isFinite(budgetTokens) &&
     budgetTokens > 0 &&
     typeof masked === 'boolean' &&
     (latched === undefined || latched === true)
   );
+}
+
+export function isFadingTier(value: unknown): value is FadingTier {
+  return isFadingTierOfVersion(value, FADING_TIER_VERSION);
+}
+
+/**
+ * A well-formed tier persisted before version 2. Stored snapshots that carry
+ * one (resume manifests, session files) stay valid; every consumer then drops
+ * it through `isFadingTier`, so the tier re-derives once instead of the
+ * snapshot being rejected as corrupt.
+ */
+export function isLegacyFadingTier(value: unknown): boolean {
+  return isFadingTierOfVersion(value, LEGACY_FADING_TIER_VERSION);
 }
 
 /** Deepest rung for a window: the point where the budget reaches its floor. */

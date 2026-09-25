@@ -2451,15 +2451,24 @@ function applyToolCallInputCaps(params: {
 
 /**
  * Whether a message opens a user turn: a human message or a role-based `user`
- * chat message. SDK-injected context (hook output after a tool batch, steers) is
- * stamped as a `HumanMessage` but belongs to the turn it follows.
+ * chat message. SDK context stamped as a `HumanMessage` belongs to the turn it
+ * follows: injected hook output after a tool batch, steers (live ones carry
+ * `injected`, replayed ones only `source: 'steer'`), and meta context.
  */
 function startsUserTurn(message: BaseMessage): boolean {
   const type = message.getType();
   if (type === 'generic') {
     return (message as { role?: unknown }).role === 'user';
   }
-  return type === 'human' && message.additional_kwargs.injected !== true;
+  if (type !== 'human') {
+    return false;
+  }
+  const kwargs = message.additional_kwargs;
+  return (
+    kwargs.injected !== true &&
+    kwargs.source !== 'steer' &&
+    kwargs.isMeta !== true
+  );
 }
 
 export function preFlightTruncateToolCallInputs(params: {

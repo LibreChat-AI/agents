@@ -3909,6 +3909,34 @@ describe('context fading of completed tool calls (issue: re-executed side effect
     );
   });
 
+  it('keeps the live batch width across a replayed steer', () => {
+    const calls = lookupCalls(8);
+    const liveTurn: BaseMessage[] = [
+      new HumanMessage('Build the report'),
+      new AIMessage({ content: '', tool_calls: calls }),
+      ...calls.map(
+        (call) =>
+          new ToolMessage({
+            content: 'ok',
+            tool_call_id: call.id,
+            name: 'lookup',
+          })
+      ),
+    ];
+
+    const withReplayedSteer = fadingTierFor([
+      ...liveTurn,
+      new HumanMessage({
+        content: 'Also include last quarter',
+        additional_kwargs: { role: 'user', source: 'steer' },
+      }),
+    ]);
+
+    expect(withReplayedSteer.budgetTokens).toBe(
+      fadingTierFor(liveTurn).budgetTokens
+    );
+  });
+
   it('keeps the live batch width across SDK-injected context', () => {
     const calls = lookupCalls(8);
     const liveTurn: BaseMessage[] = [
