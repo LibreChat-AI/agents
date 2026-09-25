@@ -10,7 +10,7 @@ const ARTIFACT_TRUNCATION_REASONS = new Set<string>([
 ]);
 
 function isNonNegativeInteger(value: unknown): value is number {
-  return typeof value === 'number' && Number.isInteger(value) && value >= 0;
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 }
 
 export function normalizeArtifactTruncation(
@@ -37,6 +37,7 @@ export function normalizeArtifactTruncation(
   }
 
   const reasons: ArtifactTruncation['reasons'] = {};
+  let reasonTotal = 0;
   for (const [reason, count] of Object.entries(candidate.reasons)) {
     if (
       !ARTIFACT_TRUNCATION_REASONS.has(reason) ||
@@ -44,7 +45,15 @@ export function normalizeArtifactTruncation(
     ) {
       return undefined;
     }
+    reasonTotal += count;
+    if (reasonTotal > candidate.skipped_count) {
+      return undefined;
+    }
     reasons[reason as ArtifactTruncationReason] = count;
+  }
+
+  if (reasonTotal !== candidate.skipped_count) {
+    return undefined;
   }
 
   return {

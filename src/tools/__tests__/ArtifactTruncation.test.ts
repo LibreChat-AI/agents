@@ -28,6 +28,29 @@ describe('artifact truncation', () => {
     { ...marker, skipped_count: 1.5 },
     { ...marker, skipped_count: '70' },
     { ...marker, reasons: null },
+    { ...marker, reasons: {} },
+    { ...marker, reasons: { max_files: 0 } },
+    { ...marker, reasons: { max_files: 69 } },
+    { ...marker, reasons: { max_files: 71 } },
+    { ...marker, reasons: { max_files: 35, size: 36 } },
+    { ...marker, reasons: { max_files: 35, size: 34 } },
+    {
+      ...marker,
+      skipped: ['report.csv'],
+      skipped_count: 1,
+    },
+    {
+      ...marker,
+      reasons: { max_files: Number.MAX_SAFE_INTEGER + 1 },
+      skipped_count: Number.MAX_SAFE_INTEGER + 1,
+    },
+    {
+      ...marker,
+      reasons: { max_files: Number.MAX_SAFE_INTEGER, size: 1 },
+      skipped_count: Number.MAX_SAFE_INTEGER,
+    },
+    { ...marker, skipped_count: NaN },
+    { ...marker, reasons: { max_files: Infinity } },
     { ...marker, reasons: { max_files: 1, unexpected: 1 } },
     { ...marker, reasons: { size: -1 } },
     { ...marker, reasons: { path: 1.2 } },
@@ -41,14 +64,50 @@ describe('artifact truncation', () => {
   });
 
   it('accepts omission counts that match or exceed the reported paths', () => {
-    expect(normalizeArtifactTruncation({ ...marker, skipped_count: 2 })).toEqual({
+    const fullyReported = {
       ...marker,
+      reasons: { max_files: 2 },
       skipped_count: 2,
-    });
+    };
+    expect(normalizeArtifactTruncation(fullyReported)).toEqual(fullyReported);
     expect(normalizeArtifactTruncation({ ...marker, skipped: [] })).toEqual({
       ...marker,
       skipped: [],
     });
+  });
+
+  it.each([
+    { max_files: 14, depth: 14, size: 14, path: 14, unreadable: 14 },
+    { max_files: 70, size: 0 },
+  ])('accepts consistent reason totals: %j', (reasons) => {
+    const value = { ...marker, reasons };
+    expect(normalizeArtifactTruncation(value)).toEqual(value);
+  });
+
+  it('accepts the largest exactly representable omission count', () => {
+    const value = {
+      ...marker,
+      reasons: { max_files: Number.MAX_SAFE_INTEGER - 1, size: 1 },
+      skipped_count: Number.MAX_SAFE_INTEGER,
+    };
+    expect(normalizeArtifactTruncation(value)).toEqual(value);
+  });
+
+  it('copies metadata without sharing mutable state across responses', () => {
+    const value = {
+      ...marker,
+      reasons: { ...marker.reasons },
+      skipped: [...marker.skipped],
+    };
+    const first = normalizeArtifactTruncation(value);
+    const second = normalizeArtifactTruncation(value);
+    value.reasons.max_files = 1;
+    value.skipped.push('later.csv');
+
+    expect(first).toEqual(marker);
+    expect(second).toEqual(marker);
+    expect(first?.reasons).not.toBe(second?.reasons);
+    expect(first?.skipped).not.toBe(second?.skipped);
   });
 
   it('reports omissions and bounds the displayed paths without suggesting a rerun', () => {

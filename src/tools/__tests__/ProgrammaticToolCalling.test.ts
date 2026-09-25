@@ -1146,22 +1146,70 @@ for member in team:
       expect(artifact.artifact_truncation).toEqual(marker);
     });
 
-    it('ignores malformed truncation metadata in programmatic responses', () => {
-      const [output, artifact] = formatCompletedResponse({
-        status: 'completed',
-        stdout: 'done\n',
-        files: [],
-        artifact_truncation: {
-          code: 'artifact_truncated',
-          reasons: { size: -1 },
-          skipped: ['omitted.csv'],
-          skipped_count: 1,
-        },
+    it.each([{ size: -1 }, { max_files: 70 }, {}])(
+      'ignores malformed truncation reasons %j in programmatic responses', (reasons) => {
+        const [output, artifact] = formatCompletedResponse({
+          status: 'completed',
+          stdout: 'done\n',
+          files: [],
+          artifact_truncation: {
+            code: 'artifact_truncated',
+            reasons,
+            skipped: ['omitted.csv'],
+            skipped_count: 1,
+          },
+        });
+
+        expect(output).not.toContain('omitted from delivery');
+        expect(artifact.artifact_truncation).toBeUndefined();
       });
 
-      expect(output).not.toContain('omitted from delivery');
-      expect(artifact.artifact_truncation).toBeUndefined();
-    });
+    it.each([1, 70])(
+      'preserves other response metadata when reason count is %i',
+      (reasonCount) => {
+        const response: t.ProgrammaticExecutionResponse = {
+          status: 'completed',
+          stdout: 'done\n',
+          stderr: 'diagnostic\n',
+          session_id: 'session-123',
+          runtime_session_id: 'runtime-123',
+          runtime_status: 'reused',
+          files: [{ id: 'file-1', name: 'kept.csv' }],
+          deleted_files: ['removed.csv'],
+          artifact_delivery: {
+            code: 'artifact_delivery_failed',
+            status: 'partial',
+            attempted: 2,
+            delivered: 1,
+            failed: 1,
+          },
+          artifact_truncation: {
+            code: 'artifact_truncated',
+            reasons: { size: reasonCount },
+            skipped: ['omitted.csv'],
+            skipped_count: 1,
+          },
+        };
+        const [output, artifact] = formatCompletedResponse(response);
+
+        expect(output).toContain('stdout:\ndone');
+        expect(output).toContain('stderr:\ndiagnostic');
+        expect(output).toContain('Artifact delivery warning:');
+        expect(output).toContain('Generated files:');
+        expect(output.includes('omitted from delivery')).toBe(reasonCount === 1);
+        expect(artifact).toEqual({
+          session_id: response.session_id,
+          runtime_session_id: response.runtime_session_id,
+          runtime_status: response.runtime_status,
+          files: response.files,
+          deleted_files: response.deleted_files,
+          artifact_delivery: response.artifact_delivery,
+          ...(reasonCount === 1
+            ? { artifact_truncation: response.artifact_truncation }
+            : {}),
+        });
+      }
+    );
 
     it('adds a /tmp scratch reminder when source code used /tmp', () => {
       const response: t.ProgrammaticExecutionResponse = {

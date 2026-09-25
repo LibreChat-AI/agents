@@ -426,6 +426,8 @@ describe('CodeAPI auth header injection', () => {
 
   it.each([
     { reasons: { unexpected: 1 }, skipped: ['file.csv'] },
+    { reasons: { max_files: 70 }, skipped: ['file.csv'], skipped_count: 1 },
+    { reasons: {}, skipped: ['file.csv'], skipped_count: 1 },
     {
       reasons: { max_files: 21 },
       skipped: Array.from({ length: 21 }, (_, index) => `file_${index}.csv`),
@@ -505,32 +507,33 @@ describe('CodeAPI auth header injection', () => {
     expect(result.artifact?.files).toEqual(files.length > 0 ? files : undefined);
   });
 
-  it('ignores invalid truncation metadata in direct Bash execution', async () => {
-    fetchMock.mockResolvedValueOnce(
-      jsonResponse({
-        session_id: 'session_123',
-        stdout: 'done\n',
-        files: [],
-        artifact_truncation: {
-          code: 'artifact_truncated',
-          reasons: { unexpected: 1 },
-          skipped: ['omitted.csv'],
-          skipped_count: 1,
-        },
-      })
-    );
-    const tool = createBashExecutionTool();
+  it.each([{ unexpected: 1 }, { max_files: 70 }, {}])(
+    'ignores invalid truncation reasons %j in direct Bash execution', async (reasons) => {
+      fetchMock.mockResolvedValueOnce(
+        jsonResponse({
+          session_id: 'session_123',
+          stdout: 'done\n',
+          files: [],
+          artifact_truncation: {
+            code: 'artifact_truncated',
+            reasons,
+            skipped: ['omitted.csv'],
+            skipped_count: 1,
+          },
+        })
+      );
+      const tool = createBashExecutionTool();
 
-    const result = (await tool.invoke({
-      name: tool.name,
-      args: { command: 'echo done' },
-      id: 'call-bash-malformed',
-      type: 'tool_call',
-    } as never)) as { content: string; artifact?: t.CodeExecutionArtifact };
+      const result = (await tool.invoke({
+        name: tool.name,
+        args: { command: 'echo done' },
+        id: 'call-bash-malformed',
+        type: 'tool_call',
+      } as never)) as { content: string; artifact?: t.CodeExecutionArtifact };
 
-    expect(result.content).not.toContain('omitted from delivery');
-    expect(result.artifact?.artifact_truncation).toBeUndefined();
-  });
+      expect(result.content).not.toContain('omitted from delivery');
+      expect(result.artifact?.artifact_truncation).toBeUndefined();
+    });
 
   it('surfaces artifact delivery failures from direct bash execution', async () => {
     fetchMock.mockResolvedValueOnce(
