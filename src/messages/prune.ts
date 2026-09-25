@@ -1991,6 +1991,19 @@ function projectRawOpenAIToolCalls(
   };
 }
 
+/** A serialized legacy `{_truncated, _originalChars}` envelope, which is rewritten
+ *  even when it fits because its wording led models to re-issue completed calls. */
+function isLegacyEnvelopeString(value: string): boolean {
+  if (!value.includes('"_truncated"') || !value.includes('"_originalChars"')) {
+    return false;
+  }
+  try {
+    return readBoundedTruncationValue(JSON.parse(value))?.legacy === true;
+  } catch {
+    return false;
+  }
+}
+
 function projectLegacyFunctionCall(
   property: PropertyRead,
   maxChars: number
@@ -2037,6 +2050,7 @@ function projectLegacyFunctionCall(
       enumerableKeys.includes('arguments') &&
       typeof argsProperty.value === 'string' &&
       argsProperty.value.length <= normalizeToolInputLimit(maxChars) &&
+      !isLegacyEnvelopeString(argsProperty.value) &&
       !hasUnsafeStructuredSerialization(property.value)
     ) {
       return { value: property.value, changed: false };

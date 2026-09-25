@@ -3985,6 +3985,32 @@ describe('context fading of completed tool calls (issue: re-executed side effect
     });
   });
 
+  it('converts a fitting legacy envelope in a singular function_call', () => {
+    const legacyArguments = JSON.stringify({
+      _truncated: '… [truncated]\n{"subject":"Report"',
+      _originalChars: 3810,
+    });
+    const message = new AIMessage({
+      content: '',
+      additional_kwargs: {
+        function_call: { name: 'send_email', arguments: legacyArguments },
+      },
+    });
+
+    const [projected] = projectToolCallInputs([message], 50_000) as AIMessage[];
+    const functionCall = projected.additional_kwargs.function_call as {
+      name: string;
+      arguments: string;
+    };
+
+    expect(functionCall.name).toBe('send_email');
+    expect(JSON.parse(functionCall.arguments)).toEqual({
+      _note: TOOL_INPUT_ELISION_NOTE,
+      _originalChars: 3810,
+      _inputPrefix: '{"subject":"Report"',
+    });
+  });
+
   it('re-caps a legacy truncation envelope into one that says the call completed', () => {
     const legacyArgs = {
       _truncated: `… [truncated]
