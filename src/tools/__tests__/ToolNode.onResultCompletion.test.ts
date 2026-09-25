@@ -509,6 +509,58 @@ describe('ToolNode per-call onResult completion emission', () => {
     expect(completionAttempts[1].result.tool_call.id).toBe('call_weather');
   });
 
+  it.each([true, false])(
+    'emits a stop instruction for aborted host results (early completion: %s)',
+    async (early) => {
+      const controller = new AbortController();
+      const completions: CompletionEvent[] = [];
+      const abortedResult: t.ToolExecuteResult = {
+        toolCallId: 'call_edit',
+        status: 'error',
+        content: '',
+        errorMessage: 'This operation was aborted',
+      };
+      jest
+        .spyOn(events, 'safeDispatchCustomEvent')
+        .mockImplementation(async (event, data): Promise<void> => {
+          if (event === GraphEvents.ON_RUN_STEP_COMPLETED) {
+            completions.push(data as CompletionEvent);
+            return;
+          }
+          if (event !== GraphEvents.ON_TOOL_EXECUTE) {
+            return;
+          }
+          const batch = data as t.ToolExecuteBatchRequest;
+          controller.abort();
+          if (early) {
+            batch.onResult?.(abortedResult);
+          }
+          batch.resolve([abortedResult]);
+        });
+
+      const node = new ToolNode({
+        tools: [createDummyTool('edit_file')],
+        eventDrivenMode: true,
+        getBreakerSignal: () => controller.signal,
+        toolCallStepIds: new Map([['call_edit', 'step_edit']]),
+      });
+      const result = (await node.invoke({
+        messages: [
+          createAIMessageWithToolCalls([
+            { id: 'call_edit', name: 'edit_file', args: {} },
+          ]),
+        ],
+      })) as { messages: ToolMessage[] };
+
+      const content = String(result.messages[0].content);
+      expect(result.messages[0].status).toBe('error');
+      expect(content).toContain('STOP what you are doing');
+      expect(content).not.toContain('Please fix your mistakes');
+      expect(completions).toHaveLength(1);
+      expect(completions[0].result.tool_call.output).toBe(content);
+    }
+  );
+
   it('emits error-status results with the standard error formatting', async () => {
     const completions: CompletionEvent[] = [];
 

@@ -129,6 +129,7 @@ import {
   resolveLocalExecutionTools,
 } from '@/tools/local';
 import { stripCodeSessionFileSummary } from '@/tools/CodeSessionFileSummary';
+import { formatToolErrorContent } from '@/tools/toolErrorContent';
 import { Constants, GraphEvents, CODE_EXECUTION_TOOLS } from '@/common';
 import { PreparedSubagentError } from '@/tools/preparedSubagents';
 import { attachRunStepResumeState } from '@/tools/runStepResume';
@@ -2201,9 +2202,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           });
         }
       }
-      const errorContent = truncateToolResultContent(
-        `Error: ${e.message}\n Please fix your mistakes.`,
-        this.maxToolResultChars
+      const errorContent = formatToolErrorContent(
+        e.message,
+        this.maxToolResultChars,
+        config.signal,
+        e
       );
       const refMeta =
         unresolvedRefs.length > 0
@@ -4461,9 +4464,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         let finalToolOutput: unknown = result.content;
 
         if (result.status === 'error') {
-          contentString = truncateToolResultContent(
-            `Error: ${result.errorMessage ?? 'Unknown error'}\n Please fix your mistakes.`,
-            this.maxToolResultChars
+          contentString = formatToolErrorContent(
+            result.errorMessage,
+            this.maxToolResultChars,
+            config.signal
           );
           /**
            * Error results bypass registration but stamp the
@@ -4977,9 +4981,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   ): Promise<boolean> {
     const output =
       result.status === 'error'
-        ? truncateToolResultContent(
-          `Error: ${result.errorMessage ?? 'Unknown error'}\n Please fix your mistakes.`,
-          this.maxToolResultChars
+        ? formatToolErrorContent(
+          result.errorMessage,
+          this.maxToolResultChars,
+          config.signal
         )
         : serializeToolOutputWithinLimits(
           result.content,

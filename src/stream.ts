@@ -56,6 +56,7 @@ import {
   truncateToolResultContent,
 } from '@/utils/truncation';
 import { resolveToolOutcome, outcomeFieldsFromResult } from '@/tools/intentArg';
+import { formatToolErrorContent } from '@/tools/toolErrorContent';
 import { snapshotValidatedModelChunk } from '@/graphs/acceptedModelResponse';
 import { TOOL_OUTPUT_REF_PATTERN } from '@/tools/toolOutputReferences';
 import { PreparedSubagentError } from '@/tools/preparedSubagents';
@@ -940,9 +941,10 @@ async function dispatchEagerToolCompletions(args: {
     }
     let output: string;
     if (result.status === 'error') {
-      output = truncateToolResultContent(
-        `Error: ${result.errorMessage ?? 'Unknown error'}\n Please fix your mistakes.`,
-        maxToolResultChars
+      output = formatToolErrorContent(
+        result.errorMessage,
+        maxToolResultChars,
+        graph.config?.signal
       );
     } else if (typeof result.content === 'string') {
       output = truncateToolResultContent(result.content, maxToolResultChars);
