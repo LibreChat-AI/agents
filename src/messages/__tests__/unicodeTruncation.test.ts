@@ -104,16 +104,28 @@ describe('Unicode-safe tool truncation', () => {
     for (let cap = 4; cap <= 200; cap++) {
       const serialized = serializeToolCallInput(input, cap);
       const projected = JSON.parse(serialized) as {
-        _truncated?: string;
+        _inputPrefix?: string;
         _originalChars?: number;
       };
       expect(serialized.length).toBeLessThanOrEqual(cap);
-      expect(projected._truncated?.isWellFormed() ?? true).toBe(true);
+      expect(projected._inputPrefix?.isWellFormed() ?? true).toBe(true);
       expect(serializeToolCallInput(projected, cap)).toBe(serialized);
-      if (projected._truncated != null) {
+      if (projected._inputPrefix != null) {
         expect(projected._originalChars).toBe(JSON.stringify(input).length);
       }
     }
+  });
+
+  it('rewrites a legacy custom-tool input marker even when it fits', () => {
+    const message = customToolMessage(
+      'run --report\n… [truncated: 5400 chars]'
+    );
+
+    const projected = projectToolCallInputs([message], 1_000);
+
+    expect(customToolInput(projected[0])).toBe(
+      'run --report\n… [shortened; call completed: 5400 chars]'
+    );
   });
 
   it('keeps custom-tool input marker and markerless cuts well-formed without mutating history', () => {
@@ -124,7 +136,9 @@ describe('Unicode-safe tool truncation', () => {
       expect(input.isWellFormed()).toBe(true);
       expect(input.length).toBeLessThanOrEqual(cap);
       if (cap > 50) {
-        expect(input).toContain(`\n… [truncated: ${emojiText.length} chars]`);
+        expect(input).toContain(
+          `\n… [shortened; call completed: ${emojiText.length} chars]`
+        );
         const shrunk = projectToolCallInputs(projected, 50);
         const direct = projectToolCallInputs([message], 50);
         expect(customToolInput(shrunk[0])).toBe(customToolInput(direct[0]));

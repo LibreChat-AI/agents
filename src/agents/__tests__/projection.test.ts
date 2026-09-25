@@ -23,7 +23,7 @@ const branch = (perMessageChars: number, count: number): AIMessage[] => {
     messages.push(
       i % 2 === 0
         ? (new HumanMessage(content) as unknown as AIMessage)
-        : new AIMessage(content),
+        : new AIMessage(content)
     );
   }
   return messages;
@@ -123,7 +123,7 @@ describe('projectAgentContextUsage', () => {
       messages,
       tokenCounter: countByChars,
       fadingTier: {
-        v: 1,
+        v: 2,
         budgetTokens: 10_000,
         masked: true,
         latched: true,

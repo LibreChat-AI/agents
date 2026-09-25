@@ -1381,20 +1381,20 @@ describe('JsonlSessionStore', () => {
     await store.appendFadingState({
       threadId: store.header.id,
       fadingTier: {
-        v: 1,
+        v: 2,
         budgetTokens: 'abc',
         masked: true,
       } as unknown as t.FadingTier,
       fadingTiers: {
         default: {
-          v: 1,
+          v: 2,
           budgetTokens: Number.NaN,
           masked: true,
         } as t.FadingTier,
       },
     });
     const fadingTier: t.FadingTier = {
-      v: 1,
+      v: 2,
       budgetTokens: 25_000,
       masked: true,
       latched: true,
@@ -1428,7 +1428,7 @@ describe('JsonlSessionStore', () => {
 
   it('persists a tier for an agent whose ID is an object prototype key', async () => {
     const fadingTier: t.FadingTier = {
-      v: 1,
+      v: 2,
       budgetTokens: 25_000,
       masked: true,
       latched: true,
@@ -1464,7 +1464,7 @@ describe('JsonlSessionStore', () => {
   it('records run.failed when resumeInterrupt throws', async () => {
     const mockRun = createMockRun('unused');
     const fadingTier: t.FadingTier = {
-      v: 1,
+      v: 2,
       budgetTokens: 25_000,
       masked: true,
       latched: true,
@@ -1507,7 +1507,7 @@ describe('JsonlSessionStore', () => {
   it('persists fading tiers when processStream throws', async () => {
     const mockRun = createMockRun('unused');
     const fadingTier: t.FadingTier = {
-      v: 1,
+      v: 2,
       budgetTokens: 12_500,
       masked: true,
       latched: true,
@@ -1610,7 +1610,7 @@ describe('JsonlSessionStore', () => {
     const mockRun = createMockRun('continued');
     const capturedConfigs = mockRunCreate(mockRun);
     const fadingTier: t.FadingTier = {
-      v: 1,
+      v: 2,
       budgetTokens: 25_000,
       masked: true,
       latched: true,
@@ -1644,7 +1644,7 @@ describe('JsonlSessionStore', () => {
     mockSummarizer('summary of prior work');
     const mockRun = createMockRun('continued');
     const fadingTier: t.FadingTier = {
-      v: 1,
+      v: 2,
       budgetTokens: 25_000,
       masked: true,
       latched: true,
@@ -1680,7 +1680,7 @@ describe('JsonlSessionStore', () => {
     const mockRun = createMockRun('resumed');
     mockRun.getCalibrationRatio.mockReturnValue(2);
     const fadingTier: t.FadingTier = {
-      v: 1,
+      v: 2,
       budgetTokens: 25_000,
       masked: true,
       latched: true,
@@ -1712,7 +1712,7 @@ describe('JsonlSessionStore', () => {
   it('carries live fading tiers into cloned sessions', async () => {
     const mockRun = createMockRun('continued');
     const fadingTier: t.FadingTier = {
-      v: 1,
+      v: 2,
       budgetTokens: 25_000,
       masked: true,
       latched: true,
@@ -1744,7 +1744,7 @@ describe('JsonlSessionStore', () => {
   it('only carries live fading tiers into a fork that retains the active leaf', async () => {
     const mockRun = createMockRun('continued');
     const fadingTier: t.FadingTier = {
-      v: 1,
+      v: 2,
       budgetTokens: 25_000,
       masked: true,
       latched: true,
@@ -1781,7 +1781,7 @@ describe('JsonlSessionStore', () => {
   it('allows graph compaction to clear a persisted fading tier', async () => {
     const mockRun = createMockRun('continued');
     const fadingTier: t.FadingTier = {
-      v: 1,
+      v: 2,
       budgetTokens: 25_000,
       masked: true,
       latched: true,
@@ -1826,7 +1826,7 @@ describe('JsonlSessionStore', () => {
   it('preserves prototype-named agent tiers across runs', async () => {
     const mockRun = createMockRun('continued');
     const fadingTier: t.FadingTier = {
-      v: 1,
+      v: 2,
       budgetTokens: 25_000,
       masked: true,
       latched: true,
@@ -1860,7 +1860,7 @@ describe('JsonlSessionStore', () => {
   it('restores fading tiers when reopening a persisted session', async () => {
     const mockRun = createMockRun('continued');
     const fadingTier: t.FadingTier = {
-      v: 1,
+      v: 2,
       budgetTokens: 25_000,
       masked: true,
       latched: true,
@@ -1904,13 +1904,13 @@ describe('JsonlSessionStore', () => {
   it('keeps fading tiers isolated by checkpoint thread', async () => {
     const mockRun = createMockRun('continued');
     const mainTier: t.FadingTier = {
-      v: 1,
+      v: 2,
       budgetTokens: 25_000,
       masked: true,
       latched: true,
     };
     const alternateTier: t.FadingTier = {
-      v: 1,
+      v: 2,
       budgetTokens: 12_500,
       masked: true,
       latched: true,
@@ -1950,13 +1950,13 @@ describe('JsonlSessionStore', () => {
   it('keeps fading tiers isolated by checkpoint namespace', async () => {
     const mockRun = createMockRun('continued');
     const namespaceATier: t.FadingTier = {
-      v: 1,
+      v: 2,
       budgetTokens: 25_000,
       masked: true,
       latched: true,
     };
     const namespaceBTier: t.FadingTier = {
-      v: 1,
+      v: 2,
       budgetTokens: 12_500,
       masked: true,
       latched: true,
@@ -2014,7 +2014,7 @@ describe('JsonlSessionStore', () => {
     const checkpointer = new MemorySaver();
     const mockRun = createMockRun('interrupted');
     const nestedTier: t.FadingTier = {
-      v: 1,
+      v: 2,
       budgetTokens: 12_500,
       masked: true,
       latched: true,
@@ -2063,13 +2063,13 @@ describe('JsonlSessionStore', () => {
   it('merges overlapping run tiers monotonically', async () => {
     const mockRun = createMockRun('continued');
     const deepTier: t.FadingTier = {
-      v: 1,
+      v: 2,
       budgetTokens: 12_500,
       masked: true,
       latched: true,
     };
     const staleTier: t.FadingTier = {
-      v: 1,
+      v: 2,
       budgetTokens: 50_000,
       masked: false,
     };
@@ -2125,7 +2125,7 @@ describe('JsonlSessionStore', () => {
   it('rejects a stale capture that started before a concurrent compaction', async () => {
     const mockRun = createMockRun('continued');
     const staleTier: t.FadingTier = {
-      v: 1,
+      v: 2,
       budgetTokens: 12_500,
       masked: true,
       latched: true,
@@ -2199,7 +2199,7 @@ describe('JsonlSessionStore', () => {
   it('discards a capture from a run that started before an explicit history rewrite', async () => {
     const mockRun = createMockRun('continued');
     const preRewriteTier: t.FadingTier = {
-      v: 1,
+      v: 2,
       budgetTokens: 12_500,
       masked: true,
       latched: true,
@@ -2258,7 +2258,7 @@ describe('JsonlSessionStore', () => {
   it('keeps a concurrent escalation from another agent when one agent resets', async () => {
     const mockRun = createMockRun('continued');
     const escalatedTier: t.FadingTier = {
-      v: 1,
+      v: 2,
       budgetTokens: 12_500,
       masked: true,
       latched: true,
@@ -2329,7 +2329,7 @@ describe('JsonlSessionStore', () => {
   it('bounds fading metadata retained for alternate checkpoint threads', async () => {
     const mockRun = createMockRun('continued');
     const fadingTier: t.FadingTier = {
-      v: 1,
+      v: 2,
       budgetTokens: 25_000,
       masked: true,
       latched: true,
