@@ -27,14 +27,14 @@ import {
   appendArtifactTruncationWarning,
   normalizeArtifactTruncation,
 } from '@/tools/ArtifactTruncation';
-import { logCodeApiDiagnostic } from '@/tools/diagnostics';
 import { appendExecutionArtifactFileSummary } from '@/tools/CodeSessionFileSummary';
 import { resolveAttachedWorkspaceInstanceId } from '@/tools/workspaceIdentity';
+import { prepareBashProgrammaticCode } from './BashProgrammaticToolCalling';
+import { logCodeApiDiagnostic } from '@/tools/diagnostics';
+import { makeRequest } from './ProgrammaticToolCalling';
 import { resolveFetchProxyAgent } from '@/utils/proxy';
 import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { Constants } from '@/common';
-import { prepareBashProgrammaticCode } from './BashProgrammaticToolCalling';
-import { makeRequest } from './ProgrammaticToolCalling';
 
 config();
 

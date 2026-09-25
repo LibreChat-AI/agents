@@ -22,7 +22,6 @@ import {
   resolveCodeApiAuthHeaders,
   selectRuntimeSessionHint,
 } from './CodeExecutor';
-import { appendExecutionArtifactFileSummary } from './CodeSessionFileSummary';
 import {
   assertUnambiguousIdentifiers,
   projectProgrammaticToolMap,
@@ -47,6 +46,7 @@ import {
   describeCodeApiError,
   logCodeApiDiagnostic,
 } from '@/tools/diagnostics';
+import { appendExecutionArtifactFileSummary } from './CodeSessionFileSummary';
 import { resolveFetchProxyAgent } from '@/utils/proxy';
 import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { Constants } from '@/common';

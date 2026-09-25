@@ -33,11 +33,11 @@ import {
   resolveProgrammaticToolDefinitions,
   selectProgrammaticTools,
 } from '../ProgrammaticCallerPolicy';
-import { Constants } from '@/common';
 import {
   appendExecutionArtifactFileSummary,
   stripCodeSessionFileSummary,
 } from '../CodeSessionFileSummary';
+import { Constants } from '@/common';
 
 describe('ProgrammaticToolCalling', () => {
   describe('tool descriptions', () => {
