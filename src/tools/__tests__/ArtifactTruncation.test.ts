@@ -23,6 +23,8 @@ describe('artifact truncation', () => {
     [],
     { ...marker, code: 'not_truncated' },
     { ...marker, skipped_count: -1 },
+    { ...marker, skipped_count: 0, skipped: [] },
+    { ...marker, skipped_count: 1 },
     { ...marker, skipped_count: 1.5 },
     { ...marker, skipped_count: '70' },
     { ...marker, reasons: null },
@@ -36,6 +38,17 @@ describe('artifact truncation', () => {
     },
   ])('rejects a malformed or oversized marker: %j', (value) => {
     expect(normalizeArtifactTruncation(value)).toBeUndefined();
+  });
+
+  it('accepts omission counts that match or exceed the reported paths', () => {
+    expect(normalizeArtifactTruncation({ ...marker, skipped_count: 2 })).toEqual({
+      ...marker,
+      skipped_count: 2,
+    });
+    expect(normalizeArtifactTruncation({ ...marker, skipped: [] })).toEqual({
+      ...marker,
+      skipped: [],
+    });
   });
 
   it('reports omissions and bounds the displayed paths without suggesting a rerun', () => {

@@ -24,11 +24,13 @@ export function normalizeArtifactTruncation(
   if (
     candidate.code !== 'artifact_truncated' ||
     !isNonNegativeInteger(candidate.skipped_count) ||
+    candidate.skipped_count === 0 ||
     candidate.reasons == null ||
     typeof candidate.reasons !== 'object' ||
     Array.isArray(candidate.reasons) ||
     !Array.isArray(candidate.skipped) ||
     candidate.skipped.length > MAX_REPORTED_TRUNCATED_PATHS ||
+    candidate.skipped.length > candidate.skipped_count ||
     candidate.skipped.some((path) => typeof path !== 'string')
   ) {
     return undefined;

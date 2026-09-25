@@ -430,6 +430,11 @@ describe('CodeAPI auth header injection', () => {
       reasons: { max_files: 21 },
       skipped: Array.from({ length: 21 }, (_, index) => `file_${index}.csv`),
     },
+    {
+      reasons: { max_files: 2 },
+      skipped: ['file_1.csv', 'file_2.csv'],
+      skipped_count: 1,
+    },
   ])(
     'ignores malformed truncation markers in direct execution',
     async (fields) => {
