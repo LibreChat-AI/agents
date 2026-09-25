@@ -40,6 +40,10 @@ import {
   normalizeArtifactDeliveryFailure,
 } from '@/tools/ArtifactDelivery';
 import {
+  appendArtifactTruncationWarning,
+  normalizeArtifactTruncation,
+} from '@/tools/ArtifactTruncation';
+import {
   describeCodeApiError,
   logCodeApiDiagnostic,
 } from '@/tools/diagnostics';
@@ -946,11 +950,18 @@ export function formatCompletedResponse(
     outputWithReminder,
     artifactDelivery
   );
+  const artifactTruncation = normalizeArtifactTruncation(
+    response.artifact_truncation
+  );
+  const outputWithWarnings = appendArtifactTruncationWarning(
+    outputWithDeliveryWarning,
+    artifactTruncation
+  );
 
   return [
     filePersistence === 'execution'
-      ? appendExecutionArtifactFileSummary(outputWithDeliveryWarning, response.files)
-      : appendCodeSessionFileSummary(outputWithDeliveryWarning, response.files),
+      ? appendExecutionArtifactFileSummary(outputWithWarnings, response.files)
+      : appendCodeSessionFileSummary(outputWithWarnings, response.files),
     {
       session_id: response.session_id,
       files: response.files,
@@ -959,6 +970,9 @@ export function formatCompletedResponse(
         : {}),
       ...(artifactDelivery != null
         ? { artifact_delivery: artifactDelivery }
+        : {}),
+      ...(artifactTruncation != null
+        ? { artifact_truncation: artifactTruncation }
         : {}),
       ...(response.runtime_session_id != null
         ? {

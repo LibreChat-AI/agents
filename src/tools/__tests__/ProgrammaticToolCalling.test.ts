@@ -1093,6 +1093,76 @@ for member in team:
       expect(artifact.artifact_delivery).toEqual(response.artifact_delivery);
     });
 
+    it.each(['session', 'execution'] as const)(
+      'warns about truncation before the %s file summary',
+      (filePersistence) => {
+        const marker: t.ArtifactTruncation = {
+          code: 'artifact_truncated',
+          reasons: { size: 2 },
+          skipped: ['omitted.csv'],
+          skipped_count: 2,
+        };
+        const files = [{ id: 'file-1', name: 'kept.csv' }];
+        const response = {
+          status: 'completed',
+          stdout: 'done\n',
+          files,
+          artifact_truncation: { ...marker, extra: 'ignored' },
+        };
+
+        const [output, artifact] = formatCompletedResponse(
+          response,
+          '',
+          filePersistence
+        );
+
+        expect(output).toContain('2 file(s) were omitted from delivery');
+        expect(output).toContain('omitted.csv (1 of 2 shown)');
+        expect(output).toContain('do not rerun automatically');
+        expect(output.indexOf('file(s) were omitted')).toBeLessThan(
+          output.indexOf('Generated files:')
+        );
+        expect(artifact.artifact_truncation).toEqual(marker);
+        expect(artifact.files).toEqual(files);
+      }
+    );
+
+    it('warns even when no programmatic files were delivered', () => {
+      const marker: t.ArtifactTruncation = {
+        code: 'artifact_truncated',
+        reasons: { depth: 1 },
+        skipped: ['nested/omitted.csv'],
+        skipped_count: 1,
+      };
+      const [output, artifact] = formatCompletedResponse({
+        status: 'completed',
+        stdout: 'done\n',
+        files: [],
+        artifact_truncation: marker,
+      });
+
+      expect(output).toContain('1 file(s) were omitted from delivery');
+      expect(output).not.toContain('Generated files:');
+      expect(artifact.artifact_truncation).toEqual(marker);
+    });
+
+    it('ignores malformed truncation metadata in programmatic responses', () => {
+      const [output, artifact] = formatCompletedResponse({
+        status: 'completed',
+        stdout: 'done\n',
+        files: [],
+        artifact_truncation: {
+          code: 'artifact_truncated',
+          reasons: { size: -1 },
+          skipped: ['omitted.csv'],
+          skipped_count: 1,
+        },
+      });
+
+      expect(output).not.toContain('omitted from delivery');
+      expect(artifact.artifact_truncation).toBeUndefined();
+    });
+
     it('adds a /tmp scratch reminder when source code used /tmp', () => {
       const response: t.ProgrammaticExecutionResponse = {
         status: 'completed',

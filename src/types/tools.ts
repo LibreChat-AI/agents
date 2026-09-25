@@ -1372,6 +1372,7 @@ export type ProgrammaticExecutionResponse = {
   /** Persisted input paths explicitly removed during this execution. */
   deleted_files?: string[];
   artifact_delivery?: ArtifactDeliveryFailure;
+  artifact_truncation?: ArtifactTruncation;
 
   /** Durable runtime session echo from a stateful backend (additive). */
   runtime_session_id?: string;
@@ -1391,6 +1392,7 @@ export type ProgrammaticExecutionArtifact = {
   /** Persisted input paths explicitly removed during this execution. */
   deleted_files?: string[];
   artifact_delivery?: ArtifactDeliveryFailure;
+  artifact_truncation?: ArtifactTruncation;
   /** Durable runtime session echo from a stateful backend (additive). */
   runtime_session_id?: string;
   runtime_status?: 'new' | 'reused';
