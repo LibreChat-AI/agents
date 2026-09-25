@@ -1592,6 +1592,15 @@ function createBoundedTruncationValue(
     : preview;
   const emptyEnvelope = toolInputElision(originalChars, '');
   if (JSON.stringify(emptyEnvelope).length > normalizedMaxChars) {
+    /** The deepest fading rung caps inputs near 100 chars, below the full
+     *  envelope for large inputs, so the note and size survive on their own. */
+    const sizedNote = {
+      _note: TOOL_INPUT_ELISION_NOTE,
+      _originalChars: originalChars,
+    };
+    if (JSON.stringify(sizedNote).length <= normalizedMaxChars) {
+      return sizedNote;
+    }
     /**
      * Even the empty envelope overflows the cap, so no preview survives —
      * but the result must still be a JSON OBJECT, never `null`. This value
@@ -1629,6 +1638,7 @@ function createBoundedTruncationValue(
 }
 
 const ELISION_ENVELOPE_KEYS = ['_note', '_originalChars', '_inputPrefix'];
+const SIZED_NOTE_KEYS = ['_note', '_originalChars'];
 const LEGACY_ENVELOPE_KEYS = ['_truncated', '_originalChars'];
 
 function hasExactKeys(keys: string[], expected: string[]): boolean {
@@ -1636,6 +1646,11 @@ function hasExactKeys(keys: string[], expected: string[]): boolean {
     keys.length === expected.length &&
     expected.every((key) => keys.includes(key))
   );
+}
+
+function hasElisionNote(input: object): boolean {
+  const note = readPropertyWithoutAccessors(input, '_note');
+  return note.own && !note.accessor && note.value === TOOL_INPUT_ELISION_NOTE;
 }
 
 /** Reads a shortened-input envelope, including the legacy `{_truncated,
@@ -1646,7 +1661,8 @@ function readBoundedTruncationValue(
   if (input == null || typeof input !== 'object' || isProxy(input)) {
     return undefined;
   }
-  let previewKey: '_inputPrefix' | '_truncated';
+  let preview: PropertyRead;
+  let legacy = false;
   try {
     const prototype = Object.getPrototypeOf(input);
     const keys = Object.keys(input);
@@ -1654,24 +1670,33 @@ function readBoundedTruncationValue(
       return undefined;
     }
     if (hasExactKeys(keys, ELISION_ENVELOPE_KEYS)) {
-      const note = readPropertyWithoutAccessors(input, '_note');
+      if (!hasElisionNote(input)) {
+        return undefined;
+      }
+      preview = readPropertyWithoutAccessors(input, '_inputPrefix');
+    } else if (hasExactKeys(keys, SIZED_NOTE_KEYS)) {
+      /** The fallback that keeps only the note and size at the tightest caps. */
+      if (!hasElisionNote(input)) {
+        return undefined;
+      }
+      preview = { found: true, own: true, accessor: false, value: '' };
+    } else if (hasExactKeys(keys, LEGACY_ENVELOPE_KEYS)) {
+      preview = readPropertyWithoutAccessors(input, '_truncated');
+      /** Every legacy envelope led with the marker; without it, a genuine input
+       *  that merely shares the two field names is left alone. */
       if (
-        !note.own ||
-        note.accessor ||
-        note.value !== TOOL_INPUT_ELISION_NOTE
+        typeof preview.value !== 'string' ||
+        !preview.value.startsWith(LEGACY_TOOL_INPUT_TRUNCATION_MARKER)
       ) {
         return undefined;
       }
-      previewKey = '_inputPrefix';
-    } else if (hasExactKeys(keys, LEGACY_ENVELOPE_KEYS)) {
-      previewKey = '_truncated';
+      legacy = true;
     } else {
       return undefined;
     }
   } catch {
     return undefined;
   }
-  const preview = readPropertyWithoutAccessors(input, previewKey);
   const originalChars = readPropertyWithoutAccessors(input, '_originalChars');
   return preview.own &&
     !preview.accessor &&
@@ -1684,7 +1709,7 @@ function readBoundedTruncationValue(
     ? {
       preview: preview.value,
       originalChars: originalChars.value,
-      legacy: previewKey === '_truncated',
+      legacy,
     }
     : undefined;
 }
@@ -2451,9 +2476,9 @@ function applyToolCallInputCaps(params: {
 
 /**
  * Whether a message opens a user turn: a human message or a role-based `user`
- * chat message. SDK context stamped as a `HumanMessage` belongs to the turn it
- * follows: injected hook output after a tool batch, steers (live ones carry
- * `injected`, replayed ones only `source: 'steer'`), and meta context.
+ * chat message. The SDK stamps every `HumanMessage` it synthesizes with a
+ * `source` (hook context, steers, routing and handoff cues, skills) and often
+ * `injected`, `isMeta` or `role: 'system'`; those belong to the turn they follow.
  */
 function startsUserTurn(message: BaseMessage): boolean {
   const type = message.getType();
@@ -2465,9 +2490,10 @@ function startsUserTurn(message: BaseMessage): boolean {
   }
   const kwargs = message.additional_kwargs;
   return (
+    kwargs.source === undefined &&
     kwargs.injected !== true &&
-    kwargs.source !== 'steer' &&
-    kwargs.isMeta !== true
+    kwargs.isMeta !== true &&
+    kwargs.role !== 'system'
   );
 }
 

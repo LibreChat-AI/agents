@@ -3937,6 +3937,64 @@ describe('context fading of completed tool calls (issue: re-executed side effect
     );
   });
 
+  it('keeps the live batch width across hook context', () => {
+    const calls = lookupCalls(8);
+    const liveTurn: BaseMessage[] = [
+      new HumanMessage('Build the report'),
+      new AIMessage({ content: '', tool_calls: calls }),
+      ...calls.map(
+        (call) =>
+          new ToolMessage({
+            content: 'ok',
+            tool_call_id: call.id,
+            name: 'lookup',
+          })
+      ),
+    ];
+
+    const withHookContext = fadingTierFor([
+      ...liveTurn,
+      new HumanMessage({
+        content: 'Additional context from a PostToolUse hook',
+        additional_kwargs: { role: 'system', source: 'hook' },
+      }),
+    ]);
+
+    expect(withHookContext.budgetTokens).toBe(
+      fadingTierFor(liveTurn).budgetTokens
+    );
+  });
+
+  it('leaves a genuine input that only shares the legacy field names alone', () => {
+    const args = { _truncated: 'caller data', _originalChars: 11 };
+    const message = new AIMessage({
+      content: '',
+      tool_calls: [
+        { id: 'call_plain', name: 'record', args, type: 'tool_call' },
+      ],
+    });
+
+    const [projected] = projectToolCallInputs([message], 50_000) as AIMessage[];
+
+    expect(projected.tool_calls?.[0].args).toEqual(args);
+  });
+
+  it('keeps the completion note and size at the minimum input cap', () => {
+    const serialized = serializeToolCallInput(
+      { body: 'x'.repeat(20_000) },
+      100
+    );
+
+    expect(serialized.length).toBeLessThanOrEqual(100);
+    expect(JSON.parse(serialized)).toEqual({
+      _note: TOOL_INPUT_ELISION_NOTE,
+      _originalChars: expect.any(Number),
+    });
+    expect(serializeToolCallInput(JSON.parse(serialized), 100)).toBe(
+      serialized
+    );
+  });
+
   it('keeps the live batch width across SDK-injected context', () => {
     const calls = lookupCalls(8);
     const liveTurn: BaseMessage[] = [
