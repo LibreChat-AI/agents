@@ -181,25 +181,33 @@ describe('fading ladder', () => {
   });
 
   it('validates and seeds persisted tiers', () => {
-    expect(isFadingTier({ v: 1, budgetTokens: 100, masked: true })).toBe(true);
-    expect(isFadingTier({ v: 2, budgetTokens: 100, masked: true })).toBe(false);
-    expect(isFadingTier({ v: 1, budgetTokens: 0, masked: true })).toBe(false);
-    expect(isFadingTier({ v: 1, budgetTokens: 100, masked: 'yes' })).toBe(
+    expect(isFadingTier({ v: 2, budgetTokens: 100, masked: true })).toBe(true);
+    /** Version 1 tiers could latch on reconstructed history widths; they re-derive. */
+    expect(isFadingTier({ v: 1, budgetTokens: 100, masked: true })).toBe(false);
+    expect(
+      seedFadingTier(100_000, { v: 1, budgetTokens: 6_250, masked: false })
+    ).toEqual({
+      v: 2,
+      budgetTokens: 100_000,
+      masked: false,
+    });
+    expect(isFadingTier({ v: 2, budgetTokens: 0, masked: true })).toBe(false);
+    expect(isFadingTier({ v: 2, budgetTokens: 100, masked: 'yes' })).toBe(
       false
     );
     expect(isFadingTier(null)).toBe(false);
     expect(
-      seedFadingTier(100_000, { v: 1, budgetTokens: 50_000, masked: true })
+      seedFadingTier(100_000, { v: 2, budgetTokens: 50_000, masked: true })
     ).toEqual({
-      v: 1,
+      v: 2,
       budgetTokens: 50_000,
       masked: true,
       latched: true,
     });
     expect(
-      seedFadingTier(100_000, { v: 1, budgetTokens: 150_000, masked: false })
+      seedFadingTier(100_000, { v: 2, budgetTokens: 150_000, masked: false })
     ).toEqual({
-      v: 1,
+      v: 2,
       budgetTokens: 100_000,
       masked: false,
       latched: true,
@@ -217,7 +225,7 @@ describe('fading ladder', () => {
     expect(tier).toEqual(createFadingTier(window));
     tier = resolveFadingTier(tier, window, { ...base, contextPressure: 0.86 });
     expect(tier).toEqual({
-      v: 1,
+      v: 2,
       budgetTokens: 50_000,
       masked: true,
       latched: true,
@@ -236,7 +244,7 @@ describe('fading ladder', () => {
 
   it('survives a mid-run budget correction and the return to the normal window', () => {
     const latched: FadingTier = {
-      v: 1,
+      v: 2,
       budgetTokens: 100_000,
       masked: true,
       latched: true,
@@ -258,14 +266,14 @@ describe('fading ladder', () => {
 
   it('keeps a restored tier informative after clamping to a smaller window', () => {
     const restored = seedFadingTier(30_000, {
-      v: 1,
+      v: 2,
       budgetTokens: 50_000,
       masked: false,
       latched: true,
     });
 
     expect(restored).toEqual({
-      v: 1,
+      v: 2,
       budgetTokens: 30_000,
       masked: false,
       latched: true,
@@ -301,7 +309,7 @@ describe('fading ladder', () => {
     );
 
     expect(tier).toEqual({
-      v: 1,
+      v: 2,
       budgetTokens: 50_000,
       masked: false,
       latched: true,
@@ -335,7 +343,7 @@ describe('fading ladder', () => {
   });
 
   it('masks consumed results to a fraction of the fresh cap with a floor', () => {
-    const masked: FadingTier = { v: 1, budgetTokens: 100_000, masked: true };
+    const masked: FadingTier = { v: 2, budgetTokens: 100_000, masked: true };
     const caps = resolveFadingCaps(masked);
     expect(caps.consumedChars).toBe(Math.floor(caps.resultChars * 0.1));
     expect(
@@ -494,7 +502,7 @@ describe('pruner keeps historical tool results byte-stable across turns', () => 
       indexTokenCountMap: countMap(messages),
       summarizationEnabled: false,
       fadingTier: {
-        v: 1,
+        v: 2,
         budgetTokens: 5000,
         masked: true,
         latched: true,
@@ -800,7 +808,7 @@ describe('pruner keeps historical tool results byte-stable across turns', () => 
 
   it('restores legacy function calls identically across model windows', () => {
     const tier: FadingTier = {
-      v: 1,
+      v: 2,
       budgetTokens: 25_000,
       masked: false,
       latched: true,
@@ -993,7 +1001,7 @@ describe('pruner keeps historical tool results byte-stable across turns', () => 
       summarizationEnabled: false,
       thinkingEnabled: true,
       fadingTier: {
-        v: 1,
+        v: 2,
         budgetTokens: 10_000,
         masked: false,
         latched: true,
@@ -1011,7 +1019,7 @@ describe('pruner keeps historical tool results byte-stable across turns', () => 
     ]);
     expect(projected.additional_kwargs.reasoning_content).toBeUndefined();
     expect(JSON.stringify(projected.tool_calls?.[0].args)).toContain(
-      '_truncated'
+      '_inputPrefix'
     );
     expect(canonicalMessages[1].content).toBe('');
     expect(
@@ -1135,9 +1143,9 @@ describe('isInformativeFadingTier', () => {
       }
     );
 
-    expect(
-      hasNonEmptyTextContent([accessorBlock, proxiedBlock] as never)
-    ).toBe(false);
+    expect(hasNonEmptyTextContent([accessorBlock, proxiedBlock] as never)).toBe(
+      false
+    );
     expect(hasNonEmptyTextContent(new Proxy([], {}) as never)).toBe(false);
   });
 
@@ -1148,19 +1156,19 @@ describe('isInformativeFadingTier', () => {
     );
     expect(
       isInformativeFadingTier(
-        { v: 1, budgetTokens: 100_000, masked: true },
+        { v: 2, budgetTokens: 100_000, masked: true },
         100_000
       )
     ).toBe(true);
     expect(
       isInformativeFadingTier(
-        { v: 1, budgetTokens: 50_000, masked: false },
+        { v: 2, budgetTokens: 50_000, masked: false },
         100_000
       )
     ).toBe(true);
     expect(
       isInformativeFadingTier(
-        { v: 1, budgetTokens: 50_000, masked: false },
+        { v: 2, budgetTokens: 50_000, masked: false },
         undefined
       )
     ).toBe(false);
@@ -1177,13 +1185,13 @@ describe('per-agent fading tier persistence', () => {
 
   it('restores keyed tiers without applying the default tier to every agent', () => {
     const defaultTier: FadingTier = {
-      v: 1,
+      v: 2,
       budgetTokens: 50_000,
       masked: false,
       latched: true,
     };
     const workerTier: FadingTier = {
-      v: 1,
+      v: 2,
       budgetTokens: 25_000,
       masked: true,
       latched: true,
@@ -1219,9 +1227,17 @@ describe('per-agent fading tier persistence', () => {
   it('ignores malformed restored tiers instead of reporting them back', () => {
     const graph = new StandardGraph({
       agents: [graphAgent('default'), graphAgent('worker')],
-      fadingTier: { v: 1, budgetTokens: Number.NaN, masked: true } as FadingTier,
+      fadingTier: {
+        v: 2,
+        budgetTokens: Number.NaN,
+        masked: true,
+      } as FadingTier,
       fadingTiers: {
-        worker: { v: 1, budgetTokens: 'abc', masked: true } as unknown as FadingTier,
+        worker: {
+          v: 2,
+          budgetTokens: 'abc',
+          masked: true,
+        } as unknown as FadingTier,
       },
     });
 
@@ -1233,7 +1249,7 @@ describe('per-agent fading tier persistence', () => {
 
   it('restores a tier learned after a persistent initial summary', () => {
     const postSummaryTier: FadingTier = {
-      v: 1,
+      v: 2,
       budgetTokens: 25_000,
       masked: true,
       latched: true,
@@ -1256,7 +1272,7 @@ describe('per-agent fading tier persistence', () => {
 
   it('round-trips prototype-sensitive agent IDs', () => {
     const tier: FadingTier = {
-      v: 1,
+      v: 2,
       budgetTokens: 25_000,
       masked: true,
       latched: true,
@@ -1282,23 +1298,34 @@ describe('seedFadingTier provenance', () => {
   });
 
   it('latches a seed that was tightened, masked, already latched, or clamped', () => {
-    expect(seedFadingTier(200_000, { v: 1, budgetTokens: 50_000, masked: false })).toEqual({
-      v: 1,
+    expect(
+      seedFadingTier(200_000, { v: 2, budgetTokens: 50_000, masked: false })
+    ).toEqual({
+      v: 2,
       budgetTokens: 50_000,
       masked: false,
       latched: true,
     });
-    expect(seedFadingTier(200_000, { v: 1, budgetTokens: 200_000, masked: true })).toEqual({
-      v: 1,
+    expect(
+      seedFadingTier(200_000, { v: 2, budgetTokens: 200_000, masked: true })
+    ).toEqual({
+      v: 2,
       budgetTokens: 200_000,
       masked: true,
       latched: true,
     });
     expect(
-      seedFadingTier(200_000, { v: 1, budgetTokens: 200_000, masked: false, latched: true })
-    ).toEqual({ v: 1, budgetTokens: 200_000, masked: false, latched: true });
-    expect(seedFadingTier(8_000, { v: 1, budgetTokens: 200_000, masked: false })).toEqual({
-      v: 1,
+      seedFadingTier(200_000, {
+        v: 2,
+        budgetTokens: 200_000,
+        masked: false,
+        latched: true,
+      })
+    ).toEqual({ v: 2, budgetTokens: 200_000, masked: false, latched: true });
+    expect(
+      seedFadingTier(8_000, { v: 2, budgetTokens: 200_000, masked: false })
+    ).toEqual({
+      v: 2,
       budgetTokens: 8_000,
       masked: false,
       latched: true,
@@ -1306,7 +1333,11 @@ describe('seedFadingTier provenance', () => {
   });
 
   it('clamps a sub-floor budget up to the ladder floor so caps stay positive', () => {
-    const seeded = seedFadingTier(200_000, { v: 1, budgetTokens: 1, masked: false });
+    const seeded = seedFadingTier(200_000, {
+      v: 2,
+      budgetTokens: 1,
+      masked: false,
+    });
     expect(seeded.budgetTokens).toBe(FADING_MIN_BUDGET_TOKENS);
     expect(seeded.latched).toBe(true);
     expect(resolveFadingCaps(seeded).resultChars).toBeGreaterThan(0);
@@ -1318,7 +1349,10 @@ describe('fadingRungForExchangeChars', () => {
   it('deepens until a result plus its input fit, even when the result cap is tiny', () => {
     const window = 200_000;
     const target = 8_000;
-    const exchangeChars = (rung: number, maxToolResultChars?: number): number => {
+    const exchangeChars = (
+      rung: number,
+      maxToolResultChars?: number
+    ): number => {
       const budget = fadingBudgetTokens(window, rung);
       const resultChars = calculateMaxToolResultChars(budget);
       return (
@@ -1376,7 +1410,10 @@ describe('hasNonEmptyTextContent hostile iteration', () => {
       false
     );
     expect(
-      hasNonEmptyTextContent({ type: 'text', text: 'x' } as unknown as BaseMessage['content'])
+      hasNonEmptyTextContent({
+        type: 'text',
+        text: 'x',
+      } as unknown as BaseMessage['content'])
     ).toBe(false);
   });
 });

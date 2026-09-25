@@ -2048,7 +2048,7 @@ describe('SubagentExecutor lazy selected-subagent resolution', () => {
     const resumeExecution = makeResumeExecution(parentToolCallId, configId);
     delete resumeExecution.subagentType;
     resumeExecution.graphState.fadingTier = {
-      v: 1,
+      v: 2,
       budgetTokens: 25_000,
       masked: true,
       latched: true,

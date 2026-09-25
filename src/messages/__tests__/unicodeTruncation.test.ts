@@ -104,13 +104,13 @@ describe('Unicode-safe tool truncation', () => {
     for (let cap = 4; cap <= 200; cap++) {
       const serialized = serializeToolCallInput(input, cap);
       const projected = JSON.parse(serialized) as {
-        _truncated?: string;
+        _inputPrefix?: string;
         _originalChars?: number;
       };
       expect(serialized.length).toBeLessThanOrEqual(cap);
-      expect(projected._truncated?.isWellFormed() ?? true).toBe(true);
+      expect(projected._inputPrefix?.isWellFormed() ?? true).toBe(true);
       expect(serializeToolCallInput(projected, cap)).toBe(serialized);
-      if (projected._truncated != null) {
+      if (projected._inputPrefix != null) {
         expect(projected._originalChars).toBe(JSON.stringify(input).length);
       }
     }
@@ -124,7 +124,9 @@ describe('Unicode-safe tool truncation', () => {
       expect(input.isWellFormed()).toBe(true);
       expect(input.length).toBeLessThanOrEqual(cap);
       if (cap > 50) {
-        expect(input).toContain(`\n… [truncated: ${emojiText.length} chars]`);
+        expect(input).toContain(
+          `\n… [shortened; call completed: ${emojiText.length} chars]`
+        );
         const shrunk = projectToolCallInputs(projected, 50);
         const direct = projectToolCallInputs([message], 50);
         expect(customToolInput(shrunk[0])).toBe(customToolInput(direct[0]));

@@ -185,7 +185,7 @@ export interface ContextUsageEvent {
  * `RunConfig.fadingTiers[agentId]`.
  */
 export interface FadingTier {
-  v: 1;
+  v: 2;
   /** Token budget the caps derive from, in raw token space. Never grows;
    *  clamped to the current context window when seeded. */
   budgetTokens: number;

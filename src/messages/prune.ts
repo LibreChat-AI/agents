@@ -1556,7 +1556,28 @@ function cloneAIMessageWithProjectedStreamContent(
   ) as AIMessage | AIMessageChunk;
 }
 
-const TOOL_INPUT_TRUNCATION_MARKER = '… [truncated]\n';
+/** Marker that led the preview in the legacy `{_truncated, _originalChars}` envelope. */
+const LEGACY_TOOL_INPUT_TRUNCATION_MARKER = '… [truncated]\n';
+
+/**
+ * Leads every shortened tool-call input. Fading only shortens calls already in
+ * history, which ran with their full input; a model that reads a shortened copy
+ * as a call that was cut off re-issues it, and a side-effecting tool (sending an
+ * email) then runs again. The note says what actually happened.
+ */
+export const TOOL_INPUT_ELISION_NOTE =
+  'Completed call; input shortened to save context.';
+
+function toolInputElision(
+  originalChars: number,
+  inputPrefix: string
+): { _note: string; _originalChars: number; _inputPrefix: string } {
+  return {
+    _note: TOOL_INPUT_ELISION_NOTE,
+    _originalChars: originalChars,
+    _inputPrefix: inputPrefix,
+  };
+}
 
 function createBoundedTruncationValue(
   preview: string,
@@ -1564,13 +1585,12 @@ function createBoundedTruncationValue(
   maxChars: number
 ): unknown {
   const normalizedMaxChars = normalizeToolInputLimit(maxChars);
-  const canonicalPrefix = preview.startsWith(TOOL_INPUT_TRUNCATION_MARKER)
-    ? preview.slice(TOOL_INPUT_TRUNCATION_MARKER.length)
+  const canonicalPrefix = preview.startsWith(
+    LEGACY_TOOL_INPUT_TRUNCATION_MARKER
+  )
+    ? preview.slice(LEGACY_TOOL_INPUT_TRUNCATION_MARKER.length)
     : preview;
-  const emptyEnvelope = {
-    _truncated: TOOL_INPUT_TRUNCATION_MARKER,
-    _originalChars: originalChars,
-  };
+  const emptyEnvelope = toolInputElision(originalChars, '');
   if (JSON.stringify(emptyEnvelope).length > normalizedMaxChars) {
     /**
      * Even the empty envelope overflows the cap, so no preview survives —
@@ -1590,49 +1610,68 @@ function createBoundedTruncationValue(
   let high = Math.min(canonicalPrefix.length, normalizedMaxChars);
   while (low < high) {
     const next = Math.ceil((low + high) / 2);
-    const candidate = {
-      _truncated:
-        TOOL_INPUT_TRUNCATION_MARKER +
-        sliceWithoutSplittingSurrogates(canonicalPrefix, 0, next),
-      _originalChars: originalChars,
-    };
+    const candidate = toolInputElision(
+      originalChars,
+      sliceWithoutSplittingSurrogates(canonicalPrefix, 0, next)
+    );
     if (JSON.stringify(candidate).length <= normalizedMaxChars) {
       low = next;
     } else {
       high = next - 1;
     }
   }
-  return {
-    // Keep the marker separate from a pure canonical prefix so another,
-    // slightly smaller cap can be derived without nesting the envelope.
-    _truncated:
-      TOOL_INPUT_TRUNCATION_MARKER +
-      sliceWithoutSplittingSurrogates(canonicalPrefix, 0, low),
-    _originalChars: originalChars,
-  };
+  // The prefix stays a pure canonical prefix, so another, slightly smaller cap
+  // can be derived from it without nesting the envelope.
+  return toolInputElision(
+    originalChars,
+    sliceWithoutSplittingSurrogates(canonicalPrefix, 0, low)
+  );
 }
 
+const ELISION_ENVELOPE_KEYS = ['_note', '_originalChars', '_inputPrefix'];
+const LEGACY_ENVELOPE_KEYS = ['_truncated', '_originalChars'];
+
+function hasExactKeys(keys: string[], expected: string[]): boolean {
+  return (
+    keys.length === expected.length &&
+    expected.every((key) => keys.includes(key))
+  );
+}
+
+/** Reads a shortened-input envelope, including the legacy `{_truncated,
+ *  _originalChars}` shape persisted before the elision note existed. */
 function readBoundedTruncationValue(
   input: unknown
 ): { preview: string; originalChars: number } | undefined {
   if (input == null || typeof input !== 'object' || isProxy(input)) {
     return undefined;
   }
+  let previewKey: '_inputPrefix' | '_truncated';
   try {
     const prototype = Object.getPrototypeOf(input);
     const keys = Object.keys(input);
-    if (
-      (prototype !== Object.prototype && prototype !== null) ||
-      keys.length !== 2 ||
-      !keys.includes('_truncated') ||
-      !keys.includes('_originalChars')
-    ) {
+    if (prototype !== Object.prototype && prototype !== null) {
+      return undefined;
+    }
+    if (hasExactKeys(keys, ELISION_ENVELOPE_KEYS)) {
+      const note = readPropertyWithoutAccessors(input, '_note');
+      if (
+        !note.own ||
+        note.accessor ||
+        note.value !== TOOL_INPUT_ELISION_NOTE
+      ) {
+        return undefined;
+      }
+      previewKey = '_inputPrefix';
+    } else if (hasExactKeys(keys, LEGACY_ENVELOPE_KEYS)) {
+      previewKey = '_truncated';
+    } else {
       return undefined;
     }
   } catch {
     return undefined;
   }
-  const preview = readPropertyWithoutAccessors(input, '_truncated');
+  const preview = readPropertyWithoutAccessors(input, previewKey);
   const originalChars = readPropertyWithoutAccessors(input, '_originalChars');
   return preview.own &&
     !preview.accessor &&
@@ -1806,8 +1845,8 @@ function projectSerializedArguments(
   }
   if (
     typeof value === 'string' &&
-    value.includes('"_truncated"') &&
-    value.includes('"_originalChars"')
+    value.includes('"_originalChars"') &&
+    (value.includes('"_inputPrefix"') || value.includes('"_truncated"'))
   ) {
     try {
       const priorTruncation = readBoundedTruncationValue(JSON.parse(value));
@@ -1833,7 +1872,8 @@ function projectSerializedArguments(
   };
 }
 
-const TRUNCATED_STRING_INPUT_PATTERN = /\n… \[truncated: (\d+) chars\]$/u;
+const TRUNCATED_STRING_INPUT_PATTERN =
+  /\n… \[(?:truncated|shortened; call completed): (\d+) chars\]$/u;
 
 function projectStringInputWithinLimit(
   value: string,
@@ -1846,7 +1886,7 @@ function projectStringInputWithinLimit(
   const match = TRUNCATED_STRING_INPUT_PATTERN.exec(value);
   const originalChars = match == null ? value.length : Number(match[1]);
   const prefix = match == null ? value : value.slice(0, match.index);
-  const marker = `\n… [truncated: ${originalChars} chars]`;
+  const marker = `\n… [shortened; call completed: ${originalChars} chars]`;
   return {
     value:
       marker.length >= normalizedMaxChars
@@ -2466,7 +2506,8 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     factoryParams.fadingTier
   );
   let restoredTierPending = isFadingTier(factoryParams.fadingTier);
-  /** Widest exchange seen so far; updated only from the appended suffix. */
+  /** Widest exchange of the current turn (since the last human message);
+   *  updated only from the appended suffix. */
   let maxToolExchangeWidth = 1;
   let toolExchangeWidthThrough = 0;
   let toolExchangeWidthSources: BaseMessage[] = [];
@@ -2533,11 +2574,16 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       originalToolContentSize = 0;
     }
     for (let i = toolExchangeWidthThrough; i < canonicalMessages.length; i++) {
-      maxToolExchangeWidth = Math.max(
-        maxToolExchangeWidth,
-        getToolCallIds(canonicalMessages[i]).size
-      );
-      toolExchangeWidthSources[i] = canonicalMessages[i];
+      const message = canonicalMessages[i];
+      /** Earlier turns come back from storage with each turn's steps merged into
+       *  one assistant message, so their call counts are an artifact of that
+       *  reconstruction, not fan-out; only the current turn's are real. The tier
+       *  itself stays latched, so a narrower width never loosens it. */
+      maxToolExchangeWidth =
+        message.getType() === 'human'
+          ? 1
+          : Math.max(maxToolExchangeWidth, getToolCallIds(message).size);
+      toolExchangeWidthSources[i] = message;
     }
     toolExchangeWidthThrough = canonicalMessages.length;
     let newOriginalToolContent: Map<number, string> | undefined;

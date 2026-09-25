@@ -4,7 +4,12 @@ import {
   calculateMaxToolResultChars,
 } from '@/utils/truncation';
 
-export const FADING_TIER_VERSION = 1;
+/**
+ * Version 2: exchange width counts only the current turn. Version 1 tiers may
+ * have latched on history whose steps storage had merged into one assistant
+ * message, so they are discarded and re-derived once.
+ */
+export const FADING_TIER_VERSION = 2;
 
 /** Context pressure at which observation masking activates. */
 export const PRESSURE_THRESHOLD_MASKING = 0.8;
@@ -34,7 +39,7 @@ export type FadingSignals = {
   /** (pruningBudget − instruction tokens) ÷ calibrationRatio, in raw token space. */
   effectiveRawTokens: number;
   summarizationEnabled: boolean;
-  /** Largest number of parallel calls observed in one assistant exchange. */
+  /** Largest number of parallel calls in one assistant exchange of the current turn. */
   toolExchangeWidth?: number;
   /** Recovery paths force at least this rung on the current window's ladder. */
   minRung?: number;
@@ -199,7 +204,10 @@ export function fadingRungForExchangeChars(
       maxToolResultChars == null
         ? windowResultChars
         : Math.min(windowResultChars, maxToolResultChars);
-    if (resultChars + calculateMaxToolCallInputChars(budgetTokens) <= targetChars) {
+    if (
+      resultChars + calculateMaxToolCallInputChars(budgetTokens) <=
+      targetChars
+    ) {
       return rung;
     }
   }
