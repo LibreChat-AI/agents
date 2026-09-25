@@ -1642,7 +1642,7 @@ function hasExactKeys(keys: string[], expected: string[]): boolean {
  *  _originalChars}` shape persisted before the elision note existed. */
 function readBoundedTruncationValue(
   input: unknown
-): { preview: string; originalChars: number } | undefined {
+): { preview: string; originalChars: number; legacy: boolean } | undefined {
   if (input == null || typeof input !== 'object' || isProxy(input)) {
     return undefined;
   }
@@ -1681,7 +1681,11 @@ function readBoundedTruncationValue(
     typeof originalChars.value === 'number' &&
     Number.isFinite(originalChars.value) &&
     originalChars.value >= 0
-    ? { preview: preview.value, originalChars: originalChars.value }
+    ? {
+      preview: preview.value,
+      originalChars: originalChars.value,
+      legacy: previewKey === '_truncated',
+    }
     : undefined;
 }
 
@@ -1696,7 +1700,9 @@ function projectToolInputWithinLimit(
       input,
       normalizedMaxChars
     );
-    if (!serializedLength.truncated) {
+    /** A legacy envelope converts even when it fits: its `_truncated` wording
+     *  is what led models to re-issue completed calls. */
+    if (!serializedLength.truncated && !priorTruncation.legacy) {
       return { value: input, changed: false };
     }
     return {
@@ -1840,9 +1846,6 @@ function projectSerializedArguments(
   maxChars: number
 ): { value: string; changed: boolean } {
   const normalizedMaxChars = normalizeToolInputLimit(maxChars);
-  if (typeof value === 'string' && value.length <= normalizedMaxChars) {
-    return { value, changed: false };
-  }
   if (
     typeof value === 'string' &&
     value.includes('"_originalChars"') &&
@@ -1851,6 +1854,9 @@ function projectSerializedArguments(
     try {
       const priorTruncation = readBoundedTruncationValue(JSON.parse(value));
       if (priorTruncation != null) {
+        if (!priorTruncation.legacy && value.length <= normalizedMaxChars) {
+          return { value, changed: false };
+        }
         return {
           value: JSON.stringify(
             createBoundedTruncationValue(
@@ -1866,6 +1872,9 @@ function projectSerializedArguments(
       // Fall through to the accessor-safe serializer for malformed JSON.
     }
   }
+  if (typeof value === 'string' && value.length <= normalizedMaxChars) {
+    return { value, changed: false };
+  }
   return {
     value: serializeToolCallInput(value, normalizedMaxChars),
     changed: true,
@@ -1874,13 +1883,17 @@ function projectSerializedArguments(
 
 const TRUNCATED_STRING_INPUT_PATTERN =
   /\n… \[(?:truncated|shortened; call completed): (\d+) chars\]$/u;
+const LEGACY_TRUNCATED_STRING_INPUT_PATTERN = /\n… \[truncated: \d+ chars\]$/u;
 
 function projectStringInputWithinLimit(
   value: string,
   maxChars: number
 ): { value: string; changed: boolean } {
   const normalizedMaxChars = normalizeToolInputLimit(maxChars);
-  if (value.length <= normalizedMaxChars) {
+  if (
+    value.length <= normalizedMaxChars &&
+    !LEGACY_TRUNCATED_STRING_INPUT_PATTERN.test(value)
+  ) {
     return { value, changed: false };
   }
   const match = TRUNCATED_STRING_INPUT_PATTERN.exec(value);
@@ -2104,16 +2117,9 @@ function projectResponsesOutput(
           ? ACCESSOR_INPUT_PLACEHOLDER
           : canonicalProperty.value;
       }
-      if (
-        type === 'custom_tool_call' &&
-        typeof source === 'string' &&
-        source.length <= normalizeToolInputLimit(maxChars)
-      ) {
-        projectedInput = {
-          value: source,
-          changed: !inputProperty.own || inputProperty.value !== source,
-        };
-      } else if (type === 'custom_tool_call') {
+      if (type === 'custom_tool_call') {
+        /** The string projection keeps fitting input as-is, except a legacy
+         *  `[truncated: N chars]` marker, which it rewrites. */
         const value =
           typeof source === 'string'
             ? projectStringInputWithinLimit(source, maxChars).value
@@ -2429,6 +2435,19 @@ function applyToolCallInputCaps(params: {
   return truncatedCount;
 }
 
+/**
+ * Whether a message opens a user turn: a human message or a role-based `user`
+ * chat message. SDK-injected context (hook output after a tool batch, steers) is
+ * stamped as a `HumanMessage` but belongs to the turn it follows.
+ */
+function startsUserTurn(message: BaseMessage): boolean {
+  const type = message.getType();
+  if (type === 'generic') {
+    return (message as { role?: unknown }).role === 'user';
+  }
+  return type === 'human' && message.additional_kwargs.injected !== true;
+}
+
 export function preFlightTruncateToolCallInputs(params: {
   messages: BaseMessage[];
   maxContextTokens: number;
@@ -2579,10 +2598,9 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
        *  one assistant message, so their call counts are an artifact of that
        *  reconstruction, not fan-out; only the current turn's are real. The tier
        *  itself stays latched, so a narrower width never loosens it. */
-      maxToolExchangeWidth =
-        message.getType() === 'human'
-          ? 1
-          : Math.max(maxToolExchangeWidth, getToolCallIds(message).size);
+      maxToolExchangeWidth = startsUserTurn(message)
+        ? 1
+        : Math.max(maxToolExchangeWidth, getToolCallIds(message).size);
       toolExchangeWidthSources[i] = message;
     }
     toolExchangeWidthThrough = canonicalMessages.length;

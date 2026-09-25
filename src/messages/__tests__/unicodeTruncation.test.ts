@@ -116,6 +116,18 @@ describe('Unicode-safe tool truncation', () => {
     }
   });
 
+  it('rewrites a legacy custom-tool input marker even when it fits', () => {
+    const message = customToolMessage(
+      'run --report\n… [truncated: 5400 chars]'
+    );
+
+    const projected = projectToolCallInputs([message], 1_000);
+
+    expect(customToolInput(projected[0])).toBe(
+      'run --report\n… [shortened; call completed: 5400 chars]'
+    );
+  });
+
   it('keeps custom-tool input marker and markerless cuts well-formed without mutating history', () => {
     const message = customToolMessage(emojiText);
     for (let cap = 4; cap <= 100; cap++) {

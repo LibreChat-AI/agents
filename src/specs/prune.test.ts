@@ -3880,6 +3880,111 @@ describe('context fading of completed tool calls (issue: re-executed side effect
     expect(reloaded.budgetTokens).toBeGreaterThan(liveWideTurn.budgetTokens);
   });
 
+  it('treats a role-based user message as a turn boundary', () => {
+    const calls = lookupCalls(8);
+    const priorTurn: BaseMessage[] = [
+      new HumanMessage('Build the report'),
+      new AIMessage({ content: '', tool_calls: calls }),
+      ...calls.map(
+        (call) =>
+          new ToolMessage({
+            content: 'ok',
+            tool_call_id: call.id,
+            name: 'lookup',
+          })
+      ),
+    ];
+
+    const genericUserTurn = fadingTierFor([
+      ...priorTurn,
+      new ChatMessage({ role: 'user', content: 'Send it' }),
+    ]);
+    const liveWideTurn = fadingTierFor([
+      new HumanMessage('Send it'),
+      ...priorTurn.slice(1),
+    ]);
+
+    expect(genericUserTurn.budgetTokens).toBeGreaterThan(
+      liveWideTurn.budgetTokens
+    );
+  });
+
+  it('keeps the live batch width across SDK-injected context', () => {
+    const calls = lookupCalls(8);
+    const liveTurn: BaseMessage[] = [
+      new HumanMessage('Build the report'),
+      new AIMessage({ content: '', tool_calls: calls }),
+      ...calls.map(
+        (call) =>
+          new ToolMessage({
+            content: 'ok',
+            tool_call_id: call.id,
+            name: 'lookup',
+          })
+      ),
+    ];
+
+    const withInjectedContext = fadingTierFor([
+      ...liveTurn,
+      new HumanMessage({
+        content: 'Hook context after the tool batch',
+        additional_kwargs: { role: 'user', injected: true },
+      }),
+    ]);
+
+    expect(withInjectedContext.budgetTokens).toBe(
+      fadingTierFor(liveTurn).budgetTokens
+    );
+  });
+
+  it('converts a legacy envelope that already fits the cap', () => {
+    const legacyArgs = {
+      _truncated: '… [truncated]\n{"subject":"Report"',
+      _originalChars: 3810,
+    };
+    const message = new AIMessage({
+      content: '',
+      tool_calls: [
+        {
+          id: 'call_send',
+          name: 'send_email',
+          args: legacyArgs,
+          type: 'tool_call',
+        },
+      ],
+      additional_kwargs: {
+        tool_calls: [
+          {
+            id: 'call_send',
+            type: 'function',
+            function: {
+              name: 'send_email',
+              arguments: JSON.stringify(legacyArgs),
+            },
+          },
+        ],
+      },
+    });
+
+    const [projected] = projectToolCallInputs([message], 50_000) as AIMessage[];
+
+    expect(projected.tool_calls?.[0].args).toEqual({
+      _note: TOOL_INPUT_ELISION_NOTE,
+      _originalChars: 3810,
+      _inputPrefix: '{"subject":"Report"',
+    });
+    const serialized = (
+      projected.additional_kwargs.tool_calls as Array<{
+        function: { arguments: string };
+      }>
+    )[0].function.arguments;
+    expect(JSON.parse(serialized)).toEqual({
+      _note: TOOL_INPUT_ELISION_NOTE,
+      _originalChars: 3810,
+      _inputPrefix: '{"subject":"Report"',
+    });
+  });
+
   it('re-caps a legacy truncation envelope into one that says the call completed', () => {
     const legacyArgs = {
       _truncated: `… [truncated]
