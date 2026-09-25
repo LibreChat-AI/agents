@@ -69,8 +69,12 @@ describe('Langfuse span registry', () => {
     const mediaDisabled = resolveLangfuseDestinationKey(
       tenantConfig({ mediaUploadEnabled: false })
     );
+    const privacyOnly = resolveLangfuseDestinationKey(
+      tenantConfig({ privacy: { mode: 'metricsOnly' } })
+    );
     expect(redacting).toBe(base);
     expect(mediaDisabled).toBe(base);
+    expect(privacyOnly).toBe(base);
   });
 
   it('passes media upload policy to the Langfuse span processor params', () => {
@@ -83,6 +87,28 @@ describe('Langfuse span registry', () => {
         mediaUploadEnabled: false,
       })
     );
+  });
+
+  it('disables media upload under metricsOnly privacy', () => {
+    const params = getLangfuseSpanProcessorParams(
+      tenantConfig({
+        mediaUploadEnabled: true,
+        privacy: { mode: 'metricsOnly' },
+      })
+    );
+    expect(params).toEqual(
+      expect.objectContaining({
+        mediaUploadEnabled: false,
+      })
+    );
+    expect(params?.mask).toBeUndefined();
+  });
+
+  it('leaves content params untouched in full privacy mode', () => {
+    const params = getLangfuseSpanProcessorParams(
+      tenantConfig({ mediaUploadEnabled: true, privacy: { mode: 'full' } })
+    );
+    expect(params?.mediaUploadEnabled).toBe(true);
   });
 
   it('separates destinations by credentials, endpoint, and environment', () => {

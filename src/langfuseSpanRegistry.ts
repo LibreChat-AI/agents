@@ -151,15 +151,22 @@ export function getLangfuseSpanProcessorParams(
   const additionalHeaders = hasAdditionalHeaders(langfuse?.additionalHeaders)
     ? { additionalHeaders: langfuse.additionalHeaders }
     : {};
+  // metricsOnly suppresses media too: media payloads are content, so the
+  // processor must not run its media create/upload/patch operations. Content
+  // attributes themselves are redacted by the wrapping span processor, which
+  // unlike the SDK `mask` callback knows which attribute it is handling.
+  const metricsOnly = langfuse?.privacy?.mode === 'metricsOnly';
+  const mediaUploadEnabled = metricsOnly ? false : langfuse?.mediaUploadEnabled;
+  const contentPolicy = {
+    ...(mediaUploadEnabled != null ? { mediaUploadEnabled } : {}),
+  };
   if (hasLangfuseConfigCredentials(langfuse)) {
     return {
       publicKey: langfuse.publicKey,
       secretKey: langfuse.secretKey,
       ...(isPresent(langfuse.baseUrl) ? { baseUrl: langfuse.baseUrl } : {}),
       ...(isPresent(environment) ? { environment } : {}),
-      ...(langfuse.mediaUploadEnabled != null
-        ? { mediaUploadEnabled: langfuse.mediaUploadEnabled }
-        : {}),
+      ...contentPolicy,
       ...additionalHeaders,
     };
   }
@@ -173,9 +180,7 @@ export function getLangfuseSpanProcessorParams(
       secretKey: process.env.LANGFUSE_SECRET_KEY as string,
       ...(isPresent(baseUrl) ? { baseUrl } : {}),
       ...(isPresent(environment) ? { environment } : {}),
-      ...(langfuse?.mediaUploadEnabled != null
-        ? { mediaUploadEnabled: langfuse.mediaUploadEnabled }
-        : {}),
+      ...contentPolicy,
       ...additionalHeaders,
     };
   }
@@ -185,9 +190,7 @@ export function getLangfuseSpanProcessorParams(
       secretKey: process.env.LANGFUSE_SECRET_KEY as string,
       baseUrl: langfuse.baseUrl,
       ...(isPresent(environment) ? { environment } : {}),
-      ...(langfuse.mediaUploadEnabled != null
-        ? { mediaUploadEnabled: langfuse.mediaUploadEnabled }
-        : {}),
+      ...contentPolicy,
       ...additionalHeaders,
     };
   }

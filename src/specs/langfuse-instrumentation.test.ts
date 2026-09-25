@@ -1,6 +1,10 @@
 const mockLangfuseSpanProcessorInstance = {};
+type MockLangfuseSpanProcessorParams = {
+  mask?: (input: { data: unknown }) => string;
+};
 const mockLangfuseSpanProcessor = jest.fn(
-  () => mockLangfuseSpanProcessorInstance
+  (_params?: MockLangfuseSpanProcessorParams) =>
+    mockLangfuseSpanProcessorInstance
 );
 const mockSetLangfuseTracerProvider = jest.fn();
 let mockContextHasActiveValue = false;
@@ -197,6 +201,24 @@ describe('Langfuse instrumentation', () => {
     expect(mockLangfuseSpanProcessor).toHaveBeenCalledWith(
       expect.objectContaining({ environment: 'staging' })
     );
+  });
+
+  it('constructs the span processor with media upload disabled under metricsOnly', async () => {
+    const { initializeLangfuseTracing } = await import('@/instrumentation');
+    initializeLangfuseTracing({
+      publicKey: 'pk-config',
+      secretKey: 'sk-config',
+      baseUrl: 'https://langfuse.config',
+      privacy: { mode: 'metricsOnly', redactionText: '[private]' },
+    });
+
+    expect(mockLangfuseSpanProcessor).toHaveBeenCalledWith(
+      expect.objectContaining({
+        mediaUploadEnabled: false,
+      })
+    );
+    const params = mockLangfuseSpanProcessor.mock.calls[0][0];
+    expect(params?.mask).toBeUndefined();
   });
 
   it('falls back to NODE_ENV when LANGFUSE_TRACING_ENVIRONMENT is unset', async () => {

@@ -79,8 +79,9 @@ export function ensureOpenTelemetryContextManager(): void {
 }
 
 /** Cache key for processor instances: the destination plus processor-level
- *  policy (`toolOutputTracing` is baked into each processor's redaction
- *  behavior), unlike the pure destination identity used for span parenting. */
+ *  policy (`toolOutputTracing` and `privacy` are baked into each processor's
+ *  redaction behavior), unlike the pure destination identity used for span
+ *  parenting. */
 function getLangfuseProcessorCacheKey(
   destinationKey: string,
   langfuse?: t.LangfuseConfig
@@ -89,6 +90,7 @@ function getLangfuseProcessorCacheKey(
     destinationKey,
     mediaUploadEnabled: langfuse?.mediaUploadEnabled,
     toolOutputTracing: langfuse?.toolOutputTracing,
+    privacy: langfuse?.privacy,
   });
 }
 

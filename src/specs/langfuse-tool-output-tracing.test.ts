@@ -1662,6 +1662,46 @@ describe('Langfuse tool output tracing redaction', () => {
     });
   });
 
+  it('keeps privacy run-level and fails closed on agent overlays', () => {
+    const credentials = {
+      publicKey: 'pk-run',
+      secretKey: 'sk-run',
+      baseUrl: 'https://langfuse.test',
+    };
+    expect(
+      resolveLangfuseConfig(
+        {
+          ...credentials,
+          privacy: { mode: 'metricsOnly', redactionText: '[run]' },
+        },
+        { privacy: { mode: 'full' } }
+      )
+    ).toMatchObject({
+      privacy: { mode: 'metricsOnly', redactionText: '[run]' },
+    });
+    // An agent overlay asking for metricsOnly without a run-level policy
+    // cannot be enforced on the shared trace, so export is disabled.
+    expect(
+      resolveLangfuseConfig(credentials, {
+        privacy: { mode: 'metricsOnly', redactionText: '[agent]' },
+      })
+    ).toMatchObject({ enabled: false });
+    expect(
+      resolveLangfuseConfig(credentials, {
+        privacy: { mode: 'metricsOnly', redactionText: '[agent]' },
+      })?.privacy
+    ).toBeUndefined();
+    // Agent-only configs cannot carry privacy either.
+    expect(
+      resolveLangfuseConfig(undefined, {
+        privacy: { mode: 'metricsOnly' },
+      })
+    ).toMatchObject({ enabled: false });
+    expect(
+      resolveLangfuseConfig(undefined, { privacy: { mode: 'full' } })?.privacy
+    ).toBeUndefined();
+  });
+
   it('merges run and agent custom headers with the agent winning collisions', () => {
     const resolved = resolveLangfuseConfig(
       {

@@ -765,7 +765,9 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
 
 function hasLangfuseTracingConfig(langfuse?: t.LangfuseConfig): boolean {
   return (
-    langfuse?.toolNodeTracing != null || langfuse?.toolOutputTracing != null
+    langfuse?.toolNodeTracing != null ||
+    langfuse?.toolOutputTracing != null ||
+    langfuse?.privacy != null
   );
 }
 

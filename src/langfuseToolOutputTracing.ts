@@ -15,12 +15,15 @@ import {
   normalizeToolName,
   resolveLangfuseConfig,
   resolveToolOutputTracingConfig,
+  resolveLangfuseContentRedactionText,
+  resolveLangfusePrivacyConfig,
 } from '@/langfuseConfig';
 import {
   shapeLangfuseSpan,
   shouldDropLangfuseSpan,
 } from '@/langfuseTraceShaping';
 import { resolveToolOutputTracingConfigForSpan } from '@/langfuseRuntimeScope';
+import { LANGFUSE_OPERATION_METADATA_KEY } from '@/langfuseOperation';
 
 export { LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT, resolveLangfuseConfig };
 
@@ -875,20 +878,188 @@ export function redactLangfuseSpanToolOutputs(
   }
 }
 
+/**
+ * Run-correlation identity preserved from masked metadata values. These keys
+ * are SDK-written identifiers (never user content) that Langfuse consumers
+ * need to link observations back to LibreChat runs, so `metricsOnly` keeps
+ * them while every other metadata entry is dropped.
+ */
+const PRESERVED_TRACE_IDENTITY_KEYS = [
+  'messageId',
+  'parentMessageId',
+  'agentId',
+  'agentName',
+  'sourceRunId',
+  'responseId',
+  LANGFUSE_OPERATION_METADATA_KEY,
+] as const;
+
+function preserveTraceIdentity(value: unknown, redactionText: string): string {
+  if (typeof value !== 'string') {
+    return redactionText;
+  }
+  const trimmed = value.trim();
+  if (!trimmed.startsWith('{')) {
+    return redactionText;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return redactionText;
+  }
+  if (parsed == null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return redactionText;
+  }
+  const source = parsed as Record<string, unknown>;
+  const preserved: Record<string, unknown> = {};
+  for (const key of PRESERVED_TRACE_IDENTITY_KEYS) {
+    if (key in source) {
+      preserved[key] = source[key];
+    }
+  }
+  return Object.keys(preserved).length > 0
+    ? JSON.stringify(preserved)
+    : redactionText;
+}
+
+/** Metadata also rides flattened, one attribute per entry. */
+const PRESERVED_TRACE_IDENTITY_KEY_SET = new Set<string>(
+  PRESERVED_TRACE_IDENTITY_KEYS
+);
+
+function redactFlattenedMetadata(attributes: Record<string, unknown>): void {
+  const prefixes = [
+    `${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.`,
+    `${LangfuseOtelSpanAttributes.TRACE_METADATA}.`,
+  ];
+  for (const key of Object.keys(attributes)) {
+    const prefix = prefixes.find((candidate) => key.startsWith(candidate));
+    if (prefix == null) {
+      continue;
+    }
+    if (PRESERVED_TRACE_IDENTITY_KEY_SET.has(key.slice(prefix.length))) {
+      continue;
+    }
+    delete attributes[key];
+  }
+}
+
+/**
+ * Applies the `metricsOnly` policy to a span's content-bearing attributes
+ * before export.
+ *
+ * Redaction happens here rather than through the Langfuse span processor's
+ * `mask` callback because the callback cannot tell which attribute it is
+ * handling: preserving run-correlation identity in metadata would also
+ * preserve same-named keys in user content (a tool returning
+ * `{"messageId": "..."}`), and a blanket replacement would strip the
+ * identity Langfuse consumers need. Per-attribute, input and output values
+ * are replaced wholesale while metadata keeps only SDK-written identifiers;
+ * flattened metadata entries are dropped unless they carry that identity.
+ *
+ * Model parameters are redacted too: they can embed content-bearing values
+ * (caller-supplied stop strings, user identifiers, tool schemas and
+ * descriptions). The model name, usage, and cost attributes stay.
+ *
+ * Fail closed: if any step throws, every masked family is replaced with the
+ * redaction text instead of exporting the value verbatim.
+ */
+function redactLangfuseSpanContent(
+  span: ReadableSpan,
+  privacy: t.LangfusePrivacyConfig
+): void {
+  const redactionText = resolveLangfuseContentRedactionText(privacy);
+  const attributes = span.attributes;
+  const contentKeys = [
+    LangfuseOtelSpanAttributes.OBSERVATION_INPUT,
+    LangfuseOtelSpanAttributes.TRACE_INPUT,
+    LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT,
+    LangfuseOtelSpanAttributes.TRACE_OUTPUT,
+    LangfuseOtelSpanAttributes.OBSERVATION_MODEL_PARAMETERS,
+  ];
+  const metadataKeys = [
+    LangfuseOtelSpanAttributes.OBSERVATION_METADATA,
+    LangfuseOtelSpanAttributes.TRACE_METADATA,
+  ];
+  try {
+    for (const key of contentKeys) {
+      if (key in attributes) {
+        attributes[key] = redactionText;
+      }
+    }
+    for (const key of metadataKeys) {
+      if (key in attributes) {
+        attributes[key] = preserveTraceIdentity(attributes[key], redactionText);
+      }
+    }
+    redactFlattenedMetadata(attributes);
+    redactLangfuseSpanStatusContent(span, redactionText);
+  } catch {
+    for (const key of [...contentKeys, ...metadataKeys]) {
+      if (key in attributes) {
+        attributes[key] = redactionText;
+      }
+    }
+    try {
+      redactFlattenedMetadata(attributes);
+      redactLangfuseSpanStatusContent(span, redactionText);
+    } catch {
+      // Status redaction is best-effort; content attributes above are the
+      // values that must never export verbatim.
+    }
+  }
+}
+
+/**
+ * Redacts content that rides outside the masked attribute families: the
+ * OTel status message and exception events. Error strings routinely embed
+ * request data (a tool reporting an invalid user value, an upstream
+ * response body). The status code stays: error vs. ok is operational data.
+ */
+function redactLangfuseSpanStatusContent(
+  span: ReadableSpan,
+  redactionText: string
+): void {
+  if (isPresent(span.status.message)) {
+    span.status.message = redactionText;
+  }
+  const statusMessageKey =
+    LangfuseOtelSpanAttributes.OBSERVATION_STATUS_MESSAGE;
+  if (statusMessageKey in span.attributes) {
+    span.attributes[statusMessageKey] = redactionText;
+  }
+  for (const event of span.events) {
+    if (event.name !== 'exception') {
+      continue;
+    }
+    for (const key of ['exception.message', 'exception.stacktrace']) {
+      if (event.attributes != null && key in event.attributes) {
+        event.attributes[key] = redactionText;
+      }
+    }
+  }
+}
+
 export function prepareLangfuseSpanForExport(
   span: ReadableSpan,
-  config?: ResolvedLangfuseToolOutputTracingConfig
+  config?: ResolvedLangfuseToolOutputTracingConfig,
+  privacy?: t.LangfusePrivacyConfig
 ): void {
   classifyLangfuseToolNodeSpan(span);
   if (config != null) {
     redactLangfuseSpanToolOutputs(span, config);
   }
   shapeLangfuseSpan(span);
+  if (privacy?.mode === 'metricsOnly') {
+    redactLangfuseSpanContent(span, privacy);
+  }
 }
 
 class ToolOutputRedactingLangfuseSpanProcessor implements SpanProcessor {
   private readonly processor: LangfuseSpanProcessor;
   private readonly fallbackConfig?: ResolvedLangfuseToolOutputTracingConfig;
+  private readonly privacy?: t.LangfusePrivacyConfig;
   private readonly spanConfigs = new WeakMap<
     object,
     ResolvedLangfuseToolOutputTracingConfig
@@ -896,10 +1067,12 @@ class ToolOutputRedactingLangfuseSpanProcessor implements SpanProcessor {
 
   constructor(
     params?: LangfuseSpanProcessorParams,
-    fallbackConfig?: ResolvedLangfuseToolOutputTracingConfig
+    fallbackConfig?: ResolvedLangfuseToolOutputTracingConfig,
+    privacy?: t.LangfusePrivacyConfig
   ) {
     this.processor = new LangfuseSpanProcessor(params);
     this.fallbackConfig = fallbackConfig;
+    this.privacy = privacy;
   }
 
   onStart(span: Span, parentContext: Context): void {
@@ -920,7 +1093,7 @@ class ToolOutputRedactingLangfuseSpanProcessor implements SpanProcessor {
       return;
     }
     const config = this.spanConfigs.get(span) ?? this.fallbackConfig;
-    prepareLangfuseSpanForExport(span, config);
+    prepareLangfuseSpanForExport(span, config, this.privacy);
     this.processor.onEnd(span);
   }
 
@@ -941,7 +1114,11 @@ export function createLangfuseSpanProcessor(
   const fallbackConfig = hasToolOutputTracingConfig(runLangfuse, agentLangfuse)
     ? resolveToolOutputTracingConfig(runLangfuse, agentLangfuse)
     : undefined;
-  return new ToolOutputRedactingLangfuseSpanProcessor(params, fallbackConfig);
+  return new ToolOutputRedactingLangfuseSpanProcessor(
+    params,
+    fallbackConfig,
+    resolveLangfusePrivacyConfig(runLangfuse)
+  );
 }
 
 function hasLangfuseEnvKeys(): boolean {
