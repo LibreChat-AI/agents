@@ -746,6 +746,7 @@ describe('Subagent Integration', () => {
   });
 
   it('reports child model usage through subagentUsageSink', async () => {
+    const childModelRunIds: string[] = [];
     const CHILD_USAGE = {
       input_tokens: 11,
       output_tokens: 7,
@@ -769,6 +770,7 @@ describe('Subagent Integration', () => {
           async _generate(
             ...args: Parameters<FakeListChatModel['_generate']>
           ): ReturnType<FakeListChatModel['_generate']> {
+            if (args[2]?.runId != null) childModelRunIds.push(args[2].runId);
             const result = await super._generate(...args);
             for (const generation of result.generations) {
               (generation.message as AIMessage).usage_metadata = {
@@ -780,6 +782,7 @@ describe('Subagent Integration', () => {
           async *_streamResponseChunks(
             ...args: Parameters<FakeListChatModel['_streamResponseChunks']>
           ): ReturnType<FakeListChatModel['_streamResponseChunks']> {
+            if (args[2]?.runId != null) childModelRunIds.push(args[2].runId);
             yield* super._streamResponseChunks(...args);
             yield new ChatGenerationChunk({
               text: '',
@@ -852,6 +855,8 @@ describe('Subagent Integration', () => {
     /** FakeListChatModel emits no ls_model_name → config fallback. */
     expect(event.model).toBe('gpt-4o-mini');
     expect(event.runId).toBe(runId);
+    expect(childModelRunIds).toContain(event.modelRunId);
+    expect(event.modelRunId).not.toBe(runId);
     expect(event.subagentRunId).toContain(`${runId}_sub_`);
     /**
      * The parent's own calls must NOT be routed through the sink — they

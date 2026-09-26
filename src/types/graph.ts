@@ -808,6 +808,8 @@ export interface SubagentUpdateEvent {
 export interface SubagentUsageEvent {
   /** Usage metadata reported by the child's model call. */
   usage: UsageMetadata;
+  /** Identity of this model call, shared with native failure recovery. */
+  modelRunId?: string;
   /**
    * Model that produced this usage. Per-call `ls_model_name` from the
    * model's callback metadata when available (covers child-side

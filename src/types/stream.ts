@@ -10,6 +10,10 @@ import type { ToolCall, ToolCallChunk } from '@langchain/core/messages/tool';
 import type { LLMResult, Generation } from '@langchain/core/outputs';
 import type { Command } from '@langchain/langgraph';
 import type Anthropic from '@anthropic-ai/sdk';
+import type {
+  NativeMediaReference,
+  NativeMediaContent,
+} from '@/types/nativeMedia';
 import type { AnthropicContentBlock } from '@/llm/anthropic/types';
 import type { AssistantTextPhase } from '@/types/assistantPhase';
 import type { SummarizeCompleteEvent } from '@/types/summarize';
@@ -375,6 +379,7 @@ export interface ReasoningDelta {
 }
 
 export type MessageDeltaUpdate = {
+  native_media?: NativeMediaReference;
   type: ContentTypes.TEXT;
   text: string;
   tool_call_ids?: string[];
@@ -497,6 +502,11 @@ export type ToolResultContent = {
   index?: number;
 };
 
+export type MessageContentImageFile = Extract<
+  NativeMediaContent,
+  { type: 'image_file' }
+>;
+
 export type MessageContentComplex = (
   | ToolResultContent
   | ThinkingContentText
@@ -506,6 +516,7 @@ export type MessageContentComplex = (
   | ReasoningContentText
   | MessageContentText
   | MessageContentImageUrl
+  | MessageContentImageFile
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   | (Record<string, any> & {
       type?: 'text' | 'image_url' | 'think' | 'thinking' | string;
@@ -515,6 +526,7 @@ export type MessageContentComplex = (
       type?: never;
     })
 ) & {
+  native_media?: NativeMediaReference;
   /** Open Responses-compatible semantic phase for assistant text. */
   phase?: AssistantTextPhase;
   /** LangChain standard-content form of provider-specific block fields. */

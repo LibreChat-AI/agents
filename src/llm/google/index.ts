@@ -3,6 +3,8 @@ import { AIMessageChunk } from '@langchain/core/messages';
 import { ChatGenerationChunk } from '@langchain/core/outputs';
 import { ChatGoogleGenerativeAI } from '@langchain/google-genai';
 import { getEnvironmentVariable } from '@langchain/core/utils/env';
+import { ChatModelStream } from '@langchain/core/language_models/stream';
+import { convertChunksToEvents } from '@langchain/core/language_models/compat';
 import {
   FunctionCallingMode,
   GoogleGenerativeAI as GenerativeAI,
@@ -12,18 +14,23 @@ import type {
   SafetySetting,
   ToolConfig,
 } from '@google/generative-ai';
+import type { BaseLanguageModelInput } from '@langchain/core/language_models/base';
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
+import type { ChatModelStreamEvent } from '@langchain/core/language_models/event';
 import type { BaseMessage, UsageMetadata } from '@langchain/core/messages';
+import type { Runnable } from '@langchain/core/runnables';
 import type { GeminiApiUsageMetadata, InputTokenDetails } from './types';
 import type { GoogleClientOptions, GoogleThinkingConfig } from '@/types';
-import { smoothGenerationChunks } from '@/llm/stream/chunkAdapters';
-import { resolveStreamDelay } from '@/llm/stream/smoother';
+import type { NativeMediaPort } from './native';
 import {
   convertResponseContentToChatGenerationChunk,
   convertBaseMessagesToContent,
   dropUnsupportedModelTurnPrefill,
   mapGenerateContentResultToChatResult,
 } from './utils/common';
+import { smoothGenerationChunks } from '@/llm/stream/chunkAdapters';
+import { resolveStreamDelay } from '@/llm/stream/smoother';
+import { NativeMediaSession } from './native';
 
 type GoogleToolConfigWithServerSideInvocations = ToolConfig & {
   includeServerSideToolInvocations?: boolean;
@@ -36,11 +43,17 @@ type GoogleToolConfigWithServerSideInvocations = ToolConfig & {
       | 'VALIDATED';
   };
 };
+type GoogleCallOptions = NonNullable<
+  Parameters<ChatGoogleGenerativeAI['invoke']>[1]
+>;
 
 export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
+  static readonly nativeMediaProtocolVersion = 1;
+  nativeMedia?: NativeMediaPort;
   _lc_stream_delay: number;
   thinkingConfig?: GoogleThinkingConfig;
   includeServerSideToolInvocations?: boolean;
+  private readonly responseModalities?: string[];
 
   /**
    * Override to add gemini-3 model support for multimodal and function calling thought signatures
@@ -57,6 +70,8 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
 
   constructor(fields: GoogleClientOptions) {
     super(fields);
+    this.nativeMedia = fields.nativeMedia;
+    this.responseModalities = fields.responseModalities?.slice();
 
     this._lc_stream_delay = resolveStreamDelay(fields._lc_stream_delay);
     this.model = fields.model.replace(/^models\//, '');
@@ -170,7 +185,8 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
       total_tokens: usageMetadata.totalTokenCount ?? 0,
     };
 
-    if (usageMetadata.cachedContentTokenCount) {
+    const hasCachedInput = Boolean(usageMetadata.cachedContentTokenCount);
+    if (hasCachedInput) {
       output.input_token_details ??= {};
       output.input_token_details.cache_read =
         usageMetadata.cachedContentTokenCount;
@@ -241,59 +257,182 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
     return params;
   }
 
+  private async prepareRequest(
+    messages: BaseMessage[],
+    options: this['ParsedCallOptions'],
+    native: NativeMediaSession
+  ): Promise<GenerateContentRequest> {
+    const admitted = await native.start();
+    const prompt =
+      convertBaseMessagesToContent(
+        await native.messages(messages),
+        this._isMultimodalModel,
+        this.useSystemInstruction,
+        this.model
+      ) ?? [];
+    const systemInstruction =
+      prompt[0]?.role === 'system' ? prompt[0] : undefined;
+    const contents = systemInstruction == null ? prompt : prompt.slice(1);
+    const parameters = this.invocationParams(options);
+    const responseModalities =
+      this.nativeMedia == null
+        ? undefined
+        : (admitted?.responseModalities ?? this.responseModalities);
+    return {
+      ...parameters,
+      generationConfig: {
+        ...parameters.generationConfig,
+        ...(responseModalities == null
+          ? {}
+          : { responseModalities: [...responseModalities] }),
+      },
+      ...(systemInstruction == null ? {} : { systemInstruction }),
+      contents: dropUnsupportedModelTurnPrefill(contents, this.model) ?? [],
+    };
+  }
+
   async _generate(
     messages: BaseMessage[],
     options: this['ParsedCallOptions'],
     runManager?: CallbackManagerForLLMRun
   ): Promise<import('@langchain/core/outputs').ChatResult> {
-    const prompt = convertBaseMessagesToContent(
-      messages,
-      this._isMultimodalModel,
-      this.useSystemInstruction,
-      this.model
+    const native = new NativeMediaSession(
+      this.nativeMedia,
+      this.model,
+      runManager?.runId,
+      options.signal
     );
-    let actualPrompt = prompt;
-    if (prompt?.[0].role === 'system') {
-      const [systemInstruction] = prompt;
-      /** @ts-ignore */
-      this.client.systemInstruction = systemInstruction;
-      actualPrompt = prompt.slice(1);
-    }
-    actualPrompt = dropUnsupportedModelTurnPrefill(actualPrompt, this.model);
-    const parameters = this.invocationParams(options);
-    const request = {
-      ...parameters,
-      contents: actualPrompt,
-    };
+    try {
+      const request = await this.prepareRequest(messages, options, native);
 
-    const res = await this.caller.callWithOptions(
-      { signal: options.signal },
-      async () =>
+      const res = await this.caller.callWithOptions(
+        { signal: options.signal },
+        async () =>
+          /** @ts-ignore */
+          this.client.generateContent(request)
+      );
+
+      const response = res.response;
+      const usageMetadata = this._convertToUsageMetadata(
         /** @ts-ignore */
-        this.client.generateContent(request)
-    );
+        response.usageMetadata,
+        this.model
+      );
+      native.observeResponse(response, usageMetadata);
 
-    const response = res.response;
-    const usageMetadata = this._convertToUsageMetadata(
       /** @ts-ignore */
-      response.usageMetadata,
-      this.model
-    );
+      const generationResult = mapGenerateContentResultToChatResult(response, {
+        usageMetadata,
+      });
 
-    /** @ts-ignore */
-    const generationResult = mapGenerateContentResultToChatResult(response, {
-      usageMetadata,
+      const generation = generationResult.generations.at(0);
+      if (generation != null) {
+        generation.message.content = await native.content(
+          generation.message.content,
+          0
+        );
+        generation.message.lc_kwargs.content = generation.message.content;
+        Object.assign(
+          generation.message.additional_kwargs,
+          native.usageIdentity()
+        );
+      }
+      await native.complete();
+      await runManager?.handleLLMNewToken(
+        generation?.text ?? '',
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined
+      );
+      return generationResult;
+    } catch (error) {
+      throw await native.reportFailure(error);
+    }
+  }
+
+  async *_streamChatModelEvents(
+    messages: BaseMessage[],
+    options: this['ParsedCallOptions'],
+    runManager?: CallbackManagerForLLMRun
+  ): AsyncGenerator<ChatModelStreamEvent> {
+    if (this.nativeMedia == null) {
+      await new NativeMediaSession(undefined, this.model).messages(messages);
+      yield* super._streamChatModelEvents(messages, options, runManager);
+      return;
+    }
+    yield* convertChunksToEvents(
+      this._streamNativeEventChunks(messages, options, runManager),
+      { signal: options.signal }
+    );
+  }
+
+  /** Keep the native typed API on the same callback lifecycle as public stream(). */
+  override streamEvents = ((
+    input: BaseLanguageModelInput,
+    options?: GoogleCallOptions & {
+      version?: 'v1' | 'v2';
+      encoding?: 'text/event-stream';
+    },
+    streamOptions?: Parameters<Runnable['streamEvents']>[2]
+  ) => {
+    if (options?.version != null) {
+      return super.streamEvents(
+        input,
+        { ...options, version: options.version },
+        streamOptions
+      );
+    }
+    if (this.nativeMedia == null) return super.streamEvents(input, options);
+    return new ChatModelStream(
+      convertChunksToEvents(this._streamTypedNativeChunks(input, options), {
+        signal: options?.signal,
+      })
+    );
+  }) as ChatGoogleGenerativeAI['streamEvents'];
+
+  private async *_streamTypedNativeChunks(
+    input: BaseLanguageModelInput,
+    options?: GoogleCallOptions
+  ): AsyncGenerator<ChatGenerationChunk> {
+    for await (const message of super._streamIterator(input, options)) {
+      yield this.nativeEventChunk(
+        new ChatGenerationChunk({
+          text: message.text,
+          message,
+          generationInfo: message.response_metadata,
+        })
+      );
+    }
+  }
+
+  private nativeEventChunk(chunk: ChatGenerationChunk): ChatGenerationChunk {
+    const content = chunk.message.content;
+    if (typeof content !== 'string' || content === '') return chunk;
+    return new ChatGenerationChunk({
+      text: chunk.text,
+      generationInfo: chunk.generationInfo,
+      message: new AIMessageChunk({
+        ...chunk.message,
+        content: [{ type: 'text', text: content }],
+      }),
     });
+  }
 
-    await runManager?.handleLLMNewToken(
-      generationResult.generations[0].text || '',
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined
-    );
-    return generationResult;
+  /** The event bridge merges string chunks into block zero, even across images. */
+  private async *_streamNativeEventChunks(
+    messages: BaseMessage[],
+    options: this['ParsedCallOptions'],
+    runManager?: CallbackManagerForLLMRun
+  ): AsyncGenerator<ChatGenerationChunk> {
+    for await (const chunk of this._streamResponseChunks(
+      messages,
+      options,
+      runManager
+    )) {
+      yield this.nativeEventChunk(chunk);
+    }
   }
 
   async *_streamResponseChunks(
@@ -301,42 +440,45 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
     options: this['ParsedCallOptions'],
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
-    yield* smoothGenerationChunks({
-      chunks: this._streamProviderChunks(messages, options),
-      delayMs: this._lc_stream_delay,
-      signal: options.signal,
-      runManager,
-    });
+    const native = new NativeMediaSession(
+      this.nativeMedia,
+      this.model,
+      runManager?.runId,
+      options.signal
+    );
+    try {
+      const request = await this.prepareRequest(messages, options, native);
+      yield* smoothGenerationChunks({
+        chunks: this._streamProviderChunks(request, options, native),
+        delayMs: this._lc_stream_delay,
+        signal: options.signal,
+        runManager,
+      });
+      await native.complete();
+    } catch (error) {
+      throw await native.reportFailure(error);
+    } finally {
+      await native.fail();
+    }
   }
 
   private async *_streamProviderChunks(
-    messages: BaseMessage[],
-    options: this['ParsedCallOptions']
+    request: GenerateContentRequest,
+    options: this['ParsedCallOptions'],
+    native: NativeMediaSession
   ): AsyncGenerator<ChatGenerationChunk> {
-    const prompt = convertBaseMessagesToContent(
-      messages,
-      this._isMultimodalModel,
-      this.useSystemInstruction,
-      this.model
-    );
-    let actualPrompt = prompt;
-    if (prompt?.[0].role === 'system') {
-      const [systemInstruction] = prompt;
-      /** @ts-ignore */
-      this.client.systemInstruction = systemInstruction;
-      actualPrompt = prompt.slice(1);
-    }
-    actualPrompt = dropUnsupportedModelTurnPrefill(actualPrompt, this.model);
-    const parameters = this.invocationParams(options);
-    const request = {
-      ...parameters,
-      contents: actualPrompt,
-    };
     const stream = await this.caller.callWithOptions(
       { signal: options.signal },
       async () => {
         /** @ts-ignore */
-        const { stream } = await this.client.generateContentStream(request);
+        const { stream, response } = await this.client.generateContentStream(
+          request,
+          {
+            signal: options.signal,
+          }
+        );
+        /** The aggregate branch rejects too; the consumed stream owns error reporting. */
+        void response.catch(() => undefined);
         return stream;
       }
     );
@@ -344,15 +486,17 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
     let index = 0;
     let lastUsageMetadata: UsageMetadata | undefined;
     for await (const response of stream) {
+      const usageMetadata = this._convertToUsageMetadata(
+        response.usageMetadata as GeminiApiUsageMetadata | undefined,
+        this.model
+      );
+      native.observeResponse(response, usageMetadata);
       if (
         'usageMetadata' in response &&
         this.streamUsage !== false &&
         options.streamUsage !== false
       ) {
-        lastUsageMetadata = this._convertToUsageMetadata(
-          response.usageMetadata as GeminiApiUsageMetadata | undefined,
-          this.model
-        );
+        lastUsageMetadata = usageMetadata;
       }
 
       const chunk = convertResponseContentToChatGenerationChunk(response, {
@@ -364,6 +508,11 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
         continue;
       }
 
+      chunk.message.content = await native.content(
+        chunk.message.content,
+        index - 1
+      );
+      chunk.message.lc_kwargs.content = chunk.message.content;
       yield chunk;
     }
 
@@ -373,6 +522,7 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
         message: new AIMessageChunk({
           content: '',
           usage_metadata: lastUsageMetadata,
+          additional_kwargs: native.usageIdentity(),
         }),
       });
     }

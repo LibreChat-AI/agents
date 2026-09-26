@@ -142,8 +142,8 @@ import { stableStringify } from '@/tools/eagerEventExecution';
 import { convertInjectedMessages } from '@/messages/injected';
 import { resolveClientOptionsModel } from '@/llm/request';
 import { composeAbortSignals } from '@/utils/misc';
-import { sleep } from '@/utils/run';
 import { HandlerRegistry } from '@/events';
+import { sleep } from '@/utils/run';
 
 export {
   buildChildInputs,
@@ -1323,10 +1323,7 @@ export class SubagentExecutor {
       };
       let deliveryAttempts = 1;
       let result = await executeAttempt();
-      while (
-        result.retryableDelivery === true &&
-        deliveryAttempts < 3
-      ) {
+      while (result.retryableDelivery === true && deliveryAttempts < 3) {
         if (deliveryAttempts > 1) {
           await sleep(
             Math.min(100 * 2 ** Math.min(deliveryAttempts - 2, 6), 5_000)
@@ -2189,7 +2186,10 @@ export class SubagentExecutor {
       parentToolCallId,
       parentConfigurable,
     });
-    if (execution.completedResult != null && settled.output.status === 'error') {
+    if (
+      execution.completedResult != null &&
+      settled.output.status === 'error'
+    ) {
       return;
     }
     const { resumeExecution } = execution;
@@ -2548,9 +2548,7 @@ export class SubagentExecutor {
       }
     } catch (error) {
       if (childSignal.aborted) {
-        throw childSignal.reason instanceof Error
-          ? childSignal.reason
-          : error;
+        throw childSignal.reason instanceof Error ? childSignal.reason : error;
       }
       if (execution.completedResult != null) {
         return {
@@ -3518,6 +3516,7 @@ function createUsageCaptureHandler(args: {
           try {
             await sink({
               usage,
+              modelRunId: runId,
               model,
               provider: callProvider,
               subagentType,
