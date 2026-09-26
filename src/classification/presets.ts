@@ -1,4 +1,8 @@
-import type { Classifier, ClassificationProviderSettings } from './types';
+import type {
+  Classifier,
+  ClassificationCredential,
+  ClassificationProviderSettings,
+} from './types';
 import type { ClassificationFetch } from './transport';
 import { createHttpClassifier } from './http';
 
@@ -22,6 +26,13 @@ export const CLASSIFICATION_PRESETS: Record<
     model: 'jev-latest',
     dialect: 'systemone',
     apiKeyEnv: 'TYPESAFE_API_KEY',
+  },
+  clickhouse: {
+    /** ClickHouse's inference gateway; the token is what `dataplanectl chai auth token` prints, hourly. */
+    baseURL: 'https://inference-internal.clickhouse.cloud/v1/systemone',
+    model: 'jev-latest',
+    dialect: 'systemone',
+    apiKeyEnv: 'CHAI_AUTH_TOKEN',
   },
   openrouter: {
     baseURL: 'https://openrouter.ai/api/alpha/decisions',
@@ -62,7 +73,7 @@ export function classificationProviderNames(): string[] {
 
 export function createClassifier(
   settings: ClassificationProviderSettings,
-  apiKey: string,
+  apiKey: ClassificationCredential,
   options?: {
     fetch?: ClassificationFetch;
     providerId?: string;

@@ -103,6 +103,15 @@ export interface Classifier {
 /** Which wire vocabulary a host speaks: the port's own, or System One's (`noul` for boolean). */
 export type ClassificationDialect = 'port' | 'systemone';
 
+/**
+ * A bearer credential: the key itself, or a function that mints one. The function form serves
+ * hosts whose tokens expire (the ClickHouse gateway's hourly Okta token): the transport calls it
+ * before each request and once more with `refresh: true` after a 401, then retries that request.
+ */
+export type ClassificationCredential =
+  | string
+  | ((options: { refresh: boolean }) => Promise<string>);
+
 /** A host, as settings rather than code. */
 export interface ClassificationProviderSettings {
   /** Full URL of the classify endpoint, not a base path. */

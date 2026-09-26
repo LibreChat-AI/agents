@@ -301,6 +301,58 @@ describe('http classifier', () => {
     expect(result.answers.q).toEqual({ type: 'boolean', probability: 0.4 });
   });
 
+  it('mints a credential function per request and re-mints once after a 401', async () => {
+    let minted = 0;
+    const seen: Array<{ auth: string | undefined; refresh: boolean }> = [];
+    const credential = async ({ refresh }: { refresh: boolean }) => {
+      minted += 1;
+      seen.push({ auth: undefined, refresh });
+      return `tok-${minted}`;
+    };
+    const ok = JSON.stringify({
+      model: 'jev',
+      answers: { q: { type: 'noul', noul: 0.9 } },
+      usage: {},
+    });
+    const expiring = fakeFetch([
+      { status: 401, body: 'expired' },
+      { status: 200, body: ok },
+    ]);
+    const classifier = createHttpClassifier({
+      endpoint: 'https://gw.example/v1/systemone',
+      apiKey: credential,
+      dialect: 'systemone',
+      fetch: expiring.fetch,
+      sleep: async () => {},
+    });
+    const result = await classifier.classify({
+      state: {},
+      questions: { q: booleanQuestion('?') },
+    });
+    expect(expiring.calls.map((c) => c.auth)).toEqual([
+      'Bearer tok-1',
+      'Bearer tok-2',
+    ]);
+    expect(seen.map((s) => s.refresh)).toEqual([false, true]);
+    expect(result.answers.q).toEqual({ type: 'boolean', probability: 0.9 });
+
+    const forbidden = fakeFetch([{ status: 403, body: 'not this route' }]);
+    const scoped = createHttpClassifier({
+      endpoint: 'https://gw.example/v1/systemone',
+      apiKey: credential,
+      fetch: forbidden.fetch,
+    });
+    await expect(
+      scoped.classify({ state: {}, questions: { q: booleanQuestion('?') } })
+    ).rejects.toMatchObject({ failure: 'unauthorized', status: 403 });
+    expect(minted).toBe(3);
+    expect(classificationPreset('clickhouse')).toMatchObject({
+      baseURL: 'https://inference-internal.clickhouse.cloud/v1/systemone',
+      dialect: 'systemone',
+      apiKeyEnv: 'CHAI_AUTH_TOKEN',
+    });
+  });
+
   it('refuses to start without a key or an endpoint', () => {
     expect(() =>
       createHttpClassifier({ endpoint: 'https://s1.example', apiKey: '' })

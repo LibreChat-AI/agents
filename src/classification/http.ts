@@ -5,6 +5,7 @@ import type {
   ClassificationResult,
   ClassificationRequest,
   ClassificationDialect,
+  ClassificationCredential,
 } from './types';
 import type { ClassificationFetch } from './transport';
 import { toWireQuestion, readAnswer } from './dialect';
@@ -15,7 +16,7 @@ export const HTTP_PROVIDER_ID = 'http';
 
 export interface HttpClassifierOptions {
   providerId?: string;
-  apiKey: string;
+  apiKey: ClassificationCredential;
   /** Full URL, not a base path. */
   endpoint: string;
   model?: string;

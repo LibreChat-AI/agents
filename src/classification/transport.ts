@@ -1,3 +1,4 @@
+import type { ClassificationCredential } from './types';
 import { ClassificationError } from './types';
 
 const DEFAULT_TIMEOUT_MS = 4_000;
@@ -22,7 +23,7 @@ export type ClassificationFetch = (
 
 export interface TransportOptions {
   providerId: string;
-  apiKey: string;
+  apiKey: ClassificationCredential;
   /** Full URL, not a base path. */
   endpoint: string;
   timeoutMs?: number;
@@ -105,8 +106,8 @@ function defaultSleep(ms: number, signal?: AbortSignal): Promise<void> {
  */
 export function createTransport(options: TransportOptions): Transport {
   const { providerId } = options;
-  const apiKey = options.apiKey.trim();
-  if (apiKey === '') {
+  const credential = options.apiKey;
+  if (typeof credential === 'string' && credential.trim() === '') {
     throw new ClassificationError(
       'unauthorized',
       'classifier requires an API key',
@@ -145,11 +146,28 @@ export function createTransport(options: TransportOptions): Transport {
   }
   const fetchImpl: ClassificationFetch = candidate;
 
+  async function resolveKey(refresh: boolean): Promise<string> {
+    if (typeof credential === 'string') {
+      return credential.trim();
+    }
+    const minted = (await credential({ refresh })).trim();
+    if (minted === '') {
+      throw new ClassificationError(
+        'unauthorized',
+        'credential function returned no token',
+        { provider: providerId }
+      );
+    }
+    return minted;
+  }
+
   async function attempt(
     payload: string,
     signal: AbortSignal | undefined,
-    timeoutMs: number
+    timeoutMs: number,
+    refreshKey: boolean
   ): Promise<string> {
+    const apiKey = await resolveKey(refreshKey);
     const timeout = new AbortController();
     const timer = setTimeout(() => timeout.abort(), timeoutMs);
     const combined =
@@ -217,13 +235,16 @@ export function createTransport(options: TransportOptions): Transport {
         : defaultTimeoutMs;
     const deadline = Date.now() + timeoutMs;
     let lastError: ClassificationError | undefined;
+    let refreshKey = false;
+    let refreshed = false;
     for (let attemptNo = 0; attemptNo <= maxRetries; attemptNo++) {
       try {
         const started = Date.now();
         const body = await attempt(
           payload,
           signal,
-          Math.max(1, deadline - started)
+          Math.max(1, deadline - started),
+          refreshKey
         );
         onAnswered?.(label, Date.now() - started);
         return body;
@@ -234,6 +255,17 @@ export function createTransport(options: TransportOptions): Transport {
             : new ClassificationError('network', String(error), {
               provider: providerId,
             });
+        if (
+          lastError.status === 401 &&
+          typeof credential === 'function' &&
+          !refreshed
+        ) {
+          refreshed = true;
+          refreshKey = true;
+          attemptNo -= 1;
+          continue;
+        }
+        refreshKey = false;
         if (attemptNo === maxRetries || !isRetryable(lastError.failure)) {
           break;
         }
