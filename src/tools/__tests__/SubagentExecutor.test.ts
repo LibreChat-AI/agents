@@ -349,6 +349,22 @@ describe('buildChildInputs', () => {
     expect(result.maxSubagentDepth).toBe(0);
   });
 
+  it('uses the parent depth at the 1-to-0 boundary even if child inputs request more', () => {
+    const config: ResolvedSubagentConfig = {
+      type: 'researcher',
+      name: 'R',
+      description: 'd',
+      allowNested: true,
+      agentInputs: { ...parentAgentInputs, maxSubagentDepth: 99 },
+    };
+
+    const child = buildChildInputs(config, 'child', 1);
+
+    expect(child.maxSubagentDepth).toBe(0);
+    expect(child.subagentConfigs).toEqual(parentAgentInputs.subagentConfigs);
+    expect(config.agentInputs.maxSubagentDepth).toBe(99);
+  });
+
   it('always strips toolDefinitions (forces traditional mode)', () => {
     const inputsWithToolDefs: AgentInputs = {
       ...parentAgentInputs,
@@ -591,6 +607,103 @@ describe('SubagentExecutor', () => {
     throw new Error(`Timed out waiting for background task ${taskId}.`);
   }
 
+  it('keeps a detached child and its thread continuation at depth zero', async () => {
+    const store = new ContinuationTaskStore();
+    const childConfig = makeConfig('researcher', {
+      allowNested: true,
+      agentInputs: {
+        ...makeChildInputs(),
+        maxSubagentDepth: 99,
+        subagentConfigs: [
+          {
+            type: 'grandchild',
+            name: 'Grandchild',
+            description: 'Must not be spawned.',
+            agentInputs: makeChildInputs('grandchild'),
+          },
+        ],
+      },
+    });
+    const observedInputs: StandardGraphInput[] = [];
+    const { factory } = makeStubGraphFactory({
+      messages: [new AIMessage('child finished')],
+    });
+    const executor = createExecutor({
+      configs: new Map([[childConfig.type, childConfig]]),
+      maxDepth: 1,
+      taskConfig: { store, scopeId: 'owner:conversation' },
+      createChildGraph: (input): StandardGraph => {
+        observedInputs.push(input);
+        return factory();
+      },
+    });
+
+    const first = JSON.parse(
+      executor.executeInBackground({
+        description: 'First task.',
+        subagentType: 'researcher',
+        parentToolCallId: 'call_first',
+      })
+    ) as { background_task_id: string; subagent_thread_id: string };
+    await waitForTask(
+      store,
+      first.background_task_id,
+      (status) => status === 'completed'
+    );
+
+    const continued = JSON.parse(
+      executor.executeInBackground({
+        description: 'Continue the task.',
+        subagentType: 'researcher',
+        subagentThreadId: first.subagent_thread_id,
+        parentToolCallId: 'call_continued',
+      })
+    ) as { background_task_id: string; subagent_thread_id: string };
+    await waitForTask(
+      store,
+      continued.background_task_id,
+      (status) => status === 'completed'
+    );
+
+    expect(continued.subagent_thread_id).toBe(first.subagent_thread_id);
+    expect(observedInputs).toHaveLength(2);
+    expect(observedInputs.map((input) => input.agents[0])).toEqual([
+      expect.objectContaining({
+        maxSubagentDepth: 0,
+        subagentConfigs: childConfig.agentInputs.subagentConfigs,
+      }),
+      expect.objectContaining({
+        maxSubagentDepth: 0,
+        subagentConfigs: childConfig.agentInputs.subagentConfigs,
+      }),
+    ]);
+    expect(
+      observedInputs.map((input) => input.subagentExecutionContext?.depth)
+    ).toEqual([1, 1]);
+  });
+
+  it('rejects background execution when the nesting budget is exhausted', () => {
+    const store = new ContinuationTaskStore();
+    const executor = createExecutor({
+      maxDepth: 0,
+      taskConfig: { store, scopeId: 'owner:conversation' },
+    });
+
+    const result = JSON.parse(
+      executor.executeInBackground({
+        description: 'Do not spawn.',
+        subagentType: 'researcher',
+        parentToolCallId: 'call_blocked',
+      })
+    ) as { status: string; message: string };
+
+    expect(result).toMatchObject({
+      status: 'rejected',
+      message: 'Maximum subagent nesting depth exceeded.',
+    });
+    expect(store.list('owner:conversation')).toEqual([]);
+  });
+
   it('runs a detached child past parent cleanup and exposes its result once', async () => {
     const store = new InMemorySubagentTaskStore();
     let finish = (_value: { messages: BaseMessage[] }): void => undefined;
@@ -715,7 +828,10 @@ describe('SubagentExecutor', () => {
     expect(deliveryAttempts).toBe(2);
     expect(
       store.claim('owner:conversation', response.background_task_id)
-    ).toMatchObject({ status: 'completed', result: 'detached result delivered' });
+    ).toMatchObject({
+      status: 'completed',
+      result: 'detached result delivered',
+    });
   });
 
   it('bounds detached result delivery retries', async () => {
@@ -792,7 +908,10 @@ describe('SubagentExecutor', () => {
     expect(clearHeavyState).toHaveBeenCalled();
     expect(
       store.get('owner:conversation', response.background_task_id)
-    ).toMatchObject({ status: 'error', error: 'Detached subagent task timed out.' });
+    ).toMatchObject({
+      status: 'error',
+      error: 'Detached subagent task timed out.',
+    });
   });
 
   it('replaces the ambient parent run config for detached child execution', async () => {
