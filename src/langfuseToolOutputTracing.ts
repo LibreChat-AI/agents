@@ -608,29 +608,7 @@ function redactValue(
     typeof value === 'string' &&
     value.startsWith(CLASSIFICATION_PROMPT_PREFIX)
   ) {
-    try {
-      const prompt = JSON.parse(
-        value.slice(CLASSIFICATION_PROMPT_PREFIX.length)
-      ) as unknown;
-      if (
-        !isRecord(prompt) ||
-        !Object.hasOwn(prompt, 'state') ||
-        !isRecord(prompt.questions)
-      ) {
-        return { value: config.redactionText, changed: true };
-      }
-      collectRedactionContext(prompt, redactionContext);
-      const result = redactValue(prompt, config, redactionContext, true);
-      if (!result.changed) {
-        return { value, changed: false };
-      }
-      return {
-        value: CLASSIFICATION_PROMPT_PREFIX + JSON.stringify(result.value),
-        changed: true,
-      };
-    } catch {
-      return { value: config.redactionText, changed: true };
-    }
+    return { value: config.redactionText, changed: true };
   }
 
   if (!isRecord(value)) {

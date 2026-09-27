@@ -282,7 +282,7 @@ describe('Langfuse tool output tracing redaction', () => {
     expect(redacted[1].content).toBe(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
   });
 
-  it('redacts nested tool results in classifier prompts while leaving public state visible', () => {
+  it('drops marked classifier prompts under selective redaction, even with mixed public state', () => {
     const prompt =
       'librechat-classifier-state:' +
       JSON.stringify({
@@ -325,7 +325,8 @@ describe('Langfuse tool output tracing redaction', () => {
     expect(observed).not.toContain('private query result');
     expect(observed).not.toContain('private server result');
     expect(observed).not.toContain('private replay result');
-    expect(observed).toContain('public result');
+    expect(observed).not.toContain('public result');
+    expect(observed).not.toContain('Classify');
     expect(observed).toContain(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
 
     const truncated = createSpan('gpt-4o', {
@@ -360,6 +361,35 @@ describe('Langfuse tool output tracing redaction', () => {
     expect(
       unredacted.attributes[LangfuseOtelSpanAttributes.OBSERVATION_INPUT]
     ).toBe(prompt);
+  });
+
+  it('does not export free-form classifier state that can quote a redacted tool result', () => {
+    const secret = 'private_sql returned a connection string';
+    const prompt =
+      'librechat-classifier-state:' +
+      JSON.stringify({
+        state: secret,
+        questions: {
+          q: { type: 'boolean', instructions: `Does this contain ${secret}?` },
+        },
+      });
+    const span = createSpan('gpt-4o', {
+      [LangfuseOtelSpanAttributes.OBSERVATION_TYPE]: 'generation',
+      [LangfuseOtelSpanAttributes.OBSERVATION_INPUT]: JSON.stringify([
+        { role: 'system', content: 'public instructions' },
+        { role: 'user', content: prompt },
+      ]),
+    });
+    redactLangfuseSpanToolOutputs(
+      span,
+      createConfig({ redactedToolNames: new Set(['private_sql']) })
+    );
+    const observed = String(
+      span.attributes[LangfuseOtelSpanAttributes.OBSERVATION_INPUT]
+    );
+    expect(observed).not.toContain(secret);
+    expect(observed).toContain('public instructions');
+    expect(observed).toContain(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
   });
 
   it('redacts captured Responses server-tool outputs wherever they are serialized', () => {

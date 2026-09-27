@@ -30,20 +30,27 @@ export async function withClassificationDeadline<T>(
     ? AbortSignal.any([callerSignal, deadline.signal])
     : deadline.signal;
   const timer = setTimeout(() => deadline.abort(), timeoutMs);
-  const expired = (): boolean =>
-    signal.aborted || performance.now() >= expiresAt;
-  const abortError = (): ClassificationError =>
-    callerSignal?.aborted === true
-      ? new ClassificationError('aborted', 'caller aborted the request', {
-        provider,
-      })
-      : new ClassificationError('timeout', 'classifier deadline exceeded', {
+  const expired = (): boolean => {
+    if (performance.now() >= expiresAt) {
+      deadline.abort();
+    }
+    return signal.aborted;
+  };
+  const abortError = (): ClassificationError => {
+    if (callerSignal?.aborted === true) {
+      return new ClassificationError('aborted', 'caller aborted the request', {
         provider,
       });
+    }
+    return new ClassificationError('timeout', 'classifier deadline exceeded', {
+      provider,
+    });
+  };
 
   const waitFor: AwaitWithinDeadline = <U>(task: Promise<U>): Promise<U> =>
     new Promise<U>((resolve, reject) => {
       if (expired()) {
+        void task.catch(() => {});
         reject(abortError());
         return;
       }
@@ -73,7 +80,13 @@ export async function withClassificationDeadline<T>(
 
   try {
     return await waitFor(operation(signal, waitFor));
+  } catch (error) {
+    if (expired()) {
+      throw abortError();
+    }
+    throw error;
   } finally {
+    expired();
     clearTimeout(timer);
   }
 }

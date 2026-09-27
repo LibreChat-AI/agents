@@ -699,6 +699,47 @@ describe('HTTP classifier', () => {
     ).rejects.toMatchObject({ failure: 'timeout' });
   });
 
+  it('aborts the fetch signal when the monotonic deadline expires before the timer runs', async () => {
+    let seenSignal: AbortSignal | undefined;
+    const fetch: ClassificationFetch = async (_url, init) => {
+      seenSignal = init.signal;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 15);
+      return new Response(measured, { status: 200 });
+    };
+    const classifier = createHttpClassifier({
+      endpoint: 'https://s1.example',
+      apiKey: 'k',
+      timeoutMs: 2,
+      fetch,
+    });
+    await expect(
+      classifier.classify({ state: {}, questions: { q: booleanQuestion('?') } })
+    ).rejects.toMatchObject({ failure: 'timeout' });
+    expect(seenSignal?.aborted).toBe(true);
+  });
+
+  it('bounds synchronous request preparation even when a state getter throws', async () => {
+    const fetch: ClassificationFetch = jest.fn(
+      async () => new Response(measured, { status: 200 })
+    );
+    const classifier = createHttpClassifier({
+      endpoint: 'https://s1.example',
+      apiKey: 'k',
+      timeoutMs: 2,
+      fetch,
+    });
+    const state = {
+      get body(): string {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 15);
+        throw new Error('private request content');
+      },
+    };
+    await expect(
+      classifier.classify({ state, questions: { q: booleanQuestion('?') } })
+    ).rejects.toMatchObject({ failure: 'timeout' });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   it('bounds backoff and response size, sanitizes failures, and hooks only parsed answers', async () => {
     const onAnswered = jest.fn();
     const limited = fakeFetch([
