@@ -4,6 +4,7 @@ import {
   AIMessage,
   AIMessageChunk,
   HumanMessage,
+  ToolMessage,
 } from '@langchain/core/messages';
 import type { UsageMetadata, BaseMessage } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
@@ -656,6 +657,124 @@ describe('Subagent Integration', () => {
       ).toEqual([
         { type: 'router', kind: 'agent' },
         { type: 'specialist', kind: 'agent' },
+      ]);
+    } finally {
+      createWorkflowSpy.mockRestore();
+    }
+  });
+
+  it('keeps both fan-out children at depth zero even when they request more nesting', async () => {
+    const originalCreateWorkflow = StandardGraph.prototype.createWorkflow;
+    const observedChildren: Array<{
+      agentId: string;
+      maxSubagentDepth?: number;
+      nestedConfigs: number;
+      hasSubagentTool: boolean;
+    }> = [];
+    const createWorkflowSpy = jest
+      .spyOn(StandardGraph.prototype, 'createWorkflow')
+      .mockImplementation(function (this: StandardGraph) {
+        const workflow = originalCreateWorkflow.call(this);
+        const agentId = this.defaultAgentId;
+        if (agentId === 'left-child' || agentId === 'right-child') {
+          const context = this.agentContexts.get(agentId);
+          observedChildren.push({
+            agentId,
+            maxSubagentDepth: context?.maxSubagentDepth,
+            nestedConfigs: context?.subagentConfigs?.length ?? 0,
+            hasSubagentTool:
+              (context?.graphTools as t.GenericTool[] | undefined)?.some(
+                (tool) => 'name' in tool && tool.name === Constants.SUBAGENT
+              ) ?? false,
+          });
+        }
+        return workflow;
+      });
+    const childTypes = ['left', 'right'];
+    const parent: t.AgentInputs = {
+      ...createParentAgent(),
+      maxSubagentDepth: 1,
+      subagentConfigs: childTypes.map((type) => ({
+        type,
+        name: `${type} child`,
+        description: `Handle the ${type} task.`,
+        allowNested: true,
+        agentInputs: {
+          ...createParentAgent(),
+          agentId: `${type}-child`,
+          maxSubagentDepth: 99,
+          subagentConfigs: [
+            {
+              type: `${type}-grandchild`,
+              name: `${type} grandchild`,
+              description: 'Must not be spawned.',
+              agentInputs: {
+                ...createParentAgent(),
+                agentId: `${type}-grandchild`,
+                subagentConfigs: undefined,
+              },
+            },
+          ],
+        },
+      })),
+    };
+
+    try {
+      const run = await Run.create<t.IState>({
+        runId: `depth-one-fan-out-${Date.now()}`,
+        graphConfig: { type: 'standard', agents: [parent] },
+        returnContent: true,
+        skipCleanup: true,
+      });
+      const toolCalls: ToolCall[] = childTypes.map((type) => ({
+        id: `call_${type}`,
+        name: Constants.SUBAGENT,
+        args: { description: `Handle ${type}.`, subagent_type: type },
+        type: 'tool_call',
+      }));
+      run.Graph?.overrideTestModel(
+        ['Delegate both tasks.', 'Both tasks completed.'],
+        10,
+        toolCalls
+      );
+
+      await run.processStream(
+        { messages: [new HumanMessage('Handle both tasks.')] },
+        callerConfig
+      );
+
+      const results = run
+        .getRunMessages()
+        ?.filter(
+          (message): message is ToolMessage =>
+            message instanceof ToolMessage &&
+            message.name === Constants.SUBAGENT
+        );
+      expect(results?.map((message) => message.tool_call_id).sort()).toEqual([
+        'call_left',
+        'call_right',
+      ]);
+      expect(results?.map((message) => message.content)).toEqual([
+        CHILD_RESPONSE,
+        CHILD_RESPONSE,
+      ]);
+      expect(
+        observedChildren.sort((left, right) =>
+          left.agentId.localeCompare(right.agentId)
+        )
+      ).toEqual([
+        {
+          agentId: 'left-child',
+          maxSubagentDepth: 0,
+          nestedConfigs: 1,
+          hasSubagentTool: false,
+        },
+        {
+          agentId: 'right-child',
+          maxSubagentDepth: 0,
+          nestedConfigs: 1,
+          hasSubagentTool: false,
+        },
       ]);
     } finally {
       createWorkflowSpy.mockRestore();

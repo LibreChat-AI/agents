@@ -6,6 +6,7 @@ import { FakeListChatModel } from '@langchain/core/utils/testing';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { GraphSubagentConfig } from '@/types';
 import type * as t from '@/types';
+import { MultiAgentGraph } from '@/graphs/MultiAgentGraph';
 import { createFakeStreamingLLM } from '@/llm/fake';
 import { Constants, Providers } from '@/common';
 import { StandardGraph } from '@/graphs/Graph';
@@ -112,7 +113,8 @@ const makeGraphConfig = (): GraphSubagentConfig => ({
 
 const createRun = async (
   graphConfig: GraphSubagentConfig,
-  overrides: Partial<t.RunConfig> = {}
+  overrides: Partial<t.RunConfig> = {},
+  maxSubagentDepth = 2
 ): Promise<Run<t.IState>> =>
   Run.create<t.IState>({
     runId: `graph-subagent-${Date.now()}-${Math.random()}`,
@@ -121,7 +123,7 @@ const createRun = async (
       agents: [
         {
           ...makeAgent('parent'),
-          maxSubagentDepth: 2,
+          maxSubagentDepth,
           subagentConfigs: [graphConfig],
         },
       ],
@@ -167,6 +169,76 @@ describe('Graph subagent integration', () => {
     );
 
     expect(result).toBe('synthesized answer');
+  });
+
+  it('runs a depth-one parallel team without giving any member a grandchild tool', async () => {
+    const config = makeGraphConfig();
+    config.agents = config.agents.map((agent) => ({
+      ...agent,
+      maxSubagentDepth: 99,
+      subagentConfigs: [
+        {
+          type: 'grandchild',
+          name: 'Grandchild',
+          description: 'Must not be spawned.',
+          agentInputs: makeAgent('grandchild'),
+        },
+      ],
+    }));
+    const originalCreateWorkflow = MultiAgentGraph.prototype.createWorkflow;
+    const observedMembers: Array<{
+      agentId: string;
+      maxSubagentDepth?: number;
+      nestedConfigs?: t.SubagentConfigEntry[];
+      hasSubagentTool: boolean;
+    }> = [];
+    const createWorkflowSpy = jest
+      .spyOn(MultiAgentGraph.prototype, 'createWorkflow')
+      .mockImplementation(function (this: MultiAgentGraph) {
+        const workflow = originalCreateWorkflow.call(this);
+        for (const [agentId, context] of this.agentContexts) {
+          observedMembers.push({
+            agentId,
+            maxSubagentDepth: context.maxSubagentDepth,
+            nestedConfigs: context.subagentConfigs,
+            hasSubagentTool:
+              (context.graphTools as t.GenericTool[] | undefined)?.some(
+                (memberTool) =>
+                  'name' in memberTool && memberTool.name === Constants.SUBAGENT
+              ) ?? false,
+          });
+        }
+        return workflow;
+      });
+
+    try {
+      const run = await createRun(config, {}, 1);
+      (run.Graph as StandardGraph).setSubagentModelOverride(
+        createFakeStreamingLLM({
+          responses: ['plan', 'left work', 'right work', 'team answer'],
+        })
+      );
+
+      const result = await getGraphSubagentTool(run).invoke(
+        {
+          description: 'Complete the parallel team.',
+          subagent_type: config.type,
+        },
+        invokeConfig
+      );
+
+      expect(result).toBe('team answer');
+      expect(observedMembers).toEqual(
+        config.agents.map(({ agentId }) => ({
+          agentId,
+          maxSubagentDepth: undefined,
+          nestedConfigs: undefined,
+          hasSubagentTool: false,
+        }))
+      );
+    } finally {
+      createWorkflowSpy.mockRestore();
+    }
   });
 
   it('does not fall back to worker text when the result member is textless', async () => {
