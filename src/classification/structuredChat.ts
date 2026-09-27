@@ -12,6 +12,7 @@ import {
   readClassificationUsage,
 } from './types';
 import { validateClassificationQuestions } from './questions';
+import { CLASSIFICATION_PROMPT_PREFIX } from './traceMarker';
 import { withClassificationDeadline } from './deadline';
 
 const MAX_QUESTIONS = 32;
@@ -36,22 +37,23 @@ function decisionSchema(
 ): Record<string, unknown> {
   const properties: Record<string, object> = Object.create(null);
   for (const [id, question] of entries) {
-    properties[id] =
-      question.type === 'boolean'
-        ? {
-          type: 'object',
-          properties: { decision: { type: 'boolean' } },
-          required: ['decision'],
-          additionalProperties: false,
-        }
-        : {
-          type: 'object',
-          properties: {
-            choice: { type: 'string', enum: Object.keys(question.criteria) },
-          },
-          required: ['choice'],
-          additionalProperties: false,
-        };
+    if (question.type === 'boolean') {
+      properties[id] = {
+        type: 'object',
+        properties: { decision: { type: 'boolean' } },
+        required: ['decision'],
+        additionalProperties: false,
+      };
+      continue;
+    }
+    properties[id] = {
+      type: 'object',
+      properties: {
+        choice: { type: 'string', enum: Object.keys(question.criteria) },
+      },
+      required: ['choice'],
+      additionalProperties: false,
+    };
   }
   return {
     type: 'object',
@@ -127,6 +129,35 @@ function readDecisions(
   return answers;
 }
 
+function questionsForChat(
+  questions: ClassificationRequest['questions'],
+  provider: string,
+  maxQuestions: number
+): Array<[string, ClassificationQuestion]> {
+  const entries = validateClassificationQuestions(questions, provider);
+  let choices = 0;
+  for (const [, question] of entries) {
+    if (question.type === 'score') {
+      throw new ClassificationError(
+        'unsupported_question',
+        'chat classification cannot score expected values',
+        { provider }
+      );
+    }
+    if (question.type === 'choice') {
+      choices += Object.keys(question.criteria).length;
+    }
+  }
+  if (entries.length > maxQuestions || choices > MAX_CHOICE_OPTIONS) {
+    throw new ClassificationError(
+      'unsupported_question',
+      'classifier question batch too large',
+      { provider }
+    );
+  }
+  return entries;
+}
+
 /** Strict provider schema or strict tool calling, without an agent loop or fabricated probabilities. */
 export function createStructuredChatClassifier(
   options: StructuredChatClassifierOptions
@@ -176,46 +207,24 @@ export function createStructuredChatClassifier(
       request: ClassificationRequest
     ): Promise<ClassificationResult> {
       const started = performance.now();
-      const entries = validateClassificationQuestions(
-        request.questions,
-        provider
-      );
-      let choices = 0;
-      for (const [, question] of entries) {
-        if (question.type === 'score') {
-          throw new ClassificationError(
-            'unsupported_question',
-            'chat classification cannot score expected values',
-            {
-              provider,
-            }
-          );
-        }
-        if (question.type === 'choice') {
-          choices += Object.keys(question.criteria).length;
-        }
-      }
-      if (entries.length > maxQuestions || choices > MAX_CHOICE_OPTIONS) {
-        throw new ClassificationError(
-          'unsupported_question',
-          'classifier question batch too large',
-          {
-            provider,
-          }
-        );
-      }
-
       return withClassificationDeadline(
         provider,
         request.timeoutMs ?? timeoutMs,
         request.signal,
         async (signal, waitFor) => {
+          const entries = questionsForChat(
+            request.questions,
+            provider,
+            maxQuestions
+          );
           let input: string;
           try {
-            input = JSON.stringify({
-              state: request.state,
-              questions: request.questions,
-            });
+            input =
+              CLASSIFICATION_PROMPT_PREFIX +
+              JSON.stringify({
+                state: request.state,
+                questions: request.questions,
+              });
           } catch {
             throw new ClassificationError(
               'bad_request',

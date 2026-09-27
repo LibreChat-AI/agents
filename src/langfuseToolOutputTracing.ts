@@ -21,6 +21,7 @@ import {
   shouldDropLangfuseSpan,
 } from '@/langfuseTraceShaping';
 import { resolveToolOutputTracingConfigForSpan } from '@/langfuseRuntimeScope';
+import { CLASSIFICATION_PROMPT_PREFIX } from '@/classification/traceMarker';
 
 export { LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT, resolveLangfuseConfig };
 
@@ -603,6 +604,35 @@ function redactValue(
     return changed ? { value: next, changed } : { value, changed };
   }
 
+  if (
+    typeof value === 'string' &&
+    value.startsWith(CLASSIFICATION_PROMPT_PREFIX)
+  ) {
+    try {
+      const prompt = JSON.parse(
+        value.slice(CLASSIFICATION_PROMPT_PREFIX.length)
+      ) as unknown;
+      if (
+        !isRecord(prompt) ||
+        !Object.hasOwn(prompt, 'state') ||
+        !isRecord(prompt.questions)
+      ) {
+        return { value: config.redactionText, changed: true };
+      }
+      collectRedactionContext(prompt, redactionContext);
+      const result = redactValue(prompt, config, redactionContext, true);
+      if (!result.changed) {
+        return { value, changed: false };
+      }
+      return {
+        value: CLASSIFICATION_PROMPT_PREFIX + JSON.stringify(result.value),
+        changed: true,
+      };
+    } catch {
+      return { value: config.redactionText, changed: true };
+    }
+  }
+
   if (!isRecord(value)) {
     return { value, changed: false };
   }
@@ -686,7 +716,9 @@ function redactSerializedValue(
 
   const trimmed = value.trim();
   if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) {
-    return { value, changed: false };
+    return trimmed.startsWith(CLASSIFICATION_PROMPT_PREFIX)
+      ? redactValue(trimmed, config, redactionContext)
+      : { value, changed: false };
   }
 
   try {

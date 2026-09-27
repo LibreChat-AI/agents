@@ -36,15 +36,9 @@ function openAIModel(
             logprobs: null,
           },
         ],
-        ...(includeUsage
-          ? {
-            usage: {
-              prompt_tokens: 12,
-              completion_tokens: 4,
-              total_tokens: 16,
-            },
-          }
-          : {}),
+        usage: includeUsage
+          ? { prompt_tokens: 12, completion_tokens: 4, total_tokens: 16 }
+          : undefined,
       }),
       { status: 200, headers: { 'content-type': 'application/json' } }
     );
@@ -90,6 +84,9 @@ describe('strict structured-chat classifier', () => {
       ['hook', 'util']
     );
     expect(calls[0].messages?.[1].content).toContain('call a test hook');
+    expect(calls[0].messages?.[1].content).toMatch(
+      /^librechat-classifier-state:/
+    );
     expect(result.answers.q).toEqual({
       type: 'boolean',
       decision: true,
@@ -257,6 +254,30 @@ describe('strict structured-chat classifier', () => {
         questions: { choice: choiceQuestion('Which?', { a: 'A', b: 'B' }) },
       })
     ).rejects.toMatchObject({ failure: 'malformed_response' });
+  });
+
+  it('checks a pre-aborted signal before reading dynamic questions', async () => {
+    const model = openAIModel({ answers: { q: { decision: true } } }, []);
+    const classifier = createStructuredChatClassifier({
+      model,
+      modelId: 'gpt-4o-mini',
+      method: 'jsonSchema',
+    });
+    const controller = new AbortController();
+    controller.abort();
+    const questions = Object.defineProperty({}, 'q', {
+      enumerable: true,
+      get: () => {
+        throw new Error('aborted questions were read');
+      },
+    }) as Record<string, ReturnType<typeof booleanQuestion>>;
+    await expect(
+      classifier.classify({
+        state: {},
+        questions,
+        signal: controller.signal,
+      })
+    ).rejects.toMatchObject({ failure: 'aborted' });
   });
 
   it('honors per-call aborts and a provider request deadline', async () => {

@@ -3,6 +3,7 @@ import {
   createClassifier,
   createHttpClassifier,
   classificationPreset,
+  CLASSIFICATION_PRESETS,
   mergeClassificationSettings,
   ClassificationError,
   booleanQuestion,
@@ -184,6 +185,58 @@ describe('classification dialect', () => {
       readAnswer({ type: 'score', score: NaN }, 'systemone', score)
     ).toBeNull();
     expect(readAnswer({ type: 'choice', choice: 7 }, 'systemone')).toBeNull();
+    const manyProbabilities = Object.fromEntries(
+      Array.from({ length: 2000 }, (_, index) => [`k${index}`, 0])
+    );
+    manyProbabilities.k0 = 1;
+    manyProbabilities.k1 = 0.05;
+    expect(
+      readAnswer(
+        { type: 'choice', choice: 'k0', probabilities: manyProbabilities },
+        'systemone'
+      )
+    ).toBeNull();
+    expect(
+      readAnswer(
+        {
+          type: 'choice',
+          choice: 'hook',
+          probabilities: { hook: 0.8, util: 0.8 },
+        },
+        'systemone',
+        choice
+      )
+    ).toBeNull();
+    expect(
+      readAnswer(
+        { type: 'choice', choice: 'hook', probabilities: { hook: 1 } },
+        'systemone',
+        choice
+      )
+    ).toBeNull();
+    expect(
+      readAnswer(
+        { type: 'score', score: 0, probabilities: { '0': 0, '1': 0, '2': 0 } },
+        'systemone',
+        score
+      )
+    ).toBeNull();
+    expect(
+      readAnswer(
+        {
+          type: 'score',
+          score: 1,
+          probabilities: { '0': 0.3333, '1': 0.3333, '2': 0.3333 },
+        },
+        'systemone',
+        score
+      )
+    ).toEqual({
+      type: 'score',
+      score: 1,
+      confidence: null,
+      probabilities: { '0': 0.3333, '1': 0.3333, '2': 0.3333 },
+    });
   });
 
   it('rejects malformed envelopes without leaking the body', () => {
@@ -333,13 +386,15 @@ describe('HTTP classifier', () => {
     );
     expect(required.requiresAuth).toBe(true);
     expect(() => createClassifier(required, undefined)).toThrow(/API key/);
-    expect(() => createClassifier(
-      mergeClassificationSettings(classificationPreset('laya'), {
-        baseURL: 'https://local.example/v1/systemone',
-        requiresAuth: true,
-      }),
-      undefined
-    )).toThrow(/API key/);
+    expect(() =>
+      createClassifier(
+        mergeClassificationSettings(classificationPreset('laya'), {
+          baseURL: 'https://local.example/v1/systemone',
+          requiresAuth: true,
+        }),
+        undefined
+      )
+    ).toThrow(/API key/);
     expect(() =>
       createClassifier(classificationPreset('laya') ?? {}, undefined)
     ).toThrow(/endpoint/);
@@ -354,6 +409,26 @@ describe('HTTP classifier', () => {
     expect(classificationPreset('nope')).toBeNull();
     expect(classificationPreset('__proto__')).toBeNull();
     expect(classificationPreset('constructor')).toBeNull();
+  });
+
+  it('does not let one tenant mutate shared preset endpoints or authentication', () => {
+    expect(Object.isFrozen(CLASSIFICATION_PRESETS)).toBe(true);
+    expect(Object.isFrozen(CLASSIFICATION_PRESETS.typesafe)).toBe(true);
+    const first = classificationPreset('typesafe');
+    const second = classificationPreset('typesafe');
+    expect(first).not.toBe(second);
+    if (first === null) {
+      throw new Error('TypeSafe preset disappeared');
+    }
+    first.baseURL = 'https://untrusted.example/v1/systemone';
+    first.requiresAuth = false;
+    expect(classificationPreset('typesafe')).toMatchObject({
+      baseURL: 'https://api.typesafe.ai/v1/systemone',
+      requiresAuth: true,
+    });
+    expect(() =>
+      createClassifier(classificationPreset('typesafe') ?? {}, undefined)
+    ).toThrow(/API key/);
   });
 
   it('nests the Cloudflare body and returns unknown usage rather than zero tokens', async () => {
@@ -504,6 +579,62 @@ describe('HTTP classifier', () => {
       'Bearer new',
     ]);
     expect(seen).toEqual([false, true]);
+  });
+
+  it('mints one token per call and retains a refreshed token across subsequent retries', async () => {
+    const auths: Array<string | undefined> = [];
+    const minted: boolean[] = [];
+    const statuses = [401, 503, 429, 200];
+    const fetch: ClassificationFetch = async (_url, init) => {
+      auths.push(init.headers.Authorization);
+      const status = statuses[auths.length - 1];
+      return new Response(status === 200 ? measured : 'retriable', { status });
+    };
+    const classifier = createHttpClassifier({
+      endpoint: 'https://s1.example',
+      apiKey: async ({ refresh }) => {
+        minted.push(refresh);
+        return refresh ? 'fresh' : 'stale';
+      },
+      dialect: 'systemone',
+      maxRetries: 2,
+      fetch,
+      sleep: async () => {},
+    });
+    const result = await classifier.classify({
+      state: {},
+      questions: { q: booleanQuestion('?') },
+    });
+    expect(result.answers.q).toEqual({ type: 'boolean', probability: 0.9 });
+    expect(auths).toEqual([
+      'Bearer stale',
+      'Bearer fresh',
+      'Bearer fresh',
+      'Bearer fresh',
+    ]);
+    expect(minted).toEqual([false, true]);
+
+    const retries = fakeFetch([
+      { status: 429, body: 'slow down', retryAfter: '0' },
+      { status: 200, body: measured },
+    ]);
+    const plainMints: boolean[] = [];
+    const plain = createHttpClassifier({
+      endpoint: 'https://s1.example',
+      apiKey: async ({ refresh }) => {
+        plainMints.push(refresh);
+        return 'one-token';
+      },
+      dialect: 'systemone',
+      fetch: retries.fetch,
+      sleep: async () => {},
+    });
+    await plain.classify({ state: {}, questions: { q: booleanQuestion('?') } });
+    expect(plainMints).toEqual([false]);
+    expect(retries.calls.map(({ auth }) => auth)).toEqual([
+      'Bearer one-token',
+      'Bearer one-token',
+    ]);
   });
 
   it('bounds hanging credential minting, caller abort, and non-cooperative response reading', async () => {

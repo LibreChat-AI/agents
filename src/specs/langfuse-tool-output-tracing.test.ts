@@ -282,6 +282,86 @@ describe('Langfuse tool output tracing redaction', () => {
     expect(redacted[1].content).toBe(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
   });
 
+  it('redacts nested tool results in classifier prompts while leaving public state visible', () => {
+    const prompt =
+      'librechat-classifier-state:' +
+      JSON.stringify({
+        state: [
+          { role: 'private_sql', content: 'private query result' },
+          { role: 'public_tool', content: 'public result' },
+          {
+            type: 'mcp_call',
+            name: 'private_sql',
+            output: 'private server result',
+          },
+          {
+            type: 'text',
+            text: JSON.stringify({
+              serverToolResult: {
+                librechatResponsesReplay: true,
+                toolName: 'private_sql',
+                status: 'success',
+                output: 'private replay result',
+              },
+            }),
+            extras: { librechatServerToolResult: { toolName: 'private_sql' } },
+          },
+        ],
+        questions: { q: { type: 'boolean', instructions: 'Classify' } },
+      });
+    const span = createSpan('gpt-4o', {
+      [LangfuseOtelSpanAttributes.OBSERVATION_TYPE]: 'generation',
+      [LangfuseOtelSpanAttributes.OBSERVATION_INPUT]: JSON.stringify([
+        { role: 'user', content: prompt },
+      ]),
+    });
+    const config = createConfig({
+      redactedToolNames: new Set(['private_sql']),
+    });
+    redactLangfuseSpanToolOutputs(span, config);
+    const observed = String(
+      span.attributes[LangfuseOtelSpanAttributes.OBSERVATION_INPUT]
+    );
+    expect(observed).not.toContain('private query result');
+    expect(observed).not.toContain('private server result');
+    expect(observed).not.toContain('private replay result');
+    expect(observed).toContain('public result');
+    expect(observed).toContain(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
+
+    const truncated = createSpan('gpt-4o', {
+      [LangfuseOtelSpanAttributes.OBSERVATION_INPUT]: JSON.stringify([
+        {
+          role: 'user',
+          content:
+            'librechat-classifier-state:{"state":[{"role":"private_sql","content":"private truncated',
+        },
+      ]),
+    });
+    redactLangfuseSpanToolOutputs(truncated, config);
+    expect(JSON.stringify(truncated.attributes)).not.toContain(
+      'private truncated'
+    );
+
+    const direct = createSpan('gpt-4o', {
+      [LangfuseOtelSpanAttributes.OBSERVATION_INPUT]: prompt,
+    });
+    redactLangfuseSpanToolOutputs(direct, createConfig({ enabled: false }));
+    const directObserved = String(
+      direct.attributes[LangfuseOtelSpanAttributes.OBSERVATION_INPUT]
+    );
+    expect(directObserved).not.toContain('private query result');
+    expect(directObserved).not.toContain('public result');
+    expect(directObserved).toContain(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
+
+    const unredacted = createSpan('gpt-4o', {
+      [LangfuseOtelSpanAttributes.OBSERVATION_INPUT]: prompt,
+    });
+    redactLangfuseSpanToolOutputs(unredacted, createConfig());
+    expect(
+      unredacted.attributes[LangfuseOtelSpanAttributes.OBSERVATION_INPUT]
+    ).toBe(prompt);
+  });
+
   it('redacts captured Responses server-tool outputs wherever they are serialized', () => {
     const outputs = [
       {

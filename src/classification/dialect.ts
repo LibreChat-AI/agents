@@ -64,7 +64,15 @@ function probabilitiesOf(
   if (entries.length === 0) {
     return null;
   }
+  if (
+    (question?.type === 'choice' &&
+      entries.length !== Object.keys(question.criteria).length) ||
+    (question?.type === 'score' && entries.length !== question.criteria.length)
+  ) {
+    return undefined;
+  }
   const probabilities: Record<string, number> = Object.create(null);
+  let total = 0;
   for (const [key, value] of entries) {
     if (!isProbability(value)) {
       return undefined;
@@ -80,8 +88,13 @@ function probabilitiesOf(
       return undefined;
     }
     probabilities[key] = value;
+    total += value;
   }
-  return probabilities;
+  const roundingTolerance = Math.min(
+    0.02,
+    Math.max(0.01, entries.length * 0.00005 + 0.001)
+  );
+  return Math.abs(total - 1) <= roundingTolerance ? probabilities : undefined;
 }
 
 /** A validated answer, or `null` for one that cannot safely be read. */

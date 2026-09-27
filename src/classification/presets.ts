@@ -12,43 +12,42 @@ export const DEFAULT_API_KEY_ENV = 'CLASSIFIER_API_KEY';
  * Known HTTP hosts as settings, not new classifier implementations. Jev and Laya speak the
  * same wire protocol, but their confidence measures and checkpoint calibration differ.
  */
-export const CLASSIFICATION_PRESETS: Record<
-  string,
-  ClassificationProviderSettings
-> = {
-  http: {
+export const CLASSIFICATION_PRESETS: Readonly<
+  Record<string, Readonly<ClassificationProviderSettings>>
+> = Object.freeze({
+  http: Object.freeze({
     dialect: 'port',
     requiresAuth: true,
     apiKeyEnv: DEFAULT_API_KEY_ENV,
-  },
-  typesafe: {
+  }),
+  typesafe: Object.freeze({
     baseURL: 'https://api.typesafe.ai/v1/systemone',
     model: 'jev-latest',
     dialect: 'systemone',
     requiresAuth: true,
     apiKeyEnv: 'TYPESAFE_API_KEY',
-  },
-  laya: {
+  }),
+  laya: Object.freeze({
     /** Supply the server's full /v1/systemone URL; no model lets Laya route by language. */
     dialect: 'systemone',
     requiresAuth: false,
-  },
-  clickhouse: {
+  }),
+  clickhouse: Object.freeze({
     /** ClickHouse's inference gateway; the token is what `dataplanectl chai auth token` prints, hourly. */
     baseURL: 'https://inference-internal.clickhouse.cloud/v1/systemone',
     model: 'jev-latest',
     dialect: 'systemone',
     requiresAuth: true,
     apiKeyEnv: 'CHAI_AUTH_TOKEN',
-  },
-  openrouter: {
+  }),
+  openrouter: Object.freeze({
     baseURL: 'https://openrouter.ai/api/alpha/decisions',
     model: '~typesafe/jev-latest',
     dialect: 'systemone',
     requiresAuth: true,
     apiKeyEnv: 'OPENROUTER_KEY',
-  },
-  cloudflare: {
+  }),
+  cloudflare: Object.freeze({
     /** No default URL: the account id is part of it. */
     model: 'typesafe/jev',
     dialect: 'systemone',
@@ -56,8 +55,8 @@ export const CLASSIFICATION_PRESETS: Record<
     responseKey: 'result',
     requiresAuth: true,
     apiKeyEnv: 'CLOUDFLARE_API_TOKEN',
-  },
-};
+  }),
+});
 
 export function classificationPreset(
   name: string | undefined
@@ -66,7 +65,7 @@ export function classificationPreset(
     return null;
   }
   return Object.hasOwn(CLASSIFICATION_PRESETS, name)
-    ? CLASSIFICATION_PRESETS[name]
+    ? { ...CLASSIFICATION_PRESETS[name] }
     : null;
 }
 

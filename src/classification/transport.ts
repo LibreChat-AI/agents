@@ -235,14 +235,16 @@ export function createTransport(options: TransportOptions): Transport {
             { provider: providerId }
           );
         let refreshed = false;
-        let refreshKey = false;
+        let key: string | null | undefined;
         let lastError: ClassificationError | undefined;
         for (let attemptNo = 0; attemptNo <= maxRetries; attemptNo++) {
           if (wasAborted()) {
             throw interrupted();
           }
           try {
-            const key = await waitFor(resolveKey(refreshKey, signal));
+            if (key === undefined) {
+              key = await waitFor(resolveKey(refreshed, signal));
+            }
             const response = await waitFor(
               fetchImpl(endpoint, {
                 method: 'POST',
@@ -279,27 +281,25 @@ export function createTransport(options: TransportOptions): Transport {
             if (wasAborted()) {
               throw interrupted();
             }
-            lastError =
-              error instanceof ClassificationError
-                ? error
-                : new ClassificationError(
-                  'network',
-                  'classifier request failed',
-                  {
-                    provider: providerId,
-                  }
-                );
+            if (error instanceof ClassificationError) {
+              lastError = error;
+            } else {
+              lastError = new ClassificationError(
+                'network',
+                'classifier request failed',
+                { provider: providerId }
+              );
+            }
             if (
               lastError.status === 401 &&
               typeof credential === 'function' &&
               !refreshed
             ) {
               refreshed = true;
-              refreshKey = true;
+              key = undefined;
               attemptNo -= 1;
               continue;
             }
-            refreshKey = false;
             if (
               attemptNo === maxRetries ||
               !['rate_limited', 'server_error', 'network'].includes(
