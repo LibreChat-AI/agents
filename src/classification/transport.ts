@@ -1,8 +1,11 @@
 import type { ClassificationCredential } from './types';
+import type { AwaitWithinDeadline } from './deadline';
+import { withClassificationDeadline } from './deadline';
 import { ClassificationError } from './types';
 
 const DEFAULT_TIMEOUT_MS = 4_000;
 const DEFAULT_MAX_RETRIES = 2;
+const MAX_RESPONSE_BYTES = 256 * 1024;
 const BACKOFF_MS = [250, 750, 1_500, 3_000, 6_000];
 const MAX_RETRY_AFTER_MS = 10_000;
 
@@ -13,55 +16,44 @@ export type ClassificationFetch = (
     headers: Record<string, string>;
     body: string;
     signal: AbortSignal;
+    redirect: 'error';
   }
-) => Promise<{
-  ok: boolean;
-  status: number;
-  headers: { get(name: string): string | null };
-  text(): Promise<string>;
-}>;
+) => Promise<Pick<Response, 'ok' | 'status' | 'headers' | 'body'>>;
 
 export interface TransportOptions {
   providerId: string;
-  apiKey: ClassificationCredential;
+  apiKey?: ClassificationCredential;
+  requiresAuth?: boolean;
   /** Full URL, not a base path. */
   endpoint: string;
   timeoutMs?: number;
   maxRetries?: number;
   fetch?: ClassificationFetch;
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
-  /** Called once per answered request with its label and wall time, for the caller's own logging. */
+  /** Called only after the response parses, with no state, answers, or credentials. */
   onAnswered?: (label: string, ms: number) => void;
 }
 
-export type Transport = (
-  payload: string,
+export type Transport = <T>(
+  prepare: () => { payload: string; parse: (body: string) => T },
   signal: AbortSignal | undefined,
   label: string,
   timeoutOverrideMs?: number
-) => Promise<string>;
+) => Promise<T>;
 
 function failureForStatus(
   status: number
 ): 'unauthorized' | 'rate_limited' | 'server_error' | 'bad_request' {
   if (status === 401 || status === 403) {
-    return 'unauthorized' as const;
+    return 'unauthorized';
   }
   if (status === 429) {
-    return 'rate_limited' as const;
+    return 'rate_limited';
   }
   if (status >= 500) {
-    return 'server_error' as const;
+    return 'server_error';
   }
-  return 'bad_request' as const;
-}
-
-function isRetryable(failure: string): boolean {
-  return (
-    failure === 'rate_limited' ||
-    failure === 'server_error' ||
-    failure === 'network'
-  );
+  return 'bad_request';
 }
 
 function retryAfterMs(header: string | null): number | undefined {
@@ -73,15 +65,9 @@ function retryAfterMs(header: string | null): number | undefined {
     return Math.min(seconds * 1_000, MAX_RETRY_AFTER_MS);
   }
   const at = Date.parse(header);
-  if (Number.isNaN(at)) {
-    return undefined;
-  }
-  return Math.min(Math.max(at - Date.now(), 0), MAX_RETRY_AFTER_MS);
-}
-
-function briefly(body: string): string {
-  const flat = body.replace(/\s+/g, ' ').trim();
-  return flat.length > 200 ? `${flat.slice(0, 200)}…` : flat;
+  return Number.isFinite(at)
+    ? Math.min(Math.max(at - Date.now(), 0), MAX_RETRY_AFTER_MS)
+    : undefined;
 }
 
 function defaultSleep(ms: number, signal?: AbortSignal): Promise<void> {
@@ -99,15 +85,58 @@ function defaultSleep(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
-/**
- * POST JSON to one endpoint with a bearer key: typed failures, one deadline for the whole call
- * (retries and backoff included), a bounded retry on rate limits, server errors and network
- * failures, honouring `retry-after` up to ten seconds.
- */
+/** Stream successful bodies only, so neither errors nor oversized replies are ever buffered. */
+async function readResponse(
+  body: ReadableStream<Uint8Array> | null,
+  waitFor: AwaitWithinDeadline,
+  provider: string
+): Promise<string> {
+  if (!body) {
+    return '';
+  }
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let bytes = 0;
+  let text = '';
+  try {
+    for (;;) {
+      const chunk = await waitFor(reader.read());
+      if (chunk.done) {
+        return text + decoder.decode();
+      }
+      bytes += chunk.value.byteLength;
+      if (bytes > MAX_RESPONSE_BYTES) {
+        throw new ClassificationError(
+          'malformed_response',
+          'classifier response too large',
+          {
+            provider,
+          }
+        );
+      }
+      text += decoder.decode(chunk.value, { stream: true });
+    }
+  } catch (error) {
+    void reader.cancel().catch(() => {});
+    throw error;
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {
+      // A timed-out read still holds the lock until cancellation settles.
+    }
+  }
+}
+
+/** One immutable transport; every call owns its signal, deadline, and credentials. */
 export function createTransport(options: TransportOptions): Transport {
   const { providerId } = options;
   const credential = options.apiKey;
-  if (typeof credential === 'string' && credential.trim() === '') {
+  if (
+    options.requiresAuth !== false &&
+    (credential == null ||
+      (typeof credential === 'string' && credential.trim() === ''))
+  ) {
     throw new ClassificationError(
       'unauthorized',
       'classifier requires an API key',
@@ -116,9 +145,8 @@ export function createTransport(options: TransportOptions): Transport {
       }
     );
   }
-
   const endpoint = options.endpoint.trim();
-  if (endpoint === '') {
+  if (!endpoint) {
     throw new ClassificationError(
       'bad_request',
       'classifier requires an endpoint',
@@ -127,15 +155,21 @@ export function createTransport(options: TransportOptions): Transport {
       }
     );
   }
-
-  const defaultTimeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const maxRetries = options.maxRetries ?? DEFAULT_MAX_RETRIES;
   const sleep = options.sleep ?? defaultSleep;
   const onAnswered = options.onAnswered;
-  const candidate =
-    options.fetch ??
-    (globalThis.fetch as unknown as ClassificationFetch | undefined);
-  if (typeof candidate !== 'function') {
+  if (!Number.isSafeInteger(maxRetries) || maxRetries < 0 || maxRetries > 5) {
+    throw new ClassificationError(
+      'bad_request',
+      'invalid classifier retry limit',
+      {
+        provider: providerId,
+      }
+    );
+  }
+  const fetchImpl: ClassificationFetch = options.fetch ?? globalThis.fetch;
+  if (typeof fetchImpl !== 'function') {
     throw new ClassificationError(
       'network',
       'no fetch implementation available',
@@ -144,155 +178,162 @@ export function createTransport(options: TransportOptions): Transport {
       }
     );
   }
-  const fetchImpl: ClassificationFetch = candidate;
 
-  async function resolveKey(refresh: boolean): Promise<string> {
+  async function resolveKey(
+    refresh: boolean,
+    signal: AbortSignal
+  ): Promise<string | null> {
     if (typeof credential === 'string') {
-      return credential.trim();
+      return credential.trim() || null;
     }
-    const minted = (await credential({ refresh })).trim();
-    if (minted === '') {
+    if (!credential) {
+      return null;
+    }
+    const minted: string = await credential({ refresh, signal });
+    const token = typeof minted === 'string' ? minted.trim() : '';
+    if (!token) {
       throw new ClassificationError(
         'unauthorized',
         'credential function returned no token',
-        { provider: providerId }
+        {
+          provider: providerId,
+        }
       );
     }
-    return minted;
+    return token;
   }
 
-  async function attempt(
-    payload: string,
-    signal: AbortSignal | undefined,
-    timeoutMs: number,
-    refreshKey: boolean
-  ): Promise<string> {
-    const apiKey = await resolveKey(refreshKey);
-    const timeout = new AbortController();
-    const timer = setTimeout(() => timeout.abort(), timeoutMs);
-    const combined =
-      signal != null
-        ? AbortSignal.any([signal, timeout.signal])
-        : timeout.signal;
-
-    try {
-      const response = await fetchImpl(endpoint, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          'Content-Type': 'application/json',
-        },
-        body: payload,
-        signal: combined,
-      });
-
-      const text = await response.text();
-      if (!response.ok) {
-        const error = new ClassificationError(
-          failureForStatus(response.status),
-          `classifier returned ${response.status}: ${briefly(text)}`,
-          { provider: providerId, status: response.status }
-        );
-        const wait = retryAfterMs(response.headers.get('retry-after'));
-        if (wait != null) {
-          error.retryAfterMs = wait;
-        }
-        throw error;
-      }
-      return text;
-    } catch (error) {
-      if (error instanceof ClassificationError) {
-        throw error;
-      }
-      if (signal?.aborted === true) {
-        throw new ClassificationError('aborted', 'caller aborted the request', {
-          provider: providerId,
-        });
-      }
-      if (timeout.signal.aborted) {
-        throw new ClassificationError(
-          'timeout',
-          `no answer within ${timeoutMs}ms`,
-          {
-            provider: providerId,
+  return async function send(prepare, callerSignal, label, timeoutOverrideMs) {
+    const started = performance.now();
+    return withClassificationDeadline(
+      providerId,
+      timeoutOverrideMs ?? timeoutMs,
+      callerSignal,
+      async (signal, waitFor) => {
+        let prepared: ReturnType<typeof prepare>;
+        try {
+          prepared = prepare();
+        } catch (error) {
+          if (error instanceof ClassificationError) {
+            throw error;
           }
-        );
-      }
-      const message = error instanceof Error ? error.message : String(error);
-      throw new ClassificationError('network', message, {
-        provider: providerId,
-      });
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-
-  /** `timeoutMs` bounds the whole call, retries and backoff included, not each attempt. */
-  return async function send(payload, signal, label, timeoutOverrideMs) {
-    const timeoutMs =
-      timeoutOverrideMs != null && timeoutOverrideMs > 0
-        ? timeoutOverrideMs
-        : defaultTimeoutMs;
-    const deadline = Date.now() + timeoutMs;
-    let lastError: ClassificationError | undefined;
-    let refreshKey = false;
-    let refreshed = false;
-    for (let attemptNo = 0; attemptNo <= maxRetries; attemptNo++) {
-      try {
-        const started = Date.now();
-        const body = await attempt(
-          payload,
-          signal,
-          Math.max(1, deadline - started),
-          refreshKey
-        );
-        onAnswered?.(label, Date.now() - started);
-        return body;
-      } catch (error) {
-        lastError =
-          error instanceof ClassificationError
-            ? error
-            : new ClassificationError('network', String(error), {
-              provider: providerId,
-            });
-        if (
-          lastError.status === 401 &&
-          typeof credential === 'function' &&
-          !refreshed
-        ) {
-          refreshed = true;
-          refreshKey = true;
-          attemptNo -= 1;
-          continue;
-        }
-        refreshKey = false;
-        if (attemptNo === maxRetries || !isRetryable(lastError.failure)) {
-          break;
-        }
-        const wait =
-          lastError.retryAfterMs ??
-          BACKOFF_MS[Math.min(attemptNo, BACKOFF_MS.length - 1)];
-        if (wait >= deadline - Date.now()) {
-          break;
-        }
-        await sleep(wait, signal);
-        if (signal?.aborted === true) {
-          lastError = new ClassificationError(
-            'aborted',
-            'caller aborted the request',
+          throw new ClassificationError(
+            'bad_request',
+            'invalid classifier request',
             {
               provider: providerId,
             }
           );
-          break;
         }
+        const { payload, parse } = prepared;
+        await waitFor(Promise.resolve());
+        const wasAborted = (): boolean => signal.aborted;
+        const interrupted = (): ClassificationError =>
+          new ClassificationError(
+            callerSignal?.aborted === true ? 'aborted' : 'timeout',
+            'classifier request interrupted',
+            { provider: providerId }
+          );
+        let refreshed = false;
+        let refreshKey = false;
+        let lastError: ClassificationError | undefined;
+        for (let attemptNo = 0; attemptNo <= maxRetries; attemptNo++) {
+          if (wasAborted()) {
+            throw interrupted();
+          }
+          try {
+            const key = await waitFor(resolveKey(refreshKey, signal));
+            const response = await waitFor(
+              fetchImpl(endpoint, {
+                method: 'POST',
+                headers: {
+                  ...(key !== null ? { Authorization: `Bearer ${key}` } : {}),
+                  'Content-Type': 'application/json',
+                },
+                body: payload,
+                signal,
+                redirect: 'error',
+              })
+            );
+            if (!response.ok) {
+              void response.body?.cancel().catch(() => {});
+              const error = new ClassificationError(
+                failureForStatus(response.status),
+                `classifier returned HTTP ${response.status}`,
+                { provider: providerId, status: response.status }
+              );
+              error.retryAfterMs = retryAfterMs(
+                response.headers.get('retry-after')
+              );
+              throw error;
+            }
+            const body = await readResponse(response.body, waitFor, providerId);
+            const result = await waitFor(Promise.resolve(parse(body)));
+            try {
+              onAnswered?.(label, performance.now() - started);
+            } catch {
+              // Observability must not turn a valid answer into a retried request.
+            }
+            return result;
+          } catch (error) {
+            if (wasAborted()) {
+              throw interrupted();
+            }
+            lastError =
+              error instanceof ClassificationError
+                ? error
+                : new ClassificationError(
+                  'network',
+                  'classifier request failed',
+                  {
+                    provider: providerId,
+                  }
+                );
+            if (
+              lastError.status === 401 &&
+              typeof credential === 'function' &&
+              !refreshed
+            ) {
+              refreshed = true;
+              refreshKey = true;
+              attemptNo -= 1;
+              continue;
+            }
+            refreshKey = false;
+            if (
+              attemptNo === maxRetries ||
+              !['rate_limited', 'server_error', 'network'].includes(
+                lastError.failure
+              )
+            ) {
+              break;
+            }
+            const wait =
+              lastError.retryAfterMs ??
+              BACKOFF_MS[Math.min(attemptNo, BACKOFF_MS.length - 1)];
+            try {
+              await waitFor(sleep(wait, signal));
+            } catch (error) {
+              if (error instanceof ClassificationError) {
+                throw error;
+              }
+              throw new ClassificationError(
+                'network',
+                'classifier backoff failed',
+                {
+                  provider: providerId,
+                }
+              );
+            }
+          }
+        }
+        throw (
+          lastError ??
+          new ClassificationError('network', 'classifier request failed', {
+            provider: providerId,
+          })
+        );
       }
-    }
-    throw (
-      lastError ??
-      new ClassificationError('network', 'request failed', {
-        provider: providerId,
-      })
     );
   };
 }

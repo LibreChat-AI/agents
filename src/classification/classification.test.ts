@@ -17,6 +17,8 @@ type FetchCall = {
   url: string;
   body: Record<string, unknown>;
   auth: string | undefined;
+  signal: AbortSignal;
+  redirect: 'error';
 };
 
 function fakeFetch(
@@ -29,59 +31,59 @@ function fakeFetch(
       url,
       body: JSON.parse(init.body) as Record<string, unknown>,
       auth: init.headers.Authorization,
+      signal: init.signal,
+      redirect: init.redirect,
     });
-    const r = responses[Math.min(i, responses.length - 1)];
-    i += 1;
-    return {
-      ok: r.status >= 200 && r.status < 300,
-      status: r.status,
-      headers: {
-        get: (name: string) =>
-          name === 'retry-after' ? (r.retryAfter ?? null) : null,
-      },
-      text: async () => r.body,
-    };
+    const reply = responses[Math.min(i++, responses.length - 1)];
+    return new Response(reply.body, {
+      status: reply.status,
+      headers:
+        reply.retryAfter !== undefined
+          ? { 'retry-after': reply.retryAfter }
+          : {},
+    });
   };
   return { fetch, calls };
 }
 
+const measured = JSON.stringify({
+  model: 'jev-1.13.0',
+  answers: { q: { type: 'noul', noul: 0.9 } },
+  usage: { input_tokens: 10, output_tokens: 1 },
+});
+
 describe('classification dialect', () => {
-  it('sends a boolean as a noul with a {true} pair on System One, unchanged on the port', () => {
+  it('maps boolean, choice, and expected-value score questions to System One', () => {
     expect(
       toWireQuestion(booleanQuestion('Is it a test?'), 'systemone')
-    ).toEqual({ type: 'noul', instructions: 'Is it a test?' });
+    ).toEqual({
+      type: 'noul',
+      instructions: 'Is it a test?',
+    });
     expect(
       toWireQuestion(
-        booleanQuestion('Is it a test?', 'it calls test()'),
+        booleanQuestion('Is it a test?', 'calls test()'),
         'systemone'
       )
     ).toEqual({
       type: 'noul',
       instructions: 'Is it a test?',
-      criteria: { true: 'it calls test()' },
+      criteria: { true: 'calls test()' },
     });
     expect(
       toWireQuestion(
-        booleanQuestion('Is it a test?', {
-          true: 'yes when',
-          false: 'no when',
-        }),
+        booleanQuestion('Test?', { true: 'yes', false: 'no' }),
         'systemone'
       )
     ).toEqual({
       type: 'noul',
-      instructions: 'Is it a test?',
-      criteria: { true: 'yes when', false: 'no when' },
+      instructions: 'Test?',
+      criteria: { true: 'yes', false: 'no' },
     });
-    expect(
-      toWireQuestion(
-        booleanQuestion('Is it a test?', 'it calls test()'),
-        'port'
-      )
-    ).toEqual({
+    expect(toWireQuestion(booleanQuestion('Test?', 'yes'), 'port')).toEqual({
       type: 'boolean',
-      instructions: 'Is it a test?',
-      criteria: { true: 'it calls test()' },
+      instructions: 'Test?',
+      criteria: { true: 'yes' },
     });
     expect(
       toWireQuestion(choiceQuestion('Which?', { a: 'A', b: null }), 'systemone')
@@ -99,7 +101,7 @@ describe('classification dialect', () => {
     });
   });
 
-  it('reads answers back in the port shape and drops what it cannot read', () => {
+  it('keeps measured probabilities and expected-value scores, but not fabricated distributions', () => {
     expect(readAnswer({ type: 'noul', noul: 0.83 }, 'systemone')).toEqual({
       type: 'boolean',
       probability: 0.83,
@@ -125,7 +127,12 @@ describe('classification dialect', () => {
       probabilities: { hook: 0.91, util: 0.09 },
     });
     expect(readAnswer({ type: 'choice', choice: 'hook' }, 'systemone')).toEqual(
-      { type: 'choice', choice: 'hook', confidence: null, probabilities: {} }
+      {
+        type: 'choice',
+        choice: 'hook',
+        confidence: null,
+        probabilities: null,
+      }
     );
     expect(
       readAnswer(
@@ -134,7 +141,6 @@ describe('classification dialect', () => {
           score: 1.7,
           confidence: 0.9,
           probabilities: { '0': 0.1, '1': 0.1, '2': 0.8 },
-          legend: { '0': 'a' },
         },
         'systemone'
       )
@@ -144,32 +150,59 @@ describe('classification dialect', () => {
       confidence: 0.9,
       probabilities: { '0': 0.1, '1': 0.1, '2': 0.8 },
     });
-    expect(readAnswer({ type: 'choice', choice: 7 }, 'systemone')).toBeNull();
-    expect(readAnswer('nope', 'systemone')).toBeNull();
   });
 
-  it('parses the envelope and refuses one without answers', () => {
-    const env = parseEnvelope(
-      '{"model":"jev-1.13.0","answers":{"a":{"type":"noul","noul":0.5},"b":{"type":"weird"}},"usage":{"input_tokens":312,"output_tokens":48}}',
-      'systemone',
-      (a) => readAnswer(a, 'systemone')
-    );
-    expect(env).toEqual({
-      model: 'jev-1.13.0',
-      answers: { a: { type: 'boolean', probability: 0.5 } },
-      usage: { inputTokens: 312, outputTokens: 48 },
-    });
-    expect(() => parseEnvelope('not json', 'x', () => null)).toThrow(
-      ClassificationError
-    );
-    expect(() => parseEnvelope('{"model":"m"}', 'x', () => null)).toThrow(
+  it('rejects invalid ranges, choices, scores, and probability distributions', () => {
+    const choice = choiceQuestion('Which?', { hook: 'yes', util: 'no' });
+    const score = scoreQuestion('Score?', ['a', 'b', 'c']);
+    expect(readAnswer({ type: 'noul', noul: -0.01 }, 'systemone')).toBeNull();
+    expect(readAnswer({ type: 'noul', noul: 1.01 }, 'systemone')).toBeNull();
+    expect(
+      readAnswer({ type: 'noul', noul: Infinity }, 'systemone')
+    ).toBeNull();
+    expect(
+      readAnswer({ type: 'choice', choice: 'other' }, 'systemone', choice)
+    ).toBeNull();
+    expect(
+      readAnswer(
+        { type: 'choice', choice: 'hook', probabilities: { hook: 1.2 } },
+        'systemone',
+        choice
+      )
+    ).toBeNull();
+    expect(
+      readAnswer(
+        { type: 'choice', choice: 'hook', probabilities: { other: 0.1 } },
+        'systemone',
+        choice
+      )
+    ).toBeNull();
+    expect(
+      readAnswer({ type: 'score', score: 2.1 }, 'systemone', score)
+    ).toBeNull();
+    expect(
+      readAnswer({ type: 'score', score: NaN }, 'systemone', score)
+    ).toBeNull();
+    expect(readAnswer({ type: 'choice', choice: 7 }, 'systemone')).toBeNull();
+  });
+
+  it('rejects malformed envelopes without leaking the body', () => {
+    expect(() =>
+      parseEnvelope('not json', 'jev', (a) => readAnswer(a, 'systemone'))
+    ).toThrow(ClassificationError);
+    expect(() => parseEnvelope('{"model":"m"}', 'jev', () => null)).toThrow(
       /no answers/
     );
+    expect(() =>
+      parseEnvelope('{"answers":{"q":{"type":"noul","noul":2}}}', 'jev', (a) =>
+        readAnswer(a, 'systemone')
+      )
+    ).toThrow(/invalid answer/);
   });
 });
 
-describe('http classifier', () => {
-  it('posts the System One body with the model and reads the reply', async () => {
+describe('HTTP classifier', () => {
+  it('posts Jev-shaped questions and keeps only measured answer probabilities', async () => {
     const { fetch, calls } = fakeFetch([
       {
         status: 200,
@@ -183,6 +216,11 @@ describe('http classifier', () => {
               probabilities: { hook: 0.7, util: 0.3 },
             },
             is_test: { type: 'noul', noul: 0.02 },
+            severity: {
+              type: 'score',
+              score: 1.7,
+              probabilities: { '0': 0.1, '1': 0.2, '2': 0.7 },
+            },
           },
           usage: { input_tokens: 10, output_tokens: 1 },
         }),
@@ -200,10 +238,12 @@ describe('http classifier', () => {
       questions: {
         role: choiceQuestion('Which?', { hook: 'a hook', util: 'a util' }),
         is_test: booleanQuestion('test?'),
+        severity: scoreQuestion('Severity?', ['low', 'medium', 'high']),
       },
     });
     expect(calls).toHaveLength(1);
     expect(calls[0].auth).toBe('Bearer k');
+    expect(calls[0].redirect).toBe('error');
     expect(calls[0].body).toEqual({
       model: 'jev-latest',
       state: { path: 'x.ts' },
@@ -214,6 +254,11 @@ describe('http classifier', () => {
           criteria: { hook: 'a hook', util: 'a util' },
         },
         is_test: { type: 'noul', instructions: 'test?' },
+        severity: {
+          type: 'score',
+          instructions: 'Severity?',
+          criteria: ['low', 'medium', 'high'],
+        },
       },
     });
     expect(result.answers.role).toEqual({
@@ -226,10 +271,92 @@ describe('http classifier', () => {
       type: 'boolean',
       probability: 0.02,
     });
+    expect(result.answers.severity).toEqual({
+      type: 'score',
+      score: 1.7,
+      confidence: null,
+      probabilities: { '0': 0.1, '1': 0.2, '2': 0.7 },
+    });
     expect(result.usage).toEqual({ inputTokens: 10, outputTokens: 1 });
   });
 
-  it('wraps the request and unwraps the response for hosts that nest them', async () => {
+  it('sends the same wire format to unauthenticated Laya without pinning a model', async () => {
+    const { fetch, calls } = fakeFetch([{ status: 200, body: measured }]);
+    const settings = mergeClassificationSettings(classificationPreset('laya'), {
+      baseURL: 'http://localhost:8000/v1/systemone',
+    });
+    const classifier = createClassifier(settings, undefined, {
+      providerId: 'laya',
+      fetch,
+    });
+    const result = await classifier.classify({
+      state: 'bill me twice',
+      questions: { q: booleanQuestion('Was billing mentioned?') },
+    });
+    expect(calls[0]).toMatchObject({
+      url: 'http://localhost:8000/v1/systemone',
+      auth: undefined,
+      body: {
+        state: 'bill me twice',
+        questions: {
+          q: { type: 'noul', instructions: 'Was billing mentioned?' },
+        },
+      },
+    });
+    expect(calls[0].body).not.toHaveProperty('model');
+    expect(result.answers.q).toEqual({ type: 'boolean', probability: 0.9 });
+    expect(classificationPreset('laya')).toMatchObject({
+      dialect: 'systemone',
+      requiresAuth: false,
+    });
+    expect(classificationPreset('laya')).not.toHaveProperty('baseURL');
+    expect(classificationPreset('laya')).not.toHaveProperty('model');
+  });
+
+  it('supports optional Laya bearer auth and keeps mandatory Jev credentials', async () => {
+    const { fetch, calls } = fakeFetch([{ status: 200, body: measured }]);
+    const laya = createClassifier(
+      mergeClassificationSettings(classificationPreset('laya'), {
+        baseURL: 'https://local.example/v1/systemone',
+      }),
+      'laya-secret',
+      { fetch }
+    );
+    await laya.classify({ state: {}, questions: { q: booleanQuestion('?') } });
+    expect(calls[0].auth).toBe('Bearer laya-secret');
+    expect(() =>
+      createClassifier(classificationPreset('typesafe') ?? {}, undefined)
+    ).toThrow(/API key/);
+    const required = mergeClassificationSettings(
+      classificationPreset('typesafe'),
+      { requiresAuth: false }
+    );
+    expect(required.requiresAuth).toBe(true);
+    expect(() => createClassifier(required, undefined)).toThrow(/API key/);
+    expect(() => createClassifier(
+      mergeClassificationSettings(classificationPreset('laya'), {
+        baseURL: 'https://local.example/v1/systemone',
+        requiresAuth: true,
+      }),
+      undefined
+    )).toThrow(/API key/);
+    expect(() =>
+      createClassifier(classificationPreset('laya') ?? {}, undefined)
+    ).toThrow(/endpoint/);
+    expect(() =>
+      createHttpClassifier({ endpoint: 'https://s1.example', apiKey: '' })
+    ).toThrow(/API key/);
+    expect(classificationPreset('typesafe')).toMatchObject({
+      baseURL: 'https://api.typesafe.ai/v1/systemone',
+      model: 'jev-latest',
+      dialect: 'systemone',
+    });
+    expect(classificationPreset('nope')).toBeNull();
+    expect(classificationPreset('__proto__')).toBeNull();
+    expect(classificationPreset('constructor')).toBeNull();
+  });
+
+  it('nests the Cloudflare body and returns unknown usage rather than zero tokens', async () => {
     const { fetch, calls } = fakeFetch([
       {
         status: 200,
@@ -260,111 +387,313 @@ describe('http classifier', () => {
         questions: { q: { type: 'noul', instructions: '?' } },
       },
     });
-    expect(result.answers.q).toEqual({ type: 'boolean', probability: 0.9 });
-    expect(result.usage).toEqual({ inputTokens: 0, outputTokens: 0 });
+    expect(result.usage).toBeNull();
   });
 
-  it('does not retry an authorization failure, and retries a rate limit once within the deadline', async () => {
-    const denied = fakeFetch([{ status: 403, body: '{"error":"no"}' }]);
+  it('marks missing answers as undefined and rejects unknown, wrong-type, and invalid answers', async () => {
+    const questions = {
+      q: booleanQuestion('?'),
+      other: booleanQuestion('Another?'),
+    };
+    const partial = fakeFetch([{ status: 200, body: measured }]);
     const classifier = createHttpClassifier({
-      endpoint: 'https://s1.example/v1/systemone',
+      endpoint: 'https://s1.example',
       apiKey: 'k',
-      fetch: denied.fetch,
+      dialect: 'systemone',
+      fetch: partial.fetch,
+    });
+    const result = await classifier.classify({ state: {}, questions });
+    expect(result.answers.q).toEqual({ type: 'boolean', probability: 0.9 });
+    expect(result.answers.other).toBeUndefined();
+
+    for (const answers of [
+      {},
+      { extra: { type: 'noul', noul: 0.5 } },
+      { q: { type: 'choice', choice: 'x' } },
+      { q: { type: 'noul', noul: -0.1 } },
+    ]) {
+      const invalid = fakeFetch([
+        { status: 200, body: JSON.stringify({ answers }) },
+      ]);
+      await expect(
+        createHttpClassifier({
+          endpoint: 'https://s1.example',
+          apiKey: 'k',
+          dialect: 'systemone',
+          fetch: invalid.fetch,
+        }).classify({ state: {}, questions: { q: booleanQuestion('?') } })
+      ).rejects.toMatchObject({ failure: 'malformed_response' });
+    }
+  });
+
+  it('rejects malformed question IDs before sending a request', async () => {
+    const { fetch, calls } = fakeFetch([{ status: 200, body: measured }]);
+    const classifier = createHttpClassifier({
+      endpoint: 'https://s1.example',
+      apiKey: 'k',
+      fetch,
     });
     await expect(
-      classifier.classify({ state: {}, questions: { q: booleanQuestion('?') } })
+      classifier.classify({
+        state: {},
+        questions: { ['bad\nid']: booleanQuestion('Is this valid?') },
+      })
+    ).rejects.toMatchObject({ failure: 'bad_request' });
+    expect(calls).toHaveLength(0);
+  });
+
+  it('retries a 429 but never retries a 403, and refreshes a minted key once for a 401', async () => {
+    const forbidden = fakeFetch([
+      { status: 403, body: 'private echoed content and key' },
+    ]);
+    await expect(
+      createHttpClassifier({
+        endpoint: 'https://s1.example',
+        apiKey: 'secret',
+        fetch: forbidden.fetch,
+      }).classify({ state: {}, questions: { q: booleanQuestion('?') } })
     ).rejects.toMatchObject({ failure: 'unauthorized', status: 403 });
-    expect(denied.calls).toHaveLength(1);
+    expect(forbidden.calls).toHaveLength(1);
 
     const limited = fakeFetch([
       { status: 429, body: 'slow down', retryAfter: '0' },
       {
         status: 200,
         body: JSON.stringify({
-          model: 'jev',
           answers: { q: { type: 'boolean', probability: 0.4 } },
-          usage: {},
         }),
       },
     ]);
     const patient = createHttpClassifier({
-      endpoint: 'https://s1.example/v1/systemone',
+      endpoint: 'https://s1.example',
       apiKey: 'k',
       fetch: limited.fetch,
       sleep: async () => {},
     });
-    const result = await patient.classify({
-      state: {},
-      questions: { q: booleanQuestion('?') },
+    expect(
+      (
+        await patient.classify({
+          state: {},
+          questions: { q: booleanQuestion('?') },
+        })
+      ).answers.q
+    ).toEqual({
+      type: 'boolean',
+      probability: 0.4,
     });
     expect(limited.calls).toHaveLength(2);
-    expect(result.answers.q).toEqual({ type: 'boolean', probability: 0.4 });
-  });
 
-  it('mints a credential function per request and re-mints once after a 401', async () => {
-    let minted = 0;
-    const seen: Array<{ auth: string | undefined; refresh: boolean }> = [];
-    const credential = async ({ refresh }: { refresh: boolean }) => {
-      minted += 1;
-      seen.push({ auth: undefined, refresh });
-      return `tok-${minted}`;
-    };
-    const ok = JSON.stringify({
-      model: 'jev',
-      answers: { q: { type: 'noul', noul: 0.9 } },
-      usage: {},
-    });
+    const seen: boolean[] = [];
     const expiring = fakeFetch([
       { status: 401, body: 'expired' },
-      { status: 200, body: ok },
+      { status: 200, body: measured },
     ]);
-    const classifier = createHttpClassifier({
-      endpoint: 'https://gw.example/v1/systemone',
+    const credential = async ({ refresh }: { refresh: boolean }) => {
+      seen.push(refresh);
+      return refresh ? 'new' : 'old';
+    };
+    await createHttpClassifier({
+      endpoint: 'https://s1.example',
       apiKey: credential,
       dialect: 'systemone',
       fetch: expiring.fetch,
-      sleep: async () => {},
-    });
-    const result = await classifier.classify({
-      state: {},
-      questions: { q: booleanQuestion('?') },
-    });
-    expect(expiring.calls.map((c) => c.auth)).toEqual([
-      'Bearer tok-1',
-      'Bearer tok-2',
+      maxRetries: 0,
+    }).classify({ state: {}, questions: { q: booleanQuestion('?') } });
+    expect(expiring.calls.map((call) => call.auth)).toEqual([
+      'Bearer old',
+      'Bearer new',
     ]);
-    expect(seen.map((s) => s.refresh)).toEqual([false, true]);
-    expect(result.answers.q).toEqual({ type: 'boolean', probability: 0.9 });
-
-    const forbidden = fakeFetch([{ status: 403, body: 'not this route' }]);
-    const scoped = createHttpClassifier({
-      endpoint: 'https://gw.example/v1/systemone',
-      apiKey: credential,
-      fetch: forbidden.fetch,
-    });
-    await expect(
-      scoped.classify({ state: {}, questions: { q: booleanQuestion('?') } })
-    ).rejects.toMatchObject({ failure: 'unauthorized', status: 403 });
-    expect(minted).toBe(3);
-    expect(classificationPreset('clickhouse')).toMatchObject({
-      baseURL: 'https://inference-internal.clickhouse.cloud/v1/systemone',
-      dialect: 'systemone',
-      apiKeyEnv: 'CHAI_AUTH_TOKEN',
-    });
+    expect(seen).toEqual([false, true]);
   });
 
-  it('refuses to start without a key or an endpoint', () => {
-    expect(() =>
-      createHttpClassifier({ endpoint: 'https://s1.example', apiKey: '' })
-    ).toThrow(/API key/);
-    expect(() => createHttpClassifier({ endpoint: '', apiKey: 'k' })).toThrow(
-      /endpoint/
-    );
-    expect(classificationPreset('typesafe')).toMatchObject({
-      baseURL: 'https://api.typesafe.ai/v1/systemone',
-      model: 'jev-latest',
-      dialect: 'systemone',
+  it('bounds hanging credential minting, caller abort, and non-cooperative response reading', async () => {
+    const calls: FetchCall[] = [];
+    const waiting = createHttpClassifier({
+      endpoint: 'https://s1.example',
+      apiKey: async () => new Promise<string>(() => {}),
+      timeoutMs: 25,
+      fetch: fakeFetch([{ status: 200, body: measured }], calls).fetch,
     });
-    expect(classificationPreset('nope')).toBeNull();
+    await expect(
+      waiting.classify({ state: {}, questions: { q: booleanQuestion('?') } })
+    ).rejects.toMatchObject({ failure: 'timeout' });
+    expect(calls).toHaveLength(0);
+
+    const cancelled = new AbortController();
+    cancelled.abort();
+    const unvisited = {
+      get secret(): string {
+        throw new Error('state was serialized');
+      },
+    };
+    await expect(
+      waiting.classify({
+        state: unvisited,
+        questions: { q: booleanQuestion('?') },
+        signal: cancelled.signal,
+      })
+    ).rejects.toMatchObject({ failure: 'aborted' });
+    const duringMint = new AbortController();
+    const pending = waiting.classify({
+      state: {},
+      questions: { q: booleanQuestion('?') },
+      signal: duringMint.signal,
+    });
+    duringMint.abort();
+    await expect(pending).rejects.toMatchObject({ failure: 'aborted' });
+
+    const hangingFetch: ClassificationFetch = async () =>
+      new Promise<Response>(() => {});
+    await expect(
+      createHttpClassifier({
+        endpoint: 'https://s1.example',
+        apiKey: 'k',
+        timeoutMs: 25,
+        fetch: hangingFetch,
+      }).classify({ state: {}, questions: { q: booleanQuestion('?') } })
+    ).rejects.toMatchObject({ failure: 'timeout' });
+
+    const hangingRead: ClassificationFetch = async () =>
+      new Response(new ReadableStream<Uint8Array>({ start() {} }), {
+        status: 200,
+      });
+    const reading = createHttpClassifier({
+      endpoint: 'https://s1.example',
+      apiKey: 'k',
+      timeoutMs: 25,
+      fetch: hangingRead,
+    });
+    await expect(
+      reading.classify({ state: {}, questions: { q: booleanQuestion('?') } })
+    ).rejects.toMatchObject({ failure: 'timeout' });
+  });
+
+  it('bounds backoff and response size, sanitizes failures, and hooks only parsed answers', async () => {
+    const onAnswered = jest.fn();
+    const limited = fakeFetch([
+      { status: 429, body: 'echo secret', retryAfter: '0' },
+    ]);
+    const backedOff = createHttpClassifier({
+      endpoint: 'https://s1.example',
+      apiKey: 'secret',
+      timeoutMs: 25,
+      fetch: limited.fetch,
+      sleep: async () => new Promise<void>(() => {}),
+      onAnswered,
+    });
+    await expect(
+      backedOff.classify({ state: {}, questions: { q: booleanQuestion('?') } })
+    ).rejects.toMatchObject({ failure: 'timeout' });
+    expect(limited.calls).toHaveLength(1);
+    expect(onAnswered).not.toHaveBeenCalled();
+
+    const oversized = fakeFetch([
+      { status: 200, body: 'x'.repeat(256 * 1024 + 1) },
+    ]);
+    await expect(
+      createHttpClassifier({
+        endpoint: 'https://s1.example',
+        apiKey: 'secret',
+        fetch: oversized.fetch,
+        onAnswered,
+      }).classify({ state: {}, questions: { q: booleanQuestion('?') } })
+    ).rejects.toMatchObject({ failure: 'malformed_response' });
+    expect(onAnswered).not.toHaveBeenCalled();
+
+    const failed = fakeFetch([
+      { status: 500, body: 'secret and echoed user content' },
+    ]);
+    try {
+      await createHttpClassifier({
+        endpoint: 'https://s1.example',
+        apiKey: 'secret',
+        fetch: failed.fetch,
+        maxRetries: 0,
+        onAnswered,
+      }).classify({ state: {}, questions: { q: booleanQuestion('?') } });
+      throw new Error('expected an HTTP failure');
+    } catch (error) {
+      expect(error).toMatchObject({ failure: 'server_error' });
+      expect(String(error)).not.toMatch(/secret|echoed/);
+    }
+    const invalid = fakeFetch([
+      { status: 200, body: 'private echoed user content' },
+    ]);
+    await expect(
+      createHttpClassifier({
+        endpoint: 'https://s1.example',
+        apiKey: 'secret',
+        fetch: invalid.fetch,
+        onAnswered,
+      }).classify({ state: {}, questions: { q: booleanQuestion('?') } })
+    ).rejects.toMatchObject({ failure: 'malformed_response' });
+    expect(onAnswered).not.toHaveBeenCalled();
+
+    const ok = fakeFetch([{ status: 200, body: measured }]);
+    await createHttpClassifier({
+      endpoint: 'https://s1.example',
+      apiKey: 'k',
+      dialect: 'systemone',
+      fetch: ok.fetch,
+      onAnswered,
+    }).classify({
+      state: {},
+      questions: { q: booleanQuestion('?') },
+      label: 'gate',
+    });
+    expect(onAnswered).toHaveBeenCalledTimes(1);
+    expect(onAnswered).toHaveBeenCalledWith('gate', expect.any(Number));
+  });
+
+  it('keeps concurrent credential refreshes and request signals independent', async () => {
+    const seen: Array<{ refresh: boolean; signal?: AbortSignal }> = [];
+    const calls: FetchCall[] = [];
+    const credential = async (options: {
+      refresh: boolean;
+      signal?: AbortSignal;
+    }) => {
+      seen.push(options);
+      return options.refresh ? 'new' : 'old';
+    };
+    const fetch: ClassificationFetch = async (url, init) => {
+      calls.push({
+        url,
+        body: JSON.parse(init.body) as Record<string, unknown>,
+        auth: init.headers.Authorization,
+        signal: init.signal,
+        redirect: init.redirect,
+      });
+      await Promise.resolve();
+      return new Response(
+        init.headers.Authorization === 'Bearer old' ? 'expired' : measured,
+        {
+          status: init.headers.Authorization === 'Bearer old' ? 401 : 200,
+        }
+      );
+    };
+    const classifier = createHttpClassifier({
+      endpoint: 'https://s1.example',
+      apiKey: credential,
+      dialect: 'systemone',
+      fetch,
+      maxRetries: 0,
+    });
+    const [first, second] = await Promise.all([
+      classifier.classify({
+        state: 'one',
+        questions: { q: booleanQuestion('?') },
+      }),
+      classifier.classify({
+        state: 'two',
+        questions: { q: booleanQuestion('?') },
+      }),
+    ]);
+    expect(first.answers.q).toEqual({ type: 'boolean', probability: 0.9 });
+    expect(second.answers.q).toEqual({ type: 'boolean', probability: 0.9 });
+    expect(seen.filter((entry) => entry.refresh)).toHaveLength(2);
+    expect(seen.filter((entry) => !entry.refresh)).toHaveLength(2);
+    expect(new Set(seen.map((entry) => entry.signal)).size).toBe(2);
+    expect(new Set(calls.map((call) => call.signal)).size).toBe(2);
+    expect(calls).toHaveLength(4);
   });
 });

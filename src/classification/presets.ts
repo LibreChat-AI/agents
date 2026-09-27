@@ -9,9 +9,8 @@ import { createHttpClassifier } from './http';
 export const DEFAULT_API_KEY_ENV = 'CLASSIFIER_API_KEY';
 
 /**
- * Known hosts, as settings rather than code. They all serve the same question shapes over HTTP
- * and differ only in URL, model name and how the body is wrapped, so a new one is an entry
- * here or the same fields supplied by the caller.
+ * Known HTTP hosts as settings, not new classifier implementations. Jev and Laya speak the
+ * same wire protocol, but their confidence measures and checkpoint calibration differ.
  */
 export const CLASSIFICATION_PRESETS: Record<
   string,
@@ -19,25 +18,34 @@ export const CLASSIFICATION_PRESETS: Record<
 > = {
   http: {
     dialect: 'port',
+    requiresAuth: true,
     apiKeyEnv: DEFAULT_API_KEY_ENV,
   },
   typesafe: {
     baseURL: 'https://api.typesafe.ai/v1/systemone',
     model: 'jev-latest',
     dialect: 'systemone',
+    requiresAuth: true,
     apiKeyEnv: 'TYPESAFE_API_KEY',
+  },
+  laya: {
+    /** Supply the server's full /v1/systemone URL; no model lets Laya route by language. */
+    dialect: 'systemone',
+    requiresAuth: false,
   },
   clickhouse: {
     /** ClickHouse's inference gateway; the token is what `dataplanectl chai auth token` prints, hourly. */
     baseURL: 'https://inference-internal.clickhouse.cloud/v1/systemone',
     model: 'jev-latest',
     dialect: 'systemone',
+    requiresAuth: true,
     apiKeyEnv: 'CHAI_AUTH_TOKEN',
   },
   openrouter: {
     baseURL: 'https://openrouter.ai/api/alpha/decisions',
     model: '~typesafe/jev-latest',
     dialect: 'systemone',
+    requiresAuth: true,
     apiKeyEnv: 'OPENROUTER_KEY',
   },
   cloudflare: {
@@ -46,6 +54,7 @@ export const CLASSIFICATION_PRESETS: Record<
     dialect: 'systemone',
     requestKey: 'input',
     responseKey: 'result',
+    requiresAuth: true,
     apiKeyEnv: 'CLOUDFLARE_API_TOKEN',
   },
 };
@@ -56,15 +65,21 @@ export function classificationPreset(
   if (name == null || name === '') {
     return null;
   }
-  return CLASSIFICATION_PRESETS[name] ?? null;
+  return Object.hasOwn(CLASSIFICATION_PRESETS, name)
+    ? CLASSIFICATION_PRESETS[name]
+    : null;
 }
 
-/** Caller settings win over the preset, field by field. */
+/** Caller settings win except that required preset authentication cannot be weakened. */
 export function mergeClassificationSettings(
   preset: ClassificationProviderSettings | null,
   configured: ClassificationProviderSettings | undefined
 ): ClassificationProviderSettings {
-  return { ...(preset ?? {}), ...(configured ?? {}) };
+  return {
+    ...(preset ?? {}),
+    ...(configured ?? {}),
+    ...(preset?.requiresAuth === true ? { requiresAuth: true } : {}),
+  };
 }
 
 export function classificationProviderNames(): string[] {
@@ -73,7 +88,7 @@ export function classificationProviderNames(): string[] {
 
 export function createClassifier(
   settings: ClassificationProviderSettings,
-  apiKey: ClassificationCredential,
+  apiKey?: ClassificationCredential,
   options?: {
     fetch?: ClassificationFetch;
     providerId?: string;
@@ -83,6 +98,7 @@ export function createClassifier(
   return createHttpClassifier({
     providerId: options?.providerId,
     apiKey,
+    requiresAuth: settings.requiresAuth,
     endpoint: settings.baseURL ?? '',
     model: settings.model,
     dialect: settings.dialect,

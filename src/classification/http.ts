@@ -1,30 +1,33 @@
 import type {
   Classifier,
-  ClassificationUsage,
   ClassificationAnswer,
   ClassificationResult,
   ClassificationRequest,
   ClassificationDialect,
   ClassificationCredential,
+  ClassificationQuestion,
 } from './types';
 import type { ClassificationFetch } from './transport';
+import {
+  ClassificationError,
+  isClassificationObject,
+  readClassificationUsage,
+} from './types';
+import { validateClassificationQuestions } from './questions';
 import { toWireQuestion, readAnswer } from './dialect';
-import { ClassificationError } from './types';
 import { createTransport } from './transport';
 
 export const HTTP_PROVIDER_ID = 'http';
 
 export interface HttpClassifierOptions {
   providerId?: string;
-  apiKey: ClassificationCredential;
+  apiKey?: ClassificationCredential;
+  requiresAuth?: boolean;
   /** Full URL, not a base path. */
   endpoint: string;
   model?: string;
-  /** Which wire vocabulary the endpoint speaks. */
   dialect?: ClassificationDialect;
-  /** Nests `state` and `questions` under this key, for hosts that wrap them. */
   requestKey?: string;
-  /** Reads the answer envelope from this key, for hosts that wrap the response. */
   responseKey?: string;
   timeoutMs?: number;
   maxRetries?: number;
@@ -36,8 +39,12 @@ export interface HttpClassifierOptions {
 export function parseEnvelope(
   body: string,
   providerId: string,
-  readOne: (answer: unknown) => ClassificationAnswer | null,
-  responseKey?: string
+  readOne: (
+    answer: unknown,
+    question?: ClassificationQuestion
+  ) => ClassificationAnswer | null,
+  responseKey?: string,
+  expected?: Record<string, ClassificationQuestion>
 ): ClassificationResult {
   let parsed: unknown;
   try {
@@ -51,7 +58,7 @@ export function parseEnvelope(
       }
     );
   }
-  if (parsed == null || typeof parsed !== 'object') {
+  if (!isClassificationObject(parsed)) {
     throw new ClassificationError(
       'malformed_response',
       'response was not an object',
@@ -60,16 +67,12 @@ export function parseEnvelope(
       }
     );
   }
-  const unwrapped =
-    responseKey != null && responseKey !== ''
-      ? ((parsed as Record<string, unknown>)[responseKey] ?? parsed)
-      : parsed;
-  const record = unwrapped as {
-    model?: unknown;
-    answers?: unknown;
-    usage?: unknown;
-  };
-  if (record.answers == null || typeof record.answers !== 'object') {
+  const unwrapped = responseKey != null && responseKey !== '' ? parsed[responseKey] : parsed;
+  if (
+    !isClassificationObject(unwrapped) ||
+    !isClassificationObject(unwrapped.answers) ||
+    Object.keys(unwrapped.answers).length === 0
+  ) {
     throw new ClassificationError(
       'malformed_response',
       'response carried no answers',
@@ -79,33 +82,38 @@ export function parseEnvelope(
     );
   }
 
-  const answers: Record<string, ClassificationAnswer> = {};
-  for (const [id, answer] of Object.entries(
-    record.answers as Record<string, unknown>
-  )) {
-    const mapped = readOne(answer);
-    if (mapped != null) {
-      answers[id] = mapped;
+  const answers: ClassificationResult['answers'] = Object.create(null);
+  for (const [id, answer] of Object.entries(unwrapped.answers)) {
+    if (expected && !Object.hasOwn(expected, id)) {
+      throw new ClassificationError(
+        'malformed_response',
+        'response carried an unknown answer',
+        {
+          provider: providerId,
+        }
+      );
     }
+    const mapped = readOne(answer, expected?.[id]);
+    if (!mapped) {
+      throw new ClassificationError(
+        'malformed_response',
+        'response carried an invalid answer',
+        {
+          provider: providerId,
+        }
+      );
+    }
+    answers[id] = mapped;
   }
 
-  const raw = (record.usage ?? {}) as {
-    input_tokens?: number;
-    output_tokens?: number;
-  };
-  const usage: ClassificationUsage = {
-    inputTokens: raw.input_tokens ?? 0,
-    outputTokens: raw.output_tokens ?? 0,
-  };
-
   return {
-    model: typeof record.model === 'string' ? record.model : 'unknown',
+    model: typeof unwrapped.model === 'string' ? unwrapped.model : 'unknown',
     answers,
-    usage,
+    usage: readClassificationUsage(unwrapped.usage),
   };
 }
 
-/** A System One host over HTTP: TypeSafe direct, the same model through a gateway, or any host that speaks the port. */
+/** Jev and Laya use the same System One HTTP dialect, but may report different confidence metrics. */
 export function createHttpClassifier(
   options: HttpClassifierOptions
 ): Classifier {
@@ -121,28 +129,53 @@ export function createHttpClassifier(
     async classify(
       request: ClassificationRequest
     ): Promise<ClassificationResult> {
-      const questions: Record<string, unknown> = {};
-      for (const [id, question] of Object.entries(request.questions)) {
-        questions[id] = toWireQuestion(question, dialect);
-      }
-      const inner = { state: request.state, questions };
-      const payload = JSON.stringify({
-        ...(model ? { model } : {}),
-        ...(requestKey != null && requestKey !== ''
-          ? { [requestKey]: inner }
-          : inner),
-      });
-      const body = await send(
-        payload,
+      return send(
+        () => {
+          const entries = validateClassificationQuestions(
+            request.questions,
+            providerId
+          );
+          const questions: Record<
+            string,
+            ReturnType<typeof toWireQuestion>
+          > = Object.create(null);
+          const expected: Record<string, ClassificationQuestion> =
+            Object.create(null);
+          for (const [id, question] of entries) {
+            questions[id] = toWireQuestion(question, dialect);
+            expected[id] = question;
+          }
+          const inner = { state: request.state, questions };
+          let payload: string;
+          try {
+            payload = JSON.stringify({
+              ...(model !== '' ? { model } : {}),
+              ...(requestKey != null && requestKey !== '' ? { [requestKey]: inner } : inner),
+            });
+          } catch {
+            throw new ClassificationError(
+              'bad_request',
+              'invalid classifier request',
+              {
+                provider: providerId,
+              }
+            );
+          }
+          return {
+            payload,
+            parse: (body: string) =>
+              parseEnvelope(
+                body,
+                providerId,
+                (answer, question) => readAnswer(answer, dialect, question),
+                responseKey,
+                expected
+              ),
+          };
+        },
         request.signal,
         request.label ?? 'classify',
         request.timeoutMs
-      );
-      return parseEnvelope(
-        body,
-        providerId,
-        (a) => readAnswer(a, dialect),
-        responseKey
       );
     },
   };

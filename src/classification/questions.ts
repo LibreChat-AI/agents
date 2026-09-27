@@ -4,7 +4,67 @@ import type {
   ChoiceQuestion,
   ScoreQuestion,
   ClassificationText,
+  ClassificationQuestion,
 } from './types';
+import { ClassificationError, isClassificationObject } from './types';
+
+function validQuestionId(id: string): boolean {
+  if (id.length === 0 || id.length > 128) {
+    return false;
+  }
+  for (let index = 0; index < id.length; index++) {
+    if (id.charCodeAt(index) < 32) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export function validateClassificationQuestions(
+  questions: Record<string, ClassificationQuestion>,
+  provider: string
+): Array<[string, ClassificationQuestion]> {
+  if (!isClassificationObject(questions)) {
+    throw new ClassificationError(
+      'bad_request',
+      'invalid classifier questions',
+      {
+        provider,
+      }
+    );
+  }
+  const entries = Object.entries(questions);
+  if (entries.length === 0) {
+    throw new ClassificationError(
+      'bad_request',
+      'classifier requires questions',
+      {
+        provider,
+      }
+    );
+  }
+  for (const [id, question] of entries) {
+    if (
+      !validQuestionId(id) ||
+      !isClassificationObject(question) ||
+      !['boolean', 'choice', 'score'].includes(question.type) ||
+      (question.type === 'choice' &&
+        (!isClassificationObject(question.criteria) ||
+          Object.keys(question.criteria).length === 0)) ||
+      (question.type === 'score' &&
+        (!Array.isArray(question.criteria) || question.criteria.length < 2))
+    ) {
+      throw new ClassificationError(
+        'bad_request',
+        'invalid classifier question',
+        {
+          provider,
+        }
+      );
+    }
+  }
+  return entries;
+}
 
 /** A yes/no question; `criteria` describes what counts as yes (a string) or both sides. */
 export function booleanQuestion(

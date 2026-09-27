@@ -1,9 +1,4 @@
-/**
- * The classification port: typed questions about a piece of content, answered by a classifier
- * with a probability per answer. A System One host (TypeSafe's Jev, the same model through a
- * gateway) answers all of them in one call; the port is what a consumer codes against, so a
- * second host is a preset, not a branch.
- */
+/** Typed decisions over content, independent of the model that makes them. */
 
 export type ClassificationJson =
   | string
@@ -25,21 +20,20 @@ export interface BooleanCriteria {
   false?: ClassificationText;
 }
 
-/** A yes/no question, answered with the probability of yes. A string criterion describes the yes side. */
+/** A string criterion describes the yes side of a yes/no question. */
 export interface BooleanQuestion {
   type: 'boolean';
   instructions: ClassificationText;
   criteria?: BooleanCriteria | string;
 }
 
-/** Pick one of the named options; a `null` description means the name speaks for itself. */
 export interface ChoiceQuestion {
   type: 'choice';
   instructions: ClassificationText;
   criteria: Record<string, ClassificationText | null>;
 }
 
-/** Rate against an ordered rubric; the answer is the expected level, which may fall between two. */
+/** The measured answer is an expected level, which may fall between two rubric levels. */
 export interface ScoreQuestion {
   type: 'score';
   instructions: ClassificationText;
@@ -51,32 +45,35 @@ export type ClassificationQuestion =
   | ChoiceQuestion
   | ScoreQuestion;
 
-export interface BooleanAnswer {
-  type: 'boolean';
-  probability: number;
-}
+/** `null` is an unmeasured decision, not a probability of zero. */
+export type BooleanAnswer =
+  | { type: 'boolean'; probability: number; decision?: never }
+  | { type: 'boolean'; probability: null; decision: boolean };
 
 export interface ChoiceAnswer {
   type: 'choice';
   choice: string;
-  /** `null` when the provider cannot measure it, which is not the same as 0. */
+  /** Backend-specific concentration measure; Jev and Laya use different definitions. */
   confidence: number | null;
-  probabilities: Record<string, number>;
+  /** `null` when no distribution was measured; never substitute an empty distribution. */
+  probabilities: Record<string, number> | null;
 }
 
 export interface ScoreAnswer {
   type: 'score';
+  /** Expected value over rubric levels, not an LLM's selection of one level. */
   score: number;
+  /** Backend-specific concentration measure; do not transfer thresholds between checkpoints. */
   confidence: number | null;
-  /** Probability per rubric level, keyed by the level's index as a string. */
-  probabilities: Record<string, number>;
+  probabilities: Record<string, number> | null;
 }
 
 export type ClassificationAnswer = BooleanAnswer | ChoiceAnswer | ScoreAnswer;
 
+/** Unknown counts are omitted, never inferred from an answer or replaced by zero. */
 export interface ClassificationUsage {
-  inputTokens: number;
-  outputTokens: number;
+  inputTokens?: number;
+  outputTokens?: number;
 }
 
 export interface ClassificationRequest {
@@ -90,8 +87,9 @@ export interface ClassificationRequest {
 
 export interface ClassificationResult {
   model: string;
-  answers: Record<string, ClassificationAnswer>;
-  usage: ClassificationUsage;
+  /** A requested answer can be omitted; callers must handle `undefined` explicitly. */
+  answers: Record<string, ClassificationAnswer | undefined>;
+  usage: ClassificationUsage | null;
 }
 
 export interface Classifier {
@@ -100,31 +98,24 @@ export interface Classifier {
   classify(request: ClassificationRequest): Promise<ClassificationResult>;
 }
 
-/** Which wire vocabulary a host speaks: the port's own, or System One's (`noul` for boolean). */
 export type ClassificationDialect = 'port' | 'systemone';
 
-/**
- * A bearer credential: the key itself, or a function that mints one. The function form serves
- * hosts whose tokens expire (the ClickHouse gateway's hourly Okta token): the transport calls it
- * before each request and once more with `refresh: true` after a 401, then retries that request.
- */
+/** A bearer key, or a per-request token minter; a 401 requests one fresh token for that call. */
 export type ClassificationCredential =
   | string
-  | ((options: { refresh: boolean }) => Promise<string>);
+  | ((options: { refresh: boolean; signal?: AbortSignal }) => Promise<string>);
 
-/** A host, as settings rather than code. */
 export interface ClassificationProviderSettings {
   /** Full URL of the classify endpoint, not a base path. */
   baseURL?: string;
   model?: string;
   dialect?: ClassificationDialect;
-  /** Nests `state` and `questions` under this key, for hosts that wrap them. */
   requestKey?: string;
-  /** Reads the answer envelope from this key, for hosts that wrap the response. */
   responseKey?: string;
   timeoutMs?: number;
   maxRetries?: number;
-  /** The environment variable an operator puts the key in. */
+  /** Auth is required by default; self-hosted Laya can be unauthenticated. */
+  requiresAuth?: boolean;
   apiKeyEnv?: string;
 }
 
@@ -137,6 +128,7 @@ export type ClassificationFailure =
   | 'server_error'
   | 'network'
   | 'unsupported_question'
+  | 'unsupported_mode'
   | 'malformed_response';
 
 export class ClassificationError extends Error {
@@ -156,6 +148,35 @@ export class ClassificationError extends Error {
     this.provider = options?.provider ?? 'unknown';
     this.status = options?.status;
   }
+}
+
+/** A JSON boundary guard; never trust a parsed response's declared TypeScript type. */
+export function isClassificationObject(
+  value: unknown
+): value is { [key: string]: unknown } {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+export function readClassificationUsage(
+  raw: unknown
+): ClassificationUsage | null {
+  if (!isClassificationObject(raw)) {
+    return null;
+  }
+  const input = raw.input_tokens;
+  const output = raw.output_tokens;
+  const usage: ClassificationUsage = {};
+  if (typeof input === 'number' && Number.isSafeInteger(input) && input >= 0) {
+    usage.inputTokens = input;
+  }
+  if (
+    typeof output === 'number' &&
+    Number.isSafeInteger(output) &&
+    output >= 0
+  ) {
+    usage.outputTokens = output;
+  }
+  return Object.keys(usage).length > 0 ? usage : null;
 }
 
 export function isBooleanAnswer(
