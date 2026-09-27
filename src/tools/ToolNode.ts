@@ -129,8 +129,8 @@ import {
   resolveLocalExecutionTools,
 } from '@/tools/local';
 import { stripCodeSessionFileSummary } from '@/tools/CodeSessionFileSummary';
-import { formatToolErrorContent } from '@/tools/toolErrorContent';
 import { Constants, GraphEvents, CODE_EXECUTION_TOOLS } from '@/common';
+import { formatToolErrorContent } from '@/tools/toolErrorContent';
 import { PreparedSubagentError } from '@/tools/preparedSubagents';
 import { attachRunStepResumeState } from '@/tools/runStepResume';
 
@@ -2621,12 +2621,14 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
         if (preResult.decision === 'ask' || reviewedApproval != null) {
           if (this.humanInTheLoop?.enabled !== true) {
-            // Fail-closed: no HITL UI configured, so we can't actually
-            // ask. Logged once via the existing helper.
-            const reason = this.resolveAskDecisionForDirectTool(
-              preResult.reason,
-              call.name
-            );
+            // Fail closed when there is no foreground approval channel.
+            const reason =
+              this.humanInTheLoop?.backgroundPausePolicy === 'deny'
+                ? this.backgroundApprovalReason(call.name, preResult.reason)
+                : this.resolveAskDecisionForDirectTool(
+                  preResult.reason,
+                  call.name
+                );
             return persistOutput(
               this.blockDirectCall({
                 call,
@@ -3008,6 +3010,13 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
    * LangGraph `interrupt()` instead — see `runDirectToolWithLifecycleHooks`.
    */
   private askDirectWarningEmitted = false;
+  private backgroundApprovalReason(toolName: string, reason?: string): string {
+    return (
+      `Approval required for "${toolName}"; unavailable in a background subagent. ` +
+      `Ask the parent to run it in the foreground.${reason == null ? '' : ` Reason: ${reason}`}`
+    );
+  }
+
   private resolveAskDecisionForDirectTool(
     reason: string | undefined,
     toolName: string
@@ -3810,7 +3819,15 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
            * JSDoc for the full rationale and the migration plan.
            */
           if (this.humanInTheLoop?.enabled !== true) {
-            blockEntry(entry, hookResult.reason ?? 'Blocked by hook');
+            blockEntry(
+              entry,
+              this.humanInTheLoop?.backgroundPausePolicy === 'deny'
+                ? this.backgroundApprovalReason(
+                  entry.call.name,
+                  hookResult.reason
+                )
+                : (hookResult.reason ?? 'Blocked by hook')
+            );
             continue;
           }
           /**
