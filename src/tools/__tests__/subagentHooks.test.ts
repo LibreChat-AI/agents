@@ -896,6 +896,175 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
     });
   });
 
+  it('keeps HITL background children off the parent checkpoint thread', async () => {
+    const checkpointer = new MemorySaver();
+    const parentConfig = {
+      ...callerConfig,
+      configurable: { thread_id: 'background-parent-checkpoint' },
+    };
+    const handlers: Record<string, t.EventHandler> = {
+      [GraphEvents.TOOL_END]: new ToolEndHandler(),
+      [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(),
+      [GraphEvents.ON_TOOL_EXECUTE]: {
+        handle: (_event, rawData): void => {
+          const request = rawData as t.ToolExecuteBatchRequest;
+          request.resolve(
+            request.toolCalls.map((call) => ({
+              toolCallId: call.id,
+              status: 'success' as const,
+              content: '42',
+            }))
+          );
+        },
+      },
+    };
+    const parent = await Run.create<t.IState>({
+      runId: 'seed-private-parent-history',
+      graphConfig: {
+        type: 'standard',
+        agents: [createParentAgentWithChildTool()],
+        compileOptions: { checkpointer },
+      },
+      humanInTheLoop: { enabled: true },
+      customHandlers: handlers,
+      returnContent: true,
+    });
+    parent.Graph!.overrideTestModel(['Parent response.'], 1);
+    await parent.processStream(
+      { messages: [new HumanMessage('private-parent-history-marker')] },
+      parentConfig
+    );
+    expect(
+      (await checkpointer.getTuple({
+        configurable: { thread_id: parentConfig.configurable.thread_id },
+      }))?.checkpoint
+    ).toBeDefined();
+
+    const observedChildMessages: string[] = [];
+    getChatModelClassSpy.mockImplementation(((provider: Providers) => {
+      if (provider === Providers.OPENAI) {
+        return class extends HitlChildFakeChatModel {
+          _streamResponseChunks(
+            messages: Parameters<FakeChatModel['_streamResponseChunks']>[0],
+            options: Parameters<FakeChatModel['_streamResponseChunks']>[1],
+            runManager?: Parameters<FakeChatModel['_streamResponseChunks']>[2]
+          ): ReturnType<FakeChatModel['_streamResponseChunks']> {
+            observedChildMessages.push(...messages.map((message) => String(message.content)));
+            return super._streamResponseChunks(messages, options, runManager);
+          }
+        };
+      }
+      return originalGetChatModelClass(provider);
+    }) as typeof providers.getChatModelClass);
+
+    const store = new InMemorySubagentTaskStore();
+    const scopeId = 'background-checkpoint-isolation';
+    const run = await Run.create<t.IState>({
+      runId: 'dispatch-after-private-parent-history',
+      graphConfig: {
+        type: 'standard',
+        agents: [createParentAgentWithChildTool()],
+        compileOptions: { checkpointer },
+      },
+      subagentTasks: { store, scopeId },
+      humanInTheLoop: { enabled: true },
+      customHandlers: handlers,
+      returnContent: true,
+    });
+    const childCall = makeSubagentToolCall('call_background_isolated');
+    childCall.args = { ...childCall.args, run_in_background: true };
+    run.Graph!.overrideTestModel(['Delegating...', 'Final parent answer.'], 1, [childCall]);
+    await run.processStream(
+      { messages: [new HumanMessage('delegate a fresh task')] },
+      parentConfig
+    );
+    let tasks = store.list(scopeId);
+    for (let attempt = 0; attempt < 200 && tasks[0]?.status === 'running'; attempt++) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 20));
+      tasks = store.list(scopeId);
+    }
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0].status).toBe('completed');
+    expect(observedChildMessages.length).toBeGreaterThan(0);
+    expect(observedChildMessages.join(' ')).not.toContain('private-parent-history-marker');
+    const parentTuple = await checkpointer.getTuple({
+      configurable: { thread_id: parentConfig.configurable.thread_id },
+    });
+    expect(JSON.stringify(parentTuple?.checkpoint.channel_values.messages)).toContain(
+      'Final parent answer.'
+    );
+    expect(JSON.stringify(parentTuple?.checkpoint.channel_values.messages)).not.toContain(
+      CHILD_RESPONSE
+    );
+    const childThreadIds = Object.keys(checkpointer.storage).filter(
+      (threadId) => threadId !== parentConfig.configurable.thread_id
+    );
+    for (const threadId of childThreadIds) {
+      const marker = await checkpointer.getTuple({ configurable: { thread_id: threadId } });
+      expect(JSON.stringify(marker?.checkpoint.channel_values.messages)).not.toContain(
+        CHILD_RESPONSE
+      );
+    }
+  });
+
+  it('fails a background child that raises an unexpected direct-tool interrupt', async () => {
+    getChatModelClassSpy.mockImplementation(((provider: Providers) =>
+      provider === Providers.OPENAI
+        ? PrimitiveInterruptFakeChatModel
+        : originalGetChatModelClass(provider)
+    ) as typeof providers.getChatModelClass);
+    let confirmAttempts = 0;
+    const confirmTool = tool(
+      async () => {
+        confirmAttempts += 1;
+        return interrupt<string, string>('confirm child');
+      },
+      {
+        name: PRIMITIVE_INTERRUPT_TOOL_NAME,
+        description: 'Requests human confirmation.',
+        schema: z.object({}),
+      }
+    );
+    const store = new InMemorySubagentTaskStore();
+    const scopeId = 'background-direct-interrupt';
+    const run = await Run.create<t.IState>({
+      runId: 'background-direct-interrupt-run',
+      graphConfig: {
+        type: 'standard',
+        agents: [createParentAgentWithPrimitiveInterruptTool(confirmTool)],
+        compileOptions: { checkpointer: new MemorySaver() },
+      },
+      subagentTasks: { store, scopeId },
+      humanInTheLoop: { enabled: true },
+      customHandlers: {
+        [GraphEvents.TOOL_END]: new ToolEndHandler(),
+        [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(),
+      },
+      returnContent: true,
+    });
+    const childCall = makeSubagentToolCall('call_unexpected_direct_interrupt');
+    childCall.args = { ...childCall.args, run_in_background: true };
+    run.Graph!.overrideTestModel(['Delegating...', 'Final parent answer.'], 1, [childCall]);
+
+    await run.processStream(
+      { messages: [new HumanMessage('confirm using a background child')] },
+      callerConfig
+    );
+    expect(run.getInterrupt()).toBeUndefined();
+    let tasks = store.list(scopeId);
+    for (let attempt = 0; attempt < 200 && tasks[0]?.status === 'running'; attempt++) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 20));
+      tasks = store.list(scopeId);
+    }
+    expect(tasks).toHaveLength(1);
+    expect(confirmAttempts).toBe(1);
+    expect(tasks[0].status).toBe('error');
+    expect(store.claim(scopeId, tasks[0].taskId)).toMatchObject({
+      status: 'error',
+      error: expect.stringContaining('cannot pause for human input'),
+    });
+  });
+
   it.each([
     {
       label: 'approve',
@@ -1260,7 +1429,7 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
           [GraphEvents.TOOL_END]: new ToolEndHandler(),
           [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(),
         },
-        humanInTheLoop: { enabled: true },
+        humanInTheLoop: { enabled: true, backgroundPausePolicy: 'deny' },
         subagentContext: {
           prepare: async (input) => {
             preparedContexts.push(input);

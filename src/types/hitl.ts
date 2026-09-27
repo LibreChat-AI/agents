@@ -414,6 +414,19 @@ export interface HumanInTheLoopConfig {
    * Durable deferred approvals require a separate resume implementation.
    */
   backgroundPausePolicy?: 'deny' | 'reject';
+  /** @internal Set only on detached children and their descendants, never on the parent run. */
+  backgroundDeny?: true;
+}
+
+/** True only on an SDK-created background child, not a foreground HITL run. */
+export function isBackgroundDenyMode(
+  config: HumanInTheLoopConfig | undefined
+): boolean {
+  return (
+    config?.backgroundDeny === true &&
+    config.enabled === false &&
+    config.backgroundPausePolicy === 'deny'
+  );
 }
 
 /**

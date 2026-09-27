@@ -133,6 +133,7 @@ import { Constants, GraphEvents, CODE_EXECUTION_TOOLS } from '@/common';
 import { formatToolErrorContent } from '@/tools/toolErrorContent';
 import { PreparedSubagentError } from '@/tools/preparedSubagents';
 import { attachRunStepResumeState } from '@/tools/runStepResume';
+import { isBackgroundDenyMode } from '@/types/hitl';
 
 function stripToolApprovalReviewConfig(
   configurable: Record<string, unknown> | undefined
@@ -1949,6 +1950,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           // they dispatch — including HITL gates on `write_file` / `edit_file`.
           hookContext: {
             registry: this.hookRegistry,
+            failClosedOnHookError:
+              isBackgroundDenyMode(this.humanInTheLoop),
             runId: (config.configurable?.run_id as string | undefined) ?? '',
             threadId: config.configurable?.thread_id as string | undefined,
             agentId: this.agentId,
@@ -2541,11 +2544,18 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             onceReplayKey: approvalReplayKey,
             onceReplaySessionId: approvalReplaySessionId,
           }).catch((): AggregatedHookResult | undefined =>
-            approvalReviewEvidence == null
+            approvalReviewEvidence == null &&
+            !isBackgroundDenyMode(this.humanInTheLoop)
               ? undefined
               : {
                 decision: 'deny',
-                reason: 'Approval policy could not be evaluated on resume',
+                reason:
+                  isBackgroundDenyMode(this.humanInTheLoop)
+                    ? 'Approval policy could not be evaluated'
+                    : 'Approval policy could not be evaluated on resume',
+                ...(isBackgroundDenyMode(this.humanInTheLoop)
+                  ? { hasHookFailures: true }
+                  : {}),
                 additionalContexts: [],
                 injectedMessages: [],
                 errors: [],
@@ -2580,6 +2590,26 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             ...call,
             args: resolvedArgs,
           };
+        }
+
+        if (
+          preResult.hasHookFailures === true &&
+          isBackgroundDenyMode(this.humanInTheLoop)
+        ) {
+          return persistOutput(
+            this.blockDirectCall({
+              call,
+              resolvedArgs,
+              reason: this.backgroundApprovalReason(
+                call.name,
+                'Approval policy could not be evaluated'
+              ),
+              hookRegistry,
+              runId,
+              threadId,
+            }),
+            effectiveCall.args as Record<string, unknown>
+          );
         }
 
         if (preResult.decision === 'deny') {
@@ -2623,7 +2653,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           if (this.humanInTheLoop?.enabled !== true) {
             // Fail closed when there is no foreground approval channel.
             const reason =
-              this.humanInTheLoop?.backgroundPausePolicy === 'deny'
+              isBackgroundDenyMode(this.humanInTheLoop)
                 ? this.backgroundApprovalReason(call.name, preResult.reason)
                 : this.resolveAskDecisionForDirectTool(
                   preResult.reason,
@@ -3635,7 +3665,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
                 matchQuery: entry.call.name,
                 onceReplayKey: approvalReplayKey,
                 onceReplaySessionId: approvalReplaySessionId,
-              }).catch((): AggregatedHookResult => HOOK_FALLBACK);
+              }).catch((): AggregatedHookResult =>
+                isBackgroundDenyMode(this.humanInTheLoop)
+                  ? { ...HOOK_FALLBACK, hasHookFailures: true }
+                  : HOOK_FALLBACK
+              );
             })
           );
 
@@ -3802,6 +3836,20 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           batchAdditionalContexts.push(ctx);
         }
 
+        if (
+          hookResult.hasHookFailures === true &&
+          isBackgroundDenyMode(this.humanInTheLoop)
+        ) {
+          blockEntry(
+            entry,
+            this.backgroundApprovalReason(
+              entry.call.name,
+              'Approval policy could not be evaluated'
+            )
+          );
+          continue;
+        }
+
         if (hookResult.decision === 'deny') {
           blockEntry(entry, hookResult.reason ?? 'Blocked by hook');
           continue;
@@ -3821,7 +3869,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           if (this.humanInTheLoop?.enabled !== true) {
             blockEntry(
               entry,
-              this.humanInTheLoop?.backgroundPausePolicy === 'deny'
+              isBackgroundDenyMode(this.humanInTheLoop)
                 ? this.backgroundApprovalReason(
                   entry.call.name,
                   hookResult.reason

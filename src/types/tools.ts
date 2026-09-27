@@ -1256,6 +1256,8 @@ export type ProgrammaticCache = {
 
 export type ProgrammaticHookContext = {
   registry: import('@/hooks').HookRegistry | undefined;
+  /** A detached HITL child must never execute an inner tool if its policy hook fails. */
+  failClosedOnHookError?: boolean;
   runId: string;
   threadId?: string;
   agentId?: string;

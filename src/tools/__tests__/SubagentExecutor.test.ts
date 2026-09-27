@@ -702,6 +702,7 @@ describe('SubagentExecutor', () => {
     expect(observedGraphs[0].humanInTheLoop).toEqual({
       enabled: false,
       backgroundPausePolicy: 'deny',
+      backgroundDeny: true,
     });
     expect(observedGraphs[0].eagerEventToolExecution).toBeUndefined();
     const child = observedInputs[0].agents[0];
@@ -758,6 +759,35 @@ describe('SubagentExecutor', () => {
     expect(
       store.get('owner:conversation', response.background_task_id)?.error
     ).toContain('cannot pause for human input');
+  });
+
+  it('fails closed if a background SubagentStart policy hook fails', async () => {
+    const store = new InMemorySubagentTaskStore();
+    const hooks = new HookRegistry();
+    hooks.register('SubagentStart', {
+      internal: true,
+      hooks: [async () => { throw new Error('authorization unavailable'); }],
+    });
+    const createChildGraph = jest.fn(makeNoopGraphFactory());
+    const executor = createExecutor({
+      taskConfig: { store, scopeId: 'owner:conversation' },
+      hookRegistry: hooks,
+      humanInTheLoop: { enabled: true },
+      createChildGraph,
+    });
+
+    const response = JSON.parse(
+      executor.executeInBackground({
+        description: 'Requires start authorization.',
+        subagentType: 'researcher',
+        parentToolCallId: 'call_start_policy_failure',
+      })
+    ) as { background_task_id: string };
+    await waitForTask(store, response.background_task_id, (status) => status === 'error');
+    expect(store.get('owner:conversation', response.background_task_id)?.error).toContain(
+      'Subagent start policy could not be evaluated'
+    );
+    expect(createChildGraph).toHaveBeenCalledTimes(1);
   });
 
   it('keeps a detached child and its thread continuation at depth zero', async () => {

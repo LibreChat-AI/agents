@@ -686,7 +686,7 @@ describe('ToolNode HITL — background deny policy', () => {
       agentId: 'agent-x',
       toolCallStepIds: new Map([['call_write', 'step_write']]),
       hookRegistry: makeHookRegistry('ask', 'write requires approval'),
-      humanInTheLoop: { enabled: false, backgroundPausePolicy: 'deny' },
+      humanInTheLoop: { enabled: false, backgroundPausePolicy: 'deny', backgroundDeny: true },
     });
     const graph = buildHITLGraph(node, [
       { id: 'call_write', name: 'write_file', args: { command: 'write' } },
@@ -724,7 +724,7 @@ describe('ToolNode HITL — background deny policy', () => {
       tools: [writeTool],
       toolMap: new Map([['write_file', writeTool]]),
       hookRegistry: makeHookRegistry('ask'),
-      humanInTheLoop: { enabled: false, backgroundPausePolicy: 'deny' },
+      humanInTheLoop: { enabled: false, backgroundPausePolicy: 'deny', backgroundDeny: true },
     });
     const graph = buildHITLGraph(node, [
       { id: 'call_write', name: 'write_file', args: { command: 'write' } },
@@ -745,6 +745,77 @@ describe('ToolNode HITL — background deny policy', () => {
     expect(toolMessages[0].content).toContain(
       'Approval required for "write_file"'
     );
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('blocks event-dispatched tools if an approval hook fails', async () => {
+    mockEventDispatch([]);
+    const dispatch = jest.spyOn(events, 'safeDispatchCustomEvent');
+    const hooks = new HookRegistry();
+    hooks.register('PreToolUse', {
+      internal: true,
+      hooks: [
+        async () => { throw new Error('approval service unavailable'); },
+        async () => ({ decision: 'allow' }),
+      ],
+    });
+    const node = new ToolNode({
+      tools: [createSchemaStub('write_file')],
+      eventDrivenMode: true,
+      agentId: 'background',
+      hookRegistry: hooks,
+      humanInTheLoop: { enabled: false, backgroundPausePolicy: 'deny', backgroundDeny: true },
+    });
+    const graph = buildHITLGraph(node, [
+      { id: 'call_unavailable', name: 'write_file', args: { command: 'write' } },
+    ]);
+
+    const result = (await graph.invoke({ messages: [] }, {
+      configurable: { thread_id: 'background-hook-failure-event' },
+    })) as { messages: BaseMessage[] };
+    const toolMessages = result.messages.filter(
+      (message): message is ToolMessage => message instanceof ToolMessage
+    );
+    expect(toolMessages).toHaveLength(1);
+    expect(toolMessages[0].status).toBe('error');
+    expect(toolMessages[0].content).toContain('Approval policy could not be evaluated');
+    expect(dispatch.mock.calls.filter(([event]) => event === 'on_tool_execute')).toHaveLength(0);
+  });
+
+  it('blocks direct tools if an approval hook fails', async () => {
+    const execute = jest.fn(async () => 'should not run');
+    const writeTool = tool(execute, {
+      name: 'write_file',
+      description: 'Writes files',
+      schema: z.object({ command: z.string() }),
+    });
+    const hooks = new HookRegistry();
+    hooks.register('PreToolUse', {
+      internal: true,
+      hooks: [
+        async () => { throw new Error('approval service unavailable'); },
+        async () => ({ decision: 'allow' }),
+      ],
+    });
+    const node = new ToolNode({
+      tools: [writeTool],
+      toolMap: new Map([['write_file', writeTool]]),
+      hookRegistry: hooks,
+      humanInTheLoop: { enabled: false, backgroundPausePolicy: 'deny', backgroundDeny: true },
+    });
+    const graph = buildHITLGraph(node, [
+      { id: 'call_unavailable', name: 'write_file', args: { command: 'write' } },
+    ]);
+
+    const result = (await graph.invoke({ messages: [] }, {
+      configurable: { thread_id: 'background-hook-failure-direct' },
+    })) as { messages: BaseMessage[] };
+    const toolMessages = result.messages.filter(
+      (message): message is ToolMessage => message instanceof ToolMessage
+    );
+    expect(toolMessages).toHaveLength(1);
+    expect(toolMessages[0].status).toBe('error');
+    expect(toolMessages[0].content).toContain('Approval policy could not be evaluated');
     expect(execute).not.toHaveBeenCalled();
   });
 });

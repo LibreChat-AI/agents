@@ -1842,6 +1842,47 @@ for member in team:
       expect(gate.input).toEqual({ path: '/tmp/rewritten' });
     });
 
+    it('fails closed on a broken approval hook in a background child bridge', async () => {
+      const { HookRegistry } = await import('@/hooks');
+      const ptcMod = require('../local/LocalProgrammaticToolCalling');
+      const registry = new HookRegistry();
+      registry.register('PreToolUse', {
+        internal: true,
+        hooks: [
+          async () => { throw new Error('approval service unavailable'); },
+          async () => ({ decision: 'allow' }),
+        ],
+      });
+
+      const gate = await ptcMod.applyPreToolUseHooksForBridge(
+        { registry, runId: 'background-child', failClosedOnHookError: true },
+        'write_file',
+        'call_bg_1',
+        { path: '/tmp/file' }
+      );
+      expect(gate.denyReason).toContain('Approval policy could not be evaluated');
+      expect(gate.denyReason).toContain('write_file');
+    });
+
+    it('identifies a denied background bridge tool when approval is needed', async () => {
+      const { HookRegistry } = await import('@/hooks');
+      const ptcMod = require('../local/LocalProgrammaticToolCalling');
+      const registry = new HookRegistry();
+      registry.register('PreToolUse', {
+        hooks: [async () => ({ decision: 'ask', reason: 'needs human approval' })],
+      });
+
+      const gate = await ptcMod.applyPreToolUseHooksForBridge(
+        { registry, runId: 'background-child', failClosedOnHookError: true },
+        'write_file',
+        'call_bg_ask',
+        { path: '/tmp/file' }
+      );
+      expect(gate.denyReason).toContain('Approval required for "write_file"');
+      expect(gate.denyReason).toContain('needs human approval');
+      expect(gate.denyReason).toContain('in the foreground');
+    });
+
     it('treats `ask` as fail-closed deny (HITL not reachable from bridge)', async () => {
       const { HookRegistry } = await import('@/hooks');
 

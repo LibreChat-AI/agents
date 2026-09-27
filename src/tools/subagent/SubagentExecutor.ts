@@ -13,6 +13,7 @@ import {
   END,
   GraphInterrupt,
   INTERRUPT,
+  MemorySaver,
   MessagesAnnotation,
   START,
   StateGraph,
@@ -141,6 +142,7 @@ import { seedAgentInitialSessions } from '@/utils/toolSessions';
 import { stableStringify } from '@/tools/eagerEventExecution';
 import { convertInjectedMessages } from '@/messages/injected';
 import { resolveClientOptionsModel } from '@/llm/request';
+import { isBackgroundDenyMode } from '@/types/hitl';
 import { composeAbortSignals } from '@/utils/misc';
 import { HandlerRegistry } from '@/events';
 import { sleep } from '@/utils/run';
@@ -1317,8 +1319,13 @@ export class SubagentExecutor {
       subagentContext: this.subagentContext,
       streamLimits: this.streamLimits,
       humanInTheLoop:
-        this.humanInTheLoop?.enabled === true
-          ? { enabled: false, backgroundPausePolicy: 'deny' }
+        this.humanInTheLoop?.enabled === true ||
+        this.humanInTheLoop?.backgroundPausePolicy === 'deny'
+          ? {
+            enabled: false,
+            backgroundPausePolicy: 'deny',
+            backgroundDeny: true,
+          }
           : this.humanInTheLoop,
       maxDepth: this.maxDepth,
       createChildGraph:
@@ -2538,7 +2545,7 @@ export class SubagentExecutor {
       parentMaxDepth: this.maxDepth,
       keepToolDefinitions: hasToolExecuteHandler,
     });
-    if (this.humanInTheLoop?.backgroundPausePolicy === 'deny') {
+    if (isBackgroundDenyMode(this.humanInTheLoop)) {
       for (const agentInputs of childPlan.agents) {
         excludeBackgroundQuestionTool(agentInputs);
       }
@@ -2692,9 +2699,17 @@ export class SubagentExecutor {
       });
     }
     childGraph ??= this.createChildGraph(childGraphInput);
-    if (this.humanInTheLoop?.backgroundPausePolicy === 'deny') {
+    if (isBackgroundDenyMode(this.humanInTheLoop)) {
       childGraph.humanInTheLoop = this.humanInTheLoop;
       childGraph.eagerEventToolExecution = undefined;
+      // Never reuse the HITL parent's saver: its checkpoint namespace may
+      // contain parent messages. A private saver also lets an unexpected
+      // interrupt surface as a task error instead of a missing-saver tool
+      // error that the child could mistake for a completed task.
+      childGraph.compileOptions = {
+        ...childGraph.compileOptions,
+        checkpointer: new MemorySaver(),
+      };
     }
     if (params.taskRuntime != null) {
       childGraph.hookRegistry = this.hookRegistry;
@@ -2814,7 +2829,8 @@ export class SubagentExecutor {
         childConfigurable[SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY] = resumeAttemptId;
       }
       childConfigurable.thread_id =
-        this.humanInTheLoop?.enabled === true
+        this.humanInTheLoop?.enabled === true ||
+        isBackgroundDenyMode(this.humanInTheLoop)
           ? childThreadId
           : (inheritedConfigurable.thread_id ?? childRunId);
       const childInvokeConfig = {
@@ -2942,16 +2958,31 @@ export class SubagentExecutor {
             },
             sessionId: currentHookSessionId,
             matchQuery: subagentType,
-          }).catch((): AggregatedHookResult => HOOK_FALLBACK);
+          }).catch((): AggregatedHookResult =>
+            isBackgroundDenyMode(this.humanInTheLoop)
+              ? { ...HOOK_FALLBACK, hasHookFailures: true }
+              : HOOK_FALLBACK
+          );
 
-          if (hookResult.decision === 'deny' || hookResult.decision === 'ask') {
+          const policyFailed =
+            hookResult.hasHookFailures === true &&
+            isBackgroundDenyMode(this.humanInTheLoop);
+          if (
+            policyFailed ||
+            hookResult.decision === 'deny' ||
+            hookResult.decision === 'ask'
+          ) {
             this.clearChildGraph(childGraph);
             execution.releaseActiveRun();
             this.executions.remove(execution);
-            return {
-              content: `Blocked: ${hookResult.reason ?? 'Blocked by hook'}`,
-              messages: [],
-            };
+            return policyFailed
+              ? createSubagentFailure(
+                'Subagent start policy could not be evaluated; background execution denied.'
+              )
+              : {
+                content: `Blocked: ${hookResult.reason ?? 'Blocked by hook'}`,
+                messages: [],
+              };
           }
         }
         execution.markStarted();
