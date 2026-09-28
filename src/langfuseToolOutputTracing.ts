@@ -157,6 +157,37 @@ function toolNameMatches(
 /** Whether a tool's outputs are excluded from tracing (global disable or
  *  `redactedToolNames` match). Exported for the activity-label prompt
  *  builder, whose prompt becomes Langfuse generation input. */
+/**
+ * Whether `candidate` redacts at least every tool output `required` redacts:
+ * text produced under `candidate` cannot carry output `required` hides.
+ */
+export function coversToolOutputRedaction(
+  candidate: ResolvedLangfuseToolOutputTracingConfig | undefined,
+  required: ResolvedLangfuseToolOutputTracingConfig
+): boolean {
+  if (candidate == null) {
+    return false;
+  }
+  if (candidate.enabled === false) {
+    return true;
+  }
+  if (required.enabled === false) {
+    return false;
+  }
+  if (
+    required.redactedToolNameMatchMode === 'partial' &&
+    candidate.redactedToolNameMatchMode !== 'partial'
+  ) {
+    return false;
+  }
+  for (const toolName of required.redactedToolNames) {
+    if (!candidate.redactedToolNames.has(toolName)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 export function shouldRedactTool(
   toolName: string | undefined,
   config: ResolvedLangfuseToolOutputTracingConfig

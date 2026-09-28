@@ -1,11 +1,15 @@
 import type { ActivityLabelToolEntry } from '@/types/activityLabel';
+import type { LangfuseToolOutputTracingConfig } from '@/types/graph';
 import {
   ACTIVITY_PHASE_PROMPT_MAX_LENGTH,
   buildActivityLabelPrompt,
   buildActivityPhaseLabelPrompt,
   normalizeActivityPhaseLabel,
 } from '@/prompts/activityLabel';
-import { LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT } from '@/langfuseToolOutputTracing';
+import {
+  coversToolOutputRedaction,
+  LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT,
+} from '@/langfuseToolOutputTracing';
 import { resolveToolOutputTracingConfig } from '@/langfuseConfig';
 
 const entries: ActivityLabelToolEntry[] = [
@@ -355,5 +359,111 @@ describe('buildActivityPhaseLabelPrompt', () => {
       'Fixed auth refresh handling'
     );
     expect(normalizeActivityPhaseLabel('x'.repeat(300))).toHaveLength(160);
+  });
+
+  it('keeps committed labels but not reasoning or commentary when child labels are redacted', () => {
+    const redaction = resolveToolOutputTracingConfig({
+      toolOutputTracing: { redactedToolNames: ['db_query'] },
+    });
+    const prompt = buildActivityPhaseLabelPrompt({
+      activities: [
+        { label: 'Counted open incidents' },
+        {
+          label: 'Grouped incidents by service',
+          thinkingExcerpts: ['REASONING_MAY_QUOTE_REDACTED_OUTPUT'],
+        },
+      ],
+      charLimit: 600,
+      assistantContext: ['COMMENTARY_MAY_QUOTE_REDACTED_OUTPUT'],
+      redaction,
+      childLabelsRedacted: true,
+    });
+    expect(prompt).toContain('Counted open incidents');
+    expect(prompt).toContain('Grouped incidents by service');
+    expect(prompt).not.toContain('REASONING_MAY_QUOTE_REDACTED_OUTPUT');
+    expect(prompt).not.toContain('COMMENTARY_MAY_QUOTE_REDACTED_OUTPUT');
+  });
+
+  it('drops committed labels under an active policy unless child labels are redacted', () => {
+    const redaction = resolveToolOutputTracingConfig({
+      toolOutputTracing: { redactedToolNames: ['db_query'] },
+    });
+    expect(
+      buildActivityPhaseLabelPrompt({
+        activities: [
+          { label: 'Counted open incidents' },
+          { label: 'Grouped by service' },
+        ],
+        charLimit: 600,
+        redaction,
+      })
+    ).toBe('');
+  });
+});
+
+describe('coversToolOutputRedaction', () => {
+  const policy = (toolOutputTracing: LangfuseToolOutputTracingConfig) =>
+    resolveToolOutputTracingConfig({ toolOutputTracing });
+
+  it('treats a missing candidate policy as not covering', () => {
+    expect(
+      coversToolOutputRedaction(undefined, policy({ redactedToolNames: ['a'] }))
+    ).toBe(false);
+  });
+
+  it('covers when the candidate redacts every tool output', () => {
+    expect(
+      coversToolOutputRedaction(
+        policy({ enabled: false }),
+        policy({ redactedToolNames: ['a'] })
+      )
+    ).toBe(true);
+  });
+
+  it('does not cover a globally disabled requirement with a named list', () => {
+    expect(
+      coversToolOutputRedaction(
+        policy({ redactedToolNames: ['a'] }),
+        policy({ enabled: false })
+      )
+    ).toBe(false);
+  });
+
+  it('requires every required tool name', () => {
+    const required = policy({ redactedToolNames: ['a', 'b'] });
+    expect(
+      coversToolOutputRedaction(
+        policy({ redactedToolNames: ['a', 'b', 'c'] }),
+        required
+      )
+    ).toBe(true);
+    expect(
+      coversToolOutputRedaction(policy({ redactedToolNames: ['a'] }), required)
+    ).toBe(false);
+  });
+
+  it('does not let exact matching cover a partial requirement', () => {
+    const required = policy({
+      redactedToolNames: ['a'],
+      redactedToolNameMatchMode: 'partial',
+    });
+    expect(
+      coversToolOutputRedaction(
+        policy({
+          redactedToolNames: ['a'],
+          redactedToolNameMatchMode: 'exact',
+        }),
+        required
+      )
+    ).toBe(false);
+    expect(
+      coversToolOutputRedaction(
+        policy({
+          redactedToolNames: ['a'],
+          redactedToolNameMatchMode: 'partial',
+        }),
+        required
+      )
+    ).toBe(true);
   });
 });

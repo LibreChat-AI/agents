@@ -303,4 +303,86 @@ describe('generateActivityPhaseLabel', () => {
     expect(String(messages[1].content)).not.toContain('OMITTED_AGENT_SECRET');
     expect(String(messages[1].content)).toContain('public-one');
   });
+
+  it('keeps child labels when every agent shares the redaction policy', async () => {
+    const run = await Run.create({
+      runId: 'uniform-policy-phase-run',
+      graphConfig: {
+        type: 'standard',
+        agents: [
+          {
+            agentId: 'agent-1',
+            provider: Providers.OPENAI,
+            clientOptions: { model: 'gpt-4.1-mini' },
+            tools: [],
+          },
+        ],
+      },
+      langfuse: {
+        toolOutputTracing: {
+          redactedToolNames: ['run_select_query'],
+          redactedToolNameMatchMode: 'partial',
+        },
+      },
+    });
+
+    await expect(
+      run.generateActivityPhaseLabel({
+        provider: Providers.OPENAI,
+        activities: [
+          { agentId: 'agent-1', label: 'Listed the orders tables' },
+          { agentId: 'agent-1', label: 'Measured daily order volume' },
+        ],
+        assistantContext: ['COMMENTARY_MAY_QUOTE_REDACTED_OUTPUT'],
+      })
+    ).resolves.toEqual({
+      label: 'Fixed session refresh handling and verified auth tests',
+    });
+
+    const prompt = String((invoke.mock.calls[0][0] as AIMessage[])[1].content);
+    expect(prompt).toContain('Listed the orders tables');
+    expect(prompt).toContain('Measured daily order volume');
+    expect(prompt).not.toContain('COMMENTARY_MAY_QUOTE_REDACTED_OUTPUT');
+  });
+
+  it('suppresses child labels when a contributing agent has a weaker policy', async () => {
+    const run = await Run.create({
+      runId: 'weaker-overlay-phase-run',
+      graphConfig: {
+        type: 'multi-agent',
+        agents: [
+          {
+            agentId: 'agent-1',
+            provider: Providers.OPENAI,
+            clientOptions: { model: 'gpt-4.1-mini' },
+            tools: [],
+          },
+          {
+            agentId: 'agent-2',
+            provider: Providers.OPENAI,
+            clientOptions: { model: 'gpt-4.1-mini' },
+            tools: [],
+            langfuse: {
+              toolOutputTracing: { redactedToolNames: ['secret_tool'] },
+            },
+          },
+        ],
+        edges: [],
+      },
+    });
+
+    await expect(
+      run.generateActivityPhaseLabel({
+        provider: Providers.OPENAI,
+        activities: [
+          {
+            agentId: 'agent-1',
+            label: 'Read WEAKER_AGENT_SECRET from secret_tool',
+          },
+          { agentId: 'agent-2', label: 'Checked the strict agent state' },
+        ],
+      })
+    ).resolves.toEqual({});
+    expect(invoke).not.toHaveBeenCalled();
+  });
 });

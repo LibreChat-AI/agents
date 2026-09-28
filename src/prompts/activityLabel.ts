@@ -277,6 +277,11 @@ export type BuildActivityPhaseLabelPromptParams = {
   charLimit: number;
   assistantContext?: string[];
   redaction?: ResolvedLangfuseToolOutputTracingConfig;
+  /**
+   * Every child label was generated under a policy covering `redaction`, so
+   * labels stay usable while reasoning and commentary remain suppressed.
+   */
+  childLabelsRedacted?: boolean;
 };
 
 /**
@@ -290,10 +295,12 @@ export function buildActivityPhaseLabelPrompt({
   charLimit,
   assistantContext,
   redaction,
+  childLabelsRedacted = false,
 }: BuildActivityPhaseLabelPromptParams): string {
   const freeFormSuppressed =
     redaction != null &&
     (redaction.enabled === false || redaction.redactedToolNames.size > 0);
+  const labelsAllowed = !freeFormSuppressed || childLabelsRedacted;
   const sections: string[] = [];
   if (
     !freeFormSuppressed &&
@@ -325,7 +332,7 @@ export function buildActivityPhaseLabelPrompt({
         status = 'partial';
       }
       if (
-        !freeFormSuppressed &&
+        labelsAllowed &&
         activity.label != null &&
         activity.label.trim() !== ''
       ) {

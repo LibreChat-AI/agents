@@ -74,6 +74,7 @@ import {
   resolveLangfuseConfig,
   resolveToolOutputTracingConfig,
 } from '@/langfuseConfig';
+import { coversToolOutputRedaction } from '@/langfuseToolOutputTracing';
 import {
   cloneToolApprovalInterruptPayload,
   TOOL_APPROVAL_REVIEW_CONFIG_KEY,
@@ -3179,6 +3180,20 @@ export class Run<_T extends t.BaseGraphState> {
         redactionText: redaction.redactionText,
       };
     }
+    /** Child labels were generated from each agent's own redacted evidence,
+     *  so they can stand in for that evidence only when every agent's policy
+     *  covers the merged phase policy. */
+    const childLabelsRedacted =
+      redaction != null &&
+      redactionContexts.length > 0 &&
+      redactionContexts.every((context) =>
+        coversToolOutputRedaction(
+          hasToolOutputTracingConfig(this.langfuse, context.langfuse)
+            ? resolveToolOutputTracingConfig(this.langfuse, context.langfuse)
+            : undefined,
+          redaction
+        )
+      );
 
     const userPrompt = buildActivityPhaseLabelPrompt({
       activities,
@@ -3186,6 +3201,7 @@ export class Run<_T extends t.BaseGraphState> {
       charLimit,
       assistantContext,
       redaction,
+      childLabelsRedacted,
     });
     if (userPrompt === '') {
       return {};
