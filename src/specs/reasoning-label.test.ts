@@ -152,7 +152,7 @@ describe('generateReasoningLabel', () => {
     expect(invoke).not.toHaveBeenCalled();
   });
 
-  it('suppresses the reasoning snapshot under the executing agent policy', async () => {
+  it('labels the reasoning snapshot under the executing agent policy', async () => {
     const run = await Run.create({
       runId: 'redacted-reasoning-run',
       graphConfig: {
@@ -179,8 +179,10 @@ describe('generateReasoningLabel', () => {
         reasoningStepId: 'reasoning-step-1',
         revision: 0,
       })
-    ).resolves.toEqual({});
-    expect(invoke).not.toHaveBeenCalled();
+    ).resolves.toHaveProperty('label');
+    /** The policy masks the traced copy only; see
+     *  activity-label-trace-masking.test.ts. */
+    expect(invoke).toHaveBeenCalledTimes(1);
   });
 
   it('rejects invalid step identity and revision without calling a model', async () => {
