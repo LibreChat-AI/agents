@@ -4,9 +4,9 @@ import { AIMessage, ToolMessage } from '@langchain/core/messages';
 import { describe, it, expect, jest, afterEach } from '@jest/globals';
 import type { StructuredToolInterface } from '@langchain/core/tools';
 import type * as t from '@/types';
+import { Constants, GraphEvents } from '@/common';
 import * as events from '@/utils/events';
 import { ToolNode } from '../ToolNode';
-import { Constants } from '@/common';
 
 /**
  * Creates a mock execute_code tool that captures the toolCall config it receives.
@@ -1798,7 +1798,10 @@ describe('ToolNode code execution session management', () => {
       const capturedRequests: t.ToolCallRequest[] = [];
       jest
         .spyOn(events, 'safeDispatchCustomEvent')
-        .mockImplementation(async (_event, data) => {
+        .mockImplementation(async (event, data) => {
+          if (event !== GraphEvents.ON_TOOL_EXECUTE) {
+            return;
+          }
           const batch = data as t.ToolExecuteBatchRequest;
           if (Array.isArray(batch.toolCalls)) {
             capturedRequests.push(...batch.toolCalls);
