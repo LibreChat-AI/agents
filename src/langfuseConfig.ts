@@ -1,3 +1,4 @@
+import type { LangfuseSpanProcessorParams } from '@langfuse/otel';
 import type { ResolvedLangfuseToolOutputTracingConfig } from '@/langfuseRuntimeContext';
 import type * as t from '@/types';
 import { parseBooleanEnv } from '@/utils/misc';
@@ -175,6 +176,32 @@ export function resolveToolOutputTracingConfig(
   };
 }
 
+export function resolveInlineMediaTracingEnabled(
+  runLangfuse?: t.LangfuseConfig,
+  agentLangfuse?: t.LangfuseConfig
+): boolean {
+  return (
+    agentLangfuse?.inlineMediaTracing?.enabled ??
+    runLangfuse?.inlineMediaTracing?.enabled ??
+    parseBooleanEnv(process.env.LANGFUSE_TRACE_INLINE_MEDIA) ??
+    false
+  );
+}
+
+/**
+ * Mirrors `LangfuseSpanProcessor`'s own default, so `data:` URIs are left for
+ * the SDK exactly when it will upload them and replace them with a reference.
+ */
+export function resolveLangfuseMediaUploadEnabled(
+  params?: LangfuseSpanProcessorParams
+): boolean {
+  if (params?.mediaUploadEnabled != null) {
+    return params.mediaUploadEnabled;
+  }
+  const env = process.env.LANGFUSE_MEDIA_UPLOAD_ENABLED;
+  return !isPresent(env) || !['false', '0'].includes(env.toLowerCase());
+}
+
 /**
  * Merges header maps case-insensitively, keeping the override's casing.
  *
@@ -239,6 +266,14 @@ export function resolveLangfuseConfig(
         ...agentLangfuse.toolOutputTracing,
       }
       : undefined;
+  const inlineMediaTracing =
+    runLangfuse.inlineMediaTracing != null ||
+    agentLangfuse.inlineMediaTracing != null
+      ? {
+        ...runLangfuse.inlineMediaTracing,
+        ...agentLangfuse.inlineMediaTracing,
+      }
+      : undefined;
   const metadata =
     runLangfuse.metadata != null || agentLangfuse.metadata != null
       ? {
@@ -277,5 +312,6 @@ export function resolveLangfuseConfig(
     ...(tags != null ? { tags } : {}),
     ...(toolNodeTracing != null ? { toolNodeTracing } : {}),
     ...(toolOutputTracing != null ? { toolOutputTracing } : {}),
+    ...(inlineMediaTracing != null ? { inlineMediaTracing } : {}),
   };
 }

@@ -129,6 +129,7 @@ This library is LibreChat's tracing surface: every agent run it orchestrates is 
 | -------------------------------------------------------------- | ---------------------------------------------------------------------------- |
 | `src/langfuseTraceShaping.ts`                                  | Export-time span rename/retype/drop rules (the shape itself)                 |
 | `src/langfuseToolOutputTracing.ts`                             | Span processor applying shaping hooks + tool-output redaction                |
+| `src/langfuseInlineMedia.ts`                                   | Export-time replacement of inline base64 media with type/size descriptors    |
 | `src/langfuse.ts`                                              | Callback handler, identity/tags/metadata, control-flow + usage normalization |
 | `src/instrumentation.ts`                                       | Tracer provider bootstrap, per-tenant routing, deterministic trace ids       |
 | `src/langfuseConfig.ts`                                        | Config resolution/merging (env vs run vs agent level)                        |
@@ -144,6 +145,7 @@ These originated from direct Langfuse-team feedback (PRs #288, #316) and must su
 - **Root-observation input/output are the conversation, not the state.** Root input reduces to the user's question, output to the assistant's answer — never full serialized graph state. Tool-dispatch input is scoped to the pending tool calls. Do not emit deprecated trace-level input/output attributes.
 - **Control flow is not an error.** `GraphInterrupt` and `ParentCommand` end their traces as successful with `controlFlow` outputs, not as error traces.
 - **Usage/cost is accurate per provider.** e.g. Bedrock cache read/write tokens are folded into input tokens so Langfuse cost math is right.
+- **Inline media is described, not exported.** Every span that serializes the conversation would otherwise carry its own copy of each attached file, so base64 payloads (raw, `data:` URIs while Langfuse media upload is off, serialized byte buffers) become a type-and-size descriptor unless a host opts in via `inlineMediaTracing`.
 - **Redaction is honored everywhere tool output can surface** — tool spans, and any generation input that embeds tool results (e.g. the activity-label prompt).
 - **Identity and metadata always propagate**: `userId`, `sessionId`, tags, environment, and trace metadata (`messageId`, `parentMessageId`, `agentId`, `agentName`) — including across LangChain callbacks that fire outside the caller's OTEL context.
 - **Trace identity is self-contained.** Root observations never inherit trace ids or parents from foreign ambient OTEL spans (e.g. a host's HTTP auto-instrumentation): the callback handler detaches them so roots stay true roots, deterministic ids apply, and concurrent runs inside one request context (an agent run plus a title run) cannot merge into one trace. Spans created through the Langfuse tracer provider are honored as parents, so hosts can still group runs under their own Langfuse observations deliberately.

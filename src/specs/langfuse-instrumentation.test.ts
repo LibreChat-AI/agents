@@ -41,6 +41,9 @@ type RoutingSpanProcessorForTest =
         fallbackConfig?: {
           enabled?: boolean;
         };
+        inlineMediaPolicy?: {
+          omitDataUris: boolean;
+        };
       }
     >;
   };
@@ -344,6 +347,33 @@ describe('Langfuse instrumentation', () => {
       2,
       expect.objectContaining({ mediaUploadEnabled: true })
     );
+  });
+
+  it('does not reuse processors across different inline media policies', async () => {
+    delete process.env.LANGFUSE_MEDIA_UPLOAD_ENABLED;
+    delete process.env.LANGFUSE_TRACE_INLINE_MEDIA;
+    const { initializeLangfuseTracing } = await import('@/instrumentation');
+    const config = {
+      publicKey: 'pk-inline-media',
+      secretKey: 'sk-inline-media',
+      baseUrl: 'https://langfuse.inline-media',
+    };
+    initializeLangfuseTracing(config);
+    initializeLangfuseTracing({
+      ...config,
+      inlineMediaTracing: { enabled: true },
+    });
+
+    const providerInput = mockBasicTracerProvider.mock
+      .calls[0][0] as BasicTracerProviderInput;
+    const routingProcessor = providerInput
+      .spanProcessors[0] as RoutingSpanProcessorForTest;
+    const childProcessors = Array.from(routingProcessor.processors.values());
+    expect(childProcessors).toHaveLength(2);
+    expect(childProcessors[0]?.inlineMediaPolicy).toEqual({
+      omitDataUris: false,
+    });
+    expect(childProcessors[1]?.inlineMediaPolicy).toBeUndefined();
   });
 
   it('reuses the isolated provider after initialization', async () => {

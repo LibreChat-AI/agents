@@ -887,6 +887,18 @@ export type LangfuseToolOutputTracingConfig = {
   redactionText?: string;
 };
 
+export type LangfuseInlineMediaTracingConfig = {
+  /**
+   * Whether inline base64 media in traced inputs and outputs (attached images,
+   * documents, audio, video) is exported verbatim. Defaults to `false`: each
+   * payload becomes a short type-and-size descriptor, since every span that
+   * serializes the conversation would otherwise carry its own full copy.
+   * `data:` URIs are left for the Langfuse SDK while its media upload is
+   * enabled. Env fallback: `LANGFUSE_TRACE_INLINE_MEDIA`.
+   */
+  enabled?: boolean;
+};
+
 export type LangfuseToolNodeTracingConfig = {
   /**
    * Opts into the internal ToolNode batch observation. Graph tool-dispatch
@@ -945,6 +957,7 @@ export interface LangfuseConfig {
   tags?: string[];
   toolNodeTracing?: LangfuseToolNodeTracingConfig;
   toolOutputTracing?: LangfuseToolOutputTracingConfig;
+  inlineMediaTracing?: LangfuseInlineMediaTracingConfig;
   /**
    * When true, derive the run's root Langfuse trace id deterministically from
    * its `runId` (`sha256(runId)` → 32 hex chars, matching `@langfuse/tracing`
