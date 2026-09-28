@@ -158,6 +158,8 @@ export interface RunStepDeltaEvent {
    * The delta containing the fields that have changed on the run step.
    */
   delta: ToolCallDelta;
+  /** Epoch ms when the SDK received this tool-call fragment, before step dispatch. */
+  observed_at?: number;
 }
 
 /**
@@ -262,6 +264,25 @@ export type ProcessedContent = {
 export type ToolCallCompleted = {
   type: 'tool_call';
   tool_call: ProcessedToolCall;
+};
+
+/**
+ * A tool call has crossed from model-authored argument preparation into SDK
+ * execution. Emitted immediately before host dispatch or direct invocation;
+ * it does not claim the host has begun its own work. Paired with the tool
+ * completion `completed_at`, the stamp measures SDK handoff-to-result time,
+ * not MCP or database execution time. The earliest `observed_at` tool-call
+ * delta for a call bounds its argument preparation time; consumers correlate
+ * deltas by step/index until an ID is known. For a call without streamed
+ * fragments, the preparation start is unknown. Never infer a missing start.
+ * An eager call may dispatch before it has a step ID, and this observational
+ * event may arrive after completion: correlate by tool call ID and timestamps,
+ * not arrival order.
+ */
+export type ToolCallsDispatchedEvent = {
+  dispatched_at: number;
+  runId?: string;
+  toolCalls: Array<{ id: string; name: string; stepId?: string }>;
 };
 
 export type ToolCompleteEvent = ToolCallCompleted & {

@@ -26,11 +26,13 @@ export async function handleToolCallChunks({
   stepKey,
   toolCallChunks,
   metadata,
+  observedAt = Date.now(),
 }: {
   graph: StandardGraph | MultiAgentGraph;
   stepKey: string;
   toolCallChunks: ToolCallChunk[];
   metadata?: Record<string, unknown>;
+  observedAt?: number;
 }): Promise<void> {
   let prevStepId: string;
   let prevRunStep: t.RunStep | undefined;
@@ -124,7 +126,8 @@ export async function handleToolCallChunks({
       type: StepTypes.TOOL_CALLS,
       tool_calls: toolCallChunks,
     },
-    metadata
+    metadata,
+    observedAt
   );
 }
 

@@ -55,13 +55,13 @@ import {
   calculateMaxToolResultChars,
   truncateToolResultContent,
 } from '@/utils/truncation';
+import { createToolCallsDispatchedEvent, safeDispatchCustomEvent } from '@/utils/events';
 import { resolveToolOutcome, outcomeFieldsFromResult } from '@/tools/intentArg';
-import { formatToolErrorContent } from '@/tools/toolErrorContent';
 import { snapshotValidatedModelChunk } from '@/graphs/acceptedModelResponse';
 import { TOOL_OUTPUT_REF_PATTERN } from '@/tools/toolOutputReferences';
+import { formatToolErrorContent } from '@/tools/toolErrorContent';
 import { PreparedSubagentError } from '@/tools/preparedSubagents';
 import { isReasoningContentBlock } from '@/messages/core';
-import { safeDispatchCustomEvent } from '@/utils/events';
 import { composeAbortSignals } from '@/utils/misc';
 import { isGoogleLike } from '@/utils/llm';
 import { getMessageId } from '@/messages';
@@ -871,6 +871,13 @@ function startEagerToolExecutions(args: {
       reject,
     };
 
+    if (graph.config != null) {
+      void safeDispatchCustomEvent(
+        GraphEvents.ON_TOOL_CALLS_DISPATCHED,
+        createToolCallsDispatchedEvent(graph.config, batchRequest.toolCalls),
+        graph.config
+      );
+    }
     void safeDispatchCustomEvent(
       GraphEvents.ON_TOOL_EXECUTE,
       batchRequest,
@@ -980,7 +987,7 @@ async function dispatchEagerToolCompletions(args: {
               progress: 1,
               ...(outcome != null && { outcome }),
             } as t.ProcessedToolCall,
-            completed_at: Date.now(),
+            completed_at: result.received_at ?? Date.now(),
           },
         },
         graph.config
@@ -1701,6 +1708,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
     // Callback delivery can beat the producer's iterator. Validate before
     // accounting, run steps, or eager dispatch reads raw tool descriptors.
     chunk = snapshotValidatedModelChunk(chunk as AIMessageChunk);
+    const observedAt = Date.now();
 
     /**
      * Enforced before every content-specific early return below
@@ -1923,6 +1931,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
         stepKey,
         toolCallChunks: chunk.tool_call_chunks,
         metadata,
+        observedAt,
       });
       if (canStreamEager) {
         if (runScopeInvalidated()) {

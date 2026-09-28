@@ -4165,6 +4165,44 @@ describe('SubagentExecutor', () => {
       expect((events[0] as { phase: string }).phase).toBe('start');
     });
 
+    it('forwards a child tool handoff as scoped, argument-free subagent activity', async () => {
+      const updates: Array<{ phase: string; data?: unknown }> = [];
+      const registry = new HandlerRegistry();
+      registry.register(GraphEvents.ON_SUBAGENT_UPDATE, {
+        handle: (_event, data): void => {
+          updates.push(data as { phase: string; data?: unknown });
+        },
+      });
+      const childEvent = {
+        dispatched_at: 1_200,
+        toolCalls: [{ id: 'child_call', name: 'search', stepId: 'child_step', args: { secret: 'never' } }],
+      };
+      const factory: () => StandardGraph = (): StandardGraph =>
+        ({
+          createWorkflow: (): { invoke: jest.Mock } => ({
+            invoke: jest.fn().mockImplementation(async (_state, options) => {
+              const forwarder = options.callbacks[0] as {
+                handleCustomEvent: (event: string, data: unknown) => Promise<void>;
+              };
+              await forwarder.handleCustomEvent(GraphEvents.ON_TOOL_CALLS_DISPATCHED, childEvent);
+              return { messages: [new AIMessage('ok')] };
+            }),
+          }),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph;
+      const executor = createExecutor({
+        createChildGraph: factory,
+        parentHandlerRegistry: registry,
+      });
+      await executor.execute({ description: 'Task', subagentType: 'researcher' });
+      expect(updates).toContainEqual(expect.objectContaining({
+        phase: 'tool_calls_dispatched',
+        data: { dispatched_at: 1_200, toolCalls: [
+          { id: 'child_call', name: 'search', stepId: 'child_step' },
+        ] },
+      }));
+    });
+
     it('routes child ON_TOOL_EXECUTE dispatches through the parent registry', async () => {
       /**
        * Drives the forwarder callback the executor installs on the child's

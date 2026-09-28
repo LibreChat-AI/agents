@@ -38,13 +38,6 @@ import {
   DEFAULT_RECURSION_LIMIT,
 } from '@/common';
 import {
-  ACTIVITY_PHASE_LABEL_PROMPT,
-  ACTIVITY_LABEL_PROMPT,
-  buildActivityLabelPrompt,
-  buildActivityPhaseLabelPrompt,
-  normalizeActivityPhaseLabel,
-} from '@/prompts/activityLabel';
-import {
   createLangfuseTraceMetadata,
   createLangfuseHandler,
   maskRedactedLabelGeneration,
@@ -53,6 +46,13 @@ import {
   isLangfuseCallbackHandler,
   withLangfuseAttributes,
 } from '@/langfuse';
+import {
+  ACTIVITY_PHASE_LABEL_PROMPT,
+  ACTIVITY_LABEL_PROMPT,
+  buildActivityLabelPrompt,
+  buildActivityPhaseLabelPrompt,
+  normalizeActivityPhaseLabel,
+} from '@/prompts/activityLabel';
 import {
   requireValidSubagentResumeManifest,
   SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY,
@@ -204,6 +204,7 @@ const CUSTOM_GRAPH_EVENTS = new Set<string>([
   GraphEvents.ON_RUN_STEP_DELTA,
   GraphEvents.ON_RUN_STEP_COMPLETED,
   GraphEvents.ON_RUN_STEP_CLOSED,
+  GraphEvents.ON_TOOL_CALLS_DISPATCHED,
   GraphEvents.ON_MESSAGE_DELTA,
   GraphEvents.ON_REASONING_DELTA,
   GraphEvents.ON_TOOL_EXECUTE,
@@ -1095,6 +1096,7 @@ export class Run<_T extends t.BaseGraphState> {
               | t.RunStep
               | t.RunStepDeltaEvent
               | t.RunStepClosedEvent
+              | t.ToolCallsDispatchedEvent
               | t.MessageDeltaEvent
               | t.ReasoningDeltaEvent
               | { result: t.ToolEndEvent },
