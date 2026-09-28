@@ -225,6 +225,15 @@ export async function applyPreToolUseHooksForBridge(
     sessionId: hookContext.runId,
     matchQuery: toolName,
   }).catch(() => undefined);
+  if (
+    hookContext.failClosedOnHookError === true &&
+    (result == null || result.hasHookFailures === true)
+  ) {
+    return {
+      input: toolInput,
+      denyReason: `Approval policy could not be evaluated for "${toolName}" in a background subagent. Ask the parent to run it in the foreground.`,
+    };
+  }
   if (result == null) {
     return { input: toolInput };
   }
@@ -236,10 +245,13 @@ export async function applyPreToolUseHooksForBridge(
     return {
       input: nextInput,
       denyReason:
-        result.reason ??
-        (result.decision === 'ask'
-          ? `Tool "${toolName}" requires human approval; bridge cannot raise an interrupt — denying.`
-          : `Tool "${toolName}" denied by PreToolUse hook.`),
+        result.decision === 'ask' &&
+        hookContext.failClosedOnHookError === true
+          ? `Approval required for "${toolName}"; unavailable in a background subagent. Ask the parent to run it in the foreground.${result.reason == null ? '' : ` Reason: ${result.reason}`}`
+          : (result.reason ??
+            (result.decision === 'ask'
+              ? `Tool "${toolName}" requires human approval; bridge cannot raise an interrupt — denying.`
+              : `Tool "${toolName}" denied by PreToolUse hook.`)),
     };
   }
   return { input: nextInput };

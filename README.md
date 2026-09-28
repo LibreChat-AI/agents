@@ -156,6 +156,38 @@ const customHandlers = composeEventHandlers(
 );
 ```
 
+### Accepted tool-call projection (opt-in)
+
+`createOpenAIToolCallStream` from `@librechat/agents/openai` formats finalized
+calls accepted by the graph, not provider fragments. Existing handlers are unchanged.
+
+- Register `projection.handlers` in `Run.create({ customHandlers })`.
+- For streaming, share `{ tracker, emit }` with the text/reasoning handlers and
+  `sendOpenAIFinalChunk`. Do not also register legacy raw tool-call handlers.
+  Map-only `{ toolCalls }` supports JSON/custom finalization. Use fresh output state.
+- Call `finish()` only after natural completion: no error, aborted signal,
+  `getInterrupt()` or `getHaltReason()`. Otherwise call `abort()` and discard it.
+  A resolved `processStream()` alone does not mean success.
+- Calls execute in the graph by default. To hand a complete call to the OpenAI
+  client instead, set `clientDelegatedToolNames: ['my_tool']` in `Run.create`
+  for a single-agent run and register its model-facing schema. The graph ends
+  without executing that call. Batches mixing delegated and graph/provider
+  tools fail closed; make separate model turns. ToolNode claims remain an
+  additional guard, never proof that an unclaimed call belongs to the client.
+- `emit` is synchronous. Failed/partial writes cannot be retried; the host owns
+  HTTP backpressure. This helper does not provide durable resume or undo tool effects.
+
+Projected arguments must be JSON data: primitives, plain objects and dense arrays.
+Getters, custom objects, cycles and nesting beyond 64 levels are rejected before projection.
+Observers receive isolated snapshots; provider IDs are reserved before synthetic IDs.
+Accepted-event snapshots cap each response at **1,024 calls / 4 MiB**. Projection
+uses those defaults for pending calls (`maxToolCalls` / `maxBufferedBytes`). These
+formatting limits do not apply to ordinary runs without accepted-event handlers;
+descriptor safety checks still apply before stream accounting and dispatch.
+These are output limits, not bounds on provider memory or tool execution.
+
+See [the design decision](docs/adr/0010-project-accepted-model-results.md).
+
 ## Development
 
 ```bash

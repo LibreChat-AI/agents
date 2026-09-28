@@ -16,6 +16,12 @@ import {
   createLocalBashProgrammaticToolCallingTool,
 } from '../local/LocalProgrammaticToolCalling';
 import {
+  CodeApiRequestError,
+  buildCodeApiHttpErrorMessage,
+  createCodeExecutionTool,
+  resolveCodeApiAuthHeaders,
+} from '../CodeExecutor';
+import {
   clampCodeApiRunTimeoutMs,
   createCodeApiRunTimeoutSchema,
   MAX_CODE_API_RUN_TIMEOUT_SCHEMA_MS,
@@ -26,12 +32,6 @@ import {
   makeRequest,
 } from '../ProgrammaticToolCalling';
 import { createBashProgrammaticToolCallingTool } from '../BashProgrammaticToolCalling';
-import {
-  CodeApiRequestError,
-  buildCodeApiHttpErrorMessage,
-  createCodeExecutionTool,
-  resolveCodeApiAuthHeaders,
-} from '../CodeExecutor';
 import { createBashExecutionTool } from '../BashExecutor';
 
 jest.mock('node-fetch', () => ({
@@ -357,6 +357,183 @@ describe('CodeAPI auth header injection', () => {
     expect(output).toContain('Artifact delivery warning:');
     expect(output).toContain('do not rerun automatically');
   });
+
+  it('warns before the file summary and echoes a normalized truncation marker', async () => {
+    const files = [{ id: 'file-1', name: 'report_001.csv' }];
+    const marker = {
+      code: 'artifact_truncated',
+      reasons: { max_files: 70 },
+      skipped: ['report_070.csv'],
+      skipped_count: 70,
+    };
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        session_id: 'session_123',
+        stdout: 'code completed\n',
+        files,
+        artifact_truncation: { ...marker, detail: 'ignored by normalization' },
+      })
+    );
+
+    const tool = createCodeExecutionTool();
+    const result = (await tool.invoke({
+      name: tool.name,
+      args: { lang: 'py', code: 'print(1)' },
+      id: 'call-truncated',
+      type: 'tool_call',
+    } as never)) as { content: string; artifact?: t.CodeExecutionArtifact };
+
+    expect(result.content).toContain('70 file(s) were omitted from delivery');
+    expect(result.content).toContain('report_070.csv (1 of 70 shown)');
+    expect(result.content).toContain('do not rerun automatically');
+    expect(result.content.indexOf('file(s) were omitted')).toBeLessThan(
+      result.content.indexOf('Generated files:')
+    );
+    expect(result.artifact?.files).toEqual(files);
+    expect(result.artifact?.artifact_truncation).toEqual(marker);
+  });
+
+  it('warns and echoes truncation metadata even when no files were delivered', async () => {
+    const marker = {
+      code: 'artifact_truncated',
+      reasons: { size: 1 },
+      skipped: ['oversized.csv'],
+      skipped_count: 1,
+    };
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        session_id: 'session_123',
+        stdout: 'done\n',
+        files: [],
+        artifact_truncation: marker,
+      })
+    );
+
+    const tool = createCodeExecutionTool();
+    const result = (await tool.invoke({
+      name: tool.name,
+      args: { lang: 'py', code: 'print(1)' },
+      id: 'call-truncated-empty',
+      type: 'tool_call',
+    } as never)) as { content: string; artifact?: t.CodeExecutionArtifact };
+
+    expect(result.content).toContain(
+      '1 file(s) were omitted from delivery (size: 1)'
+    );
+    expect(result.content).not.toContain('Generated files:');
+    expect(result.artifact?.artifact_truncation).toEqual(marker);
+  });
+
+  it.each([
+    { reasons: { unexpected: 1 }, skipped: ['file.csv'] },
+    { reasons: { max_files: 70 }, skipped: ['file.csv'], skipped_count: 1 },
+    { reasons: {}, skipped: ['file.csv'], skipped_count: 1 },
+    {
+      reasons: { max_files: 21 },
+      skipped: Array.from({ length: 21 }, (_, index) => `file_${index}.csv`),
+    },
+    {
+      reasons: { max_files: 2 },
+      skipped: ['file_1.csv', 'file_2.csv'],
+      skipped_count: 1,
+    },
+  ])(
+    'ignores malformed truncation markers in direct execution',
+    async (fields) => {
+      fetchMock.mockResolvedValueOnce(
+        jsonResponse({
+          session_id: 'session_123',
+          stdout: 'done\n',
+          files: [{ id: 'file-1', name: 'kept.csv' }],
+          artifact_truncation: {
+            code: 'artifact_truncated',
+            skipped_count: 21,
+            ...fields,
+          },
+        })
+      );
+
+      const tool = createCodeExecutionTool();
+      const result = (await tool.invoke({
+        name: tool.name,
+        args: { lang: 'py', code: 'print(1)' },
+        id: 'call-malformed-truncation',
+        type: 'tool_call',
+      } as never)) as { content: string; artifact?: t.CodeExecutionArtifact };
+
+      expect(result.content).not.toContain('omitted from delivery');
+      expect(result.artifact?.artifact_truncation).toBeUndefined();
+      expect(result.artifact?.files).toHaveLength(1);
+    }
+  );
+
+  it.each([
+    { files: [{ id: 'file-1', name: 'kept.csv' }] },
+    { files: [] },
+  ])('surfaces Bash truncation with files $files', async ({ files }) => {
+    const marker = {
+      code: 'artifact_truncated',
+      reasons: { max_files: 2 },
+      skipped: ['omitted.csv'],
+      skipped_count: 2,
+    };
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        session_id: 'session_123',
+        stdout: 'bash completed\n',
+        files,
+        artifact_truncation: { ...marker, detail: 'not trusted' },
+      })
+    );
+    const tool = createBashExecutionTool();
+
+    const result = (await tool.invoke({
+      name: tool.name,
+      args: { command: 'echo done' },
+      id: 'call-bash-truncated',
+      type: 'tool_call',
+    } as never)) as { content: string; artifact?: t.CodeExecutionArtifact };
+
+    expect(result.content).toContain('2 file(s) were omitted from delivery');
+    expect(result.content).toContain('omitted.csv (1 of 2 shown)');
+    expect(result.content).toContain('do not rerun automatically');
+    expect(result.content.includes('Generated files:')).toBe(files.length > 0);
+    if (files.length > 0) {
+      expect(result.content.indexOf('file(s) were omitted')).toBeLessThan(
+        result.content.indexOf('Generated files:')
+      );
+    }
+    expect(result.artifact?.artifact_truncation).toEqual(marker);
+    expect(result.artifact?.files).toEqual(files.length > 0 ? files : undefined);
+  });
+
+  it.each([{ unexpected: 1 }, { max_files: 70 }, {}])(
+    'ignores invalid truncation reasons %j in direct Bash execution', async (reasons) => {
+      fetchMock.mockResolvedValueOnce(
+        jsonResponse({
+          session_id: 'session_123',
+          stdout: 'done\n',
+          files: [],
+          artifact_truncation: {
+            code: 'artifact_truncated',
+            reasons,
+            skipped: ['omitted.csv'],
+            skipped_count: 1,
+          },
+        })
+      );
+      const tool = createBashExecutionTool();
+
+      const result = (await tool.invoke({
+        name: tool.name,
+        args: { command: 'echo done' },
+        id: 'call-bash-malformed',
+        type: 'tool_call',
+      } as never)) as { content: string; artifact?: t.CodeExecutionArtifact };
+
+      expect(result.content).not.toContain('omitted from delivery');
+      expect(result.artifact?.artifact_truncation).toBeUndefined();
+    });
 
   it('surfaces artifact delivery failures from direct bash execution', async () => {
     fetchMock.mockResolvedValueOnce(

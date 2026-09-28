@@ -349,6 +349,22 @@ describe('buildChildInputs', () => {
     expect(result.maxSubagentDepth).toBe(0);
   });
 
+  it('uses the parent depth at the 1-to-0 boundary even if child inputs request more', () => {
+    const config: ResolvedSubagentConfig = {
+      type: 'researcher',
+      name: 'R',
+      description: 'd',
+      allowNested: true,
+      agentInputs: { ...parentAgentInputs, maxSubagentDepth: 99 },
+    };
+
+    const child = buildChildInputs(config, 'child', 1);
+
+    expect(child.maxSubagentDepth).toBe(0);
+    expect(child.subagentConfigs).toEqual(parentAgentInputs.subagentConfigs);
+    expect(config.agentInputs.maxSubagentDepth).toBe(99);
+  });
+
   it('always strips toolDefinitions (forces traditional mode)', () => {
     const inputsWithToolDefs: AgentInputs = {
       ...parentAgentInputs,
@@ -591,6 +607,286 @@ describe('SubagentExecutor', () => {
     throw new Error(`Timed out waiting for background task ${taskId}.`);
   }
 
+  it('preserves the legacy background HITL rejection when requested', () => {
+    const store = new InMemorySubagentTaskStore();
+    const executor = createExecutor({
+      taskConfig: { store, scopeId: 'owner:conversation' },
+      humanInTheLoop: { enabled: true, backgroundPausePolicy: 'reject' },
+    });
+
+    const response = JSON.parse(
+      executor.executeInBackground({
+        description: 'Blocked by policy.',
+        subagentType: 'researcher',
+        parentToolCallId: 'call_reject',
+      })
+    ) as { status: string; message: string };
+
+    expect(response.status).toBe('rejected');
+    expect(response.message).toContain(
+      'does not support human-in-the-loop pauses'
+    );
+    expect(store.list('owner:conversation')).toEqual([]);
+  });
+
+  it('runs HITL background tasks under deny, omits question tools, and reports blocked calls', async () => {
+    const store = new InMemorySubagentTaskStore();
+    const questionTool = { name: 'ask_user_question' } as NonNullable<
+      AgentInputs['graphTools']
+    >[number];
+    const normalTool = { name: 'search' } as NonNullable<
+      AgentInputs['graphTools']
+    >[number];
+    const inputs: AgentInputs = {
+      ...makeChildInputs(),
+      tools: [questionTool, normalTool],
+      toolMap: new Map([
+        ['ask_user_question', questionTool],
+        ['search', normalTool],
+      ]),
+      toolRegistry: new Map([
+        ['ask_user_question', { name: 'ask_user_question' }],
+        ['search', { name: 'search' }],
+      ]),
+      graphTools: [questionTool, normalTool],
+      toolDefinitions: [{ name: 'ask_user_question' }, { name: 'search' }],
+    };
+    const observedInputs: StandardGraphInput[] = [];
+    const observedGraphs: StandardGraph[] = [];
+    const { factory } = makeStubGraphFactory({
+      messages: [
+        new ToolMessage({
+          name: 'delete_file',
+          tool_call_id: 'call_delete',
+          status: 'error',
+          content:
+            'Blocked: Approval required for "delete_file"; unavailable in a background subagent. Ask the parent to run it in the foreground.',
+        }),
+        new AIMessage('Could not finish that operation.'),
+      ],
+    });
+    const handlers = new HandlerRegistry();
+    handlers.register(GraphEvents.ON_TOOL_EXECUTE, {
+      handle: (): void => undefined,
+    });
+    const executor = createExecutor({
+      configs: new Map([
+        ['researcher', makeConfig('researcher', { agentInputs: inputs })],
+      ]),
+      humanInTheLoop: { enabled: true },
+      taskConfig: { store, scopeId: 'owner:conversation' },
+      parentHandlerRegistry: handlers,
+      createChildGraph: (input): StandardGraph => {
+        observedInputs.push(input);
+        const graph = factory();
+        graph.eagerEventToolExecution = { enabled: true };
+        observedGraphs.push(graph);
+        return graph;
+      },
+    });
+
+    const response = JSON.parse(
+      executor.executeInBackground({
+        description: 'Try the task.',
+        subagentType: 'researcher',
+        parentToolCallId: 'call_deny',
+      })
+    ) as { background_task_id: string; status: string };
+    expect(response.status).toBe('running');
+    await waitForTask(
+      store,
+      response.background_task_id,
+      (status) => status === 'completed'
+    );
+
+    expect(observedGraphs[0].humanInTheLoop).toEqual({
+      enabled: false,
+      backgroundPausePolicy: 'deny',
+      backgroundDeny: true,
+    });
+    expect(observedGraphs[0].eagerEventToolExecution).toBeUndefined();
+    const child = observedInputs[0].agents[0];
+    expect(
+      child.tools?.map((tool) => ('name' in tool ? tool.name : ''))
+    ).toEqual(['search']);
+    expect(child.graphTools?.map((tool) => tool.name)).toEqual(['search']);
+    expect(child.toolDefinitions?.map((tool) => tool.name)).toEqual(['search']);
+    expect([...child.toolMap!.keys()]).toEqual(['search']);
+    expect([...child.toolRegistry!.keys()]).toEqual(['search']);
+    expect(inputs.graphTools).toHaveLength(2);
+    expect(inputs.toolMap).toHaveProperty('size', 2);
+    expect(inputs.toolRegistry).toHaveProperty('size', 2);
+    expect(
+      store.claim('owner:conversation', response.background_task_id)
+    ).toMatchObject({
+      status: 'completed',
+      result: expect.stringContaining(
+        'Background approval denied for: delete_file'
+      ),
+    });
+  });
+
+  it('fails closed if a detached child unexpectedly raises an interrupt', async () => {
+    const store = new InMemorySubagentTaskStore();
+    const executor = createExecutor({
+      humanInTheLoop: { enabled: true },
+      taskConfig: { store, scopeId: 'owner:conversation' },
+      createChildGraph: makeThrowingGraphFactory(
+        new GraphInterrupt([
+          {
+            id: 'unexpected-question',
+            value: {
+              type: 'ask_user_question',
+              question: { question: 'Proceed?' },
+            },
+          },
+        ])
+      ),
+    });
+
+    const response = JSON.parse(
+      executor.executeInBackground({
+        description: 'Unexpected pause.',
+        subagentType: 'researcher',
+        parentToolCallId: 'call_unexpected',
+      })
+    ) as { background_task_id: string };
+    await waitForTask(
+      store,
+      response.background_task_id,
+      (status) => status === 'error'
+    );
+    expect(
+      store.get('owner:conversation', response.background_task_id)?.error
+    ).toContain('cannot pause for human input');
+  });
+
+  it('fails closed if a background SubagentStart policy hook fails', async () => {
+    const store = new InMemorySubagentTaskStore();
+    const hooks = new HookRegistry();
+    hooks.register('SubagentStart', {
+      internal: true,
+      hooks: [async () => { throw new Error('authorization unavailable'); }],
+    });
+    const createChildGraph = jest.fn(makeNoopGraphFactory());
+    const executor = createExecutor({
+      taskConfig: { store, scopeId: 'owner:conversation' },
+      hookRegistry: hooks,
+      humanInTheLoop: { enabled: true },
+      createChildGraph,
+    });
+
+    const response = JSON.parse(
+      executor.executeInBackground({
+        description: 'Requires start authorization.',
+        subagentType: 'researcher',
+        parentToolCallId: 'call_start_policy_failure',
+      })
+    ) as { background_task_id: string };
+    await waitForTask(store, response.background_task_id, (status) => status === 'error');
+    expect(store.get('owner:conversation', response.background_task_id)?.error).toContain(
+      'Subagent start policy could not be evaluated'
+    );
+    expect(createChildGraph).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps a detached child and its thread continuation at depth zero', async () => {
+    const store = new ContinuationTaskStore();
+    const childConfig = makeConfig('researcher', {
+      allowNested: true,
+      agentInputs: {
+        ...makeChildInputs(),
+        maxSubagentDepth: 99,
+        subagentConfigs: [
+          {
+            type: 'grandchild',
+            name: 'Grandchild',
+            description: 'Must not be spawned.',
+            agentInputs: makeChildInputs('grandchild'),
+          },
+        ],
+      },
+    });
+    const observedInputs: StandardGraphInput[] = [];
+    const { factory } = makeStubGraphFactory({
+      messages: [new AIMessage('child finished')],
+    });
+    const executor = createExecutor({
+      configs: new Map([[childConfig.type, childConfig]]),
+      maxDepth: 1,
+      taskConfig: { store, scopeId: 'owner:conversation' },
+      createChildGraph: (input): StandardGraph => {
+        observedInputs.push(input);
+        return factory();
+      },
+    });
+
+    const first = JSON.parse(
+      executor.executeInBackground({
+        description: 'First task.',
+        subagentType: 'researcher',
+        parentToolCallId: 'call_first',
+      })
+    ) as { background_task_id: string; subagent_thread_id: string };
+    await waitForTask(
+      store,
+      first.background_task_id,
+      (status) => status === 'completed'
+    );
+
+    const continued = JSON.parse(
+      executor.executeInBackground({
+        description: 'Continue the task.',
+        subagentType: 'researcher',
+        subagentThreadId: first.subagent_thread_id,
+        parentToolCallId: 'call_continued',
+      })
+    ) as { background_task_id: string; subagent_thread_id: string };
+    await waitForTask(
+      store,
+      continued.background_task_id,
+      (status) => status === 'completed'
+    );
+
+    expect(continued.subagent_thread_id).toBe(first.subagent_thread_id);
+    expect(observedInputs).toHaveLength(2);
+    expect(observedInputs.map((input) => input.agents[0])).toEqual([
+      expect.objectContaining({
+        maxSubagentDepth: 0,
+        subagentConfigs: childConfig.agentInputs.subagentConfigs,
+      }),
+      expect.objectContaining({
+        maxSubagentDepth: 0,
+        subagentConfigs: childConfig.agentInputs.subagentConfigs,
+      }),
+    ]);
+    expect(
+      observedInputs.map((input) => input.subagentExecutionContext?.depth)
+    ).toEqual([1, 1]);
+  });
+
+  it('rejects background execution when the nesting budget is exhausted', () => {
+    const store = new ContinuationTaskStore();
+    const executor = createExecutor({
+      maxDepth: 0,
+      taskConfig: { store, scopeId: 'owner:conversation' },
+    });
+
+    const result = JSON.parse(
+      executor.executeInBackground({
+        description: 'Do not spawn.',
+        subagentType: 'researcher',
+        parentToolCallId: 'call_blocked',
+      })
+    ) as { status: string; message: string };
+
+    expect(result).toMatchObject({
+      status: 'rejected',
+      message: 'Maximum subagent nesting depth exceeded.',
+    });
+    expect(store.list('owner:conversation')).toEqual([]);
+  });
+
   it('runs a detached child past parent cleanup and exposes its result once', async () => {
     const store = new InMemorySubagentTaskStore();
     let finish = (_value: { messages: BaseMessage[] }): void => undefined;
@@ -715,7 +1011,10 @@ describe('SubagentExecutor', () => {
     expect(deliveryAttempts).toBe(2);
     expect(
       store.claim('owner:conversation', response.background_task_id)
-    ).toMatchObject({ status: 'completed', result: 'detached result delivered' });
+    ).toMatchObject({
+      status: 'completed',
+      result: 'detached result delivered',
+    });
   });
 
   it('bounds detached result delivery retries', async () => {
@@ -792,7 +1091,10 @@ describe('SubagentExecutor', () => {
     expect(clearHeavyState).toHaveBeenCalled();
     expect(
       store.get('owner:conversation', response.background_task_id)
-    ).toMatchObject({ status: 'error', error: 'Detached subagent task timed out.' });
+    ).toMatchObject({
+      status: 'error',
+      error: 'Detached subagent task timed out.',
+    });
   });
 
   it('replaces the ambient parent run config for detached child execution', async () => {

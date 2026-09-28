@@ -27,6 +27,7 @@ import {
   deriveSessionMessages,
   releaseSessionProjection,
 } from './sessionProjection';
+import { FADING_TIER_VERSION, isFadingTier } from '@/messages/fading';
 import { createSummarizeNode } from '@/summarization/node';
 import { resolveStreamLimits } from '@/llm/streamLimits';
 import { JsonlSessionStore } from './JsonlSessionStore';
@@ -34,7 +35,6 @@ import { AgentContext } from '@/agents/AgentContext';
 import { ContentTypes, GraphEvents } from '@/common';
 import { createRunId, createSessionId } from './ids';
 import { deriveMessages } from './deriveMessages';
-import { isFadingTier } from '@/messages/fading';
 import { createRunHandlers } from './handlers';
 import { Run } from '@/run';
 
@@ -420,7 +420,7 @@ function mergeFadingTier(
     masked !== current.masked ||
     masked !== incoming.masked;
   return {
-    v: 1,
+    v: FADING_TIER_VERSION,
     budgetTokens,
     masked,
     ...(latched ? { latched: true } : {}),

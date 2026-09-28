@@ -4,7 +4,12 @@ import {
   calculateMaxToolResultChars,
 } from '@/utils/truncation';
 
-export const FADING_TIER_VERSION = 1;
+/**
+ * Version 2: exchange width counts only the current turn. Version 1 tiers may
+ * have latched on history whose steps storage had merged into one assistant
+ * message, so they are discarded and re-derived once.
+ */
+export const FADING_TIER_VERSION = 2;
 
 /** Context pressure at which observation masking activates. */
 export const PRESSURE_THRESHOLD_MASKING = 0.8;
@@ -34,7 +39,7 @@ export type FadingSignals = {
   /** (pruningBudget − instruction tokens) ÷ calibrationRatio, in raw token space. */
   effectiveRawTokens: number;
   summarizationEnabled: boolean;
-  /** Largest number of parallel calls observed in one assistant exchange. */
+  /** Largest number of parallel calls in one assistant exchange of the current turn. */
   toolExchangeWidth?: number;
   /** Recovery paths force at least this rung on the current window's ladder. */
   minRung?: number;
@@ -59,7 +64,10 @@ export function createFadingTier(window: number): FadingTier {
   return { v: FADING_TIER_VERSION, budgetTokens: window, masked: false };
 }
 
-export function isFadingTier(value: unknown): value is FadingTier {
+/** Tier version before exchange width became turn-scoped. */
+const LEGACY_FADING_TIER_VERSION = 1;
+
+function isFadingTierOfVersion(value: unknown, version: number): boolean {
   if (typeof value !== 'object' || value === null) {
     return false;
   }
@@ -67,13 +75,27 @@ export function isFadingTier(value: unknown): value is FadingTier {
     Record<keyof FadingTier, unknown>
   >;
   return (
-    v === FADING_TIER_VERSION &&
+    v === version &&
     typeof budgetTokens === 'number' &&
     Number.isFinite(budgetTokens) &&
     budgetTokens > 0 &&
     typeof masked === 'boolean' &&
     (latched === undefined || latched === true)
   );
+}
+
+export function isFadingTier(value: unknown): value is FadingTier {
+  return isFadingTierOfVersion(value, FADING_TIER_VERSION);
+}
+
+/**
+ * A well-formed tier persisted before version 2. Stored snapshots that carry
+ * one (resume manifests, session files) stay valid; every consumer then drops
+ * it through `isFadingTier`, so the tier re-derives once instead of the
+ * snapshot being rejected as corrupt.
+ */
+export function isLegacyFadingTier(value: unknown): boolean {
+  return isFadingTierOfVersion(value, LEGACY_FADING_TIER_VERSION);
 }
 
 /** Deepest rung for a window: the point where the budget reaches its floor. */
@@ -199,7 +221,10 @@ export function fadingRungForExchangeChars(
       maxToolResultChars == null
         ? windowResultChars
         : Math.min(windowResultChars, maxToolResultChars);
-    if (resultChars + calculateMaxToolCallInputChars(budgetTokens) <= targetChars) {
+    if (
+      resultChars + calculateMaxToolCallInputChars(budgetTokens) <=
+      targetChars
+    ) {
       return rung;
     }
   }

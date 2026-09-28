@@ -1655,6 +1655,14 @@ describe('context overflow recovery', () => {
     if (!run.Graph) {
       throw new Error('Expected graph to be initialized');
     }
+    const accepted: t.ModelResponseEvent[] = [];
+    run.Graph.handlerRegistry?.register(GraphEvents.ON_MODEL_RESPONSE, {
+      handle: (_event, data): void => {
+        if (data != null && 'type' in data && data.type === 'model_response') {
+          accepted.push(data);
+        }
+      },
+    });
     const model = new OverflowThenSucceedModel(
       signatureFor('claude-haiku-4-5-20251001')
     );
@@ -1667,6 +1675,9 @@ describe('context overflow recovery', () => {
 
     expect(model.calls).toHaveLength(2);
     expect(content).toEqual([{ type: 'text', text: 'recovered' }]);
+    expect(accepted).toHaveLength(1);
+    expect(accepted[0].id).not.toBe('');
+    expect(accepted[0].toolCalls).toEqual([]);
   });
 
   it('retargets the budget to the ceiling the provider reported', async () => {

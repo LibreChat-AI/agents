@@ -25,6 +25,16 @@ jest.mock('node-fetch', () => ({
   default: async (url: string, init?: { body?: string }) => {
     const body = JSON.parse(init?.body ?? '{}') as SandboxRequestBody;
     requests.push({ url, body });
+    const truncation = body.code?.includes('trigger_truncation') === true
+      ? {
+        artifact_truncation: {
+          code: 'artifact_truncated',
+          reasons: { max_files: 1 },
+          skipped: ['missing.csv'],
+          skipped_count: 1,
+        },
+      }
+      : {};
 
     if (url.endsWith('/exec/programmatic')) {
       if (!Array.isArray(body.tools) || body.tools.length === 0) {
@@ -43,6 +53,7 @@ jest.mock('node-fetch', () => ({
           stdout: 'programmatic',
           stderr: '',
           files: [],
+          ...truncation,
         }),
       };
     }
@@ -54,6 +65,7 @@ jest.mock('node-fetch', () => ({
         stdout: 'plain',
         stderr: '',
         files: [],
+        ...truncation,
       }),
     };
   },
@@ -217,6 +229,40 @@ describe('an empty tool manifest runs instead of being rejected', () => {
       timeout: 5000,
     });
     expect(result.artifact?.session_id).toBe('plain-session');
+  });
+});
+
+describe('artifact truncation across programmatic routes', () => {
+  beforeEach(() => {
+    requests.length = 0;
+  });
+
+  it.each([
+    ['bash', invokeBash, []],
+    ['python', invokePython, []],
+    ['bash with tools', invokeBash, ['get_weather']],
+    ['python with tools', invokePython, ['get_weather']],
+  ] as const)('surfaces omissions for %s', async (_kind, invokeTool, tool_manifest) => {
+    const result = (await invokeTool({
+      code: _kind.startsWith('python')
+        ? 'print("trigger_truncation")'
+        : 'echo trigger_truncation',
+      tool_manifest: [...tool_manifest],
+    })) as ToolResult;
+
+    expect(requests).toHaveLength(1);
+    expect(requests[0].url).toBe(
+      `${BASE_URL}/${tool_manifest.length > 0 ? 'exec/programmatic' : 'exec'}`
+    );
+    expect(result.content).toContain('1 file(s) were omitted from delivery');
+    expect(result.content).toContain('missing.csv');
+    expect(result.content).toContain('do not rerun automatically');
+    expect(result.artifact?.artifact_truncation).toEqual({
+      code: 'artifact_truncated',
+      reasons: { max_files: 1 },
+      skipped: ['missing.csv'],
+      skipped_count: 1,
+    });
   });
 });
 

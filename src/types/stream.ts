@@ -1,5 +1,6 @@
 // src/types/stream.ts
 import type {
+  AIMessageChunk,
   MessageContentImageUrl,
   MessageContentText,
   ToolMessage,
@@ -14,6 +15,24 @@ import type { AssistantTextPhase } from '@/types/assistantPhase';
 import type { SummarizeCompleteEvent } from '@/types/summarize';
 import type { ToolEndEvent } from '@/types/tools';
 import { StepTypes, ContentTypes, GraphEvents } from '@/common/enum';
+
+/** One accepted model result, detached from execution state before host dispatch.
+ * Provider chunks, failed attempts and UI run-step events are not this contract. */
+export interface ModelResponseEvent {
+  type: 'model_response';
+  /** Graph-generated acceptance ID, not a provider ID or run-step index. */
+  id: string;
+  agentId: string;
+  /** Graph-state message identity used to correlate ToolNode ownership. */
+  messageId?: string;
+  toolCalls: ReadonlyArray<ToolCall>;
+  /** Same index as toolCalls. Only a trusted graph decision of 'client'
+   * permits this call on the OpenAI client wire; absence fails closed. */
+  toolCallDispositions: ReadonlyArray<'sdk' | 'provider' | 'client'>;
+  invalidToolCalls: ReadonlyArray<
+    NonNullable<AIMessageChunk['invalid_tool_calls']>[number]
+  >;
+}
 
 export type HandleLLMEnd = (
   output: LLMResult,
@@ -542,3 +561,10 @@ export type ContentAggregatorResult = {
   contentParts: Array<MessageContentComplex | undefined>;
   aggregateContent: ContentAggregator;
 };
+
+/** Ownership, not successful completion. Interrupted/failed batches remain graph-owned. */
+export interface ModelToolsClaimedEvent {
+  type: 'model_tools_claimed';
+  agentId: string;
+  messageId: string;
+}

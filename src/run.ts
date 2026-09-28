@@ -47,6 +47,7 @@ import {
 import {
   createLangfuseTraceMetadata,
   createLangfuseHandler,
+  maskRedactedLabelGeneration,
   disposeLangfuseHandler,
   getLangfuseTraceName,
   isLangfuseCallbackHandler,
@@ -468,6 +469,7 @@ export class Run<_T extends t.BaseGraphState> {
   private langfuse?: t.LangfuseConfig;
   private toolOutputReferences?: t.ToolOutputReferencesConfig;
   private eagerEventToolExecution?: t.EagerEventToolExecutionConfig;
+  private clientDelegatedToolNames?: readonly string[];
   private codeSessionToolNames?: string[];
   private interruptingToolNames?: string[];
   private toolExecution?: t.ToolExecutionConfig;
@@ -549,12 +551,19 @@ export class Run<_T extends t.BaseGraphState> {
       }
     }
 
+    if (
+      (config.clientDelegatedToolNames?.length ?? 0) > 0 &&
+      handlerRegistry.getHandler(GraphEvents.ON_MODEL_RESPONSE) == null
+    ) {
+      throw new Error('Client tool delegation requires an accepted-result handler');
+    }
     this.handlerRegistry = handlerRegistry;
     this.hookRegistry = config.hooks;
     this.humanInTheLoop = config.humanInTheLoop;
     this.langfuse = config.langfuse;
     this.toolOutputReferences = config.toolOutputReferences;
     this.eagerEventToolExecution = config.eagerEventToolExecution;
+    this.clientDelegatedToolNames = config.clientDelegatedToolNames;
     this.codeSessionToolNames = config.codeSessionToolNames;
     this.interruptingToolNames = config.interruptingToolNames;
     this.toolExecution = config.toolExecution;
@@ -573,6 +582,9 @@ export class Run<_T extends t.BaseGraphState> {
 
     /** Handle different graph types */
     if (config.graphConfig.type === 'multi-agent') {
+      if (this.clientDelegatedToolNames != null && this.clientDelegatedToolNames.length > 0) {
+        throw new Error('Client tool delegation requires a single-agent graph');
+      }
       this.graphRunnable = this.createMultiAgentGraph(config.graphConfig);
       if (this.Graph) {
         this.Graph.handlerRegistry = handlerRegistry;
@@ -663,6 +675,7 @@ export class Run<_T extends t.BaseGraphState> {
         preemption: this.preemption,
         streamLimits: this.streamLimits,
         toolExecution: this.toolExecution,
+        clientDelegatedToolNames: this.clientDelegatedToolNames,
       },
     });
     /** Propagate compile options from graph config */
@@ -1058,6 +1071,11 @@ export class Run<_T extends t.BaseGraphState> {
       ) {
         return;
       }
+      // Accepted results are graph-owned, never inferred from provider/tool callbacks.
+      if (
+        eventName === GraphEvents.ON_MODEL_RESPONSE ||
+        eventName === GraphEvents.ON_MODEL_TOOLS_CLAIMED
+      ) return;
       const handler = this.handlerRegistry?.getHandler(eventName);
       /**
        * Tool completions arriving over the custom-event channel are the only
@@ -1554,6 +1572,10 @@ export class Run<_T extends t.BaseGraphState> {
 
           const modelEndAt =
             eventName === GraphEvents.CHAT_MODEL_END ? Date.now() : undefined;
+          if (
+            eventName === GraphEvents.ON_MODEL_RESPONSE ||
+            eventName === GraphEvents.ON_MODEL_TOOLS_CLAIMED
+          ) continue;
           const handler = this.handlerRegistry?.getHandler(eventName);
           if (handler) {
             await handler.handle(eventName, data, metadata, this.Graph);
@@ -2642,22 +2664,21 @@ export class Run<_T extends t.BaseGraphState> {
         };
       }
     }
-    /** An active redaction policy suppresses free-form reasoning/intent, so
-     *  a reasoning-only block has nothing describable left — skip the model
-     *  call rather than paying for a label built from the prompt alone. */
-    const freeFormSuppressed =
-      redaction != null &&
-      (redaction.enabled === false || redaction.redactedToolNames.size > 0);
-    if (entries.length === 0 && freeFormSuppressed) {
-      return {};
-    }
-    const userPrompt = buildActivityLabelPrompt({
+    const labelEvidence = {
       entries,
       charLimit,
       thinkingExcerpts,
       lastAssistantText:
         lastAssistantPhase === 'final_answer' ? undefined : lastAssistantText,
       previousLabels,
+    };
+    const userPrompt = buildActivityLabelPrompt(labelEvidence);
+    maskRedactedLabelGeneration(labelLangfuseHandler, {
+      modelPrompt: userPrompt,
+      tracedPrompt:
+        redaction == null
+          ? userPrompt
+          : buildActivityLabelPrompt({ ...labelEvidence, redaction }),
       redaction,
     });
 
@@ -2962,17 +2983,25 @@ export class Run<_T extends t.BaseGraphState> {
         reasoningContext?.langfuse
       )
       : undefined;
-    const userPrompt = buildReasoningLabelPrompt({
+    const reasoningEvidence = {
       visibleReasoning,
       status,
       charLimit,
       previousLabel,
-      redaction,
-    });
+    };
+    const userPrompt = buildReasoningLabelPrompt(reasoningEvidence);
     if (userPrompt === '') {
       await disposeLangfuseHandler(reasoningLangfuseHandler);
       return {};
     }
+    maskRedactedLabelGeneration(reasoningLangfuseHandler, {
+      modelPrompt: userPrompt,
+      tracedPrompt:
+        redaction == null
+          ? userPrompt
+          : buildReasoningLabelPrompt({ ...reasoningEvidence, redaction }),
+      redaction,
+    });
 
     const model = initializeModel({
       provider,
@@ -3159,13 +3188,13 @@ export class Run<_T extends t.BaseGraphState> {
       };
     }
 
-    const userPrompt = buildActivityPhaseLabelPrompt({
+    const phaseEvidence = {
       activities,
       totalActivityCount,
       charLimit,
       assistantContext,
-      redaction,
-    });
+    };
+    const userPrompt = buildActivityPhaseLabelPrompt(phaseEvidence);
     if (userPrompt === '') {
       return {};
     }
@@ -3284,6 +3313,14 @@ export class Run<_T extends t.BaseGraphState> {
         traceName: phaseParentSpanContext == null ? phaseTraceName : undefined,
       });
     }
+    maskRedactedLabelGeneration(phaseLangfuseHandler, {
+      modelPrompt: userPrompt,
+      tracedPrompt:
+        redaction == null
+          ? userPrompt
+          : buildActivityPhaseLabelPrompt({ ...phaseEvidence, redaction }),
+      redaction,
+    });
     if (phaseLangfuseHandler != null) {
       phaseChainOptions.callbacks = appendCallbacks(
         phaseChainOptions.callbacks,

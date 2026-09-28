@@ -7,6 +7,11 @@
 export enum GraphEvents {
   /* Custom Events */
 
+  /** Accepted graph model result, after fallback selection. Registry-only, not a provider callback. */
+  ON_MODEL_RESPONSE = 'on_model_response',
+  /** Registry-only: ToolNode has taken ownership of an accepted message's calls. */
+  ON_MODEL_TOOLS_CLAIMED = 'on_model_tools_claimed',
+
   /** [Custom] Agent update event in multi-agent graph/workflow */
   ON_AGENT_UPDATE = 'on_agent_update',
   /** [Custom] Delta event for run steps (message creation and tool calls) */

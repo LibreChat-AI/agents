@@ -1,3 +1,4 @@
+import { AIMessageChunk } from '@langchain/core/messages';
 import { describe, it, expect, jest, afterEach } from '@jest/globals';
 import type { AgentContext } from '@/agents/AgentContext';
 import type { StandardGraph } from '@/graphs';
@@ -2591,6 +2592,83 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
     ).toBe(true);
   });
 
+  it('emits the stop instruction for an eager tool aborted by the run', async () => {
+    const controller = new AbortController();
+    const graph = createGraph({
+      config: {
+        signal: controller.signal,
+        configurable: { user_id: 'user_1' },
+        metadata: { run_id: 'run_1' },
+      },
+    });
+    const completedEvents: Array<{ result: t.ToolEndEvent }> = [];
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data): Promise<void> => {
+        if (event === GraphEvents.ON_RUN_STEP_COMPLETED) {
+          completedEvents.push(data as { result: t.ToolEndEvent });
+          return;
+        }
+        if (event !== GraphEvents.ON_TOOL_EXECUTE) {
+          return;
+        }
+        const batch = data as t.ToolExecuteBatchRequest;
+        controller.abort();
+        batch.resolve([
+          {
+            toolCallId: 'call_weather',
+            status: 'error',
+            content: '',
+            errorMessage: 'AbortError: This operation was aborted',
+          },
+        ]);
+      });
+
+    const handler = new ChatModelStreamHandler();
+    const metadata = { langgraph_node: 'agent' };
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_call_chunks: [
+            {
+              id: 'call_weather',
+              name: 'weather',
+              args: '{"city":"NYC"}',
+              index: 0,
+            },
+          ],
+        } as unknown as t.StreamChunk,
+      },
+      metadata,
+      graph
+    );
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_call_chunks: [
+            {
+              id: 'call_stock',
+              name: 'stock',
+              args: '{"ticker":"C',
+              index: 1,
+            },
+          ],
+        } as unknown as t.StreamChunk,
+      },
+      metadata,
+      graph
+    );
+    await graph.eagerEventToolExecutions.get('call_weather')?.promise;
+
+    const output = completedEvents[0]?.result.tool_call?.output;
+    expect(output).toContain('STOP what you are doing');
+    expect(output).not.toContain('Please fix your mistakes');
+  });
+
   it('serializes bigint output before eager completion dispatch', async () => {
     const graph = createGraph();
     const completedEvents: Array<{ result: t.ToolEndEvent }> = [];
@@ -5178,5 +5256,67 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
     expect(toolExecuteCalls).toHaveLength(0);
     expect(graph.eagerEventToolExecutions.has('call_weather')).toBe(false);
     expect(graph.eagerEventToolExecutions.has('call_edit')).toBe(false);
+  });
+});
+
+describe('executable argument readiness', () => {
+  it('prevents eager host execution for string-valued parsed calls even with a final seal', async () => {
+    const graph = createGraph();
+    const requests: t.ToolExecuteBatchRequest[] = [];
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data): Promise<void> => {
+        if (event !== GraphEvents.ON_TOOL_EXECUTE) return;
+        const request = data as t.ToolExecuteBatchRequest;
+        requests.push(request);
+        request.resolve([
+          { toolCallId: 'call_weather', status: 'success', content: 'sunny' },
+        ]);
+      });
+    const raw = new AIMessageChunk({
+      content: '',
+      tool_calls: [
+        {
+          id: 'call_weather',
+          name: 'weather',
+          args: '{"city":"NYC"}' as unknown as Record<string, unknown>,
+        },
+      ],
+      response_metadata: finalToolCallResponseMetadata,
+    });
+    await new ChatModelStreamHandler().handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      { chunk: raw },
+      { langgraph_node: 'agent' },
+      graph
+    );
+    expect(requests).toHaveLength(0);
+  });
+});
+
+describe('client delegation batch barrier', () => {
+  it('does not pre-execute an SDK call before a possible client-owned call arrives', async () => {
+    const graph = createGraph();
+    graph.clientDelegatedToolNames = new Set(['client_tool']);
+    const requests: t.ToolExecuteBatchRequest[] = [];
+    jest.spyOn(events, 'safeDispatchCustomEvent').mockImplementation(
+      async (event, data): Promise<void> => {
+        if (event !== GraphEvents.ON_TOOL_EXECUTE) return;
+        const request = data as t.ToolExecuteBatchRequest;
+        requests.push(request);
+        request.resolve([{ toolCallId: 'call_weather', status: 'success', content: 'sunny' }]);
+      }
+    );
+    await new ChatModelStreamHandler().handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      { chunk: new AIMessageChunk({
+        content: '',
+        tool_calls: [{ id: 'call_weather', name: 'weather', args: { city: 'NYC' } }],
+        response_metadata: finalToolCallResponseMetadata,
+      }) },
+      { langgraph_node: 'agent' },
+      graph
+    );
+    expect(requests).toHaveLength(0);
   });
 });

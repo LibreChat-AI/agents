@@ -118,7 +118,9 @@ jobs:
           NODE_OPTIONS: '--experimental-vm-modules'
           NODE_ENV: test
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL || secrets.OPENAI_BASE_URL }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_BASE_URL: ${{ vars.ANTHROPIC_BASE_URL || secrets.ANTHROPIC_BASE_URL }}
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
           AZURE_MODEL_NAME: ${{ secrets.AZURE_MODEL_NAME }}
           AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
@@ -164,7 +166,9 @@ jobs:
           NODE_OPTIONS: '--experimental-vm-modules'
           NODE_ENV: test
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL || secrets.OPENAI_BASE_URL }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_BASE_URL: ${{ vars.ANTHROPIC_BASE_URL || secrets.ANTHROPIC_BASE_URL }}
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
           AZURE_MODEL_NAME: ${{ secrets.AZURE_MODEL_NAME }}
           AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
@@ -266,6 +270,7 @@ jobs:
           NODE_OPTIONS: '--experimental-vm-modules'
           NODE_ENV: test
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_BASE_URL: ${{ vars.ANTHROPIC_BASE_URL || secrets.ANTHROPIC_BASE_URL }}
 
       - name: Surface Anthropic LLM soft failure
         if: always() && steps.anthropic_changes.outputs.changed == 'true' && steps.anthropic_llm_tests.outcome == 'failure'

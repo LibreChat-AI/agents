@@ -8,7 +8,7 @@ import type {
   RunStepResumeState,
   ToolSessionContext,
 } from '@/types';
-import { isFadingTier } from '@/messages/fading';
+import { isFadingTier, isLegacyFadingTier } from '@/messages/fading';
 import {
   attachRunStepResumeState,
   getRunStepResumeState,
@@ -290,6 +290,11 @@ export function isToolOutputReferenceState(
   );
 }
 
+/** A current tier, or a legacy one the run then drops so it re-derives. */
+function isStoredFadingTier(value: unknown): boolean {
+  return isFadingTier(value) || isLegacyFadingTier(value);
+}
+
 function isGraphResumeState(value: unknown): value is SubagentGraphResumeState {
   if (value == null || typeof value !== 'object') {
     return false;
@@ -306,15 +311,14 @@ function isGraphResumeState(value: unknown): value is SubagentGraphResumeState {
     !state.eagerToolUsage.every(isEagerToolUsageState) ||
     !Array.isArray(state.eagerToolSuppressions) ||
     !state.eagerToolSuppressions.every(isString) ||
-    (state.runStepState != null &&
-      !isRunStepResumeState(state.runStepState)) ||
+    (state.runStepState != null && !isRunStepResumeState(state.runStepState)) ||
     (state.toolOutputReferences != null &&
       !isToolOutputReferenceState(state.toolOutputReferences)) ||
-    (state.fadingTier != null && !isFadingTier(state.fadingTier)) ||
+    (state.fadingTier != null && !isStoredFadingTier(state.fadingTier)) ||
     (state.fadingTiers != null &&
       (typeof state.fadingTiers !== 'object' ||
         Array.isArray(state.fadingTiers) ||
-        !Object.values(state.fadingTiers).every(isFadingTier)))
+        !Object.values(state.fadingTiers).every(isStoredFadingTier)))
   ) {
     return false;
   }
@@ -515,10 +519,7 @@ export function attachSubagentResumeManifest(
   const runStepState = getRunStepResumeState(payload);
   if (runStepState != null) {
     return attachRunStepResumeState(
-      attachSubagentResumeManifest(
-        stripRunStepResumeState(payload),
-        manifest
-      ),
+      attachSubagentResumeManifest(stripRunStepResumeState(payload), manifest),
       runStepState
     );
   }

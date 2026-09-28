@@ -10,6 +10,10 @@ import {
   normalizeArtifactDeliveryFailure,
 } from '@/tools/ArtifactDelivery';
 import {
+  appendArtifactTruncationWarning,
+  normalizeArtifactTruncation,
+} from '@/tools/ArtifactTruncation';
+import {
   describeCodeApiError,
   logCodeApiDiagnostic,
 } from '@/tools/diagnostics';
@@ -671,6 +675,13 @@ function createCodeExecutionTool(
           outputWithReminder,
           artifactDelivery
         );
+        const artifactTruncation = normalizeArtifactTruncation(
+          result.artifact_truncation
+        );
+        const outputWithWarnings = appendArtifactTruncationWarning(
+          outputWithDeliveryWarning,
+          artifactTruncation
+        );
         const hasFiles = result.files != null && result.files.length > 0;
         const deletionEcho =
           result.deleted_files != null
@@ -687,13 +698,16 @@ function createCodeExecutionTool(
             }
             : {};
         return [
-          appendCodeSessionFileSummary(outputWithDeliveryWarning, result.files),
+          appendCodeSessionFileSummary(outputWithWarnings, result.files),
           (hasFiles
             ? {
               session_id: result.session_id,
               files: result.files,
               ...(artifactDelivery != null
                 ? { artifact_delivery: artifactDelivery }
+                : {}),
+              ...(artifactTruncation != null
+                ? { artifact_truncation: artifactTruncation }
                 : {}),
               ...deletionEcho,
               ...runtimeEcho,
@@ -702,6 +716,9 @@ function createCodeExecutionTool(
               session_id: result.session_id,
               ...(artifactDelivery != null
                 ? { artifact_delivery: artifactDelivery }
+                : {}),
+              ...(artifactTruncation != null
+                ? { artifact_truncation: artifactTruncation }
                 : {}),
               ...deletionEcho,
               ...runtimeEcho,

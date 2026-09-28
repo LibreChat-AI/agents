@@ -279,6 +279,11 @@ export type RunConfig = {
    */
   langfuse?: g.LangfuseConfig;
   customHandlers?: Record<string, g.EventHandler>;
+  /** Explicit client-owned tools for a single-agent graph. A batch mixing
+   * client and SDK/provider calls fails closed; omitted means SDK ownership.
+   * Hosts must register the corresponding model-facing tool schemas.
+   */
+  clientDelegatedToolNames?: readonly string[];
   /**
    * Receives token usage for every model call made inside subagent child
    * runs (including nested subagents). Child graphs execute via `invoke()`

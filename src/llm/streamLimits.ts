@@ -981,7 +981,7 @@ export function linkStreamLimitCanonical(
   canonical: object
 ): void {
   Object.defineProperty(copy, STREAM_LIMIT_CANONICAL, {
-    value: canonical,
+    value: canonicalChunk(canonical),
     enumerable: false,
     configurable: true,
   });

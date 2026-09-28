@@ -402,3 +402,9 @@ export async function sendOpenAIFinalChunk(
   );
   await writeOpenAISSE(config.writer, '[DONE]');
 }
+
+export { createOpenAIToolCallStream } from './toolProjection';
+export type {
+  OpenAIToolCallStream,
+  OpenAIToolCallStreamConfig,
+} from './toolProjection';

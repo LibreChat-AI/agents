@@ -313,6 +313,8 @@ export type ToolNodeOptions = {
   ) => void;
   /** SDK-owned checkpoint snapshot for open run-step lifecycle state. */
   createRunStepResumeState?: () => RunStepResumeState;
+  /** Internal ownership bridge, awaited before ToolNode can execute a batch. */
+  onToolCallsClaimed?: (messageId: string, config: RunnableConfig) => Promise<void>;
 };
 
 export type ToolNodeConstructorParams = ToolRefs & ToolNodeOptions;
@@ -495,6 +497,21 @@ export type ArtifactDeliveryFailure = {
   failed: number;
 };
 
+export type ArtifactTruncationReason =
+  | 'max_files'
+  | 'depth'
+  | 'size'
+  | 'path'
+  | 'unreadable';
+
+export type ArtifactTruncation = {
+  code: 'artifact_truncated';
+  reasons: Partial<Record<ArtifactTruncationReason, number>>;
+  /** Up to 20 relative paths omitted from the response. */
+  skipped: string[];
+  skipped_count: number;
+};
+
 export type ExecuteResult = {
   /**
    * Execution session id — the (transient) sandbox run that produced
@@ -508,6 +525,7 @@ export type ExecuteResult = {
   /** Persisted input paths explicitly removed during this execution. */
   deleted_files?: string[];
   artifact_delivery?: ArtifactDeliveryFailure;
+  artifact_truncation?: ArtifactTruncation;
   /**
    * Durable runtime session id echoed by a stateful Code API backend
    * (hash of tenant+user+hint). Additive; absent on stateless servers.
@@ -1238,6 +1256,8 @@ export type ProgrammaticCache = {
 
 export type ProgrammaticHookContext = {
   registry: import('@/hooks').HookRegistry | undefined;
+  /** A detached HITL child must never execute an inner tool if its policy hook fails. */
+  failClosedOnHookError?: boolean;
   runId: string;
   threadId?: string;
   agentId?: string;
@@ -1354,6 +1374,7 @@ export type ProgrammaticExecutionResponse = {
   /** Persisted input paths explicitly removed during this execution. */
   deleted_files?: string[];
   artifact_delivery?: ArtifactDeliveryFailure;
+  artifact_truncation?: ArtifactTruncation;
 
   /** Durable runtime session echo from a stateful backend (additive). */
   runtime_session_id?: string;
@@ -1373,6 +1394,7 @@ export type ProgrammaticExecutionArtifact = {
   /** Persisted input paths explicitly removed during this execution. */
   deleted_files?: string[];
   artifact_delivery?: ArtifactDeliveryFailure;
+  artifact_truncation?: ArtifactTruncation;
   /** Durable runtime session echo from a stateful backend (additive). */
   runtime_session_id?: string;
   runtime_status?: 'new' | 'reused';
@@ -1455,6 +1477,7 @@ export type CodeExecutionArtifact = {
   /** Persisted input paths explicitly removed during this execution. */
   deleted_files?: string[];
   artifact_delivery?: ArtifactDeliveryFailure;
+  artifact_truncation?: ArtifactTruncation;
   /** Durable runtime session echo from a stateful backend (additive). */
   runtime_session_id?: string;
   runtime_status?: 'new' | 'reused';

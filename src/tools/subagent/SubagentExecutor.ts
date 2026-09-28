@@ -13,6 +13,7 @@ import {
   END,
   GraphInterrupt,
   INTERRUPT,
+  MemorySaver,
   MessagesAnnotation,
   START,
   StateGraph,
@@ -141,9 +142,10 @@ import { seedAgentInitialSessions } from '@/utils/toolSessions';
 import { stableStringify } from '@/tools/eagerEventExecution';
 import { convertInjectedMessages } from '@/messages/injected';
 import { resolveClientOptionsModel } from '@/llm/request';
+import { isBackgroundDenyMode } from '@/types/hitl';
 import { composeAbortSignals } from '@/utils/misc';
-import { sleep } from '@/utils/run';
 import { HandlerRegistry } from '@/events';
+import { sleep } from '@/utils/run';
 
 export {
   buildChildInputs,
@@ -875,6 +877,27 @@ function createSubagentFailure(
   return { content, messages: [], error };
 }
 
+function excludeBackgroundQuestionTool(agentInputs: AgentInputs): void {
+  const questionTool = 'ask_user_question';
+  agentInputs.tools = agentInputs.tools?.filter(
+    (tool) => !('name' in tool) || tool.name !== questionTool
+  );
+  agentInputs.graphTools = agentInputs.graphTools?.filter(
+    (tool) => tool.name !== questionTool
+  );
+  agentInputs.toolDefinitions = agentInputs.toolDefinitions?.filter(
+    (tool) => tool.name !== questionTool
+  );
+  if (agentInputs.toolMap?.has(questionTool) === true) {
+    agentInputs.toolMap = new Map(agentInputs.toolMap);
+    agentInputs.toolMap.delete(questionTool);
+  }
+  if (agentInputs.toolRegistry?.has(questionTool) === true) {
+    agentInputs.toolRegistry = new Map(agentInputs.toolRegistry);
+    agentInputs.toolRegistry.delete(questionTool);
+  }
+}
+
 /**
  * Factory that constructs a child graph for subagent execution. Injected
  * rather than imported so that `SubagentExecutor` does not have a runtime
@@ -1106,7 +1129,10 @@ export class SubagentExecutor {
         message: 'Maximum subagent nesting depth exceeded.',
       });
     }
-    if (this.humanInTheLoop?.enabled === true) {
+    if (
+      this.humanInTheLoop?.enabled === true &&
+      this.humanInTheLoop.backgroundPausePolicy === 'reject'
+    ) {
       return JSON.stringify({
         status: 'rejected',
         message:
@@ -1292,6 +1318,15 @@ export class SubagentExecutor {
       usageSink: this.usageSink,
       subagentContext: this.subagentContext,
       streamLimits: this.streamLimits,
+      humanInTheLoop:
+        this.humanInTheLoop?.enabled === true ||
+        this.humanInTheLoop?.backgroundPausePolicy === 'deny'
+          ? {
+            enabled: false,
+            backgroundPausePolicy: 'deny',
+            backgroundDeny: true,
+          }
+          : this.humanInTheLoop,
       maxDepth: this.maxDepth,
       createChildGraph:
         detachedGraphFactory == null
@@ -1337,6 +1372,27 @@ export class SubagentExecutor {
       }
       if (result.error != null) {
         throw new Error(result.error);
+      }
+      if (this.humanInTheLoop?.enabled === true) {
+        const deniedTools = new Set<string>();
+        for (const message of result.messages) {
+          if (
+            message instanceof ToolMessage &&
+            message.status === 'error' &&
+            typeof message.content === 'string' &&
+            message.content.startsWith('Blocked: Approval required for "') &&
+            message.name != null
+          ) {
+            deniedTools.add(message.name);
+            if (deniedTools.size >= 10) break;
+          }
+        }
+        if (deniedTools.size > 0) {
+          return {
+            ...result,
+            content: `${result.content}\nBackground approval denied for: ${[...deniedTools].join(', ')}. Ask the parent to run those tools in the foreground.`,
+          };
+        }
       }
       return result;
     } finally {
@@ -2489,6 +2545,11 @@ export class SubagentExecutor {
       parentMaxDepth: this.maxDepth,
       keepToolDefinitions: hasToolExecuteHandler,
     });
+    if (isBackgroundDenyMode(this.humanInTheLoop)) {
+      for (const agentInputs of childPlan.agents) {
+        excludeBackgroundQuestionTool(agentInputs);
+      }
+    }
     const childAgentId = childPlan.subjectAgentId;
     const currentHookSessionId =
       asNonEmptyString(params.hookSessionId) ??
@@ -2638,6 +2699,18 @@ export class SubagentExecutor {
       });
     }
     childGraph ??= this.createChildGraph(childGraphInput);
+    if (isBackgroundDenyMode(this.humanInTheLoop)) {
+      childGraph.humanInTheLoop = this.humanInTheLoop;
+      childGraph.eagerEventToolExecution = undefined;
+      // Never reuse the HITL parent's saver: its checkpoint namespace may
+      // contain parent messages. A private saver also lets an unexpected
+      // interrupt surface as a task error instead of a missing-saver tool
+      // error that the child could mistake for a completed task.
+      childGraph.compileOptions = {
+        ...childGraph.compileOptions,
+        checkpointer: new MemorySaver(),
+      };
+    }
     if (params.taskRuntime != null) {
       childGraph.hookRegistry = this.hookRegistry;
     }
@@ -2756,7 +2829,8 @@ export class SubagentExecutor {
         childConfigurable[SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY] = resumeAttemptId;
       }
       childConfigurable.thread_id =
-        this.humanInTheLoop?.enabled === true
+        this.humanInTheLoop?.enabled === true ||
+        isBackgroundDenyMode(this.humanInTheLoop)
           ? childThreadId
           : (inheritedConfigurable.thread_id ?? childRunId);
       const childInvokeConfig = {
@@ -2884,16 +2958,31 @@ export class SubagentExecutor {
             },
             sessionId: currentHookSessionId,
             matchQuery: subagentType,
-          }).catch((): AggregatedHookResult => HOOK_FALLBACK);
+          }).catch((): AggregatedHookResult =>
+            isBackgroundDenyMode(this.humanInTheLoop)
+              ? { ...HOOK_FALLBACK, hasHookFailures: true }
+              : HOOK_FALLBACK
+          );
 
-          if (hookResult.decision === 'deny' || hookResult.decision === 'ask') {
+          const policyFailed =
+            hookResult.hasHookFailures === true &&
+            isBackgroundDenyMode(this.humanInTheLoop);
+          if (
+            policyFailed ||
+            hookResult.decision === 'deny' ||
+            hookResult.decision === 'ask'
+          ) {
             this.clearChildGraph(childGraph);
             execution.releaseActiveRun();
             this.executions.remove(execution);
-            return {
-              content: `Blocked: ${hookResult.reason ?? 'Blocked by hook'}`,
-              messages: [],
-            };
+            return policyFailed
+              ? createSubagentFailure(
+                'Subagent start policy could not be evaluated; background execution denied.'
+              )
+              : {
+                content: `Blocked: ${hookResult.reason ?? 'Blocked by hook'}`,
+                messages: [],
+              };
           }
         }
         execution.markStarted();
@@ -2956,7 +3045,8 @@ export class SubagentExecutor {
           };
         }
       }
-    } catch (error) {
+    } catch (caught) {
+      let error = caught;
       /** Stamped at failure, not after the error-envelope work below. */
       const childTerminalAt = Date.now();
       /**
@@ -2971,6 +3061,11 @@ export class SubagentExecutor {
        * `cancelled` here.
        */
       const abortedBeforeError = childSignal.aborted;
+      if (isGraphInterrupt(error) && params.taskRuntime != null) {
+        error = new Error(
+          'Background subagent cannot pause for human input. Run the tool in the foreground.'
+        );
+      }
       if (isGraphInterrupt(error)) {
         const activeChildRun = execution.activeRun;
         if (activeChildRun != null) {

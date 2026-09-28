@@ -129,6 +129,26 @@ describe('ToolNode breaker signal composition', () => {
     expect(signal?.aborted).toBe(true);
   });
 
+  it('returns a stop instruction when a direct tool fails on a stopped run', async () => {
+    const controller = new AbortController();
+    const interrupted = createSignalBlindTool('edit_file', async () => {
+      controller.abort();
+      throw new DOMException('This operation was aborted', 'AbortError');
+    });
+    const node = new ToolNode({
+      tools: [interrupted],
+      getBreakerSignal: () => controller.signal,
+    });
+
+    const result = (await node.invoke({
+      messages: [createToolCallMessage('call_edit', 'edit_file')],
+    })) as { messages: ToolMessage[] };
+
+    expect(result.messages[0].status).toBe('error');
+    expect(result.messages[0].content).toContain('STOP what you are doing');
+    expect(result.messages[0].content).not.toContain('Please fix your mistakes');
+  });
+
   it('leaves the caller signal untouched when no breaker accessor is set', async () => {
     const caller = new AbortController();
     const { tool: capture, observed } = createSignalCaptureTool('capture');
