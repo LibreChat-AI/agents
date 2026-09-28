@@ -67,7 +67,8 @@ export function parseEnvelope(
       }
     );
   }
-  const unwrapped = responseKey != null && responseKey !== '' ? parsed[responseKey] : parsed;
+  const unwrapped =
+    responseKey != null && responseKey !== '' ? parsed[responseKey] : parsed;
   if (
     !isClassificationObject(unwrapped) ||
     !isClassificationObject(unwrapped.answers) ||
@@ -150,7 +151,9 @@ export function createHttpClassifier(
           try {
             payload = JSON.stringify({
               ...(model !== '' ? { model } : {}),
-              ...(requestKey != null && requestKey !== '' ? { [requestKey]: inner } : inner),
+              ...(requestKey != null && requestKey !== ''
+                ? { [requestKey]: inner }
+                : inner),
             });
           } catch {
             throw new ClassificationError(
