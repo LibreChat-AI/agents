@@ -16,7 +16,10 @@ test('workflow files have valid YAML and unique mapping keys', async () => {
 
   await Promise.all(
     files.map(async (file) => {
-      const source = await readFile(path.join(workflowsDirectory, file), 'utf8');
+      const source = await readFile(
+        path.join(workflowsDirectory, file),
+        'utf8'
+      );
       await assert.doesNotReject(format(source, { parser: 'yaml' }), file);
     })
   );
