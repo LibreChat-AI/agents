@@ -26,6 +26,8 @@ export enum GraphEvents {
   ON_MESSAGE_DELTA = 'on_message_delta',
   /** [Custom] Reasoning Delta events for messages */
   ON_REASONING_DELTA = 'on_reasoning_delta',
+  /** [Custom] Per-call handoff boundary between streamed tool preparation and execution */
+  ON_TOOL_CALLS_DISPATCHED = 'on_tool_calls_dispatched',
   /** [Custom] Request to execute tools - dispatched by ToolNode, handled by host */
   ON_TOOL_EXECUTE = 'on_tool_execute',
   /** [Custom] Emitted when the summarize node begins generating a summary */

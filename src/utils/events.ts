@@ -2,6 +2,7 @@
 // src/utils/events.ts
 import { dispatchCustomEvent } from '@langchain/core/callbacks/dispatch';
 import type { RunnableConfig } from '@langchain/core/runnables';
+import type { ToolCallsDispatchedEvent } from '@/types/stream';
 import type { ToolExecuteBatchRequest } from '@/types/tools';
 import type { AgentLogEvent } from '@/types/graph';
 import { traceHostToolResults } from '@/langfuse';
@@ -52,6 +53,22 @@ export async function safeDispatchCustomEvent(
     console.error('Error dispatching custom event:', e);
     return false;
   }
+}
+
+/** Builds an argument-free snapshot once per handoff, not once per result. */
+export function createToolCallsDispatchedEvent(
+  config: RunnableConfig,
+  calls: readonly Pick<
+    ToolExecuteBatchRequest['toolCalls'][number],
+    'id' | 'name' | 'stepId'
+  >[]
+): ToolCallsDispatchedEvent {
+  const runId = config.configurable?.run_id;
+  return {
+    dispatched_at: Date.now(),
+    ...(typeof runId === 'string' ? { runId } : {}),
+    toolCalls: calls.map(({ id, name, stepId }) => ({ id, name, stepId })),
+  };
 }
 
 /**

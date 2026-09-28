@@ -17,6 +17,7 @@ import type {
   RunStepDeltaEvent,
   RunStepResumeState,
   RunStepClosedEvent,
+  ToolCallsDispatchedEvent,
   MessageDeltaEvent,
   ReasoningDeltaEvent,
 } from '@/types/stream';
@@ -209,6 +210,7 @@ export interface EventHandler {
       | RunStep
       | RunStepDeltaEvent
       | RunStepClosedEvent
+      | ToolCallsDispatchedEvent
       | MessageDeltaEvent
       | ReasoningDeltaEvent
       | SummarizeStartEvent

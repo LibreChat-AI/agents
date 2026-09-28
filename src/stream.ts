@@ -55,13 +55,13 @@ import {
   calculateMaxToolResultChars,
   truncateToolResultContent,
 } from '@/utils/truncation';
+import { createToolCallsDispatchedEvent, safeDispatchCustomEvent } from '@/utils/events';
 import { resolveToolOutcome, outcomeFieldsFromResult } from '@/tools/intentArg';
-import { formatToolErrorContent } from '@/tools/toolErrorContent';
 import { snapshotValidatedModelChunk } from '@/graphs/acceptedModelResponse';
 import { TOOL_OUTPUT_REF_PATTERN } from '@/tools/toolOutputReferences';
+import { formatToolErrorContent } from '@/tools/toolErrorContent';
 import { PreparedSubagentError } from '@/tools/preparedSubagents';
 import { isReasoningContentBlock } from '@/messages/core';
-import { safeDispatchCustomEvent } from '@/utils/events';
 import { composeAbortSignals } from '@/utils/misc';
 import { isGoogleLike } from '@/utils/llm';
 import { getMessageId } from '@/messages';
@@ -871,6 +871,13 @@ function startEagerToolExecutions(args: {
       reject,
     };
 
+    if (graph.config != null) {
+      void safeDispatchCustomEvent(
+        GraphEvents.ON_TOOL_CALLS_DISPATCHED,
+        createToolCallsDispatchedEvent(graph.config, batchRequest.toolCalls),
+        graph.config
+      );
+    }
     void safeDispatchCustomEvent(
       GraphEvents.ON_TOOL_EXECUTE,
       batchRequest,

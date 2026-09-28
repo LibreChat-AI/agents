@@ -170,7 +170,7 @@ function stripHostExecutionConfig(
 }
 import { convertInjectedMessages } from '@/messages/injected';
 import { stampSyntheticProviderMessage } from '@/messages/provenance';
-import { safeDispatchCustomEvent } from '@/utils/events';
+import { createToolCallsDispatchedEvent, safeDispatchCustomEvent } from '@/utils/events';
 import { RunnableCallable, composeAbortSignals } from '@/utils';
 import {
   executeHooks,
@@ -1672,6 +1672,15 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     };
     this.throwIfBreakerTripped(config);
     config.signal?.throwIfAborted();
+    if (call.id != null && call.id !== '') {
+      void safeDispatchCustomEvent(
+        GraphEvents.ON_TOOL_CALLS_DISPATCHED,
+        createToolCallsDispatchedEvent(config, [
+          { id: call.id, name: call.name, stepId: this.toolCallStepIds?.get(call.id) },
+        ]),
+        config
+      );
+    }
     return tool.invoke(invokeParams, runtime);
   }
 
@@ -4410,6 +4419,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               ...(canEmitEarlyCompletions && { onResult }),
             };
 
+            void safeDispatchCustomEvent(
+              GraphEvents.ON_TOOL_CALLS_DISPATCHED,
+              createToolCallsDispatchedEvent(config, dispatchRequests),
+              config
+            );
             void safeDispatchCustomEvent(
               GraphEvents.ON_TOOL_EXECUTE,
               batchRequest,

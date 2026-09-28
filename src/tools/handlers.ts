@@ -32,6 +32,7 @@ export async function handleToolCallChunks({
   toolCallChunks: ToolCallChunk[];
   metadata?: Record<string, unknown>;
 }): Promise<void> {
+  const observedAt = Date.now();
   let prevStepId: string;
   let prevRunStep: t.RunStep | undefined;
   try {
@@ -124,7 +125,8 @@ export async function handleToolCallChunks({
       type: StepTypes.TOOL_CALLS,
       tool_calls: toolCallChunks,
     },
-    metadata
+    metadata,
+    observedAt
   );
 }
 

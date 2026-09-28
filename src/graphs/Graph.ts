@@ -766,7 +766,8 @@ export abstract class Graph<
   abstract dispatchRunStepDelta(
     id: string,
     delta: t.ToolCallDelta,
-    metadata?: Record<string, unknown>
+    metadata?: Record<string, unknown>,
+    observedAt?: number
   ): Promise<void>;
   abstract dispatchMessageDelta(
     id: string,
@@ -6130,7 +6131,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   async dispatchRunStepDelta(
     id: string,
     delta: t.ToolCallDelta,
-    metadata?: Record<string, unknown>
+    metadata?: Record<string, unknown>,
+    observedAt?: number
   ): Promise<void> {
     if (!this.config) {
       throw new Error('No config provided');
@@ -6140,6 +6142,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     const runStepDelta: t.RunStepDeltaEvent = {
       id,
       delta,
+      ...(observedAt != null && { observed_at: observedAt }),
     };
     const handler = this.handlerRegistry?.getHandler(
       GraphEvents.ON_RUN_STEP_DELTA
