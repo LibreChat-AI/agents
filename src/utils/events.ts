@@ -25,11 +25,13 @@ export async function safeDispatchCustomEvent(
         resolve: (
           results: Parameters<ToolExecuteBatchRequest['resolve']>[0]
         ): void => {
+          const receivedAt = Date.now();
+          const stamped = results.map((result) => ({ ...result, received_at: receivedAt }));
           void traceHostToolResults(request, results, config).then(
-            () => request.resolve(results),
+            () => request.resolve(stamped),
             () => {
               console.warn('Failed to record host tool execution metadata');
-              request.resolve(results);
+              request.resolve(stamped);
             }
           );
         },

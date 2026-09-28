@@ -700,6 +700,8 @@ export type OutcomePatch = {
 export type ToolExecuteResult = {
   /** Matches ToolCallRequest.id */
   toolCallId: string;
+  /** SDK-stamped result receipt time; never host-supplied or inferred from handler cleanup. */
+  received_at?: number;
   /** Tool output content */
   content: string | unknown[];
   /** Optional artifact (for content_and_artifact format) */

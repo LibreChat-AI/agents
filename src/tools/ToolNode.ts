@@ -4343,7 +4343,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       const dispatchRequestById = new Map(
         dispatchRequests.map((request) => [request.id, request])
       );
+      const receivedAtById = new Map<string, number>();
       const onResult = (result: t.ToolExecuteResult): void => {
+        const receivedAt = Date.now();
         /** Runtime-honest widening: hosts may omit the id despite the
          * field type. */
         const resultToolCallId = result.toolCallId as string | undefined;
@@ -4358,8 +4360,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           return;
         }
         earlyCompletionDispatchedIds.add(result.toolCallId);
+        receivedAtById.set(result.toolCallId, receivedAt);
         earlyCompletionDispatches.push(
-          this.dispatchEarlyToolCompletion(result, request, config).then(
+          this.dispatchEarlyToolCompletion({ ...result, received_at: receivedAt }, request, config).then(
             (dispatched) => {
               if (!dispatched) {
                 earlyCompletionDispatchedIds.delete(result.toolCallId);
@@ -4411,6 +4414,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
                   | undefined,
               signal: config.signal,
               resolve: (results): void => {
+                const receivedAt = Date.now();
+                for (const result of results) {
+                  if (dispatchRequestById.has(result.toolCallId)) {
+                    receivedAtById.set(result.toolCallId, result.received_at ?? receivedAt);
+                  }
+                }
                 resultSettled = true;
                 settledResults = results;
                 maybeResolve();
@@ -4709,7 +4718,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             request?.turn,
             resolveToolOutcome(request?.args, outcomeFieldsFromResult(result), {
               isError: result.status === 'error',
-            })
+            }),
+            receivedAtById.get(result.toolCallId) ?? result.received_at
           );
         }
 
@@ -5011,7 +5021,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     output: string,
     config: RunnableConfig,
     turn?: number,
-    outcome?: string
+    outcome?: string,
+    receivedAt?: number
   ): Promise<boolean> {
     const stepId = this.toolCallStepIds?.get(toolCallId) ?? '';
     if (!stepId) {
@@ -5038,7 +5049,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             progress: 1,
             ...(outcome != null && { outcome }),
           } as t.ProcessedToolCall,
-          completed_at: Date.now(),
+          completed_at: receivedAt ?? Date.now(),
         },
       },
       config
@@ -5078,7 +5089,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       request.turn,
       resolveToolOutcome(request.args, outcomeFieldsFromResult(result), {
         isError: result.status === 'error',
-      })
+      }),
+      result.received_at
     );
   }
 

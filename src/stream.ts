@@ -987,7 +987,7 @@ async function dispatchEagerToolCompletions(args: {
               progress: 1,
               ...(outcome != null && { outcome }),
             } as t.ProcessedToolCall,
-            completed_at: Date.now(),
+            completed_at: result.received_at ?? Date.now(),
           },
         },
         graph.config
@@ -1708,6 +1708,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
     // Callback delivery can beat the producer's iterator. Validate before
     // accounting, run steps, or eager dispatch reads raw tool descriptors.
     chunk = snapshotValidatedModelChunk(chunk as AIMessageChunk);
+    const observedAt = Date.now();
 
     /**
      * Enforced before every content-specific early return below
@@ -1930,6 +1931,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
         stepKey,
         toolCallChunks: chunk.tool_call_chunks,
         metadata,
+        observedAt,
       });
       if (canStreamEager) {
         if (runScopeInvalidated()) {

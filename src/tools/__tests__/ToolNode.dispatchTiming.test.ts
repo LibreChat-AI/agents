@@ -113,6 +113,35 @@ describe('tool dispatch timing', () => {
     expect(result.messages).toHaveLength(2);
   });
 
+  it('stamps the fallback host result at resolve, not after handler cleanup', async () => {
+    let now = 1_000;
+    jest.spyOn(Date, 'now').mockImplementation(() => now);
+    const completions: t.ToolCompleteEvent[] = [];
+    jest.spyOn(events, 'safeDispatchCustomEvent').mockImplementation(
+      async (event, data): Promise<void> => {
+        if (event === GraphEvents.ON_TOOL_EXECUTE) {
+          now = 1_200;
+          (data as t.ToolExecuteBatchRequest).resolve([
+            { toolCallId: 'fast', content: 'done', status: 'success' },
+          ]);
+          await Promise.resolve();
+          now = 8_000;
+        }
+        if (event === GraphEvents.ON_RUN_STEP_COMPLETED) {
+          completions.push((data as { result: t.ToolCompleteEvent }).result);
+        }
+      }
+    );
+    const node = new ToolNode({
+      tools: [makeTool('fast_tool')],
+      eventDrivenMode: true,
+      toolCallStepIds: new Map([['fast', 'step_fast']]),
+    });
+    await node.invoke({ messages: [message([{ id: 'fast', name: 'fast_tool' }])] });
+    expect(completions).toHaveLength(1);
+    expect(completions[0].completed_at).toBe(1_200);
+  });
+
   it('does not announce dispatch for a call denied before host execution', async () => {
     const starts: t.ToolCallsDispatchedEvent[] = [];
     const registry = new HookRegistry();

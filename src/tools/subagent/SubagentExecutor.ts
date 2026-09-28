@@ -3463,6 +3463,10 @@ export class SubagentExecutor {
           scheduleWrap(eventName, 'run_step', data, memberAgentId);
           return;
         }
+        if (eventName === GraphEvents.ON_TOOL_CALLS_DISPATCHED) {
+          scheduleWrap(eventName, 'tool_calls_dispatched', data, memberAgentId);
+          return;
+        }
         if (eventName === GraphEvents.ON_RUN_STEP_DELTA) {
           scheduleWrap(eventName, 'run_step_delta', data, memberAgentId);
           return;
@@ -3815,6 +3819,26 @@ export function sanitizeForwardedSubagentUpdateData(
   }
   if (eventName === GraphEvents.ON_RUN_STEP_DELTA) {
     return sanitizeRunStepDeltaUpdateData(data);
+  }
+  if (eventName === GraphEvents.ON_TOOL_CALLS_DISPATCHED) {
+    if (!isObjectLike(data)) return undefined;
+    const event = data as { dispatched_at?: number; toolCalls?: unknown };
+    if (!Array.isArray(event.toolCalls) || typeof event.dispatched_at !== 'number') {
+      return undefined;
+    }
+    return {
+      dispatched_at: event.dispatched_at,
+      toolCalls: (event.toolCalls as unknown[]).flatMap((call) => {
+        if (!isObjectLike(call)) return [];
+        const entry = call as Record<string, unknown>;
+        if (typeof entry.id !== 'string' || typeof entry.name !== 'string') return [];
+        return [{
+          id: entry.id,
+          name: entry.name,
+          ...(typeof entry.stepId === 'string' ? { stepId: entry.stepId } : {}),
+        }];
+      }),
+    };
   }
   if (eventName === GraphEvents.ON_RUN_STEP_COMPLETED) {
     return sanitizeRunStepCompletedUpdateData(data);

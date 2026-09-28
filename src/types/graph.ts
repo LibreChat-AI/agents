@@ -696,6 +696,7 @@ export type SubagentUpdatePhase =
   | 'start'
   | 'run_step'
   | 'run_step_delta'
+  | 'tool_calls_dispatched'
   | 'run_step_completed'
   | 'run_step_closed'
   | 'message_delta'

@@ -335,6 +335,49 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
     expect((completions[0].completed_at ?? 0) - starts[0].dispatched_at).toBe(40);
   });
 
+  it('timestamps a coalesced fragment before an awaited step and eager host dispatch', async () => {
+    let now = 1_000;
+    jest.spyOn(Date, 'now').mockImplementation(() => now);
+    const graph = createGraph();
+    const dispatchRunStep = graph.dispatchRunStep.bind(graph);
+    graph.dispatchRunStep = jest.fn<StandardGraph['dispatchRunStep']>(async (key, details, meta) => {
+      now = 1_900;
+      return dispatchRunStep(key, details, meta);
+    });
+    const dispatches: t.ToolCallsDispatchedEvent[] = [];
+    jest.spyOn(events, 'safeDispatchCustomEvent').mockImplementation(
+      async (event, data): Promise<void> => {
+        if (event === GraphEvents.ON_TOOL_CALLS_DISPATCHED) {
+          dispatches.push(data as t.ToolCallsDispatchedEvent);
+        }
+        if (event === GraphEvents.ON_TOOL_EXECUTE) {
+          (data as t.ToolExecuteBatchRequest).resolve([
+            { toolCallId: 'call_weather', status: 'success', content: 'sunny' },
+          ]);
+        }
+      }
+    );
+    await new ChatModelStreamHandler().handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      { chunk: {
+        content: '',
+        tool_calls: [{ id: 'call_weather', name: 'weather', args: { city: 'NYC' } }],
+        tool_call_chunks: [{ id: 'call_weather', name: 'weather', args: '{"city":"NYC"}', index: 0 }],
+        response_metadata: finalToolCallResponseMetadata,
+      } as unknown as t.StreamChunk },
+      { langgraph_node: 'agent' },
+      graph
+    );
+    expect(dispatches).toHaveLength(1);
+    expect(dispatches[0].dispatched_at).toBe(1_900);
+    expect(graph.dispatchRunStepDelta).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ type: StepTypes.TOOL_CALLS }),
+      { langgraph_node: 'agent' },
+      1_000
+    );
+  });
+
   it('captures normalized code-session identity before eager dispatch', async () => {
     const graph = createGraph({
       sessions: new Map([
