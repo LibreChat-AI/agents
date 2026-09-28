@@ -407,6 +407,26 @@ export interface HumanInTheLoopConfig {
    * UI is ready to render and resolve `tool_approval` interrupts.
    */
   enabled?: boolean;
+  /**
+   * Background children cannot pause for human input. `deny` (the default)
+   * lets them run but blocks tools whose hooks request approval, and excludes
+   * `ask_user_question`. `reject` preserves the legacy admission check.
+   * Durable deferred approvals require a separate resume implementation.
+   */
+  backgroundPausePolicy?: 'deny' | 'reject';
+  /** @internal Set only on detached children and their descendants, never on the parent run. */
+  backgroundDeny?: true;
+}
+
+/** True only on an SDK-created background child, not a foreground HITL run. */
+export function isBackgroundDenyMode(
+  config: HumanInTheLoopConfig | undefined
+): boolean {
+  return (
+    config?.backgroundDeny === true &&
+    config.enabled === false &&
+    config.backgroundPausePolicy === 'deny'
+  );
 }
 
 /**

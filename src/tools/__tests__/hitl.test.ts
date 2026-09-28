@@ -33,12 +33,13 @@ import type {
   StopHookOutput,
   UserPromptSubmitHookOutput,
 } from '@/hooks';
-import type * as t from '@/types';
 import type { ReplayableSubagentTool } from '@/tools/subagent/SubagentReplay';
+import type * as t from '@/types';
 import {
   TOOL_APPROVAL_REVIEW_CONFIG_KEY,
   createToolApprovalReviewEvidence,
 } from '@/hitl/approvalReview';
+import { TOOL_BATCH_REPLAY_KEY, getToolBatchReplayState } from '../toolBatchReplay';
 import {
   SUBAGENT_REPLAY_CONTROLLER,
 } from '@/tools/subagent/SubagentReplay';
@@ -50,7 +51,6 @@ import { HookRegistry, createToolPolicyHook } from '@/hooks';
 import * as events from '@/utils/events';
 import { askUserQuestion } from '@/hitl';
 import { ToolNode } from '../ToolNode';
-import { TOOL_BATCH_REPLAY_KEY, getToolBatchReplayState } from '../toolBatchReplay';
 
 async function flushAsyncWork(): Promise<void> {
   await Promise.resolve();
@@ -673,6 +673,150 @@ describe('ToolNode HITL — `ask` decision raises interrupt() when humanInTheLoo
     );
     expect(toolMessages).toHaveLength(1);
     expect(toolMessages[0].content).toBe('host-result');
+  });
+});
+
+describe('ToolNode HITL — background deny policy', () => {
+  it('blocks event-driven calls requesting approval with actionable feedback', async () => {
+    mockEventDispatch([]);
+    const dispatch = jest.spyOn(events, 'safeDispatchCustomEvent');
+    const node = new ToolNode({
+      tools: [createSchemaStub('write_file')],
+      eventDrivenMode: true,
+      agentId: 'agent-x',
+      toolCallStepIds: new Map([['call_write', 'step_write']]),
+      hookRegistry: makeHookRegistry('ask', 'write requires approval'),
+      humanInTheLoop: { enabled: false, backgroundPausePolicy: 'deny', backgroundDeny: true },
+    });
+    const graph = buildHITLGraph(node, [
+      { id: 'call_write', name: 'write_file', args: { command: 'write' } },
+    ]);
+
+    const result = (await graph.invoke(
+      { messages: [] },
+      {
+        configurable: { thread_id: 'background-deny-event' },
+      }
+    )) as { messages: BaseMessage[] };
+    const toolMessages = result.messages.filter(
+      (message): message is ToolMessage => message instanceof ToolMessage
+    );
+    expect(isInterrupted(result)).toBe(false);
+    expect(toolMessages).toHaveLength(1);
+    expect(toolMessages[0].status).toBe('error');
+    expect(toolMessages[0].content).toContain(
+      'Approval required for "write_file"'
+    );
+    expect(toolMessages[0].content).toContain('write requires approval');
+    expect(
+      dispatch.mock.calls.filter(([event]) => event === 'on_tool_execute')
+    ).toHaveLength(0);
+  });
+
+  it('blocks a direct tool requesting approval before its body runs', async () => {
+    const execute = jest.fn(async () => 'should not run');
+    const writeTool = tool(execute, {
+      name: 'write_file',
+      description: 'Writes files',
+      schema: z.object({ command: z.string() }),
+    });
+    const node = new ToolNode({
+      tools: [writeTool],
+      toolMap: new Map([['write_file', writeTool]]),
+      hookRegistry: makeHookRegistry('ask'),
+      humanInTheLoop: { enabled: false, backgroundPausePolicy: 'deny', backgroundDeny: true },
+    });
+    const graph = buildHITLGraph(node, [
+      { id: 'call_write', name: 'write_file', args: { command: 'write' } },
+    ]);
+
+    const result = (await graph.invoke(
+      { messages: [] },
+      {
+        configurable: { thread_id: 'background-deny-direct' },
+      }
+    )) as { messages: BaseMessage[] };
+    const toolMessages = result.messages.filter(
+      (message): message is ToolMessage => message instanceof ToolMessage
+    );
+    expect(isInterrupted(result)).toBe(false);
+    expect(toolMessages).toHaveLength(1);
+    expect(toolMessages[0].status).toBe('error');
+    expect(toolMessages[0].content).toContain(
+      'Approval required for "write_file"'
+    );
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('blocks event-dispatched tools if an approval hook fails', async () => {
+    mockEventDispatch([]);
+    const dispatch = jest.spyOn(events, 'safeDispatchCustomEvent');
+    const hooks = new HookRegistry();
+    hooks.register('PreToolUse', {
+      internal: true,
+      hooks: [
+        async () => { throw new Error('approval service unavailable'); },
+        async () => ({ decision: 'allow' }),
+      ],
+    });
+    const node = new ToolNode({
+      tools: [createSchemaStub('write_file')],
+      eventDrivenMode: true,
+      agentId: 'background',
+      hookRegistry: hooks,
+      humanInTheLoop: { enabled: false, backgroundPausePolicy: 'deny', backgroundDeny: true },
+    });
+    const graph = buildHITLGraph(node, [
+      { id: 'call_unavailable', name: 'write_file', args: { command: 'write' } },
+    ]);
+
+    const result = (await graph.invoke({ messages: [] }, {
+      configurable: { thread_id: 'background-hook-failure-event' },
+    })) as { messages: BaseMessage[] };
+    const toolMessages = result.messages.filter(
+      (message): message is ToolMessage => message instanceof ToolMessage
+    );
+    expect(toolMessages).toHaveLength(1);
+    expect(toolMessages[0].status).toBe('error');
+    expect(toolMessages[0].content).toContain('Approval policy could not be evaluated');
+    expect(dispatch.mock.calls.filter(([event]) => event === 'on_tool_execute')).toHaveLength(0);
+  });
+
+  it('blocks direct tools if an approval hook fails', async () => {
+    const execute = jest.fn(async () => 'should not run');
+    const writeTool = tool(execute, {
+      name: 'write_file',
+      description: 'Writes files',
+      schema: z.object({ command: z.string() }),
+    });
+    const hooks = new HookRegistry();
+    hooks.register('PreToolUse', {
+      internal: true,
+      hooks: [
+        async () => { throw new Error('approval service unavailable'); },
+        async () => ({ decision: 'allow' }),
+      ],
+    });
+    const node = new ToolNode({
+      tools: [writeTool],
+      toolMap: new Map([['write_file', writeTool]]),
+      hookRegistry: hooks,
+      humanInTheLoop: { enabled: false, backgroundPausePolicy: 'deny', backgroundDeny: true },
+    });
+    const graph = buildHITLGraph(node, [
+      { id: 'call_unavailable', name: 'write_file', args: { command: 'write' } },
+    ]);
+
+    const result = (await graph.invoke({ messages: [] }, {
+      configurable: { thread_id: 'background-hook-failure-direct' },
+    })) as { messages: BaseMessage[] };
+    const toolMessages = result.messages.filter(
+      (message): message is ToolMessage => message instanceof ToolMessage
+    );
+    expect(toolMessages).toHaveLength(1);
+    expect(toolMessages[0].status).toBe('error');
+    expect(toolMessages[0].content).toContain('Approval policy could not be evaluated');
+    expect(execute).not.toHaveBeenCalled();
   });
 });
 
