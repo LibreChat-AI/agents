@@ -47,6 +47,7 @@ import {
 import {
   createLangfuseTraceMetadata,
   createLangfuseHandler,
+  maskRedactedLabelGeneration,
   disposeLangfuseHandler,
   getLangfuseTraceName,
   isLangfuseCallbackHandler,
@@ -2663,22 +2664,21 @@ export class Run<_T extends t.BaseGraphState> {
         };
       }
     }
-    /** An active redaction policy suppresses free-form reasoning/intent, so
-     *  a reasoning-only block has nothing describable left — skip the model
-     *  call rather than paying for a label built from the prompt alone. */
-    const freeFormSuppressed =
-      redaction != null &&
-      (redaction.enabled === false || redaction.redactedToolNames.size > 0);
-    if (entries.length === 0 && freeFormSuppressed) {
-      return {};
-    }
-    const userPrompt = buildActivityLabelPrompt({
+    const labelEvidence = {
       entries,
       charLimit,
       thinkingExcerpts,
       lastAssistantText:
         lastAssistantPhase === 'final_answer' ? undefined : lastAssistantText,
       previousLabels,
+    };
+    const userPrompt = buildActivityLabelPrompt(labelEvidence);
+    maskRedactedLabelGeneration(labelLangfuseHandler, {
+      modelPrompt: userPrompt,
+      tracedPrompt:
+        redaction == null
+          ? userPrompt
+          : buildActivityLabelPrompt({ ...labelEvidence, redaction }),
       redaction,
     });
 
@@ -2983,17 +2983,25 @@ export class Run<_T extends t.BaseGraphState> {
         reasoningContext?.langfuse
       )
       : undefined;
-    const userPrompt = buildReasoningLabelPrompt({
+    const reasoningEvidence = {
       visibleReasoning,
       status,
       charLimit,
       previousLabel,
-      redaction,
-    });
+    };
+    const userPrompt = buildReasoningLabelPrompt(reasoningEvidence);
     if (userPrompt === '') {
       await disposeLangfuseHandler(reasoningLangfuseHandler);
       return {};
     }
+    maskRedactedLabelGeneration(reasoningLangfuseHandler, {
+      modelPrompt: userPrompt,
+      tracedPrompt:
+        redaction == null
+          ? userPrompt
+          : buildReasoningLabelPrompt({ ...reasoningEvidence, redaction }),
+      redaction,
+    });
 
     const model = initializeModel({
       provider,
@@ -3180,13 +3188,13 @@ export class Run<_T extends t.BaseGraphState> {
       };
     }
 
-    const userPrompt = buildActivityPhaseLabelPrompt({
+    const phaseEvidence = {
       activities,
       totalActivityCount,
       charLimit,
       assistantContext,
-      redaction,
-    });
+    };
+    const userPrompt = buildActivityPhaseLabelPrompt(phaseEvidence);
     if (userPrompt === '') {
       return {};
     }
@@ -3305,6 +3313,14 @@ export class Run<_T extends t.BaseGraphState> {
         traceName: phaseParentSpanContext == null ? phaseTraceName : undefined,
       });
     }
+    maskRedactedLabelGeneration(phaseLangfuseHandler, {
+      modelPrompt: userPrompt,
+      tracedPrompt:
+        redaction == null
+          ? userPrompt
+          : buildActivityPhaseLabelPrompt({ ...phaseEvidence, redaction }),
+      redaction,
+    });
     if (phaseLangfuseHandler != null) {
       phaseChainOptions.callbacks = appendCallbacks(
         phaseChainOptions.callbacks,

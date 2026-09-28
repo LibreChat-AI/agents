@@ -1,7 +1,11 @@
 import { tool } from '@langchain/core/tools';
 import { CallbackHandler } from '@langfuse/langchain';
 import { LangfuseOtelContextKeys } from '@langfuse/core';
-import { AIMessage, AIMessageChunk } from '@langchain/core/messages';
+import {
+  AIMessage,
+  HumanMessage,
+  AIMessageChunk,
+} from '@langchain/core/messages';
 import { isGraphInterrupt, isParentCommand } from '@langchain/langgraph';
 import { context as otelContext, trace as otelTrace } from '@opentelemetry/api';
 import {
@@ -67,6 +71,13 @@ const GRAPH_INTERRUPT_TOOL_OUTPUT = JSON.stringify(
 
 export type LangfuseTraceMetadata = Record<string, string>;
 export type LangfuseTraceAttributes = Record<string, string | number | boolean>;
+
+/**
+ * What a label call's Langfuse generation records in place of the prompt the
+ * model received and the text it returned, when the model saw evidence the
+ * tool-output redaction policy keeps out of traces.
+ */
+export type LangfuseGenerationMask = { input: string; output: string };
 type LangfuseMetadata = NonNullable<t.LangfuseConfig['metadata']>;
 type LangfuseConfigTraceAttributes = NonNullable<
   t.LangfuseConfig['librechatTraceAttributes']
@@ -310,6 +321,7 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
   private readonly identity: HandlerIdentity;
   private readonly toolOutputTracing?: ResolvedLangfuseToolOutputTracingConfig;
   private readonly trackedRunIds = new Set<string>();
+  private generationMask?: LangfuseGenerationMask;
   private deferredRootStarted = false;
   private deferredRootOutcome:
     | {
@@ -607,10 +619,54 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
   ): ReturnType<CallbackHandler['handleChainEnd']> {
     const [output, runId, parentRunId] = args;
     if (runId === this.deferredRootRunId && parentRunId == null) {
-      this.deferredRootOutcome = { type: 'end', output };
+      this.deferredRootOutcome = {
+        type: 'end',
+        output: this.maskOutputs(output),
+      };
       return Promise.resolve();
     }
+    args[0] = this.maskOutputs(output);
     return super.handleChainEnd(...args);
+  }
+
+  /** Keeps usage and response metadata so cost tracking survives the mask. */
+  private maskGenerations(output: LLMResult): LLMResult {
+    const mask = this.generationMask;
+    if (mask == null) {
+      return output;
+    }
+    return {
+      ...output,
+      generations: output.generations.map((generations) =>
+        generations.map((generation) => {
+          if (!('message' in generation) || generation.message == null) {
+            return { ...generation, text: mask.output };
+          }
+          const message = generation.message as AIMessage;
+          return {
+            ...generation,
+            text: mask.output,
+            message: new AIMessage({
+              content: mask.output,
+              usage_metadata: message.usage_metadata,
+              response_metadata: message.response_metadata,
+            }),
+          };
+        })
+      ),
+    };
+  }
+
+  private maskOutputs(
+    output: Parameters<CallbackHandler['handleChainEnd']>[0]
+  ): Parameters<CallbackHandler['handleChainEnd']>[0] {
+    const mask = this.generationMask;
+    return mask == null ? output : { output: mask.output };
+  }
+
+  /** Records `mask` for every model call and chain result this handler traces. */
+  maskGeneration(mask: LangfuseGenerationMask): void {
+    this.generationMask = mask;
   }
 
   async finishDeferredRoot(): Promise<void> {
@@ -650,6 +706,13 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
   override handleChatModelStart(
     ...args: Parameters<CallbackHandler['handleChatModelStart']>
   ): ReturnType<CallbackHandler['handleChatModelStart']> {
+    const mask = this.generationMask;
+    if (mask != null) {
+      args[1] = args[1].map((messages) => [
+        ...messages.filter((message) => message.getType() === 'system'),
+        new HumanMessage(mask.input),
+      ]);
+    }
     return this.withRuntimeContext(
       () => super.handleChatModelStart(...args),
       this.startsDetachedRun(args[2], args[3]),
@@ -660,6 +723,10 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
   override handleLLMStart(
     ...args: Parameters<CallbackHandler['handleLLMStart']>
   ): ReturnType<CallbackHandler['handleLLMStart']> {
+    const mask = this.generationMask;
+    if (mask != null) {
+      args[1] = args[1].map(() => mask.input);
+    }
     return this.withRuntimeContext(
       () => super.handleLLMStart(...args),
       this.startsDetachedRun(args[2], args[3]),
@@ -673,7 +740,7 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
     parentRunId?: string
   ): Promise<void> {
     return super.handleLLMEnd(
-      normalizeBedrockUsageForLangfuse(output),
+      this.maskGenerations(normalizeBedrockUsageForLangfuse(output)),
       runId,
       parentRunId
     );
@@ -935,6 +1002,36 @@ export function createLegacyLangfuseHandler(
   params: LangfuseHandlerParams
 ): CallbackHandler {
   return new ScopedLangfuseCallbackHandler(params);
+}
+
+/**
+ * Label calls send the model every piece of evidence. When the redacted copy
+ * differs, the trace records that copy and hides the reply, which may restate
+ * what was redacted. A no-op for any callback other than a label handler.
+ */
+export function maskRedactedLabelGeneration(
+  handler: unknown,
+  {
+    modelPrompt,
+    tracedPrompt,
+    redaction,
+  }: {
+    modelPrompt: string;
+    tracedPrompt: string;
+    redaction?: ResolvedLangfuseToolOutputTracingConfig;
+  }
+): void {
+  if (
+    !(handler instanceof ScopedLangfuseCallbackHandler) ||
+    redaction == null ||
+    tracedPrompt === modelPrompt
+  ) {
+    return;
+  }
+  handler.maskGeneration({
+    input: tracedPrompt === '' ? redaction.redactionText : tracedPrompt,
+    output: redaction.redactionText,
+  });
 }
 
 export function createLangfuseHandler({
