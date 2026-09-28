@@ -193,7 +193,7 @@ describe('generateActivityPhaseLabel', () => {
     expect(retryCallbacks.handlers).toHaveLength(0);
   });
 
-  it('applies every agent redaction policy when any activity is unattributed', async () => {
+  it('sends every agent\'s evidence to the model when an activity is unattributed', async () => {
     const run = await Run.create({
       runId: 'mixed-attribution-phase-run',
       graphConfig: {
@@ -236,14 +236,15 @@ describe('generateActivityPhaseLabel', () => {
       ],
     });
 
+    /** Tool-output redaction governs tool-call observations, not label evidence. */
     const messages = invoke.mock.calls[0][0] as AIMessage[];
-    expect(String(messages[1].content)).not.toContain('STRICT_AGENT_SECRET');
-    expect(String(messages[1].content)).toContain(
+    expect(String(messages[1].content)).toContain('STRICT_AGENT_SECRET');
+    expect(String(messages[1].content)).not.toContain(
       LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT
     );
   });
 
-  it('applies every policy when omitted activities have no complete agent list', async () => {
+  it('keeps assistant context for the model when omitted activities have no agent list', async () => {
     const run = await Run.create({
       runId: 'omitted-attribution-phase-run',
       graphConfig: {
@@ -300,7 +301,7 @@ describe('generateActivityPhaseLabel', () => {
     });
 
     const messages = invoke.mock.calls[0][0] as AIMessage[];
-    expect(String(messages[1].content)).not.toContain('OMITTED_AGENT_SECRET');
+    expect(String(messages[1].content)).toContain('OMITTED_AGENT_SECRET');
     expect(String(messages[1].content)).toContain('public-one');
   });
 });

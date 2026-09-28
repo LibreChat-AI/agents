@@ -69,11 +69,7 @@ import {
   stripToolBatchReplayState,
   getPublicToolInterruptPayload,
 } from '@/tools/toolBatchReplay';
-import {
-  hasToolOutputTracingConfig,
-  resolveLangfuseConfig,
-  resolveToolOutputTracingConfig,
-} from '@/langfuseConfig';
+import { resolveLangfuseConfig } from '@/langfuseConfig';
 import {
   cloneToolApprovalInterruptPayload,
   TOOL_APPROVAL_REVIEW_CONFIG_KEY,
@@ -2621,57 +2617,8 @@ export class Run<_T extends t.BaseGraphState> {
       );
     }
 
-    /** The label prompt becomes Langfuse generation input, so the resolved
-     *  tool-output redaction policy (global disable / redactedToolNames)
-     *  applies to it exactly as to structured tool observations. */
-    let redaction = hasToolOutputTracingConfig(
-      this.langfuse,
-      labelContext?.langfuse
-    )
-      ? resolveToolOutputTracingConfig(this.langfuse, labelContext?.langfuse)
-      : undefined;
-    /** Multi-agent graph with no `agentId`: the caller did not say WHICH
-     *  agent ran this batch, so resolving from the default agent could trace
-     *  raw output that a stricter sibling's policy forbids. Fold every
-     *  agent's policy into the strictest one instead of guessing. */
-    const agentContexts = this.Graph?.agentContexts;
-    if (agentId == null && agentContexts != null && agentContexts.size > 1) {
-      for (const context of agentContexts.values()) {
-        if (!hasToolOutputTracingConfig(this.langfuse, context.langfuse)) {
-          continue;
-        }
-        const candidate = resolveToolOutputTracingConfig(
-          this.langfuse,
-          context.langfuse
-        );
-        if (redaction == null) {
-          redaction = candidate;
-          continue;
-        }
-        redaction = {
-          enabled: redaction.enabled === false ? false : candidate.enabled,
-          redactedToolNames: new Set([
-            ...redaction.redactedToolNames,
-            ...candidate.redactedToolNames,
-          ]),
-          redactedToolNameMatchMode:
-            redaction.redactedToolNameMatchMode === 'partial' ||
-            candidate.redactedToolNameMatchMode === 'partial'
-              ? 'partial'
-              : 'exact',
-          redactionText: redaction.redactionText,
-        };
-      }
-    }
-    /** An active redaction policy suppresses free-form reasoning/intent, so
-     *  a reasoning-only block has nothing describable left — skip the model
-     *  call rather than paying for a label built from the prompt alone. */
-    const freeFormSuppressed =
-      redaction != null &&
-      (redaction.enabled === false || redaction.redactedToolNames.size > 0);
-    if (entries.length === 0 && freeFormSuppressed) {
-      return {};
-    }
+    /** Tool-output redaction applies to tool-call observations, not to the
+     *  label model's evidence, so the label is written from the full batch. */
     const userPrompt = buildActivityLabelPrompt({
       entries,
       charLimit,
@@ -2679,7 +2626,6 @@ export class Run<_T extends t.BaseGraphState> {
       lastAssistantText:
         lastAssistantPhase === 'final_answer' ? undefined : lastAssistantText,
       previousLabels,
-      redaction,
     });
 
     const model = initializeModel({
@@ -2974,21 +2920,11 @@ export class Run<_T extends t.BaseGraphState> {
       );
     }
 
-    const redaction = hasToolOutputTracingConfig(
-      this.langfuse,
-      reasoningContext?.langfuse
-    )
-      ? resolveToolOutputTracingConfig(
-        this.langfuse,
-        reasoningContext?.langfuse
-      )
-      : undefined;
     const userPrompt = buildReasoningLabelPrompt({
       visibleReasoning,
       status,
       charLimit,
       previousLabel,
-      redaction,
     });
     if (userPrompt === '') {
       await disposeLangfuseHandler(reasoningLangfuseHandler);
@@ -3107,12 +3043,6 @@ export class Run<_T extends t.BaseGraphState> {
     }
 
     const phaseSeq = ++this.activityPhaseLabelSeq;
-    const hasUnattributedActivity = activities.some(
-      (activity) => activity.agentId == null
-    );
-    const hasOmittedActivitiesWithoutAgentIds =
-      agentIds == null &&
-      (totalActivityCount ?? activities.length) > activities.length;
     const contributingAgentIds = [
       ...new Set([
         ...(agentIds ?? []),
@@ -3138,54 +3068,11 @@ export class Run<_T extends t.BaseGraphState> {
       phaseContext?.langfuse
     );
 
-    let redaction = hasToolOutputTracingConfig(
-      this.langfuse,
-      phaseContext?.langfuse
-    )
-      ? resolveToolOutputTracingConfig(this.langfuse, phaseContext?.langfuse)
-      : undefined;
-    const redactionContexts =
-      contributingAgentIds.length > 0 &&
-      !hasUnattributedActivity &&
-      !hasOmittedActivitiesWithoutAgentIds
-        ? contributingAgentIds.flatMap((agentId) => {
-          const context = agentContexts?.get(agentId);
-          return context == null ? [] : [context];
-        })
-        : Array.from(agentContexts?.values() ?? []);
-    for (const context of redactionContexts) {
-      if (!hasToolOutputTracingConfig(this.langfuse, context.langfuse)) {
-        continue;
-      }
-      const candidate = resolveToolOutputTracingConfig(
-        this.langfuse,
-        context.langfuse
-      );
-      if (redaction == null) {
-        redaction = candidate;
-        continue;
-      }
-      redaction = {
-        enabled: redaction.enabled === false ? false : candidate.enabled,
-        redactedToolNames: new Set([
-          ...redaction.redactedToolNames,
-          ...candidate.redactedToolNames,
-        ]),
-        redactedToolNameMatchMode:
-          redaction.redactedToolNameMatchMode === 'partial' ||
-          candidate.redactedToolNameMatchMode === 'partial'
-            ? 'partial'
-            : 'exact',
-        redactionText: redaction.redactionText,
-      };
-    }
-
     const userPrompt = buildActivityPhaseLabelPrompt({
       activities,
       totalActivityCount,
       charLimit,
       assistantContext,
-      redaction,
     });
     if (userPrompt === '') {
       return {};
