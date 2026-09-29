@@ -33,8 +33,8 @@ export function validateClassificationQuestions(
       }
     );
   }
-  const entries = Object.entries(questions);
-  if (entries.length === 0) {
+  const supplied = Object.entries(questions);
+  if (supplied.length === 0) {
     throw new ClassificationError(
       'bad_request',
       'classifier requires questions',
@@ -43,7 +43,8 @@ export function validateClassificationQuestions(
       }
     );
   }
-  for (const [id, question] of entries) {
+  const entries: Array<[string, ClassificationQuestion]> = [];
+  for (const [id, question] of supplied) {
     if (
       !validQuestionId(id) ||
       !isClassificationObject(question) ||
@@ -61,6 +62,22 @@ export function validateClassificationQuestions(
           provider,
         }
       );
+    }
+    if (question.type === 'choice') {
+      entries.push([id, { ...question, criteria: { ...question.criteria } }]);
+    } else if (question.type === 'score') {
+      entries.push([id, { ...question, criteria: [...question.criteria] }]);
+    } else {
+      entries.push([
+        id,
+        {
+          ...question,
+          ...(question.criteria !== null &&
+          typeof question.criteria === 'object'
+            ? { criteria: { ...question.criteria } }
+            : {}),
+        },
+      ]);
     }
   }
   return entries;

@@ -156,6 +156,21 @@ export function readAnswer(
   ) {
     return null;
   }
+  if (probabilities !== null) {
+    let weightedScore = 0;
+    let levels = 0;
+    for (const [level, probability] of Object.entries(probabilities)) {
+      weightedScore += Number(level) * probability;
+      levels += 1;
+    }
+    const roundingTolerance = Math.min(
+      0.02,
+      0.00005 * (1 + (levels * (levels - 1)) / 2) + 0.001
+    );
+    if (Math.abs(record.score - weightedScore) > roundingTolerance) {
+      return null;
+    }
+  }
   return {
     type: 'score',
     score: record.score,

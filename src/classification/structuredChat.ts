@@ -13,12 +13,80 @@ import {
 } from './types';
 import { validateClassificationQuestions } from './questions';
 import { CLASSIFICATION_PROMPT_PREFIX } from './traceMarker';
+import { failureForStatus, retryAfterMs } from './transport';
 import { withClassificationDeadline } from './deadline';
 
 const MAX_QUESTIONS = 32;
 const MAX_CHOICE_OPTIONS = 128;
 const DEFAULT_TIMEOUT_MS = 20_000;
 const PROVIDER_ID = 'structured-chat';
+
+function readChatUsage(raw: unknown): ClassificationResult['usage'] {
+  if (!isClassificationObject(raw)) {
+    return null;
+  }
+  const usage = readClassificationUsage(raw.usage_metadata);
+  const response = isClassificationObject(raw.response_metadata)
+    ? raw.response_metadata
+    : null;
+  const nested = isClassificationObject(response?.metadata)
+    ? response.metadata
+    : null;
+  const bedrock = isClassificationObject(nested?.usage)
+    ? nested.usage
+    : response?.usage;
+  if (
+    usage?.inputTokens === undefined ||
+    !isClassificationObject(bedrock) ||
+    usage.inputTokens !== bedrock.inputTokens
+  ) {
+    return usage;
+  }
+  const read = bedrock.cacheReadInputTokens;
+  const write = bedrock.cacheWriteInputTokens;
+  if (
+    (read != null &&
+      (typeof read !== 'number' || !Number.isSafeInteger(read) || read < 0)) ||
+    (write != null &&
+      (typeof write !== 'number' || !Number.isSafeInteger(write) || write < 0))
+  ) {
+    return usage;
+  }
+  const inputTokens =
+    usage.inputTokens +
+    (typeof read === 'number' ? read : 0) +
+    (typeof write === 'number' ? write : 0);
+  return Number.isSafeInteger(inputTokens) ? { ...usage, inputTokens } : usage;
+}
+
+function providerFailure(
+  error: unknown,
+  provider: string
+): ClassificationError {
+  const details = isClassificationObject(error) ? error : null;
+  const metadata = isClassificationObject(details?.$metadata)
+    ? details.$metadata
+    : null;
+  const rawStatus =
+    details?.status ?? details?.statusCode ?? metadata?.httpStatusCode;
+  const status =
+    typeof rawStatus === 'number' &&
+    Number.isInteger(rawStatus) &&
+    rawStatus >= 100 &&
+    rawStatus <= 599
+      ? rawStatus
+      : undefined;
+  const classified = new ClassificationError(
+    status == null ? 'network' : failureForStatus(status),
+    'structured classifier request failed',
+    { provider, status }
+  );
+  const headers = details?.headers;
+  if (headers instanceof Headers) {
+    classified.retryAfterMs = retryAfterMs(headers.get('retry-after'));
+  }
+  return classified;
+}
 
 export interface StructuredChatClassifierOptions {
   /** An already configured chat model whose chosen method enforces strict schemas. */
@@ -223,7 +291,7 @@ export function createStructuredChatClassifier(
               CLASSIFICATION_PROMPT_PREFIX +
               JSON.stringify({
                 state: request.state,
-                questions: request.questions,
+                questions: Object.fromEntries(entries),
               });
           } catch {
             throw new ClassificationError(
@@ -269,22 +337,13 @@ export function createStructuredChatClassifier(
             if (error instanceof ClassificationError) {
               throw error;
             }
-            throw new ClassificationError(
-              'network',
-              'structured classifier request failed',
-              {
-                provider,
-              }
-            );
+            throw providerFailure(error, provider);
           }
           const answers = readDecisions(output.parsed, entries, provider);
-          const rawUsage = isClassificationObject(output.raw)
-            ? output.raw.usage_metadata
-            : null;
           const result: ClassificationResult = {
             model: modelId,
             answers,
-            usage: readClassificationUsage(rawUsage),
+            usage: readChatUsage(output.raw),
           };
           await waitFor(Promise.resolve());
           try {

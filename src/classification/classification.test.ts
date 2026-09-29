@@ -185,6 +185,24 @@ describe('classification dialect', () => {
       readAnswer({ type: 'score', score: NaN }, 'systemone', score)
     ).toBeNull();
     expect(readAnswer({ type: 'choice', choice: 7 }, 'systemone')).toBeNull();
+    expect(
+      readAnswer(
+        { type: 'score', score: 0, probabilities: { '0': 0, '1': 0, '2': 1 } },
+        'systemone',
+        score
+      )
+    ).toBeNull();
+    expect(
+      readAnswer(
+        {
+          type: 'score',
+          score: 1.6,
+          probabilities: { '0': 0.1, '1': 0.2, '2': 0.7 },
+        },
+        'systemone',
+        score
+      )
+    ).toMatchObject({ type: 'score', score: 1.6 });
     const manyProbabilities = Object.fromEntries(
       Array.from({ length: 2000 }, (_, index) => [`k${index}`, 0])
     );
@@ -271,7 +289,7 @@ describe('HTTP classifier', () => {
             is_test: { type: 'noul', noul: 0.02 },
             severity: {
               type: 'score',
-              score: 1.7,
+              score: 1.6,
               probabilities: { '0': 0.1, '1': 0.2, '2': 0.7 },
             },
           },
@@ -326,11 +344,66 @@ describe('HTTP classifier', () => {
     });
     expect(result.answers.severity).toEqual({
       type: 'score',
-      score: 1.7,
+      score: 1.6,
       confidence: null,
       probabilities: { '0': 0.1, '1': 0.2, '2': 0.7 },
     });
     expect(result.usage).toEqual({ inputTokens: 10, outputTokens: 1 });
+  });
+
+  it('validates against the question sent, not a caller mutation during fetch', async () => {
+    let reply: ((response: Response) => void) | undefined;
+    let requested: (() => void) | undefined;
+    const sent = new Promise<void>((resolve) => {
+      requested = resolve;
+    });
+    const pending = new Promise<Response>((resolve) => {
+      reply = resolve;
+    });
+    let payload = '';
+    const fetch: ClassificationFetch = async (_url, init) => {
+      payload = init.body;
+      requested?.();
+      return pending;
+    };
+    const classifier = createHttpClassifier({
+      endpoint: 'https://s1.example/v1/systemone',
+      apiKey: 'k',
+      dialect: 'systemone',
+      fetch,
+    });
+    const pick = choiceQuestion('Pick?', { first: 'First', second: 'Second' });
+    const questions = { pick };
+    const resultPromise = classifier.classify({ state: 'hello', questions });
+    await sent;
+    Object.assign(pick, { type: 'boolean' });
+    delete pick.criteria.first;
+    pick.criteria.third = 'Third';
+    reply?.(
+      new Response(
+        JSON.stringify({
+          answers: {
+            pick: {
+              type: 'choice',
+              choice: 'first',
+              probabilities: { first: 0.8, second: 0.2 },
+            },
+          },
+        })
+      )
+    );
+    expect((await resultPromise).answers.pick).toMatchObject({
+      type: 'choice',
+      choice: 'first',
+    });
+    expect(JSON.parse(payload)).toMatchObject({
+      questions: {
+        pick: {
+          type: 'choice',
+          criteria: { first: 'First', second: 'Second' },
+        },
+      },
+    });
   });
 
   it('sends the same wire format to unauthenticated Laya without pinning a model', async () => {

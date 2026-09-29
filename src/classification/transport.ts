@@ -41,7 +41,7 @@ export type Transport = <T>(
   timeoutOverrideMs?: number
 ) => Promise<T>;
 
-function failureForStatus(
+export function failureForStatus(
   status: number
 ): 'unauthorized' | 'rate_limited' | 'server_error' | 'bad_request' {
   if (status === 401 || status === 403) {
@@ -56,7 +56,7 @@ function failureForStatus(
   return 'bad_request';
 }
 
-function retryAfterMs(header: string | null): number | undefined {
+export function retryAfterMs(header: string | null): number | undefined {
   if (header == null || header === '') {
     return undefined;
   }
