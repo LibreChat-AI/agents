@@ -29,8 +29,8 @@ import type {
   MessageContentReasoningBlock,
 } from '../types';
 import { serializeStructuredValueBounded } from '@/utils/toolContent';
-import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
 import { isReasoningContentBlock } from '@/messages/reasoningTypes';
+import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
 
 /**
  * Reasoning blocks from other providers, relative to Bedrock. Bedrock's native
@@ -736,9 +736,7 @@ function convertAIMessageToConverseMessage(
   } else if (Array.isArray(msg.content)) {
     const parsedToolCallIds = new Set(
       isAIMessage(msg)
-        ? (msg.tool_calls ?? []).flatMap((toolCall) =>
-          toolCall.id != null ? [toolCall.id] : []
-        )
+        ? (msg.tool_calls ?? []).flatMap(({ id }) => id ?? [])
         : []
     );
     const concatenatedBlocks = concatenateLangchainReasoningBlocks(
@@ -1144,13 +1142,23 @@ export interface ConvertToConverseMessagesOptions {
  * models reject an assistant turn that carries it (OpenAI GPT: "This model doesn't support the
  * reasoningContent.reasoningText.text field for assistant messages"), so a handoff or model
  * switch from Claude to another Bedrock model fails on its first request. A model that can't be
- * identified (none given, or an ARN) keeps the reasoning, as before.
+ * identified (none given, or an opaque resource ARN) keeps the reasoning, as before.
  */
 export function replaysBedrockReasoning(model?: string): boolean {
-  if (model == null || model === '' || model.startsWith('arn:')) {
+  if (model == null || model === '') {
     return true;
   }
-  const id = model.toLowerCase();
+  let id = model.toLowerCase();
+  if (id.startsWith('arn:')) {
+    const modelId =
+      /^arn:[^:]+:bedrock:[^:]*:[^:]*:(?:foundation-model|inference-profile)\/(.+)$/.exec(
+        id
+      )?.[1];
+    if (modelId == null) {
+      return true;
+    }
+    id = modelId;
+  }
   return id.includes('anthropic') || id.includes('claude');
 }
 
