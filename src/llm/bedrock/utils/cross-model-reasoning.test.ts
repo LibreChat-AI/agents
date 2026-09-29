@@ -188,7 +188,7 @@ describe.each([
         new HumanMessage('How much stock is left?'),
         new AIMessage({
           content: [reasoningBlocks[format]],
-          response_metadata: { output_version: format },
+          response_metadata: format === 'v1' ? { output_version: 'v1' } : {},
           tool_calls: [
             { id: 'stock_call', name: 'stock', args: {}, type: 'tool_call' },
           ],
