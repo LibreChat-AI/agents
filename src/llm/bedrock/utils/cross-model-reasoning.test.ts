@@ -164,8 +164,54 @@ describe('convertToConverseMessages â€” cross-model reasoning (Bedrock Claude â†
   });
 });
 
+describe.each([
+  'deepseek.v3.2',
+  'moonshot.kimi-k2-thinking',
+  'qwen.qwen3-32b-v1:0',
+  'us.amazon.nova-2-lite-v1:0',
+  'global.xai.grok-4.6',
+  'arn:aws:bedrock:us-east-1::foundation-model/deepseek.r1-v1:0',
+  'arn:aws:bedrock:us-east-1:123456789012:inference-profile/global.moonshotai.kimi-k3',
+])('unchanged reasoning replay for %s', (model) => {
+  it.each(['native', 'v1'] as const)(
+    'preserves %s reasoning and tool calls in a tool loop',
+    (format) => {
+      const reasoningText = 'Check stock before answering.';
+      const reasoningBlocks = {
+        native: {
+          type: 'reasoning_content',
+          reasoningText: { text: reasoningText },
+        },
+        v1: { type: 'reasoning', reasoning: reasoningText },
+      };
+      const messages: BaseMessage[] = [
+        new HumanMessage('How much stock is left?'),
+        new AIMessage({
+          content: [reasoningBlocks[format]],
+          response_metadata: { output_version: format },
+          tool_calls: [
+            { id: 'stock_call', name: 'stock', args: {}, type: 'tool_call' },
+          ],
+        }),
+        new ToolMessage({ tool_call_id: 'stock_call', content: '10 units' }),
+      ];
+      const [turn] = assistantTurns(
+        convertToConverseMessages(messages, { model })
+      );
+
+      expect(turn[0].reasoningContent).toEqual({
+        reasoningText: { text: reasoningText },
+      });
+      expect(turn[1].toolUse).toMatchObject({
+        toolUseId: 'stock_call',
+        name: 'stock',
+      });
+    }
+  );
+});
+
 describe('replaysBedrockReasoning', () => {
-  it('replays reasoning only to Claude, or when the model is unknown', () => {
+  it('only suppresses reasoning for identified OpenAI targets', () => {
     expect(replaysBedrockReasoning('eu.anthropic.claude-sonnet-5')).toBe(true);
     expect(
       replaysBedrockReasoning('anthropic.claude-3-7-sonnet-20250219-v1:0')
@@ -179,13 +225,15 @@ describe('replaysBedrockReasoning', () => {
     ).toBe(true);
     expect(replaysBedrockReasoning('global.openai.gpt-6-luna')).toBe(false);
     expect(replaysBedrockReasoning('openai.gpt-oss-120b-1:0')).toBe(false);
-    expect(replaysBedrockReasoning('global.xai.grok-4.6')).toBe(false);
+    expect(replaysBedrockReasoning('global.xai.grok-4.6')).toBe(true);
+    expect(replaysBedrockReasoning('unknown-model')).toBe(true);
+    expect(replaysBedrockReasoning('GLOBAL.OPENAI.GPT-6-LUNA')).toBe(false);
   });
 
   it.each([
     'arn:aws-us-gov:bedrock:us-gov-west-1::foundation-model/openai.gpt-oss-120b-1:0',
     'arn:aws-cn:bedrock:cn-north-1:123456789012:inference-profile/openai.gpt-oss-120b-1:0',
-  ])('identifies a non-Claude model in %s', (model) => {
+  ])('identifies an OpenAI model in %s', (model) => {
     expect(replaysBedrockReasoning(model)).toBe(false);
   });
 

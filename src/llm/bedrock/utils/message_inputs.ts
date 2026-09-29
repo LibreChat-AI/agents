@@ -777,7 +777,7 @@ function convertAIMessageToConverseMessage(
         const reasoningBlock = block as MessageContentReasoningBlock;
         // Bedrock Converse rejects reasoningContent whose reasoningText.text is
         // null/empty (a signature-only block that never merged with its text),
-        // and models other than Claude reject reasoningContent outright. Drop
+        // and OpenAI models reject reasoningContent outright. Drop
         // it rather than emit an invalid request; the empty-turn placeholder
         // below covers a turn left with no content.
         if (
@@ -1138,11 +1138,10 @@ export interface ConvertToConverseMessagesOptions {
 }
 
 /**
- * Bedrock replays prior reasoning (`reasoningContent`) only to Anthropic Claude. Other Bedrock
- * models reject an assistant turn that carries it (OpenAI GPT: "This model doesn't support the
- * reasoningContent.reasoningText.text field for assistant messages"), so a handoff or model
- * switch from Claude to another Bedrock model fails on its first request. A model that can't be
- * identified (none given, or an opaque resource ARN) keeps the reasoning, as before.
+ * OpenAI Bedrock models reject prior `reasoningContent`, including on Claude-to-GPT handoffs.
+ * Only suppress replay for identified OpenAI targets; other model families retain the existing
+ * behavior because their Bedrock reasoning-replay requirements have not been verified here.
+ * Missing model IDs and opaque resource ARNs also retain the existing behavior.
  */
 export function replaysBedrockReasoning(model?: string): boolean {
   if (model == null || model === '') {
@@ -1159,7 +1158,7 @@ export function replaysBedrockReasoning(model?: string): boolean {
     }
     id = modelId;
   }
-  return id.includes('anthropic') || id.includes('claude');
+  return !/(?:^|\.)openai\./.test(id);
 }
 
 /**

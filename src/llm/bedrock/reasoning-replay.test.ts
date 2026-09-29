@@ -47,6 +47,18 @@ describe('Bedrock reasoning replay in streaming requests', () => {
       replayReasoning: true,
     },
     {
+      model: 'deepseek.v3.2',
+      replayReasoning: true,
+    },
+    {
+      model: 'moonshot.kimi-k2-thinking',
+      replayReasoning: true,
+    },
+    {
+      model: 'qwen.qwen3-32b-v1:0',
+      replayReasoning: true,
+    },
+    {
       model: profileArn,
       replayReasoning: true,
     },
