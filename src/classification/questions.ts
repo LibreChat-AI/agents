@@ -72,8 +72,7 @@ export function validateClassificationQuestions(
         id,
         {
           ...question,
-          ...(question.criteria !== null &&
-          typeof question.criteria === 'object'
+          ...(isClassificationObject(question.criteria)
             ? { criteria: { ...question.criteria } }
             : {}),
         },
