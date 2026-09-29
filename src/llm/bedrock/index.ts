@@ -270,8 +270,10 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
     options: this['ParsedCallOptions'] & CustomChatBedrockConverseCallOptions,
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
-    const { converseMessages, converseSystem } =
-      convertToConverseMessages(messages);
+    const { converseMessages, converseSystem } = convertToConverseMessages(
+      messages,
+      { model: this.model }
+    );
     const params = this.invocationParams(options);
 
     let { streamUsage } = this;
