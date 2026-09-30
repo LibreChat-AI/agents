@@ -205,6 +205,7 @@ describe('SubagentExecutor lazy selected-subagent resolution', () => {
     const healthyResolver = jest.fn(async () => makeAgent('healthy-child'));
     const healthyConfig = makeLazyConfig('healthy', healthyResolver);
     const executor = createExecutor([failingConfig, healthyConfig]);
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
 
     const failed = await executor.execute({
       description: 'Fail this selected child.',
@@ -224,6 +225,45 @@ describe('SubagentExecutor lazy selected-subagent resolution', () => {
     expect(failed.content).not.toContain('private-selected-resolver-secret');
     expect(succeeded.content).toBe('Task completed');
     expect(healthyResolver).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(
+      '[SubagentExecutor] Subagent resolution failed',
+      {
+        phase: 'config',
+        subagentType: 'failing',
+        aborted: false,
+        type: 'Error',
+      }
+    );
+    expect(JSON.stringify(warn.mock.calls)).not.toContain('oauth-token');
+    warn.mockRestore();
+  });
+
+  it('labels a start-up failure caused by an aborted child signal', async () => {
+    const controller = new AbortController();
+    const config = makeLazyConfig('aborted', async () => {
+      controller.abort();
+      throw new Error('resolver saw the abort');
+    });
+    const executor = createExecutor([config]);
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const failed = await executor.execute({
+      description: 'Abort while resolving.',
+      subagentType: config.type,
+      parentToolCallId: 'call_aborted',
+      signal: controller.signal,
+    });
+
+    expect(failed.content).toBe(
+      'Subagent error: Unable to initialize the selected subagent.'
+    );
+    expect(warn).toHaveBeenCalledWith(
+      '[SubagentExecutor] Subagent resolution failed',
+      expect.objectContaining({ subagentType: 'aborted', aborted: true })
+    );
+    expect(JSON.stringify(warn.mock.calls)).not.toContain('resolver saw');
+    warn.mockRestore();
   });
 
   it('releases lazy resolution when SubagentStart denies', async () => {

@@ -30,6 +30,7 @@ describe('host tool metadata completion', () => {
           (payload as ToolExecuteBatchRequest).resolve(results);
         });
       const resolve = jest.fn();
+      const clock = jest.spyOn(Date, 'now').mockReturnValue(1_000);
       const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
       try {
         await safeDispatchCustomEvent(GraphEvents.ON_TOOL_EXECUTE, {
@@ -38,11 +39,16 @@ describe('host tool metadata completion', () => {
           reject: jest.fn(),
         } as ToolExecuteBatchRequest);
         expect(resolve).not.toHaveBeenCalled();
+        clock.mockReturnValue(9_000);
         finishTracing();
         await Promise.resolve();
         expect(resolve).toHaveBeenCalledTimes(1);
-        expect(resolve).toHaveBeenCalledWith(results);
+        expect(resolve).toHaveBeenCalledWith([
+          { toolCallId: 'call', status: 'success', content: 'rows', received_at: 1_000 },
+        ]);
+        expect(results[0].received_at).toBeUndefined();
       } finally {
+        clock.mockRestore();
         warn.mockRestore();
       }
     }

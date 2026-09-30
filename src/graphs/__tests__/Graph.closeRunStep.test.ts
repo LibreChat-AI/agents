@@ -1,6 +1,6 @@
 // src/graphs/__tests__/Graph.closeRunStep.test.ts
-import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
 import { CallbackManager } from '@langchain/core/callbacks/manager';
+import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
 import type * as t from '@/types';
 import { GraphEvents, StepTypes, Providers } from '@/common';
 import { HandlerRegistry } from '@/events';
@@ -58,6 +58,29 @@ function seedStep(
   graph.contentIndexMap.set(id, index);
   return step;
 }
+
+describe('StandardGraph.dispatchRunStepDelta', () => {
+  it('delivers the producer receipt time rather than timing a slow consumer', async () => {
+    const { graph } = createGraph();
+    const received: t.RunStepDeltaEvent[] = [];
+    graph.config = { configurable: { run_id: 'run_1' } };
+    graph.handlerRegistry?.register(GraphEvents.ON_RUN_STEP_DELTA, {
+      handle: async (_event, data): Promise<void> => {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        received.push(data as t.RunStepDeltaEvent);
+      },
+    });
+    await graph.dispatchRunStepDelta(
+      'step_tool',
+      { type: StepTypes.TOOL_CALLS, tool_calls: [{ index: 0, args: '{', type: 'tool_call_chunk' }] },
+      undefined,
+      1_000
+    );
+    expect(received).toEqual([
+      { id: 'step_tool', delta: expect.objectContaining({ type: StepTypes.TOOL_CALLS }), observed_at: 1_000 },
+    ]);
+  });
+});
 
 describe('StandardGraph.closeRunStep', () => {
   it('stamps the terminal status + timestamp and emits ON_RUN_STEP_CLOSED once', async () => {

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, jest } from '@jest/globals';
+import { describe, it, expect, beforeEach, afterEach, jest } from '@jest/globals';
 import type { ToolCall, ToolCallChunk } from '@langchain/core/messages/tool';
 import type { AgentContext } from '@/agents/AgentContext';
 import type { StandardGraph } from '@/graphs';
@@ -99,6 +99,33 @@ describe('handleToolCallChunks', () => {
     graph = createMockGraph();
   });
 
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  it('stamps every streamed fragment at receipt, before awaiting slow step creation', async () => {
+    const step = makeRunStep(StepTypes.MESSAGE_CREATION);
+    graph.getRunStep.mockReturnValue(step);
+    jest.spyOn(Date, 'now').mockImplementation(() => 1_000);
+    graph.dispatchRunStep.mockImplementation(async () => {
+      jest.spyOn(Date, 'now').mockImplementation(() => 1_800);
+      return 'step_with_tool';
+    });
+    const chunk = makeToolCallChunk({ index: 2 });
+    await handleToolCallChunks({
+      graph: graph as unknown as StandardGraph,
+      stepKey: 'step-key',
+      toolCallChunks: [chunk],
+      metadata: defaultMetadata,
+    });
+    expect(graph.dispatchRunStepDelta).toHaveBeenCalledWith(
+      'step_with_tool',
+      { type: StepTypes.TOOL_CALLS, tool_calls: [chunk] },
+      defaultMetadata,
+      1_000
+    );
+  });
+
   it('creates TOOL_CALLS step when previous step is MESSAGE_CREATION', async () => {
     const msgStep = makeRunStep(StepTypes.MESSAGE_CREATION);
     graph.getRunStep.mockReturnValue(msgStep);
@@ -137,7 +164,8 @@ describe('handleToolCallChunks', () => {
     expect(graph.dispatchRunStepDelta).toHaveBeenCalledWith(
       'prev-step-id',
       expect.objectContaining({ type: StepTypes.TOOL_CALLS }),
-      defaultMetadata
+      defaultMetadata,
+      expect.any(Number)
     );
   });
 
