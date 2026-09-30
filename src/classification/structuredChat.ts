@@ -21,7 +21,7 @@ const MAX_CHOICE_OPTIONS = 128;
 const DEFAULT_TIMEOUT_MS = 20_000;
 const PROVIDER_ID = 'structured-chat';
 
-function readChatUsage(raw: unknown): ClassificationResult['usage'] {
+export function readChatUsage(raw: unknown): ClassificationResult['usage'] {
   if (!isClassificationObject(raw)) {
     return null;
   }
@@ -93,7 +93,7 @@ export interface StructuredChatClassifierOptions {
   model: BaseChatModel;
   modelId: string;
   providerId?: string;
-  /** Choose the mode verified for this provider; JSON-mode prompting is never a fallback. */
+  /** Verified OpenAI strict modes or Anthropic strict tool calling; other adapters fail closed. */
   method: 'jsonSchema' | 'functionCalling';
   timeoutMs?: number;
   maxQuestions?: number;
@@ -304,6 +304,13 @@ export function createStructuredChatClassifier(
           }
           let structured: ReturnType<typeof model.withStructuredOutput>;
           try {
+            const adapter = model._llmType();
+            if (
+              adapter !== 'openai' &&
+              (adapter !== 'anthropic' || method !== 'functionCalling')
+            ) {
+              throw new Error('unverified strict classifier adapter');
+            }
             structured = model.withStructuredOutput(decisionSchema(entries), {
               name: 'ClassifyDecisions',
               method,

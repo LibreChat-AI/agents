@@ -52,6 +52,7 @@ function isProbability(value: unknown): value is number {
 /** `undefined` means malformed; `null` means no distribution was reported. */
 function probabilitiesOf(
   raw: unknown,
+  answerType: 'choice' | 'score',
   question?: ClassificationQuestion,
   selectedChoice?: string
 ): Record<string, number> | null | undefined {
@@ -83,9 +84,8 @@ function probabilitiesOf(
       return undefined;
     }
     if (
-      question?.type === 'score' &&
-      (!/^(0|[1-9][0-9]*)$/.test(key) ||
-        Number(key) >= question.criteria.length)
+      answerType === 'score' &&
+      (!/^(0|[1-9][0-9]*)$/.test(key) || Number(key) >= entries.length)
     ) {
       return undefined;
     }
@@ -138,6 +138,7 @@ export function readAnswer(
   }
   const probabilities = probabilitiesOf(
     record.probabilities,
+    record.type,
     question,
     record.type === 'choice' && typeof record.choice === 'string'
       ? record.choice
@@ -183,7 +184,10 @@ export function readAnswer(
       0.02,
       0.00005 * (1 + (levels * (levels - 1)) / 2) + 0.001
     );
-    if (Math.abs(record.score - weightedScore) > roundingTolerance) {
+    if (
+      !Number.isFinite(weightedScore) ||
+      Math.abs(record.score - weightedScore) > roundingTolerance
+    ) {
       return null;
     }
   }

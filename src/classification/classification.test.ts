@@ -296,6 +296,53 @@ describe('classification dialect', () => {
     }
   );
 
+  it.each([
+    { invalid: 1 },
+    { NaN: 1 },
+    { '01': 0, '0': 1 },
+    { '-1': 0, '0': 1 },
+    { '1.5': 0, '0': 1 },
+    { '1e2': 0, '0': 1 },
+    { Infinity: 0, '0': 1 },
+    { '0': 1, '2': 0 },
+    { '0': 1, ['9'.repeat(400)]: 0 },
+  ])(
+    'rejects malformed score levels %j without an expected question',
+    (probabilities) => {
+      const answer = { type: 'score', score: 0, probabilities };
+      for (const dialect of ['port', 'systemone'] as const) {
+        expect(readAnswer(answer, dialect)).toBeNull();
+        expect(() =>
+          parseEnvelope(
+            JSON.stringify({ answers: { q: answer } }),
+            'test',
+            (raw) => readAnswer(raw, dialect)
+          )
+        ).toThrow(ClassificationError);
+      }
+    }
+  );
+
+  it('keeps valid measured and unmeasured scores without an expected question', () => {
+    for (const dialect of ['port', 'systemone'] as const) {
+      expect(
+        readAnswer(
+          {
+            type: 'score',
+            score: 1.7,
+            probabilities: { '0': 0.1, '1': 0.1, '2': 0.8 },
+          },
+          dialect
+        )
+      ).toMatchObject({ type: 'score', score: 1.7 });
+      expect(readAnswer({ type: 'score', score: 99 }, dialect)).toMatchObject({
+        type: 'score',
+        score: 99,
+        probabilities: null,
+      });
+    }
+  });
+
   it('rejects malformed envelopes without leaking the body', () => {
     expect(() =>
       parseEnvelope('not json', 'jev', (a) => readAnswer(a, 'systemone'))

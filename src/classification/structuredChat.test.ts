@@ -1,6 +1,7 @@
 import { ChatOpenAI } from '@langchain/openai';
 import { ChatAnthropic } from '@langchain/anthropic';
 import { AIMessage } from '@langchain/core/messages';
+import { ChatGoogleGenerativeAI } from '@langchain/google-genai';
 import type { ClassificationQuestion } from './index';
 import {
   createStructuredChatClassifier,
@@ -9,6 +10,7 @@ import {
   scoreQuestion,
 } from './index';
 import { CustomChatBedrockConverse } from '@/llm/bedrock';
+import { readChatUsage } from './structuredChat';
 
 type ProviderCall = {
   response_format?: {
@@ -21,8 +23,14 @@ type ProviderCall = {
 function openAIModel(
   parsed: object,
   calls: ProviderCall[],
-  includeUsage = true
+  includeUsage = true,
+  method: 'jsonSchema' | 'functionCalling' = 'jsonSchema'
 ): ChatOpenAI {
+  const toolCall = {
+    id: 'call_test',
+    type: 'function',
+    function: { name: 'ClassifyDecisions', arguments: JSON.stringify(parsed) },
+  };
   const fetch: typeof globalThis.fetch = async (_url, init) => {
     calls.push(JSON.parse(String(init?.body)) as ProviderCall);
     return new Response(
@@ -34,8 +42,12 @@ function openAIModel(
         choices: [
           {
             index: 0,
-            message: { role: 'assistant', content: JSON.stringify(parsed) },
-            finish_reason: 'stop',
+            message: {
+              role: 'assistant',
+              content: method === 'jsonSchema' ? JSON.stringify(parsed) : null,
+              tool_calls: method === 'functionCalling' ? [toolCall] : undefined,
+            },
+            finish_reason: method === 'functionCalling' ? 'tool_calls' : 'stop',
             logprobs: null,
           },
         ],
@@ -55,54 +67,68 @@ function openAIModel(
 }
 
 describe('strict structured-chat classifier', () => {
-  it('batches boolean and choice questions into one provider-enforced schema with raw usage', async () => {
-    const calls: ProviderCall[] = [];
-    const model = openAIModel(
-      { answers: { q: { decision: true }, role: { choice: 'hook' } } },
-      calls
-    );
-    const classifier = createStructuredChatClassifier({
-      model,
-      modelId: 'gpt-4o-mini',
-      method: 'jsonSchema',
-    });
-    const result = await classifier.classify({
-      state: { text: 'call a test hook' },
-      questions: {
-        q: booleanQuestion('Is this a test?'),
-        role: choiceQuestion('Which role?', {
-          hook: 'a hook',
-          util: 'a utility',
-        }),
-      },
-    });
-    expect(calls).toHaveLength(1);
-    expect(calls[0]).toHaveProperty('response_format.json_schema.strict', true);
-    expect(calls[0]).toHaveProperty(
-      'response_format.json_schema.schema.properties.answers.properties.q.properties.decision.type',
-      'boolean'
-    );
-    expect(calls[0]).toHaveProperty(
-      'response_format.json_schema.schema.properties.answers.properties.role.properties.choice.enum',
-      ['hook', 'util']
-    );
-    expect(calls[0].messages?.[1].content).toContain('call a test hook');
-    expect(calls[0].messages?.[1].content).toMatch(
-      /^librechat-classifier-state:/
-    );
-    expect(result.answers.q).toEqual({
-      type: 'boolean',
-      decision: true,
-      probability: null,
-    });
-    expect(result.answers.role).toEqual({
-      type: 'choice',
-      choice: 'hook',
-      confidence: null,
-      probabilities: null,
-    });
-    expect(result.usage).toEqual({ inputTokens: 12, outputTokens: 4 });
-  });
+  it.each(['jsonSchema', 'functionCalling'] as const)(
+    'batches boolean and choice questions into strict OpenAI %s with raw usage',
+    async (method) => {
+      const calls: ProviderCall[] = [];
+      const model = openAIModel(
+        { answers: { q: { decision: true }, role: { choice: 'hook' } } },
+        calls,
+        true,
+        method
+      );
+      const classifier = createStructuredChatClassifier({
+        model,
+        modelId: 'gpt-4o-mini',
+        method,
+      });
+      const result = await classifier.classify({
+        state: { text: 'call a test hook' },
+        questions: {
+          q: booleanQuestion('Is this a test?'),
+          role: choiceQuestion('Which role?', {
+            hook: 'a hook',
+            util: 'a utility',
+          }),
+        },
+      });
+      expect(calls).toHaveLength(1);
+      const schemaPath =
+        method === 'jsonSchema'
+          ? 'response_format.json_schema.schema'
+          : 'tools.0.function.parameters';
+      expect(calls[0]).toHaveProperty(
+        method === 'jsonSchema'
+          ? 'response_format.json_schema.strict'
+          : 'tools.0.function.strict',
+        true
+      );
+      expect(calls[0]).toHaveProperty(
+        `${schemaPath}.properties.answers.properties.q.properties.decision.type`,
+        'boolean'
+      );
+      expect(calls[0]).toHaveProperty(
+        `${schemaPath}.properties.answers.properties.role.properties.choice.enum`,
+        ['hook', 'util']
+      );
+      expect(calls[0].messages?.[1].content).toContain('call a test hook');
+      expect(calls[0].messages?.[1].content).toMatch(
+        /^librechat-classifier-state:/
+      );
+      expect(result.answers.q).toEqual({
+        type: 'boolean',
+        decision: true,
+        probability: null,
+      });
+      expect(result.answers.role).toEqual({
+        type: 'choice',
+        choice: 'hook',
+        confidence: null,
+        probabilities: null,
+      });
+      expect(result.usage).toEqual({ inputTokens: 12, outputTokens: 4 });
+    }
+  );
 
   it('uses actual Anthropic strict tool calling, not JSON-mode fallback', async () => {
     const calls: ProviderCall[] = [];
@@ -233,16 +259,41 @@ describe('strict structured-chat classifier', () => {
     });
   });
 
-  it('counts Bedrock prompt cache buckets once, matching the fork billing convention', async () => {
-    const model = new CustomChatBedrockConverse({
-      model: 'anthropic.claude-3-sonnet-20240229-v1:0',
-      region: 'us-east-1',
-      credentials: { accessKeyId: 'test', secretAccessKey: 'test' },
-    });
-    let inputTokens = 13;
-    const generate = jest
-      .spyOn(model, '_generate')
-      .mockImplementation(async () => ({
+  it.each([13, 1025])(
+    'counts Bedrock-shaped cache buckets once from raw input usage %s',
+    (inputTokens) => {
+      const raw = new AIMessage({
+        content: '',
+        usage_metadata: {
+          input_tokens: inputTokens,
+          output_tokens: 5,
+          total_tokens: 1030,
+        },
+        response_metadata: {
+          usage: {
+            inputTokens: 13,
+            outputTokens: 5,
+            cacheReadInputTokens: 1000,
+            cacheWriteInputTokens: 12,
+          },
+        },
+      });
+      expect(readChatUsage(raw)).toEqual({
+        inputTokens: 1025,
+        outputTokens: 5,
+      });
+    }
+  );
+
+  it.each(['jsonSchema', 'functionCalling'] as const)(
+    'rejects Bedrock %s before invocation even when its adapter silently accepts strict options',
+    async (method) => {
+      const model = new CustomChatBedrockConverse({
+        model: 'anthropic.claude-3-sonnet-20240229-v1:0',
+        region: 'us-east-1',
+        credentials: { accessKeyId: 'test', secretAccessKey: 'test' },
+      });
+      const generate = jest.spyOn(model, '_generate').mockResolvedValue({
         generations: [
           {
             text: '',
@@ -255,39 +306,60 @@ describe('strict structured-chat classifier', () => {
                   args: { answers: { q: { decision: true } } },
                 },
               ],
-              usage_metadata: {
-                input_tokens: inputTokens,
-                output_tokens: 5,
-                total_tokens: 1030,
-              },
-              response_metadata: {
-                usage: {
-                  inputTokens: 13,
-                  outputTokens: 5,
-                  cacheReadInputTokens: 1000,
-                  cacheWriteInputTokens: 12,
-                },
-              },
             }),
           },
         ],
-      }));
+      });
+      const structured = jest.spyOn(model, 'withStructuredOutput');
+      const onAnswered = jest.fn();
+      const classifier = createStructuredChatClassifier({
+        model,
+        modelId: 'gpt-4o-mini',
+        providerId: 'openai',
+        method,
+        onAnswered,
+      });
+      await expect(
+        classifier.classify({
+          state: 'test',
+          questions: { q: booleanQuestion('?') },
+        })
+      ).rejects.toMatchObject({ failure: 'unsupported_mode' });
+      expect(structured).not.toHaveBeenCalled();
+      expect(generate).not.toHaveBeenCalled();
+      expect(onAnswered).not.toHaveBeenCalled();
+    }
+  );
+
+  it('rejects unverified adapters even when their structured pipeline would return valid JSON', async () => {
+    const model = new ChatGoogleGenerativeAI({
+      model: 'gemini-2.5-flash',
+      apiKey: 'test',
+    });
+    const generate = jest.spyOn(model, '_generate').mockResolvedValue({
+      generations: [
+        {
+          text: '',
+          message: new AIMessage({
+            content: JSON.stringify({ answers: { q: { decision: true } } }),
+          }),
+        },
+      ],
+    });
+    const structured = jest.spyOn(model, 'withStructuredOutput');
     const classifier = createStructuredChatClassifier({
       model,
-      modelId: 'anthropic.claude-3-sonnet-20240229-v1:0',
-      method: 'functionCalling',
+      modelId: model.model,
+      method: 'jsonSchema',
     });
-    const request = { state: 'test', questions: { q: booleanQuestion('?') } };
-    expect((await classifier.classify(request)).usage).toEqual({
-      inputTokens: 1025,
-      outputTokens: 5,
-    });
-    inputTokens = 1025;
-    expect((await classifier.classify(request)).usage).toEqual({
-      inputTokens: 1025,
-      outputTokens: 5,
-    });
-    expect(generate).toHaveBeenCalledTimes(2);
+    await expect(
+      classifier.classify({
+        state: 'test',
+        questions: { q: booleanQuestion('?') },
+      })
+    ).rejects.toMatchObject({ failure: 'unsupported_mode' });
+    expect(structured).not.toHaveBeenCalled();
+    expect(generate).not.toHaveBeenCalled();
   });
 
   it('rejects an unsupported provider mode and rejects score before invocation', async () => {
