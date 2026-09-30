@@ -1,6 +1,7 @@
 import { ChatOpenAI } from '@langchain/openai';
 import { ChatAnthropic } from '@langchain/anthropic';
 import { AIMessage } from '@langchain/core/messages';
+import type { ClassificationQuestion } from './index';
 import {
   createStructuredChatClassifier,
   booleanQuestion,
@@ -358,6 +359,34 @@ describe('strict structured-chat classifier', () => {
       ).rejects.toMatchObject({ failure: 'malformed_response' });
       expect(calls).toHaveLength(1);
       expect(onAnswered).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each([
+    null,
+    [],
+    7,
+    true,
+    false,
+    { yes: 'Yes' },
+    { true: 7 },
+    { false: null },
+  ])(
+    'rejects malformed boolean criteria %j before chat invocation',
+    async (criteria) => {
+      const calls: ProviderCall[] = [];
+      const classifier = createStructuredChatClassifier({
+        model: openAIModel({ answers: { q: { decision: true } } }, calls),
+        modelId: 'gpt-4o-mini',
+        method: 'jsonSchema',
+      });
+      const question = JSON.parse(
+        JSON.stringify({ type: 'boolean', instructions: '?', criteria })
+      ) as ClassificationQuestion;
+      await expect(
+        classifier.classify({ state: {}, questions: { q: question } })
+      ).rejects.toMatchObject({ failure: 'bad_request' });
+      expect(calls).toHaveLength(0);
     }
   );
 

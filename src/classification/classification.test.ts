@@ -1,4 +1,4 @@
-import type { ClassificationFetch } from './index';
+import type { ClassificationFetch, ClassificationQuestion } from './index';
 import {
   createClassifier,
   createHttpClassifier,
@@ -256,6 +256,45 @@ describe('classification dialect', () => {
       probabilities: { '0': 0.3333, '1': 0.3333, '2': 0.3333 },
     });
   });
+
+  it.each(['port', 'systemone'] as const)(
+    'requires measured choices to select a maximum in the %s dialect, allowing ties',
+    (dialect) => {
+      const question = choiceQuestion('Which?', { a: 'A', b: 'B' });
+      expect(
+        readAnswer(
+          { type: 'choice', choice: 'a', probabilities: { a: 0.1, b: 0.9 } },
+          dialect,
+          question
+        )
+      ).toBeNull();
+      expect(
+        readAnswer(
+          { type: 'choice', choice: 'missing', probabilities: { a: 1, b: 0 } },
+          dialect
+        )
+      ).toBeNull();
+      for (const choice of ['a', 'b']) {
+        expect(
+          readAnswer(
+            { type: 'choice', choice, probabilities: { a: 0.5, b: 0.5 } },
+            dialect,
+            question
+          )
+        ).toMatchObject({ type: 'choice', choice });
+      }
+      expect(
+        readAnswer(
+          { type: 'choice', choice: 'b', probabilities: { a: 0.1, b: 0.9 } },
+          dialect,
+          question
+        )
+      ).toMatchObject({ type: 'choice', choice: 'b' });
+      expect(
+        readAnswer({ type: 'choice', choice: 'a' }, dialect, question)
+      ).toMatchObject({ type: 'choice', choice: 'a', probabilities: null });
+    }
+  );
 
   it('rejects malformed envelopes without leaking the body', () => {
     expect(() =>
@@ -572,6 +611,95 @@ describe('HTTP classifier', () => {
         }).classify({ state: {}, questions: { q: booleanQuestion('?') } })
       ).rejects.toMatchObject({ failure: 'malformed_response' });
     }
+  });
+
+  it('rejects a contradictory measured choice without firing the answer hook', async () => {
+    const onAnswered = jest.fn();
+    const { fetch, calls } = fakeFetch([
+      {
+        status: 200,
+        body: JSON.stringify({
+          answers: {
+            q: {
+              type: 'choice',
+              choice: 'a',
+              probabilities: { a: 0.1, b: 0.9 },
+            },
+          },
+        }),
+      },
+    ]);
+    const classifier = createHttpClassifier({
+      endpoint: 'https://s1.example',
+      apiKey: 'k',
+      dialect: 'systemone',
+      fetch,
+      onAnswered,
+    });
+    await expect(
+      classifier.classify({
+        state: {},
+        questions: { q: choiceQuestion('Which?', { a: 'A', b: 'B' }) },
+      })
+    ).rejects.toMatchObject({ failure: 'malformed_response' });
+    expect(calls).toHaveLength(1);
+    expect(onAnswered).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    null,
+    [],
+    7,
+    true,
+    false,
+    { yes: 'Yes' },
+    { true: 7 },
+    { false: null },
+  ])(
+    'rejects malformed boolean criteria %j before HTTP transport',
+    async (criteria) => {
+      const { fetch, calls } = fakeFetch([{ status: 200, body: measured }]);
+      const apiKey = jest.fn(async () => 'k');
+      const classifier = createHttpClassifier({
+        endpoint: 'https://s1.example',
+        apiKey,
+        dialect: 'systemone',
+        fetch,
+      });
+      const question = JSON.parse(
+        JSON.stringify({ type: 'boolean', instructions: '?', criteria })
+      ) as ClassificationQuestion;
+      await expect(
+        classifier.classify({ state: {}, questions: { q: question } })
+      ).rejects.toMatchObject({ failure: 'bad_request' });
+      expect(calls).toHaveLength(0);
+      expect(apiKey).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each([
+    undefined,
+    '',
+    'Matches',
+    {},
+    { true: 'Matches' },
+    { false: 'Does not match' },
+    { true: 'Matches', false: 'Does not match' },
+    { true: ['Matches'], false: { text: 'Does not match' } },
+  ])('accepts supported boolean criteria %j', async (criteria) => {
+    const { fetch, calls } = fakeFetch([{ status: 200, body: measured }]);
+    const classifier = createHttpClassifier({
+      endpoint: 'https://s1.example',
+      apiKey: 'k',
+      dialect: 'systemone',
+      fetch,
+    });
+    const result = await classifier.classify({
+      state: {},
+      questions: { q: booleanQuestion('?', criteria) },
+    });
+    expect(result.answers.q).toEqual({ type: 'boolean', probability: 0.9 });
+    expect(calls).toHaveLength(1);
   });
 
   it('rejects malformed question IDs before sending a request', async () => {

@@ -52,7 +52,8 @@ function isProbability(value: unknown): value is number {
 /** `undefined` means malformed; `null` means no distribution was reported. */
 function probabilitiesOf(
   raw: unknown,
-  question?: ClassificationQuestion
+  question?: ClassificationQuestion,
+  selectedChoice?: string
 ): Record<string, number> | null | undefined {
   if (raw == null) {
     return null;
@@ -73,6 +74,7 @@ function probabilitiesOf(
   }
   const probabilities: Record<string, number> = Object.create(null);
   let total = 0;
+  let maximum = 0;
   for (const [key, value] of entries) {
     if (!isProbability(value)) {
       return undefined;
@@ -89,6 +91,14 @@ function probabilitiesOf(
     }
     probabilities[key] = value;
     total += value;
+    maximum = Math.max(maximum, value);
+  }
+  if (
+    selectedChoice !== undefined &&
+    (!Object.hasOwn(probabilities, selectedChoice) ||
+      probabilities[selectedChoice] < maximum)
+  ) {
+    return undefined;
   }
   const roundingTolerance = Math.min(
     0.02,
@@ -126,7 +136,13 @@ export function readAnswer(
   if (confidence != null && !isProbability(confidence)) {
     return null;
   }
-  const probabilities = probabilitiesOf(record.probabilities, question);
+  const probabilities = probabilitiesOf(
+    record.probabilities,
+    question,
+    record.type === 'choice' && typeof record.choice === 'string'
+      ? record.choice
+      : undefined
+  );
   if (probabilities === undefined) {
     return null;
   }

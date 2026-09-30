@@ -20,6 +20,27 @@ function validQuestionId(id: string): boolean {
   return true;
 }
 
+function validBooleanCriteria(criteria: BooleanQuestion['criteria']): boolean {
+  if (criteria === undefined || typeof criteria === 'string') {
+    return true;
+  }
+  if (!isClassificationObject(criteria)) {
+    return false;
+  }
+  for (const [side, description] of Object.entries(criteria)) {
+    if (
+      (side !== 'true' && side !== 'false') ||
+      (description !== undefined &&
+        typeof description !== 'string' &&
+        !Array.isArray(description) &&
+        !isClassificationObject(description))
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
 export function validateClassificationQuestions(
   questions: Record<string, ClassificationQuestion>,
   provider: string
@@ -49,6 +70,8 @@ export function validateClassificationQuestions(
       !validQuestionId(id) ||
       !isClassificationObject(question) ||
       !['boolean', 'choice', 'score'].includes(question.type) ||
+      (question.type === 'boolean' &&
+        !validBooleanCriteria(question.criteria)) ||
       (question.type === 'choice' &&
         (!isClassificationObject(question.criteria) ||
           Object.keys(question.criteria).length === 0)) ||
