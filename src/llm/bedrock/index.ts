@@ -25,10 +25,13 @@ import { ChatBedrockConverse } from '@langchain/aws';
 import { AIMessageChunk } from '@langchain/core/messages';
 import { ChatGenerationChunk, ChatResult } from '@langchain/core/outputs';
 import {
+  ConverseCommand,
   ConverseStreamCommand,
-  type ConverseStreamOutput,
-  type GuardrailConfiguration,
-  type GuardrailStreamConfiguration,
+} from '@aws-sdk/client-bedrock-runtime';
+import type {
+  ConverseStreamOutput,
+  GuardrailConfiguration,
+  GuardrailStreamConfiguration,
 } from '@aws-sdk/client-bedrock-runtime';
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
 import type { BaseMessage, ResponseMetadata } from '@langchain/core/messages';
@@ -36,6 +39,7 @@ import type { ChatBedrockConverseInput } from '@langchain/aws';
 import type { SmoothItem } from '@/llm/stream/smoother';
 import type { ContentBlockDeltaEvent } from './types';
 import {
+  convertConverseMessageToLangChainMessage,
   convertToConverseMessages,
   createConverseToolUseStopChunk,
   handleConverseStreamContentBlockStart,
@@ -67,6 +71,51 @@ type BedrockEmittedChunk = {
   callbackChunk?: ChatGenerationChunk;
   callbackToken: string;
 };
+
+function extractBedrockErrorMessage(error: unknown): string | undefined {
+  if (typeof error === 'string') {
+    return error;
+  }
+  if (error == null || typeof error !== 'object') {
+    return undefined;
+  }
+  if ('message' in error && typeof error.message === 'string') {
+    return error.message;
+  }
+  if ('Message' in error && typeof error.Message === 'string') {
+    return error.Message;
+  }
+  if ('errors' in error && Array.isArray(error.errors)) {
+    const nestedErrors: unknown[] = error.errors;
+    const messages: string[] = [];
+    for (const nestedError of nestedErrors) {
+      if (typeof nestedError === 'string') {
+        messages.push(nestedError);
+      } else if (
+        nestedError != null &&
+        typeof nestedError === 'object' &&
+        'message' in nestedError &&
+        typeof nestedError.message === 'string'
+      ) {
+        messages.push(nestedError.message);
+      }
+    }
+    if (messages.length > 0) {
+      return messages.join('; ');
+    }
+  }
+  return undefined;
+}
+
+function normalizeBedrockError(error: unknown): Error {
+  if (error instanceof Error) {
+    return error;
+  }
+  const message =
+    extractBedrockErrorMessage(error) ??
+    'An error occurred while calling Bedrock Converse.';
+  return new Error(message, { cause: error });
+}
 
 /**
  * Resolves the text a delta contributes to the smoothing cadence, preferring a
@@ -235,26 +284,57 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
   }
 
   /**
-   * Override _generateNonStreaming to use applicationInferenceProfile as modelId.
-   * Uses the same model-swapping pattern as streaming for consistency.
+   * Prepare model-aware replay with the configured model; the inference profile
+   * is only the wire target and must not mutate shared model state.
    */
   override async _generateNonStreaming(
     messages: BaseMessage[],
     options: this['ParsedCallOptions'] & CustomChatBedrockConverseCallOptions,
-    runManager?: CallbackManagerForLLMRun
+    _runManager?: CallbackManagerForLLMRun
   ): Promise<ChatResult> {
-    const originalModel = this.model;
-    if (
-      this.applicationInferenceProfile != null &&
-      this.applicationInferenceProfile !== ''
-    ) {
-      this.model = this.applicationInferenceProfile;
-    }
-
     try {
-      return await super._generateNonStreaming(messages, options, runManager);
-    } finally {
-      this.model = originalModel;
+      const { converseMessages, converseSystem } = convertToConverseMessages(
+        messages,
+        { model: this.model }
+      );
+      const modelId = this.getModelId();
+      const params = this.invocationParams(options);
+      applyCachePointsToConversePayload({
+        cacheControl: options.cache_control,
+        system: converseSystem,
+        messages: converseMessages,
+        params,
+        modelId,
+      });
+      const command = new ConverseCommand({
+        modelId,
+        messages: converseMessages,
+        ...(Array.isArray(converseSystem) && converseSystem.length > 0
+          ? { system: converseSystem }
+          : {}),
+        requestMetadata: options.requestMetadata,
+        ...params,
+      });
+      const { output, ...responseMetadata } = await this.client.send(command, {
+        abortSignal: options.signal,
+      });
+      if (!output?.message) {
+        throw new Error('No message found in Bedrock response.');
+      }
+      const message = convertConverseMessageToLangChainMessage(
+        output.message,
+        responseMetadata
+      );
+      return {
+        generations: [
+          {
+            text: typeof message.content === 'string' ? message.content : '',
+            message,
+          },
+        ],
+      };
+    } catch (error) {
+      throw normalizeBedrockError(error);
     }
   }
 

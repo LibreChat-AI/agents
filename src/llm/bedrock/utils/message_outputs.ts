@@ -6,6 +6,7 @@ import { ChatGenerationChunk } from '@langchain/core/outputs';
 import { AIMessage, AIMessageChunk } from '@langchain/core/messages';
 import type { UsageMetadata } from '@langchain/core/messages';
 import type {
+  BedrockContentBlock,
   BedrockMessage,
   ConverseResponse,
   ContentBlockDeltaEvent,
@@ -87,6 +88,35 @@ export function bedrockReasoningBlockToLangchainReasoningBlock(
   throw new Error('Invalid reasoning content');
 }
 
+type BedrockResponseContentBlock =
+  | {
+      type: 'cache_point';
+      cachePoint: NonNullable<BedrockContentBlock['cachePoint']>;
+    }
+  | {
+      type: 'citations_content';
+      citationsContent: NonNullable<BedrockContentBlock['citationsContent']>;
+    }
+  | {
+      type: 'document';
+      document: NonNullable<BedrockContentBlock['document']>;
+    }
+  | {
+      type: 'guard_content';
+      guardContent: NonNullable<BedrockContentBlock['guardContent']>;
+    }
+  | { type: 'image'; image: NonNullable<BedrockContentBlock['image']> }
+  | MessageContentReasoningBlock
+  | { type: 'text'; text: string }
+  | {
+      type: 'tool_result';
+      toolResult: NonNullable<BedrockContentBlock['toolResult']>;
+    }
+  | { type: 'video'; video: NonNullable<BedrockContentBlock['video']> }
+  | { type: 'non_standard'; value: Record<string, unknown> };
+
+const BEDROCK_RESPONSE_PROVIDER = 'bedrock-converse' as const;
+
 /**
  * Convert a Bedrock Converse message to a LangChain message.
  */
@@ -108,46 +138,41 @@ export function convertConverseMessageToLangChainMessage(
     '$metadata' in responseMetadata &&
     responseMetadata.$metadata != null &&
     typeof responseMetadata.$metadata === 'object' &&
-    'requestId' in responseMetadata.$metadata
+    'requestId' in responseMetadata.$metadata &&
+    typeof responseMetadata.$metadata.requestId === 'string'
   ) {
-    requestId = responseMetadata.$metadata.requestId as string;
+    requestId = responseMetadata.$metadata.requestId;
   }
 
-  let tokenUsage:
-    | {
-        input_tokens: number;
-        output_tokens: number;
-        total_tokens: number;
-        input_token_details?: {
-          cache_read: number;
-          cache_creation: number;
-        };
-      }
-    | undefined;
+  let tokenUsage: UsageMetadata | undefined;
   if (responseMetadata.usage != null) {
-    const usage = responseMetadata.usage as NonNullable<
-      typeof responseMetadata.usage
-    > & {
-      cacheReadInputTokens?: number;
-      cacheWriteInputTokens?: number;
-    };
-    const input_tokens = usage.inputTokens ?? 0;
+    const usage = responseMetadata.usage;
+    const cacheReadInputTokens = usage.cacheReadInputTokens ?? 0;
+    const cacheWriteInputTokens = usage.cacheWriteInputTokens ?? 0;
+    const input_tokens =
+      (usage.inputTokens ?? 0) + cacheReadInputTokens + cacheWriteInputTokens;
     const output_tokens = usage.outputTokens ?? 0;
-    const cacheRead = usage.cacheReadInputTokens;
-    const cacheWrite = usage.cacheWriteInputTokens;
+    const inputTokenDetails = {
+      ...(usage.cacheReadInputTokens !== undefined && {
+        cache_read: usage.cacheReadInputTokens,
+      }),
+      ...(usage.cacheWriteInputTokens !== undefined && {
+        cache_creation: usage.cacheWriteInputTokens,
+      }),
+    };
     tokenUsage = {
       input_tokens,
       output_tokens,
       total_tokens: usage.totalTokens ?? input_tokens + output_tokens,
+      input_token_details:
+        Object.keys(inputTokenDetails).length > 0 ? inputTokenDetails : undefined,
     };
-    if (cacheRead != null || cacheWrite != null) {
-      tokenUsage.input_token_details = {
-        cache_read: cacheRead ?? 0,
-        cache_creation: cacheWrite ?? 0,
-      };
-    }
   }
 
+  const normalizedResponseMetadata = {
+    ...responseMetadata,
+    model_provider: BEDROCK_RESPONSE_PROVIDER,
+  };
   if (
     message.content.length === 1 &&
     'text' in message.content[0] &&
@@ -155,54 +180,71 @@ export function convertConverseMessageToLangChainMessage(
   ) {
     return new AIMessage({
       content: message.content[0].text,
-      response_metadata: responseMetadata,
-      usage_metadata: tokenUsage,
-      id: requestId,
-    });
-  } else {
-    const toolCalls: Array<{
-      id?: string;
-      name: string;
-      args: Record<string, unknown>;
-      type: 'tool_call';
-    }> = [];
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const content: any[] = [];
-
-    message.content.forEach((c) => {
-      if (
-        'toolUse' in c &&
-        c.toolUse != null &&
-        c.toolUse.name != null &&
-        c.toolUse.name !== '' &&
-        c.toolUse.input != null &&
-        typeof c.toolUse.input === 'object'
-      ) {
-        toolCalls.push({
-          id: c.toolUse.toolUseId,
-          name: c.toolUse.name,
-          args: c.toolUse.input as Record<string, unknown>,
-          type: 'tool_call',
-        });
-      } else if ('text' in c && typeof c.text === 'string') {
-        content.push({ type: 'text', text: c.text });
-      } else if ('reasoningContent' in c && c.reasoningContent != null) {
-        content.push(
-          bedrockReasoningBlockToLangchainReasoningBlock(c.reasoningContent)
-        );
-      } else {
-        content.push(c);
-      }
-    });
-
-    return new AIMessage({
-      content: content.length ? content : '',
-      tool_calls: toolCalls.length ? toolCalls : undefined,
-      response_metadata: responseMetadata,
+      response_metadata: normalizedResponseMetadata,
       usage_metadata: tokenUsage,
       id: requestId,
     });
   }
+
+  const toolCalls: Array<{
+    id?: string;
+    name: string;
+    args: Record<string, unknown>;
+    type: 'tool_call';
+  }> = [];
+  const content: BedrockResponseContentBlock[] = [];
+
+  message.content.forEach((block) => {
+    if ('cachePoint' in block && block.cachePoint != null) {
+      content.push({ type: 'cache_point', cachePoint: block.cachePoint });
+    } else if ('citationsContent' in block && block.citationsContent != null) {
+      content.push({
+        type: 'citations_content',
+        citationsContent: block.citationsContent,
+      });
+    } else if ('document' in block && block.document != null) {
+      content.push({ type: 'document', document: block.document });
+    } else if ('guardContent' in block && block.guardContent != null) {
+      content.push({ type: 'guard_content', guardContent: block.guardContent });
+    } else if ('image' in block && block.image != null) {
+      content.push({ type: 'image', image: block.image });
+    } else if ('reasoningContent' in block && block.reasoningContent != null) {
+      content.push(
+        bedrockReasoningBlockToLangchainReasoningBlock(block.reasoningContent)
+      );
+    } else if ('text' in block && typeof block.text === 'string') {
+      content.push({ type: 'text', text: block.text });
+    } else if ('toolResult' in block && block.toolResult != null) {
+      content.push({ type: 'tool_result', toolResult: block.toolResult });
+    } else if (
+      'toolUse' in block &&
+      block.toolUse != null &&
+      block.toolUse.name != null &&
+      block.toolUse.name !== '' &&
+      block.toolUse.input != null &&
+      typeof block.toolUse.input === 'object' &&
+      !Array.isArray(block.toolUse.input)
+    ) {
+      toolCalls.push({
+        id: block.toolUse.toolUseId,
+        name: block.toolUse.name,
+        args: block.toolUse.input,
+        type: 'tool_call',
+      });
+    } else if ('video' in block && block.video != null) {
+      content.push({ type: 'video', video: block.video });
+    } else {
+      content.push({ type: 'non_standard', value: { ...block } });
+    }
+  });
+
+  return new AIMessage({
+    content: content.length ? content : '',
+    tool_calls: toolCalls.length ? toolCalls : undefined,
+    response_metadata: normalizedResponseMetadata,
+    usage_metadata: tokenUsage,
+    id: requestId,
+  });
 }
 
 /**

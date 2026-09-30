@@ -18,6 +18,7 @@ import type {
  */
 export interface MessageContentReasoningBlock {
   type: 'reasoning_content';
+  [key: string]: unknown;
   reasoningText?: {
     text?: string;
     signature?: string;
