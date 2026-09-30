@@ -8,12 +8,15 @@ import type {
 import type { LangfuseSpanProcessorParams } from '@langfuse/otel';
 import type { Context } from '@opentelemetry/api';
 import type { ResolvedLangfuseToolOutputTracingConfig } from '@/langfuseRuntimeContext';
+import type { LangfuseInlineMediaPolicy } from '@/langfuseInlineMedia';
 import type * as t from '@/types';
 import {
   LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT,
   hasToolOutputTracingConfig,
   normalizeToolName,
+  resolveInlineMediaTracingEnabled,
   resolveLangfuseConfig,
+  resolveLangfuseMediaUploadEnabled,
   resolveToolOutputTracingConfig,
 } from '@/langfuseConfig';
 import {
@@ -21,6 +24,7 @@ import {
   shouldDropLangfuseSpan,
 } from '@/langfuseTraceShaping';
 import { resolveToolOutputTracingConfigForSpan } from '@/langfuseRuntimeScope';
+import { omitLangfuseSpanInlineMedia } from '@/langfuseInlineMedia';
 
 export { LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT, resolveLangfuseConfig };
 
@@ -877,11 +881,15 @@ export function redactLangfuseSpanToolOutputs(
 
 export function prepareLangfuseSpanForExport(
   span: ReadableSpan,
-  config?: ResolvedLangfuseToolOutputTracingConfig
+  config?: ResolvedLangfuseToolOutputTracingConfig,
+  inlineMediaPolicy?: LangfuseInlineMediaPolicy
 ): void {
   classifyLangfuseToolNodeSpan(span);
   if (config != null) {
     redactLangfuseSpanToolOutputs(span, config);
+  }
+  if (inlineMediaPolicy != null) {
+    omitLangfuseSpanInlineMedia(span, inlineMediaPolicy);
   }
   shapeLangfuseSpan(span);
 }
@@ -889,6 +897,7 @@ export function prepareLangfuseSpanForExport(
 class ToolOutputRedactingLangfuseSpanProcessor implements SpanProcessor {
   private readonly processor: LangfuseSpanProcessor;
   private readonly fallbackConfig?: ResolvedLangfuseToolOutputTracingConfig;
+  private readonly inlineMediaPolicy?: LangfuseInlineMediaPolicy;
   private readonly spanConfigs = new WeakMap<
     object,
     ResolvedLangfuseToolOutputTracingConfig
@@ -896,10 +905,12 @@ class ToolOutputRedactingLangfuseSpanProcessor implements SpanProcessor {
 
   constructor(
     params?: LangfuseSpanProcessorParams,
-    fallbackConfig?: ResolvedLangfuseToolOutputTracingConfig
+    fallbackConfig?: ResolvedLangfuseToolOutputTracingConfig,
+    inlineMediaPolicy?: LangfuseInlineMediaPolicy
   ) {
     this.processor = new LangfuseSpanProcessor(params);
     this.fallbackConfig = fallbackConfig;
+    this.inlineMediaPolicy = inlineMediaPolicy;
   }
 
   onStart(span: Span, parentContext: Context): void {
@@ -920,7 +931,7 @@ class ToolOutputRedactingLangfuseSpanProcessor implements SpanProcessor {
       return;
     }
     const config = this.spanConfigs.get(span) ?? this.fallbackConfig;
-    prepareLangfuseSpanForExport(span, config);
+    prepareLangfuseSpanForExport(span, config, this.inlineMediaPolicy);
     this.processor.onEnd(span);
   }
 
@@ -941,7 +952,17 @@ export function createLangfuseSpanProcessor(
   const fallbackConfig = hasToolOutputTracingConfig(runLangfuse, agentLangfuse)
     ? resolveToolOutputTracingConfig(runLangfuse, agentLangfuse)
     : undefined;
-  return new ToolOutputRedactingLangfuseSpanProcessor(params, fallbackConfig);
+  const inlineMediaPolicy = resolveInlineMediaTracingEnabled(
+    runLangfuse,
+    agentLangfuse
+  )
+    ? undefined
+    : { omitDataUris: !resolveLangfuseMediaUploadEnabled(params) };
+  return new ToolOutputRedactingLangfuseSpanProcessor(
+    params,
+    fallbackConfig,
+    inlineMediaPolicy
+  );
 }
 
 function hasLangfuseEnvKeys(): boolean {
