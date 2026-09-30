@@ -29,8 +29,8 @@ import type {
   MessageContentReasoningBlock,
 } from '../types';
 import { serializeStructuredValueBounded } from '@/utils/toolContent';
-import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
 import { isReasoningContentBlock } from '@/messages/reasoningTypes';
+import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
 
 /**
  * Reasoning blocks from other providers, relative to Bedrock. Bedrock's native
@@ -714,13 +714,16 @@ function coerceBedrockToolUseInput(input: unknown): Record<string, unknown> {
     : {};
 }
 
-function convertAIMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
+function convertAIMessageToConverseMessage(
+  msg: BaseMessage,
+  replayReasoning = true
+): BedrockMessage {
   // Check for v1 format from other providers (PR #9766 fix)
   const responseMetadata = msg.response_metadata as
     | { output_version?: string }
     | undefined;
   if (responseMetadata?.output_version === 'v1') {
-    return convertFromV1ToChatBedrockConverseMessage(msg);
+    return convertFromV1ToChatBedrockConverseMessage(msg, replayReasoning);
   }
 
   const assistantMsg: BedrockMessage = {
@@ -733,9 +736,7 @@ function convertAIMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
   } else if (Array.isArray(msg.content)) {
     const parsedToolCallIds = new Set(
       isAIMessage(msg)
-        ? (msg.tool_calls ?? []).flatMap((toolCall) =>
-          toolCall.id != null ? [toolCall.id] : []
-        )
+        ? (msg.tool_calls ?? []).flatMap(({ id }) => id ?? [])
         : []
     );
     const concatenatedBlocks = concatenateLangchainReasoningBlocks(
@@ -775,10 +776,14 @@ function convertAIMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
       } else if (block.type === 'reasoning_content') {
         const reasoningBlock = block as MessageContentReasoningBlock;
         // Bedrock Converse rejects reasoningContent whose reasoningText.text is
-        // null/empty (a signature-only block that never merged with its text).
-        // Drop it rather than emit an invalid request; the empty-turn
-        // placeholder below covers a turn left with no content.
-        if (!isSerializableBedrockReasoningBlock(reasoningBlock)) {
+        // null/empty (a signature-only block that never merged with its text),
+        // and OpenAI models reject reasoningContent outright. Drop
+        // it rather than emit an invalid request; the empty-turn placeholder
+        // below covers a turn left with no content.
+        if (
+          !replayReasoning ||
+          !isSerializableBedrockReasoningBlock(reasoningBlock)
+        ) {
           return;
         }
         contentBlocks.push({
@@ -856,7 +861,8 @@ function convertAIMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
  * (Implements PR #9766 fix for output_version v1 detection)
  */
 function convertFromV1ToChatBedrockConverseMessage(
-  msg: BaseMessage
+  msg: BaseMessage,
+  replayReasoning = true
 ): BedrockMessage {
   const contentBlocks: BedrockContentBlock[] = [];
   const assistantMsg: BedrockMessage = {
@@ -898,7 +904,11 @@ function convertFromV1ToChatBedrockConverseMessage(
         /** Bedrock Converse rejects `reasoningText` with a null/empty `text`
          * (`Member must not be null`), e.g. when the producing model omitted
          * reasoning text (`thinking.display: "omitted"`) — drop rather than send. */
-        if (reasoning.reasoning == null || reasoning.reasoning === '') {
+        if (
+          !replayReasoning ||
+          reasoning.reasoning == null ||
+          reasoning.reasoning === ''
+        ) {
           droppedUnserializableContent = true;
           continue;
         }
@@ -909,7 +919,10 @@ function convertFromV1ToChatBedrockConverseMessage(
         } as BedrockContentBlock);
       } else if (block.type === 'reasoning_content') {
         const reasoningBlock = block as MessageContentReasoningBlock;
-        if (!isSerializableBedrockReasoningBlock(reasoningBlock)) {
+        if (
+          !replayReasoning ||
+          !isSerializableBedrockReasoningBlock(reasoningBlock)
+        ) {
           droppedUnserializableContent = true;
           continue;
         }
@@ -1118,13 +1131,47 @@ function convertToolMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
   };
 }
 
+/** Options for {@link convertToConverseMessages}. */
+export interface ConvertToConverseMessagesOptions {
+  /** The model the request is for, which decides whether prior reasoning is replayed. */
+  model?: string;
+}
+
+/**
+ * OpenAI Bedrock models reject prior `reasoningContent`, including on Claude-to-GPT handoffs.
+ * Only suppress replay for identified OpenAI targets; other model families retain the existing
+ * behavior because their Bedrock reasoning-replay requirements have not been verified here.
+ * Missing model IDs and opaque resource ARNs also retain the existing behavior.
+ */
+export function replaysBedrockReasoning(model?: string): boolean {
+  if (model == null || model === '') {
+    return true;
+  }
+  let id = model.toLowerCase();
+  if (id.startsWith('arn:')) {
+    const modelId =
+      /^arn:[^:]+:bedrock:[^:]*:[^:]*:(?:foundation-model|inference-profile)\/(.+)$/.exec(
+        id
+      )?.[1];
+    if (modelId == null) {
+      return true;
+    }
+    id = modelId;
+  }
+  return !/(?:^|\.)openai\./.test(id);
+}
+
 /**
  * Convert LangChain messages to Bedrock Converse messages.
  */
-export function convertToConverseMessages(messages: BaseMessage[]): {
+export function convertToConverseMessages(
+  messages: BaseMessage[],
+  options: ConvertToConverseMessagesOptions = {}
+): {
   converseMessages: BedrockMessage[];
   converseSystem: BedrockSystemContentBlock[];
 } {
+  const replayReasoning = replaysBedrockReasoning(options.model);
   const converseSystem = messages
     .filter((msg) => msg._getType() === 'system')
     .flatMap((msg) => convertSystemMessageToConverseMessage(msg));
@@ -1133,7 +1180,7 @@ export function convertToConverseMessages(messages: BaseMessage[]): {
     .filter((msg) => msg._getType() !== 'system')
     .map((msg) => {
       if (msg._getType() === 'ai') {
-        return convertAIMessageToConverseMessage(msg);
+        return convertAIMessageToConverseMessage(msg, replayReasoning);
       } else if (msg._getType() === 'human' || msg._getType() === 'generic') {
         return convertHumanMessageToConverseMessage(msg);
       } else if (msg._getType() === 'tool') {
