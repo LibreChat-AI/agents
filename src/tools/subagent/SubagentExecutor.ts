@@ -141,6 +141,7 @@ import { stripRunStepResumeState } from '@/tools/runStepResume';
 import { seedAgentInitialSessions } from '@/utils/toolSessions';
 import { stableStringify } from '@/tools/eagerEventExecution';
 import { convertInjectedMessages } from '@/messages/injected';
+import { logSubagentResolutionFailure } from './diagnostics';
 import { resolveClientOptionsModel } from '@/llm/request';
 import { isBackgroundDenyMode } from '@/types/hitl';
 import { composeAbortSignals } from '@/utils/misc';
@@ -1358,10 +1359,7 @@ export class SubagentExecutor {
       };
       let deliveryAttempts = 1;
       let result = await executeAttempt();
-      while (
-        result.retryableDelivery === true &&
-        deliveryAttempts < 3
-      ) {
+      while (result.retryableDelivery === true && deliveryAttempts < 3) {
         if (deliveryAttempts > 1) {
           await sleep(
             Math.min(100 * 2 ** Math.min(deliveryAttempts - 2, 6), 5_000)
@@ -2245,7 +2243,10 @@ export class SubagentExecutor {
       parentToolCallId,
       parentConfigurable,
     });
-    if (execution.completedResult != null && settled.output.status === 'error') {
+    if (
+      execution.completedResult != null &&
+      settled.output.status === 'error'
+    ) {
       return;
     }
     const { resumeExecution } = execution;
@@ -2492,6 +2493,12 @@ export class SubagentExecutor {
       if (error instanceof StreamLimitExceededError) {
         throw error;
       }
+      logSubagentResolutionFailure(
+        'identity',
+        executableConfig.type,
+        childSignal,
+        error
+      );
       return createSubagentFailure(SUBAGENT_RESOLUTION_ERROR_MESSAGE);
     }
     const { childRunId, childThreadId, approvalExecutionScope } = identity;
@@ -2522,6 +2529,12 @@ export class SubagentExecutor {
       if (error instanceof StreamLimitExceededError) {
         throw error;
       }
+      logSubagentResolutionFailure(
+        'config',
+        executableConfig.type,
+        childSignal,
+        error
+      );
       return createSubagentFailure(SUBAGENT_RESOLUTION_ERROR_MESSAGE);
     }
 
@@ -2609,9 +2622,7 @@ export class SubagentExecutor {
       }
     } catch (error) {
       if (childSignal.aborted) {
-        throw childSignal.reason instanceof Error
-          ? childSignal.reason
-          : error;
+        throw childSignal.reason instanceof Error ? childSignal.reason : error;
       }
       if (execution.completedResult != null) {
         return {
@@ -2958,10 +2969,11 @@ export class SubagentExecutor {
             },
             sessionId: currentHookSessionId,
             matchQuery: subagentType,
-          }).catch((): AggregatedHookResult =>
-            isBackgroundDenyMode(this.humanInTheLoop)
-              ? { ...HOOK_FALLBACK, hasHookFailures: true }
-              : HOOK_FALLBACK
+          }).catch(
+            (): AggregatedHookResult =>
+              isBackgroundDenyMode(this.humanInTheLoop)
+                ? { ...HOOK_FALLBACK, hasHookFailures: true }
+                : HOOK_FALLBACK
           );
 
           const policyFailed =
@@ -3823,7 +3835,10 @@ export function sanitizeForwardedSubagentUpdateData(
   if (eventName === GraphEvents.ON_TOOL_CALLS_DISPATCHED) {
     if (!isObjectLike(data)) return undefined;
     const event = data as { dispatched_at?: number; toolCalls?: unknown };
-    if (!Array.isArray(event.toolCalls) || typeof event.dispatched_at !== 'number') {
+    if (
+      !Array.isArray(event.toolCalls) ||
+      typeof event.dispatched_at !== 'number'
+    ) {
       return undefined;
     }
     return {
@@ -3831,12 +3846,17 @@ export function sanitizeForwardedSubagentUpdateData(
       toolCalls: (event.toolCalls as unknown[]).flatMap((call) => {
         if (!isObjectLike(call)) return [];
         const entry = call as Record<string, unknown>;
-        if (typeof entry.id !== 'string' || typeof entry.name !== 'string') return [];
-        return [{
-          id: entry.id,
-          name: entry.name,
-          ...(typeof entry.stepId === 'string' ? { stepId: entry.stepId } : {}),
-        }];
+        if (typeof entry.id !== 'string' || typeof entry.name !== 'string')
+          return [];
+        return [
+          {
+            id: entry.id,
+            name: entry.name,
+            ...(typeof entry.stepId === 'string'
+              ? { stepId: entry.stepId }
+              : {}),
+          },
+        ];
       }),
     };
   }
