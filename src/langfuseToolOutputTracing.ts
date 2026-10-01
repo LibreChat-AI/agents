@@ -604,10 +604,7 @@ function redactValue(
     return changed ? { value: next, changed } : { value, changed };
   }
 
-  if (
-    typeof value === 'string' &&
-    value.startsWith(DECISION_PROMPT_PREFIX)
-  ) {
+  if (typeof value === 'string' && value.startsWith(DECISION_PROMPT_PREFIX)) {
     return { value: config.redactionText, changed: true };
   }
 

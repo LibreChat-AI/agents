@@ -52,9 +52,13 @@ export function validateDecisionQuestions(
   }
   const supplied = Object.entries(questions);
   if (supplied.length === 0) {
-    throw new DecisionError('bad_request', 'decision model requires questions', {
-      provider,
-    });
+    throw new DecisionError(
+      'bad_request',
+      'decision model requires questions',
+      {
+        provider,
+      }
+    );
   }
   const entries: Array<[string, DecisionQuestion]> = [];
   for (const [id, question] of supplied) {
@@ -70,9 +74,13 @@ export function validateDecisionQuestions(
       (question.type === 'score' &&
         (!Array.isArray(question.criteria) || question.criteria.length < 2))
     ) {
-      throw new DecisionError('bad_request', 'invalid decision model question', {
-        provider,
-      });
+      throw new DecisionError(
+        'bad_request',
+        'invalid decision model question',
+        {
+          provider,
+        }
+      );
     }
     if (question.type === 'choice') {
       entries.push([id, { ...question, criteria: { ...question.criteria } }]);

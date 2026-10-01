@@ -9,7 +9,9 @@ export type DecisionJson =
   | { [key: string]: DecisionJson };
 
 export type DecisionText =
-  string | DecisionJson[] | { [key: string]: DecisionJson };
+  | string
+  | DecisionJson[]
+  | { [key: string]: DecisionJson };
 
 export type DecisionState = DecisionText;
 
