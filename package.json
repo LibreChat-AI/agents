@@ -1,6 +1,6 @@
 {
   "name": "@librechat/agents",
-  "version": "4.0.0",
+  "version": "4.0.1",
   "reova": {
     "enabled": true,
     "endpoint": "https://telemetry.reo.dev/data"
@@ -315,8 +315,8 @@
     "@opentelemetry/sdk-node": "^0.220.0",
     "@types/diff": "^7.0.2",
     "ai-tokenizer": "^1.0.6",
-    "axios": "^1.18.1",
-    "cheerio": "^1.0.0",
+    "axios": "^1.20.0",
+    "cheerio": "^1.2.0",
     "diff": "^9.0.0",
     "dotenv": "^16.4.7",
     "https-proxy-agent": "^7.0.6",
