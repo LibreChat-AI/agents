@@ -282,9 +282,9 @@ describe('Langfuse tool output tracing redaction', () => {
     expect(redacted[1].content).toBe(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
   });
 
-  it('drops marked classifier prompts under selective redaction, even with mixed public state', () => {
+  it('drops marked decision model prompts under selective redaction, even with mixed public state', () => {
     const prompt =
-      'librechat-classifier-state:' +
+      'librechat-decision-state:' +
       JSON.stringify({
         state: [
           { role: 'private_sql', content: 'private query result' },
@@ -334,7 +334,7 @@ describe('Langfuse tool output tracing redaction', () => {
         {
           role: 'user',
           content:
-            'librechat-classifier-state:{"state":[{"role":"private_sql","content":"private truncated',
+            'librechat-decision-state:{"state":[{"role":"private_sql","content":"private truncated',
         },
       ]),
     });
@@ -363,10 +363,10 @@ describe('Langfuse tool output tracing redaction', () => {
     ).toBe(prompt);
   });
 
-  it('does not export free-form classifier state that can quote a redacted tool result', () => {
+  it('does not export free-form decision model state that can quote a redacted tool result', () => {
     const secret = 'private_sql returned a connection string';
     const prompt =
-      'librechat-classifier-state:' +
+      'librechat-decision-state:' +
       JSON.stringify({
         state: secret,
         questions: {

@@ -21,7 +21,7 @@ import {
   shouldDropLangfuseSpan,
 } from '@/langfuseTraceShaping';
 import { resolveToolOutputTracingConfigForSpan } from '@/langfuseRuntimeScope';
-import { CLASSIFICATION_PROMPT_PREFIX } from '@/classification/traceMarker';
+import { DECISION_PROMPT_PREFIX } from '@/decisions/traceMarker';
 
 export { LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT, resolveLangfuseConfig };
 
@@ -606,7 +606,7 @@ function redactValue(
 
   if (
     typeof value === 'string' &&
-    value.startsWith(CLASSIFICATION_PROMPT_PREFIX)
+    value.startsWith(DECISION_PROMPT_PREFIX)
   ) {
     return { value: config.redactionText, changed: true };
   }
@@ -694,7 +694,7 @@ function redactSerializedValue(
 
   const trimmed = value.trim();
   if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) {
-    return trimmed.startsWith(CLASSIFICATION_PROMPT_PREFIX)
+    return trimmed.startsWith(DECISION_PROMPT_PREFIX)
       ? redactValue(trimmed, config, redactionContext)
       : { value, changed: false };
   }

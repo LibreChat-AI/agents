@@ -1,49 +1,44 @@
 /** Typed decisions over content, independent of the model that makes them. */
 
-export type ClassificationJson =
+export type DecisionJson =
   | string
   | number
   | boolean
   | null
-  | ClassificationJson[]
-  | { [key: string]: ClassificationJson };
+  | DecisionJson[]
+  | { [key: string]: DecisionJson };
 
-export type ClassificationText =
-  | string
-  | ClassificationJson[]
-  | { [key: string]: ClassificationJson };
+export type DecisionText =
+  string | DecisionJson[] | { [key: string]: DecisionJson };
 
-export type ClassificationState = ClassificationText;
+export type DecisionState = DecisionText;
 
 export interface BooleanCriteria {
-  true?: ClassificationText;
-  false?: ClassificationText;
+  true?: DecisionText;
+  false?: DecisionText;
 }
 
 /** A string criterion describes the yes side of a yes/no question. */
 export interface BooleanQuestion {
   type: 'boolean';
-  instructions: ClassificationText;
+  instructions: DecisionText;
   criteria?: BooleanCriteria | string;
 }
 
 export interface ChoiceQuestion {
   type: 'choice';
-  instructions: ClassificationText;
-  criteria: Record<string, ClassificationText | null>;
+  instructions: DecisionText;
+  criteria: Record<string, DecisionText | null>;
 }
 
 /** The measured answer is an expected level, which may fall between two rubric levels. */
 export interface ScoreQuestion {
   type: 'score';
-  instructions: ClassificationText;
-  criteria: ClassificationText[];
+  instructions: DecisionText;
+  criteria: DecisionText[];
 }
 
-export type ClassificationQuestion =
-  | BooleanQuestion
-  | ChoiceQuestion
-  | ScoreQuestion;
+export type DecisionQuestion = BooleanQuestion | ChoiceQuestion | ScoreQuestion;
 
 /** `null` is an unmeasured decision, not a probability of zero. */
 export type BooleanAnswer =
@@ -68,48 +63,48 @@ export interface ScoreAnswer {
   probabilities: Record<string, number> | null;
 }
 
-export type ClassificationAnswer = BooleanAnswer | ChoiceAnswer | ScoreAnswer;
+export type DecisionAnswer = BooleanAnswer | ChoiceAnswer | ScoreAnswer;
 
 /** Unknown counts are omitted, never inferred from an answer or replaced by zero. */
-export interface ClassificationUsage {
+export interface DecisionUsage {
   inputTokens?: number;
   outputTokens?: number;
 }
 
-export interface ClassificationRequest {
-  state: ClassificationState;
-  questions: Record<string, ClassificationQuestion>;
+export interface DecisionRequest {
+  state: DecisionState;
+  questions: Record<string, DecisionQuestion>;
   signal?: AbortSignal;
   label?: string;
   /** Overrides the provider's timeout for this request alone. */
   timeoutMs?: number;
 }
 
-export interface ClassificationResult {
+export interface DecisionResult {
   model: string;
   /** A requested answer can be omitted; callers must handle `undefined` explicitly. */
-  answers: Record<string, ClassificationAnswer | undefined>;
-  usage: ClassificationUsage | null;
+  answers: Record<string, DecisionAnswer | undefined>;
+  usage: DecisionUsage | null;
 }
 
-export interface Classifier {
+export interface DecisionModel {
   readonly id: string;
   readonly model: string;
-  classify(request: ClassificationRequest): Promise<ClassificationResult>;
+  decide(request: DecisionRequest): Promise<DecisionResult>;
 }
 
-export type ClassificationDialect = 'port' | 'systemone';
+export type DecisionDialect = 'port' | 'systemone';
 
 /** A bearer key, or a per-request token minter; a 401 requests one fresh token for that call. */
-export type ClassificationCredential =
+export type DecisionCredential =
   | string
   | ((options: { refresh: boolean; signal?: AbortSignal }) => Promise<string>);
 
-export interface ClassificationProviderSettings {
-  /** Full URL of the classify endpoint, not a base path. */
+export interface DecisionProviderSettings {
+  /** Full URL of the decision endpoint, not a base path. */
   baseURL?: string;
   model?: string;
-  dialect?: ClassificationDialect;
+  dialect?: DecisionDialect;
   requestKey?: string;
   responseKey?: string;
   timeoutMs?: number;
@@ -119,7 +114,7 @@ export interface ClassificationProviderSettings {
   apiKeyEnv?: string;
 }
 
-export type ClassificationFailure =
+export type DecisionFailure =
   | 'timeout'
   | 'aborted'
   | 'rate_limited'
@@ -131,19 +126,19 @@ export type ClassificationFailure =
   | 'unsupported_mode'
   | 'malformed_response';
 
-export class ClassificationError extends Error {
-  readonly failure: ClassificationFailure;
+export class DecisionError extends Error {
+  readonly failure: DecisionFailure;
   readonly provider: string;
   readonly status?: number;
   retryAfterMs?: number;
 
   constructor(
-    failure: ClassificationFailure,
+    failure: DecisionFailure,
     message: string,
     options?: { provider?: string; status?: number }
   ) {
     super(message);
-    this.name = 'ClassificationError';
+    this.name = 'DecisionError';
     this.failure = failure;
     this.provider = options?.provider ?? 'unknown';
     this.status = options?.status;
@@ -151,21 +146,19 @@ export class ClassificationError extends Error {
 }
 
 /** A JSON boundary guard; never trust a parsed response's declared TypeScript type. */
-export function isClassificationObject(
+export function isDecisionObject(
   value: unknown
 ): value is { [key: string]: unknown } {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
-export function readClassificationUsage(
-  raw: unknown
-): ClassificationUsage | null {
-  if (!isClassificationObject(raw)) {
+export function readDecisionUsage(raw: unknown): DecisionUsage | null {
+  if (!isDecisionObject(raw)) {
     return null;
   }
   const input = raw.input_tokens;
   const output = raw.output_tokens;
-  const usage: ClassificationUsage = {};
+  const usage: DecisionUsage = {};
   if (typeof input === 'number' && Number.isSafeInteger(input) && input >= 0) {
     usage.inputTokens = input;
   }
@@ -180,19 +173,19 @@ export function readClassificationUsage(
 }
 
 export function isBooleanAnswer(
-  answer: ClassificationAnswer | undefined
+  answer: DecisionAnswer | undefined
 ): answer is BooleanAnswer {
   return answer?.type === 'boolean';
 }
 
 export function isChoiceAnswer(
-  answer: ClassificationAnswer | undefined
+  answer: DecisionAnswer | undefined
 ): answer is ChoiceAnswer {
   return answer?.type === 'choice';
 }
 
 export function isScoreAnswer(
-  answer: ClassificationAnswer | undefined
+  answer: DecisionAnswer | undefined
 ): answer is ScoreAnswer {
   return answer?.type === 'score';
 }

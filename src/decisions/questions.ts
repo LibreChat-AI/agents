@@ -3,10 +3,10 @@ import type {
   BooleanQuestion,
   ChoiceQuestion,
   ScoreQuestion,
-  ClassificationText,
-  ClassificationQuestion,
+  DecisionText,
+  DecisionQuestion,
 } from './types';
-import { ClassificationError, isClassificationObject } from './types';
+import { DecisionError, isDecisionObject } from './types';
 
 function validQuestionId(id: string): boolean {
   if (id.length === 0 || id.length > 128) {
@@ -24,7 +24,7 @@ function validBooleanCriteria(criteria: BooleanQuestion['criteria']): boolean {
   if (criteria === undefined || typeof criteria === 'string') {
     return true;
   }
-  if (!isClassificationObject(criteria)) {
+  if (!isDecisionObject(criteria)) {
     return false;
   }
   for (const [side, description] of Object.entries(criteria)) {
@@ -33,7 +33,7 @@ function validBooleanCriteria(criteria: BooleanQuestion['criteria']): boolean {
       (description !== undefined &&
         typeof description !== 'string' &&
         !Array.isArray(description) &&
-        !isClassificationObject(description))
+        !isDecisionObject(description))
     ) {
       return false;
     }
@@ -41,50 +41,38 @@ function validBooleanCriteria(criteria: BooleanQuestion['criteria']): boolean {
   return true;
 }
 
-export function validateClassificationQuestions(
-  questions: Record<string, ClassificationQuestion>,
+export function validateDecisionQuestions(
+  questions: Record<string, DecisionQuestion>,
   provider: string
-): Array<[string, ClassificationQuestion]> {
-  if (!isClassificationObject(questions)) {
-    throw new ClassificationError(
-      'bad_request',
-      'invalid classifier questions',
-      {
-        provider,
-      }
-    );
+): Array<[string, DecisionQuestion]> {
+  if (!isDecisionObject(questions)) {
+    throw new DecisionError('bad_request', 'invalid decision model questions', {
+      provider,
+    });
   }
   const supplied = Object.entries(questions);
   if (supplied.length === 0) {
-    throw new ClassificationError(
-      'bad_request',
-      'classifier requires questions',
-      {
-        provider,
-      }
-    );
+    throw new DecisionError('bad_request', 'decision model requires questions', {
+      provider,
+    });
   }
-  const entries: Array<[string, ClassificationQuestion]> = [];
+  const entries: Array<[string, DecisionQuestion]> = [];
   for (const [id, question] of supplied) {
     if (
       !validQuestionId(id) ||
-      !isClassificationObject(question) ||
+      !isDecisionObject(question) ||
       !['boolean', 'choice', 'score'].includes(question.type) ||
       (question.type === 'boolean' &&
         !validBooleanCriteria(question.criteria)) ||
       (question.type === 'choice' &&
-        (!isClassificationObject(question.criteria) ||
+        (!isDecisionObject(question.criteria) ||
           Object.keys(question.criteria).length === 0)) ||
       (question.type === 'score' &&
         (!Array.isArray(question.criteria) || question.criteria.length < 2))
     ) {
-      throw new ClassificationError(
-        'bad_request',
-        'invalid classifier question',
-        {
-          provider,
-        }
-      );
+      throw new DecisionError('bad_request', 'invalid decision model question', {
+        provider,
+      });
     }
     if (question.type === 'choice') {
       entries.push([id, { ...question, criteria: { ...question.criteria } }]);
@@ -95,7 +83,7 @@ export function validateClassificationQuestions(
         id,
         {
           ...question,
-          ...(isClassificationObject(question.criteria)
+          ...(isDecisionObject(question.criteria)
             ? { criteria: { ...question.criteria } }
             : {}),
         },
@@ -107,7 +95,7 @@ export function validateClassificationQuestions(
 
 /** A yes/no question; `criteria` describes what counts as yes (a string) or both sides. */
 export function booleanQuestion(
-  instructions: ClassificationText,
+  instructions: DecisionText,
   criteria?: BooleanCriteria | string
 ): BooleanQuestion {
   return criteria == null
@@ -117,16 +105,16 @@ export function booleanQuestion(
 
 /** Pick one of the named options; a `null` description means the name speaks for itself. */
 export function choiceQuestion(
-  instructions: ClassificationText,
-  criteria: Record<string, ClassificationText | null>
+  instructions: DecisionText,
+  criteria: Record<string, DecisionText | null>
 ): ChoiceQuestion {
   return { type: 'choice', instructions, criteria };
 }
 
 /** Rate against an ordered rubric, level 0 first. */
 export function scoreQuestion(
-  instructions: ClassificationText,
-  levels: ClassificationText[]
+  instructions: DecisionText,
+  levels: DecisionText[]
 ): ScoreQuestion {
   return { type: 'score', instructions, criteria: levels };
 }

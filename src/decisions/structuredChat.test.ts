@@ -2,9 +2,9 @@ import { ChatOpenAI } from '@langchain/openai';
 import { ChatAnthropic } from '@langchain/anthropic';
 import { AIMessage } from '@langchain/core/messages';
 import { ChatGoogleGenerativeAI } from '@langchain/google-genai';
-import type { ClassificationQuestion } from './index';
+import type { DecisionQuestion } from './index';
 import {
-  createStructuredChatClassifier,
+  createStructuredChatDecisionModel,
   booleanQuestion,
   choiceQuestion,
   scoreQuestion,
@@ -29,7 +29,7 @@ function openAIModel(
   const toolCall = {
     id: 'call_test',
     type: 'function',
-    function: { name: 'ClassifyDecisions', arguments: JSON.stringify(parsed) },
+    function: { name: 'DecideQuestions', arguments: JSON.stringify(parsed) },
   };
   const fetch: typeof globalThis.fetch = async (_url, init) => {
     calls.push(JSON.parse(String(init?.body)) as ProviderCall);
@@ -66,7 +66,7 @@ function openAIModel(
   });
 }
 
-describe('strict structured-chat classifier', () => {
+describe('strict structured-chat decisionModel', () => {
   it.each(['jsonSchema', 'functionCalling'] as const)(
     'batches boolean and choice questions into strict OpenAI %s with raw usage',
     async (method) => {
@@ -77,12 +77,12 @@ describe('strict structured-chat classifier', () => {
         true,
         method
       );
-      const classifier = createStructuredChatClassifier({
+      const decisionModel = createStructuredChatDecisionModel({
         model,
         modelId: 'gpt-4o-mini',
         method,
       });
-      const result = await classifier.classify({
+      const result = await decisionModel.decide({
         state: { text: 'call a test hook' },
         questions: {
           q: booleanQuestion('Is this a test?'),
@@ -113,7 +113,7 @@ describe('strict structured-chat classifier', () => {
       );
       expect(calls[0].messages?.[1].content).toContain('call a test hook');
       expect(calls[0].messages?.[1].content).toMatch(
-        /^librechat-classifier-state:/
+        /^librechat-decision-state:/
       );
       expect(result.answers.q).toEqual({
         type: 'boolean',
@@ -144,7 +144,7 @@ describe('strict structured-chat classifier', () => {
             {
               type: 'tool_use',
               id: 'toolu_test',
-              name: 'ClassifyDecisions',
+              name: 'DecideQuestions',
               input: { answers: { q: { decision: false } } },
             },
           ],
@@ -161,12 +161,12 @@ describe('strict structured-chat classifier', () => {
       clientOptions: { fetch },
       maxRetries: 0,
     });
-    const classifier = createStructuredChatClassifier({
+    const decisionModel = createStructuredChatDecisionModel({
       model,
       modelId: 'claude-haiku-4-5-20251001',
       method: 'functionCalling',
     });
-    const result = await classifier.classify({
+    const result = await decisionModel.decide({
       state: 'test',
       questions: { q: booleanQuestion('?') },
     });
@@ -204,13 +204,13 @@ describe('strict structured-chat classifier', () => {
         maxRetries: 0,
         configuration: { fetch },
       });
-      const classifier = createStructuredChatClassifier({
+      const decisionModel = createStructuredChatDecisionModel({
         model,
         modelId: 'gpt-4o-mini',
         method: 'jsonSchema',
       });
       try {
-        await classifier.classify({
+        await decisionModel.decide({
           state: 'private state',
           questions: { q: booleanQuestion('?') },
         });
@@ -242,13 +242,13 @@ describe('strict structured-chat classifier', () => {
       clientOptions: { fetch },
       maxRetries: 0,
     });
-    const classifier = createStructuredChatClassifier({
+    const decisionModel = createStructuredChatDecisionModel({
       model,
       modelId: 'claude-haiku-4-5-20251001',
       method: 'functionCalling',
     });
     await expect(
-      classifier.classify({
+      decisionModel.decide({
         state: 'test',
         questions: { q: booleanQuestion('?') },
       })
@@ -302,7 +302,7 @@ describe('strict structured-chat classifier', () => {
               tool_calls: [
                 {
                   id: 'tool-test',
-                  name: 'ClassifyDecisions',
+                  name: 'DecideQuestions',
                   args: { answers: { q: { decision: true } } },
                 },
               ],
@@ -312,7 +312,7 @@ describe('strict structured-chat classifier', () => {
       });
       const structured = jest.spyOn(model, 'withStructuredOutput');
       const onAnswered = jest.fn();
-      const classifier = createStructuredChatClassifier({
+      const decisionModel = createStructuredChatDecisionModel({
         model,
         modelId: 'gpt-4o-mini',
         providerId: 'openai',
@@ -320,7 +320,7 @@ describe('strict structured-chat classifier', () => {
         onAnswered,
       });
       await expect(
-        classifier.classify({
+        decisionModel.decide({
           state: 'test',
           questions: { q: booleanQuestion('?') },
         })
@@ -347,13 +347,13 @@ describe('strict structured-chat classifier', () => {
       ],
     });
     const structured = jest.spyOn(model, 'withStructuredOutput');
-    const classifier = createStructuredChatClassifier({
+    const decisionModel = createStructuredChatDecisionModel({
       model,
       modelId: model.model,
       method: 'jsonSchema',
     });
     await expect(
-      classifier.classify({
+      decisionModel.decide({
         state: 'test',
         questions: { q: booleanQuestion('?') },
       })
@@ -370,26 +370,26 @@ describe('strict structured-chat classifier', () => {
       apiKey: 'testing',
       maxRetries: 0,
     });
-    const notSupported = createStructuredChatClassifier({
+    const notSupported = createStructuredChatDecisionModel({
       model: legacy,
       modelId: 'gpt-4',
       method: 'jsonSchema',
     });
     await expect(
-      notSupported.classify({
+      notSupported.decide({
         state: {},
         questions: { q: booleanQuestion('?') },
       })
     ).rejects.toMatchObject({ failure: 'unsupported_mode' });
     expect(calls).toHaveLength(0);
 
-    const chat = createStructuredChatClassifier({
+    const chat = createStructuredChatDecisionModel({
       model,
       modelId: 'gpt-4o-mini',
       method: 'jsonSchema',
     });
     await expect(
-      chat.classify({
+      chat.decide({
         state: {},
         questions: { score: scoreQuestion('How bad?', ['fine', 'bad']) },
       })
@@ -401,7 +401,7 @@ describe('strict structured-chat classifier', () => {
       ])
     );
     await expect(
-      chat.classify({ state: {}, questions: tooMany })
+      chat.decide({ state: {}, questions: tooMany })
     ).rejects.toMatchObject({ failure: 'unsupported_question' });
     expect(calls).toHaveLength(0);
   });
@@ -417,14 +417,14 @@ describe('strict structured-chat classifier', () => {
     async (parsed) => {
       const calls: ProviderCall[] = [];
       const onAnswered = jest.fn();
-      const classifier = createStructuredChatClassifier({
+      const decisionModel = createStructuredChatDecisionModel({
         model: openAIModel(parsed, calls),
         modelId: 'gpt-4o-mini',
         method: 'jsonSchema',
         onAnswered,
       });
       await expect(
-        classifier.classify({
+        decisionModel.decide({
           state: 'secret input',
           questions: { q: booleanQuestion('?') },
         })
@@ -447,16 +447,16 @@ describe('strict structured-chat classifier', () => {
     'rejects malformed boolean criteria %j before chat invocation',
     async (criteria) => {
       const calls: ProviderCall[] = [];
-      const classifier = createStructuredChatClassifier({
+      const decisionModel = createStructuredChatDecisionModel({
         model: openAIModel({ answers: { q: { decision: true } } }, calls),
         modelId: 'gpt-4o-mini',
         method: 'jsonSchema',
       });
       const question = JSON.parse(
         JSON.stringify({ type: 'boolean', instructions: '?', criteria })
-      ) as ClassificationQuestion;
+      ) as DecisionQuestion;
       await expect(
-        classifier.classify({ state: {}, questions: { q: question } })
+        decisionModel.decide({ state: {}, questions: { q: question } })
       ).rejects.toMatchObject({ failure: 'bad_request' });
       expect(calls).toHaveLength(0);
     }
@@ -464,18 +464,18 @@ describe('strict structured-chat classifier', () => {
 
   it('preserves unknown usage and validates choices even if the model returns another label', async () => {
     const calls: ProviderCall[] = [];
-    const classifier = createStructuredChatClassifier({
+    const decisionModel = createStructuredChatDecisionModel({
       model: openAIModel({ answers: { q: { decision: false } } }, calls, false),
       modelId: 'gpt-4o-mini',
       method: 'jsonSchema',
     });
-    const result = await classifier.classify({
+    const result = await decisionModel.decide({
       state: 'test',
       questions: { q: booleanQuestion('?') },
     });
     expect(result.usage).toBeNull();
 
-    const invalid = createStructuredChatClassifier({
+    const invalid = createStructuredChatDecisionModel({
       model: openAIModel(
         { answers: { choice: { choice: 'not listed' } } },
         calls
@@ -484,7 +484,7 @@ describe('strict structured-chat classifier', () => {
       method: 'jsonSchema',
     });
     await expect(
-      invalid.classify({
+      invalid.decide({
         state: 'test',
         questions: { choice: choiceQuestion('Which?', { a: 'A', b: 'B' }) },
       })
@@ -512,13 +512,13 @@ describe('strict structured-chat classifier', () => {
       maxRetries: 0,
       configuration: { fetch },
     });
-    const classifier = createStructuredChatClassifier({
+    const decisionModel = createStructuredChatDecisionModel({
       model,
       modelId: 'gpt-4o-mini',
       method: 'jsonSchema',
     });
     const pick = choiceQuestion('Pick?', { first: 'First', second: 'Second' });
-    const resultPromise = classifier.classify({
+    const resultPromise = decisionModel.decide({
       state: 'hello',
       questions: { pick },
     });
@@ -561,7 +561,7 @@ describe('strict structured-chat classifier', () => {
 
   it('checks a pre-aborted signal before reading dynamic questions', async () => {
     const model = openAIModel({ answers: { q: { decision: true } } }, []);
-    const classifier = createStructuredChatClassifier({
+    const decisionModel = createStructuredChatDecisionModel({
       model,
       modelId: 'gpt-4o-mini',
       method: 'jsonSchema',
@@ -575,7 +575,7 @@ describe('strict structured-chat classifier', () => {
       },
     }) as Record<string, ReturnType<typeof booleanQuestion>>;
     await expect(
-      classifier.classify({
+      decisionModel.decide({
         state: {},
         questions,
         signal: controller.signal,
@@ -598,7 +598,7 @@ describe('strict structured-chat classifier', () => {
       maxRetries: 0,
       configuration: { fetch },
     });
-    const classifier = createStructuredChatClassifier({
+    const decisionModel = createStructuredChatDecisionModel({
       model,
       modelId: 'gpt-4o-mini',
       method: 'jsonSchema',
@@ -607,14 +607,17 @@ describe('strict structured-chat classifier', () => {
     const cancelled = new AbortController();
     cancelled.abort();
     await expect(
-      classifier.classify({
+      decisionModel.decide({
         state: {},
         questions: { q: booleanQuestion('?') },
         signal: cancelled.signal,
       })
     ).rejects.toMatchObject({ failure: 'aborted' });
     await expect(
-      classifier.classify({ state: {}, questions: { q: booleanQuestion('?') } })
+      decisionModel.decide({
+        state: {},
+        questions: { q: booleanQuestion('?') },
+      })
     ).rejects.toMatchObject({ failure: 'timeout' });
   });
 });

@@ -1,19 +1,19 @@
 import type {
-  Classifier,
-  ClassificationCredential,
-  ClassificationProviderSettings,
+  DecisionModel,
+  DecisionCredential,
+  DecisionProviderSettings,
 } from './types';
-import type { ClassificationFetch } from './transport';
-import { createHttpClassifier } from './http';
+import type { DecisionFetch } from './transport';
+import { createHttpDecisionModel } from './http';
 
-export const DEFAULT_API_KEY_ENV = 'CLASSIFIER_API_KEY';
+export const DEFAULT_API_KEY_ENV = 'DECISION_API_KEY';
 
 /**
- * Known HTTP hosts as settings, not new classifier implementations. Jev and Laya speak the
+ * Known HTTP hosts as settings, not new decision model implementations. Jev and Laya speak the
  * same wire protocol, but their confidence measures and checkpoint calibration differ.
  */
-export const CLASSIFICATION_PRESETS: Readonly<
-  Record<string, Readonly<ClassificationProviderSettings>>
+export const DECISION_PRESETS: Readonly<
+  Record<string, Readonly<DecisionProviderSettings>>
 > = Object.freeze({
   http: Object.freeze({
     dialect: 'port',
@@ -58,22 +58,22 @@ export const CLASSIFICATION_PRESETS: Readonly<
   }),
 });
 
-export function classificationPreset(
+export function decisionPreset(
   name: string | undefined
-): ClassificationProviderSettings | null {
+): DecisionProviderSettings | null {
   if (name == null || name === '') {
     return null;
   }
-  return Object.hasOwn(CLASSIFICATION_PRESETS, name)
-    ? { ...CLASSIFICATION_PRESETS[name] }
+  return Object.hasOwn(DECISION_PRESETS, name)
+    ? { ...DECISION_PRESETS[name] }
     : null;
 }
 
 /** Caller settings win except that required preset authentication cannot be weakened. */
-export function mergeClassificationSettings(
-  preset: ClassificationProviderSettings | null,
-  configured: ClassificationProviderSettings | undefined
-): ClassificationProviderSettings {
+export function mergeDecisionSettings(
+  preset: DecisionProviderSettings | null,
+  configured: DecisionProviderSettings | undefined
+): DecisionProviderSettings {
   return {
     ...(preset ?? {}),
     ...(configured ?? {}),
@@ -81,20 +81,20 @@ export function mergeClassificationSettings(
   };
 }
 
-export function classificationProviderNames(): string[] {
-  return Object.keys(CLASSIFICATION_PRESETS);
+export function decisionProviderNames(): string[] {
+  return Object.keys(DECISION_PRESETS);
 }
 
-export function createClassifier(
-  settings: ClassificationProviderSettings,
-  apiKey?: ClassificationCredential,
+export function createDecisionModel(
+  settings: DecisionProviderSettings,
+  apiKey?: DecisionCredential,
   options?: {
-    fetch?: ClassificationFetch;
+    fetch?: DecisionFetch;
     providerId?: string;
     onAnswered?: (label: string, ms: number) => void;
   }
-): Classifier {
-  return createHttpClassifier({
+): DecisionModel {
+  return createHttpDecisionModel({
     providerId: options?.providerId,
     apiKey,
     requiresAuth: settings.requiresAuth,

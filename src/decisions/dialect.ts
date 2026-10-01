@@ -1,14 +1,14 @@
 import type {
-  ClassificationAnswer,
-  ClassificationDialect,
-  ClassificationQuestion,
+  DecisionAnswer,
+  DecisionDialect,
+  DecisionQuestion,
 } from './types';
-import { isClassificationObject } from './types';
+import { isDecisionObject } from './types';
 
 interface WireQuestion {
   type: string;
-  instructions: ClassificationQuestion['instructions'];
-  criteria?: ClassificationQuestion['criteria'];
+  instructions: DecisionQuestion['instructions'];
+  criteria?: DecisionQuestion['criteria'];
 }
 
 interface WireAnswer {
@@ -23,8 +23,8 @@ interface WireAnswer {
 
 /** System One calls a yes/no question a `noul`; both dialects use a `{true, false}` criterion. */
 export function toWireQuestion(
-  question: ClassificationQuestion,
-  dialect: ClassificationDialect
+  question: DecisionQuestion,
+  dialect: DecisionDialect
 ): WireQuestion {
   const type =
     dialect === 'systemone' && question.type === 'boolean'
@@ -53,13 +53,13 @@ function isProbability(value: unknown): value is number {
 function probabilitiesOf(
   raw: unknown,
   answerType: 'choice' | 'score',
-  question?: ClassificationQuestion,
+  question?: DecisionQuestion,
   selectedChoice?: string
 ): Record<string, number> | null | undefined {
   if (raw == null) {
     return null;
   }
-  if (!isClassificationObject(raw)) {
+  if (!isDecisionObject(raw)) {
     return undefined;
   }
   const entries = Object.entries(raw);
@@ -110,10 +110,10 @@ function probabilitiesOf(
 /** A validated answer, or `null` for one that cannot safely be read. */
 export function readAnswer(
   answer: unknown,
-  dialect: ClassificationDialect,
-  question?: ClassificationQuestion
-): ClassificationAnswer | null {
-  if (!isClassificationObject(answer)) {
+  dialect: DecisionDialect,
+  question?: DecisionQuestion
+): DecisionAnswer | null {
+  if (!isDecisionObject(answer)) {
     return null;
   }
   const record: WireAnswer = answer;

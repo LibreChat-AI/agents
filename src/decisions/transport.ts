@@ -1,7 +1,7 @@
-import type { ClassificationCredential } from './types';
 import type { AwaitWithinDeadline } from './deadline';
-import { withClassificationDeadline } from './deadline';
-import { ClassificationError } from './types';
+import type { DecisionCredential } from './types';
+import { withDecisionDeadline } from './deadline';
+import { DecisionError } from './types';
 
 const DEFAULT_TIMEOUT_MS = 4_000;
 const DEFAULT_MAX_RETRIES = 2;
@@ -9,7 +9,7 @@ const MAX_RESPONSE_BYTES = 256 * 1024;
 const BACKOFF_MS = [250, 750, 1_500, 3_000, 6_000];
 const MAX_RETRY_AFTER_MS = 10_000;
 
-export type ClassificationFetch = (
+export type DecisionFetch = (
   input: string,
   init: {
     method: string;
@@ -22,13 +22,13 @@ export type ClassificationFetch = (
 
 export interface TransportOptions {
   providerId: string;
-  apiKey?: ClassificationCredential;
+  apiKey?: DecisionCredential;
   requiresAuth?: boolean;
   /** Full URL, not a base path. */
   endpoint: string;
   timeoutMs?: number;
   maxRetries?: number;
-  fetch?: ClassificationFetch;
+  fetch?: DecisionFetch;
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   /** Called only after the response parses, with no state, answers, or credentials. */
   onAnswered?: (label: string, ms: number) => void;
@@ -106,9 +106,9 @@ async function readResponse(
       }
       bytes += chunk.value.byteLength;
       if (bytes > MAX_RESPONSE_BYTES) {
-        throw new ClassificationError(
+        throw new DecisionError(
           'malformed_response',
-          'classifier response too large',
+          'decision model response too large',
           {
             provider,
           }
@@ -137,9 +137,9 @@ export function createTransport(options: TransportOptions): Transport {
     (credential == null ||
       (typeof credential === 'string' && credential.trim() === ''))
   ) {
-    throw new ClassificationError(
+    throw new DecisionError(
       'unauthorized',
-      'classifier requires an API key',
+      'decision model requires an API key',
       {
         provider: providerId,
       }
@@ -147,9 +147,9 @@ export function createTransport(options: TransportOptions): Transport {
   }
   const endpoint = options.endpoint.trim();
   if (!endpoint) {
-    throw new ClassificationError(
+    throw new DecisionError(
       'bad_request',
-      'classifier requires an endpoint',
+      'decision model requires an endpoint',
       {
         provider: providerId,
       }
@@ -160,23 +160,19 @@ export function createTransport(options: TransportOptions): Transport {
   const sleep = options.sleep ?? defaultSleep;
   const onAnswered = options.onAnswered;
   if (!Number.isSafeInteger(maxRetries) || maxRetries < 0 || maxRetries > 5) {
-    throw new ClassificationError(
+    throw new DecisionError(
       'bad_request',
-      'invalid classifier retry limit',
+      'invalid decision model retry limit',
       {
         provider: providerId,
       }
     );
   }
-  const fetchImpl: ClassificationFetch = options.fetch ?? globalThis.fetch;
+  const fetchImpl: DecisionFetch = options.fetch ?? globalThis.fetch;
   if (typeof fetchImpl !== 'function') {
-    throw new ClassificationError(
-      'network',
-      'no fetch implementation available',
-      {
-        provider: providerId,
-      }
-    );
+    throw new DecisionError('network', 'no fetch implementation available', {
+      provider: providerId,
+    });
   }
 
   async function resolveKey(
@@ -192,7 +188,7 @@ export function createTransport(options: TransportOptions): Transport {
     const minted: string = await credential({ refresh, signal });
     const token = typeof minted === 'string' ? minted.trim() : '';
     if (!token) {
-      throw new ClassificationError(
+      throw new DecisionError(
         'unauthorized',
         'credential function returned no token',
         {
@@ -205,7 +201,7 @@ export function createTransport(options: TransportOptions): Transport {
 
   return async function send(prepare, callerSignal, label, timeoutOverrideMs) {
     const started = performance.now();
-    return withClassificationDeadline(
+    return withDecisionDeadline(
       providerId,
       timeoutOverrideMs ?? timeoutMs,
       callerSignal,
@@ -214,12 +210,12 @@ export function createTransport(options: TransportOptions): Transport {
         try {
           prepared = prepare();
         } catch (error) {
-          if (error instanceof ClassificationError) {
+          if (error instanceof DecisionError) {
             throw error;
           }
-          throw new ClassificationError(
+          throw new DecisionError(
             'bad_request',
-            'invalid classifier request',
+            'invalid decision model request',
             {
               provider: providerId,
             }
@@ -228,15 +224,15 @@ export function createTransport(options: TransportOptions): Transport {
         const { payload, parse } = prepared;
         await waitFor(Promise.resolve());
         const wasAborted = (): boolean => signal.aborted;
-        const interrupted = (): ClassificationError =>
-          new ClassificationError(
+        const interrupted = (): DecisionError =>
+          new DecisionError(
             callerSignal?.aborted === true ? 'aborted' : 'timeout',
-            'classifier request interrupted',
+            'decision model request interrupted',
             { provider: providerId }
           );
         let refreshed = false;
         let key: string | null | undefined;
-        let lastError: ClassificationError | undefined;
+        let lastError: DecisionError | undefined;
         for (let attemptNo = 0; attemptNo <= maxRetries; attemptNo++) {
           if (wasAborted()) {
             throw interrupted();
@@ -259,9 +255,9 @@ export function createTransport(options: TransportOptions): Transport {
             );
             if (!response.ok) {
               void response.body?.cancel().catch(() => {});
-              const error = new ClassificationError(
+              const error = new DecisionError(
                 failureForStatus(response.status),
-                `classifier returned HTTP ${response.status}`,
+                `decision model returned HTTP ${response.status}`,
                 { provider: providerId, status: response.status }
               );
               error.retryAfterMs = retryAfterMs(
@@ -281,12 +277,12 @@ export function createTransport(options: TransportOptions): Transport {
             if (wasAborted()) {
               throw interrupted();
             }
-            if (error instanceof ClassificationError) {
+            if (error instanceof DecisionError) {
               lastError = error;
             } else {
-              lastError = new ClassificationError(
+              lastError = new DecisionError(
                 'network',
-                'classifier request failed',
+                'decision model request failed',
                 { provider: providerId }
               );
             }
@@ -314,12 +310,12 @@ export function createTransport(options: TransportOptions): Transport {
             try {
               await waitFor(sleep(wait, signal));
             } catch (error) {
-              if (error instanceof ClassificationError) {
+              if (error instanceof DecisionError) {
                 throw error;
               }
-              throw new ClassificationError(
+              throw new DecisionError(
                 'network',
-                'classifier backoff failed',
+                'decision model backoff failed',
                 {
                   provider: providerId,
                 }
@@ -329,7 +325,7 @@ export function createTransport(options: TransportOptions): Transport {
         }
         throw (
           lastError ??
-          new ClassificationError('network', 'classifier request failed', {
+          new DecisionError('network', 'decision model request failed', {
             provider: providerId,
           })
         );

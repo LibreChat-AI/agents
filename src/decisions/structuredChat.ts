@@ -1,43 +1,39 @@
 import { HumanMessage, SystemMessage } from '@langchain/core/messages';
 import type { BaseChatModel } from '@langchain/core/language_models/chat_models';
 import type {
-  Classifier,
-  ClassificationQuestion,
-  ClassificationResult,
-  ClassificationRequest,
+  DecisionModel,
+  DecisionQuestion,
+  DecisionResult,
+  DecisionRequest,
 } from './types';
-import {
-  ClassificationError,
-  isClassificationObject,
-  readClassificationUsage,
-} from './types';
-import { validateClassificationQuestions } from './questions';
-import { CLASSIFICATION_PROMPT_PREFIX } from './traceMarker';
+import { DecisionError, isDecisionObject, readDecisionUsage } from './types';
 import { failureForStatus, retryAfterMs } from './transport';
-import { withClassificationDeadline } from './deadline';
+import { validateDecisionQuestions } from './questions';
+import { DECISION_PROMPT_PREFIX } from './traceMarker';
+import { withDecisionDeadline } from './deadline';
 
 const MAX_QUESTIONS = 32;
 const MAX_CHOICE_OPTIONS = 128;
 const DEFAULT_TIMEOUT_MS = 20_000;
 const PROVIDER_ID = 'structured-chat';
 
-export function readChatUsage(raw: unknown): ClassificationResult['usage'] {
-  if (!isClassificationObject(raw)) {
+export function readChatUsage(raw: unknown): DecisionResult['usage'] {
+  if (!isDecisionObject(raw)) {
     return null;
   }
-  const usage = readClassificationUsage(raw.usage_metadata);
-  const response = isClassificationObject(raw.response_metadata)
+  const usage = readDecisionUsage(raw.usage_metadata);
+  const response = isDecisionObject(raw.response_metadata)
     ? raw.response_metadata
     : null;
-  const nested = isClassificationObject(response?.metadata)
+  const nested = isDecisionObject(response?.metadata)
     ? response.metadata
     : null;
-  const bedrock = isClassificationObject(nested?.usage)
+  const bedrock = isDecisionObject(nested?.usage)
     ? nested.usage
     : response?.usage;
   if (
     usage?.inputTokens === undefined ||
-    !isClassificationObject(bedrock) ||
+    !isDecisionObject(bedrock) ||
     usage.inputTokens !== bedrock.inputTokens
   ) {
     return usage;
@@ -59,12 +55,9 @@ export function readChatUsage(raw: unknown): ClassificationResult['usage'] {
   return Number.isSafeInteger(inputTokens) ? { ...usage, inputTokens } : usage;
 }
 
-function providerFailure(
-  error: unknown,
-  provider: string
-): ClassificationError {
-  const details = isClassificationObject(error) ? error : null;
-  const metadata = isClassificationObject(details?.$metadata)
+function providerFailure(error: unknown, provider: string): DecisionError {
+  const details = isDecisionObject(error) ? error : null;
+  const metadata = isDecisionObject(details?.$metadata)
     ? details.$metadata
     : null;
   const rawStatus =
@@ -76,19 +69,19 @@ function providerFailure(
     rawStatus <= 599
       ? rawStatus
       : undefined;
-  const classified = new ClassificationError(
+  const failure = new DecisionError(
     status == null ? 'network' : failureForStatus(status),
-    'structured classifier request failed',
+    'structured decision model request failed',
     { provider, status }
   );
   const headers = details?.headers;
   if (headers instanceof Headers) {
-    classified.retryAfterMs = retryAfterMs(headers.get('retry-after'));
+    failure.retryAfterMs = retryAfterMs(headers.get('retry-after'));
   }
-  return classified;
+  return failure;
 }
 
-export interface StructuredChatClassifierOptions {
+export interface StructuredChatDecisionModelOptions {
   /** An already configured chat model whose chosen method enforces strict schemas. */
   model: BaseChatModel;
   modelId: string;
@@ -101,7 +94,7 @@ export interface StructuredChatClassifierOptions {
 }
 
 function decisionSchema(
-  entries: Array<[string, ClassificationQuestion]>
+  entries: Array<[string, DecisionQuestion]>
 ): Record<string, unknown> {
   const properties: Record<string, object> = Object.create(null);
   for (const [id, question] of entries) {
@@ -141,32 +134,32 @@ function decisionSchema(
 /** Do not trust even a provider-parsed response: check every required id and choice locally. */
 function readDecisions(
   parsed: unknown,
-  entries: Array<[string, ClassificationQuestion]>,
+  entries: Array<[string, DecisionQuestion]>,
   provider: string
-): ClassificationResult['answers'] {
-  const invalid = (): ClassificationError =>
-    new ClassificationError(
+): DecisionResult['answers'] {
+  const invalid = (): DecisionError =>
+    new DecisionError(
       'malformed_response',
-      'invalid structured classifier answer',
+      'invalid structured decision model answer',
       {
         provider,
       }
     );
   if (
-    !isClassificationObject(parsed) ||
+    !isDecisionObject(parsed) ||
     Object.keys(parsed).length !== 1 ||
-    !isClassificationObject(parsed.answers) ||
+    !isDecisionObject(parsed.answers) ||
     Object.keys(parsed.answers).length !== entries.length
   ) {
     throw invalid();
   }
-  const answers: ClassificationResult['answers'] = Object.create(null);
+  const answers: DecisionResult['answers'] = Object.create(null);
   for (const [id, question] of entries) {
     if (!Object.hasOwn(parsed.answers, id)) {
       throw invalid();
     }
     const raw = parsed.answers[id];
-    if (!isClassificationObject(raw) || Object.keys(raw).length !== 1) {
+    if (!isDecisionObject(raw) || Object.keys(raw).length !== 1) {
       throw invalid();
     }
     if (question.type === 'boolean') {
@@ -198,17 +191,17 @@ function readDecisions(
 }
 
 function questionsForChat(
-  questions: ClassificationRequest['questions'],
+  questions: DecisionRequest['questions'],
   provider: string,
   maxQuestions: number
-): Array<[string, ClassificationQuestion]> {
-  const entries = validateClassificationQuestions(questions, provider);
+): Array<[string, DecisionQuestion]> {
+  const entries = validateDecisionQuestions(questions, provider);
   let choices = 0;
   for (const [, question] of entries) {
     if (question.type === 'score') {
-      throw new ClassificationError(
+      throw new DecisionError(
         'unsupported_question',
-        'chat classification cannot score expected values',
+        'chat decision cannot score expected values',
         { provider }
       );
     }
@@ -217,9 +210,9 @@ function questionsForChat(
     }
   }
   if (entries.length > maxQuestions || choices > MAX_CHOICE_OPTIONS) {
-    throw new ClassificationError(
+    throw new DecisionError(
       'unsupported_question',
-      'classifier question batch too large',
+      'decision model question batch too large',
       { provider }
     );
   }
@@ -227,23 +220,23 @@ function questionsForChat(
 }
 
 /** Strict provider schema or strict tool calling, without an agent loop or fabricated probabilities. */
-export function createStructuredChatClassifier(
-  options: StructuredChatClassifierOptions
-): Classifier {
+export function createStructuredChatDecisionModel(
+  options: StructuredChatDecisionModelOptions
+): DecisionModel {
   const provider = options.providerId ?? PROVIDER_ID;
   if (!['jsonSchema', 'functionCalling'].includes(options.method)) {
-    throw new ClassificationError(
+    throw new DecisionError(
       'unsupported_mode',
-      'unsupported structured classifier mode',
+      'unsupported structured decision model mode',
       {
         provider,
       }
     );
   }
   if (!options.modelId.trim()) {
-    throw new ClassificationError(
+    throw new DecisionError(
       'bad_request',
-      'classifier requires a model id',
+      'decision model requires a model id',
       {
         provider,
       }
@@ -255,9 +248,9 @@ export function createStructuredChatClassifier(
     maxQuestions < 1 ||
     maxQuestions > MAX_QUESTIONS
   ) {
-    throw new ClassificationError(
+    throw new DecisionError(
       'bad_request',
-      'invalid classifier question limit',
+      'invalid decision model question limit',
       {
         provider,
       }
@@ -271,11 +264,9 @@ export function createStructuredChatClassifier(
   return {
     id: provider,
     model: modelId,
-    async classify(
-      request: ClassificationRequest
-    ): Promise<ClassificationResult> {
+    async decide(request: DecisionRequest): Promise<DecisionResult> {
       const started = performance.now();
-      return withClassificationDeadline(
+      return withDecisionDeadline(
         provider,
         request.timeoutMs ?? timeoutMs,
         request.signal,
@@ -288,15 +279,15 @@ export function createStructuredChatClassifier(
           let input: string;
           try {
             input =
-              CLASSIFICATION_PROMPT_PREFIX +
+              DECISION_PROMPT_PREFIX +
               JSON.stringify({
                 state: request.state,
                 questions: Object.fromEntries(entries),
               });
           } catch {
-            throw new ClassificationError(
+            throw new DecisionError(
               'bad_request',
-              'invalid classifier request',
+              'invalid decision model request',
               {
                 provider,
               }
@@ -309,16 +300,16 @@ export function createStructuredChatClassifier(
               adapter !== 'openai' &&
               (adapter !== 'anthropic' || method !== 'functionCalling')
             ) {
-              throw new Error('unverified strict classifier adapter');
+              throw new Error('unverified strict decision model adapter');
             }
             structured = model.withStructuredOutput(decisionSchema(entries), {
-              name: 'ClassifyDecisions',
+              name: 'DecideQuestions',
               method,
               strict: true,
               includeRaw: true,
             });
           } catch {
-            throw new ClassificationError(
+            throw new DecisionError(
               'unsupported_mode',
               'model cannot enforce the requested strict mode',
               {
@@ -341,13 +332,13 @@ export function createStructuredChatClassifier(
               )
             );
           } catch (error) {
-            if (error instanceof ClassificationError) {
+            if (error instanceof DecisionError) {
               throw error;
             }
             throw providerFailure(error, provider);
           }
           const answers = readDecisions(output.parsed, entries, provider);
-          const result: ClassificationResult = {
+          const result: DecisionResult = {
             model: modelId,
             answers,
             usage: readChatUsage(output.raw),
@@ -355,11 +346,11 @@ export function createStructuredChatClassifier(
           await waitFor(Promise.resolve());
           try {
             onAnswered?.(
-              request.label ?? 'classify',
+              request.label ?? 'decide',
               performance.now() - started
             );
           } catch {
-            // A callback error must not make a valid classification fail.
+            // A callback error must not make a valid decision fail.
           }
           return result;
         }

@@ -1,9 +1,9 @@
-import { ClassificationError } from './types';
+import { DecisionError } from './types';
 
 export type AwaitWithinDeadline = <T>(task: Promise<T>) => Promise<T>;
 
 /** Bounds even non-cooperative credential minters, fetches, body reads, and model calls. */
-export async function withClassificationDeadline<T>(
+export async function withDecisionDeadline<T>(
   provider: string,
   timeoutMs: number,
   callerSignal: AbortSignal | undefined,
@@ -14,12 +14,12 @@ export async function withClassificationDeadline<T>(
     timeoutMs <= 0 ||
     timeoutMs > 3_600_000
   ) {
-    throw new ClassificationError('bad_request', 'invalid classifier timeout', {
+    throw new DecisionError('bad_request', 'invalid decision model timeout', {
       provider,
     });
   }
   if (callerSignal?.aborted === true) {
-    throw new ClassificationError('aborted', 'caller aborted the request', {
+    throw new DecisionError('aborted', 'caller aborted the request', {
       provider,
     });
   }
@@ -36,13 +36,13 @@ export async function withClassificationDeadline<T>(
     }
     return signal.aborted;
   };
-  const abortError = (): ClassificationError => {
+  const abortError = (): DecisionError => {
     if (callerSignal?.aborted === true) {
-      return new ClassificationError('aborted', 'caller aborted the request', {
+      return new DecisionError('aborted', 'caller aborted the request', {
         provider,
       });
     }
-    return new ClassificationError('timeout', 'classifier deadline exceeded', {
+    return new DecisionError('timeout', 'decision model deadline exceeded', {
       provider,
     });
   };

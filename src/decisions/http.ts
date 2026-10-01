@@ -1,37 +1,33 @@
 import type {
-  Classifier,
-  ClassificationAnswer,
-  ClassificationResult,
-  ClassificationRequest,
-  ClassificationDialect,
-  ClassificationCredential,
-  ClassificationQuestion,
+  DecisionModel,
+  DecisionAnswer,
+  DecisionResult,
+  DecisionRequest,
+  DecisionDialect,
+  DecisionCredential,
+  DecisionQuestion,
 } from './types';
-import type { ClassificationFetch } from './transport';
-import {
-  ClassificationError,
-  isClassificationObject,
-  readClassificationUsage,
-} from './types';
-import { validateClassificationQuestions } from './questions';
+import type { DecisionFetch } from './transport';
+import { DecisionError, isDecisionObject, readDecisionUsage } from './types';
+import { validateDecisionQuestions } from './questions';
 import { toWireQuestion, readAnswer } from './dialect';
 import { createTransport } from './transport';
 
 export const HTTP_PROVIDER_ID = 'http';
 
-export interface HttpClassifierOptions {
+export interface HttpDecisionModelOptions {
   providerId?: string;
-  apiKey?: ClassificationCredential;
+  apiKey?: DecisionCredential;
   requiresAuth?: boolean;
   /** Full URL, not a base path. */
   endpoint: string;
   model?: string;
-  dialect?: ClassificationDialect;
+  dialect?: DecisionDialect;
   requestKey?: string;
   responseKey?: string;
   timeoutMs?: number;
   maxRetries?: number;
-  fetch?: ClassificationFetch;
+  fetch?: DecisionFetch;
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   onAnswered?: (label: string, ms: number) => void;
 }
@@ -41,25 +37,21 @@ export function parseEnvelope(
   providerId: string,
   readOne: (
     answer: unknown,
-    question?: ClassificationQuestion
-  ) => ClassificationAnswer | null,
+    question?: DecisionQuestion
+  ) => DecisionAnswer | null,
   responseKey?: string,
-  expected?: Record<string, ClassificationQuestion>
-): ClassificationResult {
+  expected?: Record<string, DecisionQuestion>
+): DecisionResult {
   let parsed: unknown;
   try {
     parsed = JSON.parse(body);
   } catch {
-    throw new ClassificationError(
-      'malformed_response',
-      'response was not JSON',
-      {
-        provider: providerId,
-      }
-    );
+    throw new DecisionError('malformed_response', 'response was not JSON', {
+      provider: providerId,
+    });
   }
-  if (!isClassificationObject(parsed)) {
-    throw new ClassificationError(
+  if (!isDecisionObject(parsed)) {
+    throw new DecisionError(
       'malformed_response',
       'response was not an object',
       {
@@ -70,11 +62,11 @@ export function parseEnvelope(
   const unwrapped =
     responseKey != null && responseKey !== '' ? parsed[responseKey] : parsed;
   if (
-    !isClassificationObject(unwrapped) ||
-    !isClassificationObject(unwrapped.answers) ||
+    !isDecisionObject(unwrapped) ||
+    !isDecisionObject(unwrapped.answers) ||
     Object.keys(unwrapped.answers).length === 0
   ) {
-    throw new ClassificationError(
+    throw new DecisionError(
       'malformed_response',
       'response carried no answers',
       {
@@ -83,10 +75,10 @@ export function parseEnvelope(
     );
   }
 
-  const answers: ClassificationResult['answers'] = Object.create(null);
+  const answers: DecisionResult['answers'] = Object.create(null);
   for (const [id, answer] of Object.entries(unwrapped.answers)) {
     if (expected && !Object.hasOwn(expected, id)) {
-      throw new ClassificationError(
+      throw new DecisionError(
         'malformed_response',
         'response carried an unknown answer',
         {
@@ -96,7 +88,7 @@ export function parseEnvelope(
     }
     const mapped = readOne(answer, expected?.[id]);
     if (!mapped) {
-      throw new ClassificationError(
+      throw new DecisionError(
         'malformed_response',
         'response carried an invalid answer',
         {
@@ -110,29 +102,27 @@ export function parseEnvelope(
   return {
     model: typeof unwrapped.model === 'string' ? unwrapped.model : 'unknown',
     answers,
-    usage: readClassificationUsage(unwrapped.usage),
+    usage: readDecisionUsage(unwrapped.usage),
   };
 }
 
 /** Jev and Laya use the same System One HTTP dialect, but may report different confidence metrics. */
-export function createHttpClassifier(
-  options: HttpClassifierOptions
-): Classifier {
+export function createHttpDecisionModel(
+  options: HttpDecisionModelOptions
+): DecisionModel {
   const providerId = options.providerId ?? HTTP_PROVIDER_ID;
   const send = createTransport({ ...options, providerId });
   const model = options.model ?? '';
-  const dialect: ClassificationDialect = options.dialect ?? 'port';
+  const dialect: DecisionDialect = options.dialect ?? 'port';
   const { requestKey, responseKey } = options;
 
   return {
     id: providerId,
     model,
-    async classify(
-      request: ClassificationRequest
-    ): Promise<ClassificationResult> {
+    async decide(request: DecisionRequest): Promise<DecisionResult> {
       return send(
         () => {
-          const entries = validateClassificationQuestions(
+          const entries = validateDecisionQuestions(
             request.questions,
             providerId
           );
@@ -140,7 +130,7 @@ export function createHttpClassifier(
             string,
             ReturnType<typeof toWireQuestion>
           > = Object.create(null);
-          const expected: Record<string, ClassificationQuestion> =
+          const expected: Record<string, DecisionQuestion> =
             Object.create(null);
           for (const [id, question] of entries) {
             questions[id] = toWireQuestion(question, dialect);
@@ -156,9 +146,9 @@ export function createHttpClassifier(
                 : inner),
             });
           } catch {
-            throw new ClassificationError(
+            throw new DecisionError(
               'bad_request',
-              'invalid classifier request',
+              'invalid decision model request',
               {
                 provider: providerId,
               }
@@ -177,7 +167,7 @@ export function createHttpClassifier(
           };
         },
         request.signal,
-        request.label ?? 'classify',
+        request.label ?? 'decide',
         request.timeoutMs
       );
     },

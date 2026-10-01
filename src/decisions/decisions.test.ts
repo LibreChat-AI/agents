@@ -1,11 +1,11 @@
-import type { ClassificationFetch, ClassificationQuestion } from './index';
+import type { DecisionFetch, DecisionQuestion } from './index';
 import {
-  createClassifier,
-  createHttpClassifier,
-  classificationPreset,
-  CLASSIFICATION_PRESETS,
-  mergeClassificationSettings,
-  ClassificationError,
+  createDecisionModel,
+  createHttpDecisionModel,
+  decisionPreset,
+  DECISION_PRESETS,
+  mergeDecisionSettings,
+  DecisionError,
   booleanQuestion,
   choiceQuestion,
   scoreQuestion,
@@ -25,9 +25,9 @@ type FetchCall = {
 function fakeFetch(
   responses: Array<{ status: number; body: string; retryAfter?: string }>,
   calls: FetchCall[] = []
-): { fetch: ClassificationFetch; calls: FetchCall[] } {
+): { fetch: DecisionFetch; calls: FetchCall[] } {
   let i = 0;
-  const fetch: ClassificationFetch = async (url, init) => {
+  const fetch: DecisionFetch = async (url, init) => {
     calls.push({
       url,
       body: JSON.parse(init.body) as Record<string, unknown>,
@@ -53,7 +53,7 @@ const measured = JSON.stringify({
   usage: { input_tokens: 10, output_tokens: 1 },
 });
 
-describe('classification dialect', () => {
+describe('decision dialect', () => {
   it('maps boolean, choice, and expected-value score questions to System One', () => {
     expect(
       toWireQuestion(booleanQuestion('Is it a test?'), 'systemone')
@@ -318,7 +318,7 @@ describe('classification dialect', () => {
             'test',
             (raw) => readAnswer(raw, dialect)
           )
-        ).toThrow(ClassificationError);
+        ).toThrow(DecisionError);
       }
     }
   );
@@ -346,7 +346,7 @@ describe('classification dialect', () => {
   it('rejects malformed envelopes without leaking the body', () => {
     expect(() =>
       parseEnvelope('not json', 'jev', (a) => readAnswer(a, 'systemone'))
-    ).toThrow(ClassificationError);
+    ).toThrow(DecisionError);
     expect(() => parseEnvelope('{"model":"m"}', 'jev', () => null)).toThrow(
       /no answers/
     );
@@ -358,7 +358,7 @@ describe('classification dialect', () => {
   });
 });
 
-describe('HTTP classifier', () => {
+describe('HTTP decisionModel', () => {
   it('posts Jev-shaped questions and keeps only measured answer probabilities', async () => {
     const { fetch, calls } = fakeFetch([
       {
@@ -383,14 +383,14 @@ describe('HTTP classifier', () => {
         }),
       },
     ]);
-    const classifier = createHttpClassifier({
+    const decisionModel = createHttpDecisionModel({
       endpoint: 'https://s1.example/v1/systemone',
       apiKey: 'k',
       model: 'jev-latest',
       dialect: 'systemone',
       fetch,
     });
-    const result = await classifier.classify({
+    const result = await decisionModel.decide({
       state: { path: 'x.ts' },
       questions: {
         role: choiceQuestion('Which?', { hook: 'a hook', util: 'a util' }),
@@ -447,12 +447,12 @@ describe('HTTP classifier', () => {
       reply = resolve;
     });
     let payload = '';
-    const fetch: ClassificationFetch = async (_url, init) => {
+    const fetch: DecisionFetch = async (_url, init) => {
       payload = init.body;
       requested?.();
       return pending;
     };
-    const classifier = createHttpClassifier({
+    const decisionModel = createHttpDecisionModel({
       endpoint: 'https://s1.example/v1/systemone',
       apiKey: 'k',
       dialect: 'systemone',
@@ -460,7 +460,7 @@ describe('HTTP classifier', () => {
     });
     const pick = choiceQuestion('Pick?', { first: 'First', second: 'Second' });
     const questions = { pick };
-    const resultPromise = classifier.classify({ state: 'hello', questions });
+    const resultPromise = decisionModel.decide({ state: 'hello', questions });
     await sent;
     Object.assign(pick, { type: 'boolean' });
     delete pick.criteria.first;
@@ -494,14 +494,14 @@ describe('HTTP classifier', () => {
 
   it('sends the same wire format to unauthenticated Laya without pinning a model', async () => {
     const { fetch, calls } = fakeFetch([{ status: 200, body: measured }]);
-    const settings = mergeClassificationSettings(classificationPreset('laya'), {
+    const settings = mergeDecisionSettings(decisionPreset('laya'), {
       baseURL: 'http://localhost:8000/v1/systemone',
     });
-    const classifier = createClassifier(settings, undefined, {
+    const decisionModel = createDecisionModel(settings, undefined, {
       providerId: 'laya',
       fetch,
     });
-    const result = await classifier.classify({
+    const result = await decisionModel.decide({
       state: 'bill me twice',
       questions: { q: booleanQuestion('Was billing mentioned?') },
     });
@@ -517,37 +517,36 @@ describe('HTTP classifier', () => {
     });
     expect(calls[0].body).not.toHaveProperty('model');
     expect(result.answers.q).toEqual({ type: 'boolean', probability: 0.9 });
-    expect(classificationPreset('laya')).toMatchObject({
+    expect(decisionPreset('laya')).toMatchObject({
       dialect: 'systemone',
       requiresAuth: false,
     });
-    expect(classificationPreset('laya')).not.toHaveProperty('baseURL');
-    expect(classificationPreset('laya')).not.toHaveProperty('model');
+    expect(decisionPreset('laya')).not.toHaveProperty('baseURL');
+    expect(decisionPreset('laya')).not.toHaveProperty('model');
   });
 
   it('supports optional Laya bearer auth and keeps mandatory Jev credentials', async () => {
     const { fetch, calls } = fakeFetch([{ status: 200, body: measured }]);
-    const laya = createClassifier(
-      mergeClassificationSettings(classificationPreset('laya'), {
+    const laya = createDecisionModel(
+      mergeDecisionSettings(decisionPreset('laya'), {
         baseURL: 'https://local.example/v1/systemone',
       }),
       'laya-secret',
       { fetch }
     );
-    await laya.classify({ state: {}, questions: { q: booleanQuestion('?') } });
+    await laya.decide({ state: {}, questions: { q: booleanQuestion('?') } });
     expect(calls[0].auth).toBe('Bearer laya-secret');
     expect(() =>
-      createClassifier(classificationPreset('typesafe') ?? {}, undefined)
+      createDecisionModel(decisionPreset('typesafe') ?? {}, undefined)
     ).toThrow(/API key/);
-    const required = mergeClassificationSettings(
-      classificationPreset('typesafe'),
-      { requiresAuth: false }
-    );
+    const required = mergeDecisionSettings(decisionPreset('typesafe'), {
+      requiresAuth: false,
+    });
     expect(required.requiresAuth).toBe(true);
-    expect(() => createClassifier(required, undefined)).toThrow(/API key/);
+    expect(() => createDecisionModel(required, undefined)).toThrow(/API key/);
     expect(() =>
-      createClassifier(
-        mergeClassificationSettings(classificationPreset('laya'), {
+      createDecisionModel(
+        mergeDecisionSettings(decisionPreset('laya'), {
           baseURL: 'https://local.example/v1/systemone',
           requiresAuth: true,
         }),
@@ -555,38 +554,38 @@ describe('HTTP classifier', () => {
       )
     ).toThrow(/API key/);
     expect(() =>
-      createClassifier(classificationPreset('laya') ?? {}, undefined)
+      createDecisionModel(decisionPreset('laya') ?? {}, undefined)
     ).toThrow(/endpoint/);
     expect(() =>
-      createHttpClassifier({ endpoint: 'https://s1.example', apiKey: '' })
+      createHttpDecisionModel({ endpoint: 'https://s1.example', apiKey: '' })
     ).toThrow(/API key/);
-    expect(classificationPreset('typesafe')).toMatchObject({
+    expect(decisionPreset('typesafe')).toMatchObject({
       baseURL: 'https://api.typesafe.ai/v1/systemone',
       model: 'jev-latest',
       dialect: 'systemone',
     });
-    expect(classificationPreset('nope')).toBeNull();
-    expect(classificationPreset('__proto__')).toBeNull();
-    expect(classificationPreset('constructor')).toBeNull();
+    expect(decisionPreset('nope')).toBeNull();
+    expect(decisionPreset('__proto__')).toBeNull();
+    expect(decisionPreset('constructor')).toBeNull();
   });
 
   it('does not let one tenant mutate shared preset endpoints or authentication', () => {
-    expect(Object.isFrozen(CLASSIFICATION_PRESETS)).toBe(true);
-    expect(Object.isFrozen(CLASSIFICATION_PRESETS.typesafe)).toBe(true);
-    const first = classificationPreset('typesafe');
-    const second = classificationPreset('typesafe');
+    expect(Object.isFrozen(DECISION_PRESETS)).toBe(true);
+    expect(Object.isFrozen(DECISION_PRESETS.typesafe)).toBe(true);
+    const first = decisionPreset('typesafe');
+    const second = decisionPreset('typesafe');
     expect(first).not.toBe(second);
     if (first === null) {
       throw new Error('TypeSafe preset disappeared');
     }
     first.baseURL = 'https://untrusted.example/v1/systemone';
     first.requiresAuth = false;
-    expect(classificationPreset('typesafe')).toMatchObject({
+    expect(decisionPreset('typesafe')).toMatchObject({
       baseURL: 'https://api.typesafe.ai/v1/systemone',
       requiresAuth: true,
     });
     expect(() =>
-      createClassifier(classificationPreset('typesafe') ?? {}, undefined)
+      createDecisionModel(decisionPreset('typesafe') ?? {}, undefined)
     ).toThrow(/API key/);
   });
 
@@ -603,14 +602,14 @@ describe('HTTP classifier', () => {
         }),
       },
     ]);
-    const classifier = createClassifier(
-      mergeClassificationSettings(classificationPreset('cloudflare'), {
+    const decisionModel = createDecisionModel(
+      mergeDecisionSettings(decisionPreset('cloudflare'), {
         baseURL: 'https://cf.example/run',
       }),
       'k',
       { fetch }
     );
-    const result = await classifier.classify({
+    const result = await decisionModel.decide({
       state: 'hello',
       questions: { q: booleanQuestion('?') },
     });
@@ -630,13 +629,13 @@ describe('HTTP classifier', () => {
       other: booleanQuestion('Another?'),
     };
     const partial = fakeFetch([{ status: 200, body: measured }]);
-    const classifier = createHttpClassifier({
+    const decisionModel = createHttpDecisionModel({
       endpoint: 'https://s1.example',
       apiKey: 'k',
       dialect: 'systemone',
       fetch: partial.fetch,
     });
-    const result = await classifier.classify({ state: {}, questions });
+    const result = await decisionModel.decide({ state: {}, questions });
     expect(result.answers.q).toEqual({ type: 'boolean', probability: 0.9 });
     expect(result.answers.other).toBeUndefined();
 
@@ -650,12 +649,12 @@ describe('HTTP classifier', () => {
         { status: 200, body: JSON.stringify({ answers }) },
       ]);
       await expect(
-        createHttpClassifier({
+        createHttpDecisionModel({
           endpoint: 'https://s1.example',
           apiKey: 'k',
           dialect: 'systemone',
           fetch: invalid.fetch,
-        }).classify({ state: {}, questions: { q: booleanQuestion('?') } })
+        }).decide({ state: {}, questions: { q: booleanQuestion('?') } })
       ).rejects.toMatchObject({ failure: 'malformed_response' });
     }
   });
@@ -676,7 +675,7 @@ describe('HTTP classifier', () => {
         }),
       },
     ]);
-    const classifier = createHttpClassifier({
+    const decisionModel = createHttpDecisionModel({
       endpoint: 'https://s1.example',
       apiKey: 'k',
       dialect: 'systemone',
@@ -684,7 +683,7 @@ describe('HTTP classifier', () => {
       onAnswered,
     });
     await expect(
-      classifier.classify({
+      decisionModel.decide({
         state: {},
         questions: { q: choiceQuestion('Which?', { a: 'A', b: 'B' }) },
       })
@@ -707,7 +706,7 @@ describe('HTTP classifier', () => {
     async (criteria) => {
       const { fetch, calls } = fakeFetch([{ status: 200, body: measured }]);
       const apiKey = jest.fn(async () => 'k');
-      const classifier = createHttpClassifier({
+      const decisionModel = createHttpDecisionModel({
         endpoint: 'https://s1.example',
         apiKey,
         dialect: 'systemone',
@@ -715,9 +714,9 @@ describe('HTTP classifier', () => {
       });
       const question = JSON.parse(
         JSON.stringify({ type: 'boolean', instructions: '?', criteria })
-      ) as ClassificationQuestion;
+      ) as DecisionQuestion;
       await expect(
-        classifier.classify({ state: {}, questions: { q: question } })
+        decisionModel.decide({ state: {}, questions: { q: question } })
       ).rejects.toMatchObject({ failure: 'bad_request' });
       expect(calls).toHaveLength(0);
       expect(apiKey).not.toHaveBeenCalled();
@@ -735,13 +734,13 @@ describe('HTTP classifier', () => {
     { true: ['Matches'], false: { text: 'Does not match' } },
   ])('accepts supported boolean criteria %j', async (criteria) => {
     const { fetch, calls } = fakeFetch([{ status: 200, body: measured }]);
-    const classifier = createHttpClassifier({
+    const decisionModel = createHttpDecisionModel({
       endpoint: 'https://s1.example',
       apiKey: 'k',
       dialect: 'systemone',
       fetch,
     });
-    const result = await classifier.classify({
+    const result = await decisionModel.decide({
       state: {},
       questions: { q: booleanQuestion('?', criteria) },
     });
@@ -751,13 +750,13 @@ describe('HTTP classifier', () => {
 
   it('rejects malformed question IDs before sending a request', async () => {
     const { fetch, calls } = fakeFetch([{ status: 200, body: measured }]);
-    const classifier = createHttpClassifier({
+    const decisionModel = createHttpDecisionModel({
       endpoint: 'https://s1.example',
       apiKey: 'k',
       fetch,
     });
     await expect(
-      classifier.classify({
+      decisionModel.decide({
         state: {},
         questions: { ['bad\nid']: booleanQuestion('Is this valid?') },
       })
@@ -770,11 +769,11 @@ describe('HTTP classifier', () => {
       { status: 403, body: 'private echoed content and key' },
     ]);
     await expect(
-      createHttpClassifier({
+      createHttpDecisionModel({
         endpoint: 'https://s1.example',
         apiKey: 'secret',
         fetch: forbidden.fetch,
-      }).classify({ state: {}, questions: { q: booleanQuestion('?') } })
+      }).decide({ state: {}, questions: { q: booleanQuestion('?') } })
     ).rejects.toMatchObject({ failure: 'unauthorized', status: 403 });
     expect(forbidden.calls).toHaveLength(1);
 
@@ -787,7 +786,7 @@ describe('HTTP classifier', () => {
         }),
       },
     ]);
-    const patient = createHttpClassifier({
+    const patient = createHttpDecisionModel({
       endpoint: 'https://s1.example',
       apiKey: 'k',
       fetch: limited.fetch,
@@ -795,7 +794,7 @@ describe('HTTP classifier', () => {
     });
     expect(
       (
-        await patient.classify({
+        await patient.decide({
           state: {},
           questions: { q: booleanQuestion('?') },
         })
@@ -815,13 +814,13 @@ describe('HTTP classifier', () => {
       seen.push(refresh);
       return refresh ? 'new' : 'old';
     };
-    await createHttpClassifier({
+    await createHttpDecisionModel({
       endpoint: 'https://s1.example',
       apiKey: credential,
       dialect: 'systemone',
       fetch: expiring.fetch,
       maxRetries: 0,
-    }).classify({ state: {}, questions: { q: booleanQuestion('?') } });
+    }).decide({ state: {}, questions: { q: booleanQuestion('?') } });
     expect(expiring.calls.map((call) => call.auth)).toEqual([
       'Bearer old',
       'Bearer new',
@@ -833,12 +832,12 @@ describe('HTTP classifier', () => {
     const auths: Array<string | undefined> = [];
     const minted: boolean[] = [];
     const statuses = [401, 503, 429, 200];
-    const fetch: ClassificationFetch = async (_url, init) => {
+    const fetch: DecisionFetch = async (_url, init) => {
       auths.push(init.headers.Authorization);
       const status = statuses[auths.length - 1];
       return new Response(status === 200 ? measured : 'retriable', { status });
     };
-    const classifier = createHttpClassifier({
+    const decisionModel = createHttpDecisionModel({
       endpoint: 'https://s1.example',
       apiKey: async ({ refresh }) => {
         minted.push(refresh);
@@ -849,7 +848,7 @@ describe('HTTP classifier', () => {
       fetch,
       sleep: async () => {},
     });
-    const result = await classifier.classify({
+    const result = await decisionModel.decide({
       state: {},
       questions: { q: booleanQuestion('?') },
     });
@@ -867,7 +866,7 @@ describe('HTTP classifier', () => {
       { status: 200, body: measured },
     ]);
     const plainMints: boolean[] = [];
-    const plain = createHttpClassifier({
+    const plain = createHttpDecisionModel({
       endpoint: 'https://s1.example',
       apiKey: async ({ refresh }) => {
         plainMints.push(refresh);
@@ -877,7 +876,7 @@ describe('HTTP classifier', () => {
       fetch: retries.fetch,
       sleep: async () => {},
     });
-    await plain.classify({ state: {}, questions: { q: booleanQuestion('?') } });
+    await plain.decide({ state: {}, questions: { q: booleanQuestion('?') } });
     expect(plainMints).toEqual([false]);
     expect(retries.calls.map(({ auth }) => auth)).toEqual([
       'Bearer one-token',
@@ -887,14 +886,14 @@ describe('HTTP classifier', () => {
 
   it('bounds hanging credential minting, caller abort, and non-cooperative response reading', async () => {
     const calls: FetchCall[] = [];
-    const waiting = createHttpClassifier({
+    const waiting = createHttpDecisionModel({
       endpoint: 'https://s1.example',
       apiKey: async () => new Promise<string>(() => {}),
       timeoutMs: 25,
       fetch: fakeFetch([{ status: 200, body: measured }], calls).fetch,
     });
     await expect(
-      waiting.classify({ state: {}, questions: { q: booleanQuestion('?') } })
+      waiting.decide({ state: {}, questions: { q: booleanQuestion('?') } })
     ).rejects.toMatchObject({ failure: 'timeout' });
     expect(calls).toHaveLength(0);
 
@@ -906,14 +905,14 @@ describe('HTTP classifier', () => {
       },
     };
     await expect(
-      waiting.classify({
+      waiting.decide({
         state: unvisited,
         questions: { q: booleanQuestion('?') },
         signal: cancelled.signal,
       })
     ).rejects.toMatchObject({ failure: 'aborted' });
     const duringMint = new AbortController();
-    const pending = waiting.classify({
+    const pending = waiting.decide({
       state: {},
       questions: { q: booleanQuestion('?') },
       signal: duringMint.signal,
@@ -921,56 +920,59 @@ describe('HTTP classifier', () => {
     duringMint.abort();
     await expect(pending).rejects.toMatchObject({ failure: 'aborted' });
 
-    const hangingFetch: ClassificationFetch = async () =>
+    const hangingFetch: DecisionFetch = async () =>
       new Promise<Response>(() => {});
     await expect(
-      createHttpClassifier({
+      createHttpDecisionModel({
         endpoint: 'https://s1.example',
         apiKey: 'k',
         timeoutMs: 25,
         fetch: hangingFetch,
-      }).classify({ state: {}, questions: { q: booleanQuestion('?') } })
+      }).decide({ state: {}, questions: { q: booleanQuestion('?') } })
     ).rejects.toMatchObject({ failure: 'timeout' });
 
-    const hangingRead: ClassificationFetch = async () =>
+    const hangingRead: DecisionFetch = async () =>
       new Response(new ReadableStream<Uint8Array>({ start() {} }), {
         status: 200,
       });
-    const reading = createHttpClassifier({
+    const reading = createHttpDecisionModel({
       endpoint: 'https://s1.example',
       apiKey: 'k',
       timeoutMs: 25,
       fetch: hangingRead,
     });
     await expect(
-      reading.classify({ state: {}, questions: { q: booleanQuestion('?') } })
+      reading.decide({ state: {}, questions: { q: booleanQuestion('?') } })
     ).rejects.toMatchObject({ failure: 'timeout' });
   });
 
   it('aborts the fetch signal when the monotonic deadline expires before the timer runs', async () => {
     let seenSignal: AbortSignal | undefined;
-    const fetch: ClassificationFetch = async (_url, init) => {
+    const fetch: DecisionFetch = async (_url, init) => {
       seenSignal = init.signal;
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 15);
       return new Response(measured, { status: 200 });
     };
-    const classifier = createHttpClassifier({
+    const decisionModel = createHttpDecisionModel({
       endpoint: 'https://s1.example',
       apiKey: 'k',
       timeoutMs: 2,
       fetch,
     });
     await expect(
-      classifier.classify({ state: {}, questions: { q: booleanQuestion('?') } })
+      decisionModel.decide({
+        state: {},
+        questions: { q: booleanQuestion('?') },
+      })
     ).rejects.toMatchObject({ failure: 'timeout' });
     expect(seenSignal?.aborted).toBe(true);
   });
 
   it('bounds synchronous request preparation even when a state getter throws', async () => {
-    const fetch: ClassificationFetch = jest.fn(
+    const fetch: DecisionFetch = jest.fn(
       async () => new Response(measured, { status: 200 })
     );
-    const classifier = createHttpClassifier({
+    const decisionModel = createHttpDecisionModel({
       endpoint: 'https://s1.example',
       apiKey: 'k',
       timeoutMs: 2,
@@ -983,7 +985,7 @@ describe('HTTP classifier', () => {
       },
     };
     await expect(
-      classifier.classify({ state, questions: { q: booleanQuestion('?') } })
+      decisionModel.decide({ state, questions: { q: booleanQuestion('?') } })
     ).rejects.toMatchObject({ failure: 'timeout' });
     expect(fetch).not.toHaveBeenCalled();
   });
@@ -993,7 +995,7 @@ describe('HTTP classifier', () => {
     const limited = fakeFetch([
       { status: 429, body: 'echo secret', retryAfter: '0' },
     ]);
-    const backedOff = createHttpClassifier({
+    const backedOff = createHttpDecisionModel({
       endpoint: 'https://s1.example',
       apiKey: 'secret',
       timeoutMs: 25,
@@ -1002,7 +1004,7 @@ describe('HTTP classifier', () => {
       onAnswered,
     });
     await expect(
-      backedOff.classify({ state: {}, questions: { q: booleanQuestion('?') } })
+      backedOff.decide({ state: {}, questions: { q: booleanQuestion('?') } })
     ).rejects.toMatchObject({ failure: 'timeout' });
     expect(limited.calls).toHaveLength(1);
     expect(onAnswered).not.toHaveBeenCalled();
@@ -1011,12 +1013,12 @@ describe('HTTP classifier', () => {
       { status: 200, body: 'x'.repeat(256 * 1024 + 1) },
     ]);
     await expect(
-      createHttpClassifier({
+      createHttpDecisionModel({
         endpoint: 'https://s1.example',
         apiKey: 'secret',
         fetch: oversized.fetch,
         onAnswered,
-      }).classify({ state: {}, questions: { q: booleanQuestion('?') } })
+      }).decide({ state: {}, questions: { q: booleanQuestion('?') } })
     ).rejects.toMatchObject({ failure: 'malformed_response' });
     expect(onAnswered).not.toHaveBeenCalled();
 
@@ -1024,13 +1026,13 @@ describe('HTTP classifier', () => {
       { status: 500, body: 'secret and echoed user content' },
     ]);
     try {
-      await createHttpClassifier({
+      await createHttpDecisionModel({
         endpoint: 'https://s1.example',
         apiKey: 'secret',
         fetch: failed.fetch,
         maxRetries: 0,
         onAnswered,
-      }).classify({ state: {}, questions: { q: booleanQuestion('?') } });
+      }).decide({ state: {}, questions: { q: booleanQuestion('?') } });
       throw new Error('expected an HTTP failure');
     } catch (error) {
       expect(error).toMatchObject({ failure: 'server_error' });
@@ -1040,23 +1042,23 @@ describe('HTTP classifier', () => {
       { status: 200, body: 'private echoed user content' },
     ]);
     await expect(
-      createHttpClassifier({
+      createHttpDecisionModel({
         endpoint: 'https://s1.example',
         apiKey: 'secret',
         fetch: invalid.fetch,
         onAnswered,
-      }).classify({ state: {}, questions: { q: booleanQuestion('?') } })
+      }).decide({ state: {}, questions: { q: booleanQuestion('?') } })
     ).rejects.toMatchObject({ failure: 'malformed_response' });
     expect(onAnswered).not.toHaveBeenCalled();
 
     const ok = fakeFetch([{ status: 200, body: measured }]);
-    await createHttpClassifier({
+    await createHttpDecisionModel({
       endpoint: 'https://s1.example',
       apiKey: 'k',
       dialect: 'systemone',
       fetch: ok.fetch,
       onAnswered,
-    }).classify({
+    }).decide({
       state: {},
       questions: { q: booleanQuestion('?') },
       label: 'gate',
@@ -1075,7 +1077,7 @@ describe('HTTP classifier', () => {
       seen.push(options);
       return options.refresh ? 'new' : 'old';
     };
-    const fetch: ClassificationFetch = async (url, init) => {
+    const fetch: DecisionFetch = async (url, init) => {
       calls.push({
         url,
         body: JSON.parse(init.body) as Record<string, unknown>,
@@ -1091,7 +1093,7 @@ describe('HTTP classifier', () => {
         }
       );
     };
-    const classifier = createHttpClassifier({
+    const decisionModel = createHttpDecisionModel({
       endpoint: 'https://s1.example',
       apiKey: credential,
       dialect: 'systemone',
@@ -1099,11 +1101,11 @@ describe('HTTP classifier', () => {
       maxRetries: 0,
     });
     const [first, second] = await Promise.all([
-      classifier.classify({
+      decisionModel.decide({
         state: 'one',
         questions: { q: booleanQuestion('?') },
       }),
-      classifier.classify({
+      decisionModel.decide({
         state: 'two',
         questions: { q: booleanQuestion('?') },
       }),
