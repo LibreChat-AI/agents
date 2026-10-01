@@ -5,7 +5,7 @@ A `DecisionModel` asks typed boolean, choice, or score questions about one state
 ## Backends
 
 - **Jev and Laya:** `createDecisionModel(settings, credential?, options?)` uses the same System One HTTP adapter. `decisionPreset('laya')` supplies only the dialect and optional-auth setting. Supply the full server `/v1/systemone` endpoint in `settings.baseURL`; omitting `settings.model` lets Laya route to a checkpoint. A supplied key is still sent as a bearer token. Jev, gateway, OpenRouter, Cloudflare, and generic HTTP settings require a credential unless `requiresAuth: false` is explicitly set.
-- **Strict structured chat:** `createStructuredChatDecisionModel({ model, modelId, method: 'jsonSchema' | 'functionCalling' })` injects an already configured LangChain chat model. The verified adapters are OpenAI (including Azure through the same implementation) in either strict mode and Anthropic in strict `functionCalling` mode. Bedrock and other unverified adapters fail with `unsupported_mode` before invocation, even if `withStructuredOutput` silently accepts strict options. Unsupported modes and score questions fail rather than falling back to JSON-mode prompting or asking a model for expected-value scores. Up to 32 compatible questions (128 choice options total) share one model invocation; larger batches fail explicitly.
+- **Strict structured chat:** `createStructuredChatDecisionModel({ model, modelId, method: 'jsonSchema' | 'functionCalling' })` injects an already configured LangChain chat model. The verified adapters are OpenAI and Azure OpenAI in either strict mode and Anthropic in strict `functionCalling` mode. Bedrock and other unverified adapters fail with `unsupported_mode` before invocation, even if `withStructuredOutput` silently accepts strict options. Unsupported modes and score questions fail rather than falling back to JSON-mode prompting or asking a model for expected-value scores. Up to 32 compatible questions (128 choice options total) share one model invocation; larger batches fail explicitly.
 
 ```ts
 const laya = createDecisionModel(
@@ -34,6 +34,19 @@ A System One boolean answer has a measured `probability: number`. A structured-c
 Use the request's `signal` and `timeoutMs` to bound a call. HTTP timeouts cover credential minting, retries, response reading, and backoff. Credential minters run once per call, plus one refresh after a 401; the refreshed key persists across retries. HTTP redirects fail rather than forwarding bearer keys. SDK errors and the `onAnswered(label, elapsedMs)` hook contain no response content or credentials; the caller supplies the label and must not put secrets in it.
 
 The structured-chat adapter sends the original state to the provider. Its prompt carries a marker so Langfuse can drop the **entire state and question text** from generation inputs when any tool-output redaction policy is active. Selectively removing identifiable tool fields would still leak a private result quoted in free-form state or instructions. With no active redaction policy, prompts remain visible. Configure provider-side logging separately. No defaults should change until quality, calibration, latency, and cost have been evaluated for each backend and use case.
+
+## Structured Output Capabilities
+
+The private `structuredOutput.ts` binding boundary owns adapter/method options. The caller explicitly chooses the method; there is no automatic mode fallback, public capability registry, provider-profile override, or extra provider SDK import at runtime.
+
+| Adapter                           | `jsonSchema`                                                                 | `functionCalling`                      |
+| --------------------------------- | ---------------------------------------------------------------------------- | -------------------------------------- |
+| OpenAI (`openai`)                 | Native schema with `strict: true`                                            | Tool schema with `strict: true`        |
+| Azure OpenAI (`azure_openai`)     | Native schema with `strict: true`                                            | Tool schema with `strict: true`        |
+| Anthropic (`anthropic`)           | Reject locally: the locked SDK translates choice enums into description text | Tool schema with `strict: true`        |
+| Other adapters, including Bedrock | Reject locally with `unsupported_mode`                                       | Reject locally with `unsupported_mode` |
+
+A model's `profile.structuredOutput` metadata is not proof that an adapter forwards the requested enforcement options. Contract tests exercise both strict modes through locked upstream and LibreChat OpenAI/Azure implementations, plus strict Anthropic tool calling, with controlled provider responses. Native Anthropic support stays disabled: its locked schema transformer moves `enum` constraints into description text, so a choice would no longer be provider-enforced. Local validation cannot replace that guarantee, and the SDK does not silently switch methods. Endpoint/checkpoint support remains provider-owned; remote rejections return sanitized typed failures. All answers are still validated locally, probabilities remain unmeasured for chat, and score questions remain unsupported.
 
 ## API Naming
 
