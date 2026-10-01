@@ -572,21 +572,20 @@ describe('strict structured-chat decisionModel', () => {
       const fail = (): never => {
         throw new Error('private question text and API key');
       };
+      const dynamicQuestions = {
+        get q(): DecisionQuestion {
+          return fail();
+        },
+      };
+      const dynamicCriteria = {
+        get a(): string {
+          return fail();
+        },
+        b: 'B',
+      };
+      const choiceQuestions = { q: choiceQuestion('Which?', dynamicCriteria) };
       const questions =
-        source === 'question'
-          ? {
-              get q(): DecisionQuestion {
-                return fail();
-              },
-            }
-          : {
-              q: choiceQuestion('Which?', {
-                get a(): string {
-                  return fail();
-                },
-                b: 'B',
-              }),
-            };
+        source === 'question' ? dynamicQuestions : choiceQuestions;
       try {
         await decisionModel.decide({ state: 'test', questions });
         throw new Error('expected sanitized preparation failure');
