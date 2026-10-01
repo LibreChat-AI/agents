@@ -287,6 +287,9 @@ export interface ScrapeResult {
   highlights?: Highlight[];
 }
 
+/** Host implementations need only the public ranking seam, not BaseReranker's private state. */
+export type SearchReranker = Pick<BaseReranker, 'provider' | 'rerank'>;
+
 export interface ProcessSourcesConfig {
   topResults?: number;
   /** Max chars of scraped content stored per source and passed to the
@@ -306,7 +309,7 @@ export interface ProcessSourcesConfig {
   separatorExpandBy?: number;
   strategies?: string[];
   filterContent?: boolean;
-  reranker?: BaseReranker;
+  reranker?: SearchReranker;
   logger?: Logger;
 }
 

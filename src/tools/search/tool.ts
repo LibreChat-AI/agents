@@ -12,6 +12,10 @@ import {
   newsSchema,
   DATE_RANGE,
 } from './schema';
+import {
+  formatResultsForLLM,
+  MISSING_SEARCH_RESULT_DATA_ERROR,
+} from './format';
 import { createSearchAPI, createSourceProcessor } from './search';
 import { createKeenableScraper } from './keenable-scraper';
 import { createSerperScraper } from './serper-scraper';
@@ -21,10 +25,6 @@ import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { createCrwScraper } from './crw-scraper';
 import { expandHighlights } from './highlights';
 import { createSearchMetrics } from './metrics';
-import {
-  formatResultsForLLM,
-  MISSING_SEARCH_RESULT_DATA_ERROR,
-} from './format';
 import { createDefaultLogger } from './utils';
 import { createReranker } from './rerankers';
 import { Constants } from '@/common';
@@ -535,13 +535,13 @@ export const createSearchTool = (
   } = config;
 
   const logger = config.logger || createDefaultLogger();
-  const effectiveTavilySearchOptions =
-    searchProvider === 'tavily' && config.safeSearch != null
-      ? {
-        ...tavilySearchOptions,
-        safeSearch: config.safeSearch !== 0,
-      }
-      : tavilySearchOptions;
+  let effectiveTavilySearchOptions = tavilySearchOptions;
+  if (searchProvider === 'tavily' && config.safeSearch != null) {
+    effectiveTavilySearchOptions = {
+      ...tavilySearchOptions,
+      safeSearch: config.safeSearch !== 0,
+    };
+  }
 
   const schemaProperties: Record<string, unknown> = {
     intent: { ...INTENT_PROPERTY },
@@ -643,20 +643,22 @@ export const createSearchTool = (
     });
   }
 
-  const selectedReranker = createReranker({
-    rerankerType,
-    jinaApiKey,
-    jinaApiUrl,
-    cohereApiKey,
-    cohereApiUrl,
-    ragApiUrl,
-    ragApiTokenSupplier,
-    ragApiProfile,
-    rerankerTimeout,
-    httpAgent,
-    httpsAgent,
-    logger,
-  });
+  const selectedReranker =
+    config.reranker ??
+    createReranker({
+      rerankerType,
+      jinaApiKey,
+      jinaApiUrl,
+      cohereApiKey,
+      cohereApiUrl,
+      ragApiUrl,
+      ragApiTokenSupplier,
+      ragApiProfile,
+      rerankerTimeout,
+      httpAgent,
+      httpsAgent,
+      logger,
+    });
 
   /** `none` is a deliberate opt-out that `createReranker` already reports;
    * only an unusable configuration warrants a warning here. */
