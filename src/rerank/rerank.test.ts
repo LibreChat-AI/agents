@@ -2,7 +2,7 @@ import { createLogger } from 'winston';
 import { ChatOpenAI } from '@langchain/openai';
 import type { DecisionFetch, DecisionModel, DecisionResult } from '@/decisions';
 import type { RerankObservation, SearchMetrics } from '@/tools/search/types';
-import type { Reranker, RerankResult } from './types';
+import type { Reranker, RerankRequest, RerankResult } from './types';
 import {
   createDecisionModel,
   decisionPreset,
@@ -175,6 +175,103 @@ function collector(observations: RerankObservation[]): SearchMetrics {
 const silentLogger = createLogger({ silent: true });
 
 describe('web-search rerank adapter', () => {
+  it.each([
+    { timeoutMs: undefined, expectedScore: 0, aborted: true },
+    { timeoutMs: 100, expectedScore: 2, aborted: false },
+    { timeoutMs: 5, expectedScore: 0, aborted: true },
+  ])(
+    'preserves the ranker deadline unless explicitly overridden by $timeoutMs',
+    async ({ timeoutMs, expectedScore, aborted }) => {
+      jest.useFakeTimers();
+      try {
+        let signal: AbortSignal | undefined;
+        const model: DecisionModel = {
+          id: 'delayed',
+          model: 'delayed',
+          decide: async (request): Promise<DecisionResult> => {
+            signal = request.signal;
+            return new Promise((resolve) => {
+              setTimeout(
+                () =>
+                  resolve({
+                    answers: {
+                      d0: {
+                        type: 'score',
+                        score: 2,
+                        confidence: null,
+                        probabilities: null,
+                      },
+                    },
+                    model: 'delayed',
+                    usage: null,
+                  }),
+                40
+              );
+            });
+          },
+        };
+        const ranker = createSystemOneReranker({
+          model,
+          rubric,
+          timeoutMs: 10,
+        });
+        const adapter = createWebSearchReranker(ranker, {
+          timeoutMs,
+          logger: silentLogger,
+        });
+        const observations: RerankObservation[] = [];
+        const pending = adapter.rerank(
+          'q',
+          ['candidate'],
+          1,
+          collector(observations)
+        );
+        await jest.advanceTimersByTimeAsync(50);
+        expect(await pending).toEqual([
+          { text: 'candidate', score: expectedScore },
+        ]);
+        expect(signal?.aborted).toBe(aborted);
+        expect(observations).toHaveLength(1);
+        expect(observations[0].reason).toBe(aborted ? 'error' : undefined);
+      } finally {
+        jest.useRealTimers();
+      }
+    }
+  );
+
+  it('keeps the default outer deadline without forwarding a request override', async () => {
+    jest.useFakeTimers();
+    try {
+      let signal: AbortSignal | undefined;
+      const rerank = jest.fn(
+        async (request: RerankRequest): Promise<RerankResult> => {
+          signal = request.signal;
+          return new Promise(() => {});
+        }
+      );
+      const reranker: Reranker = { id: 'non-cooperative', rerank };
+      const adapter = createWebSearchReranker(reranker, {
+        logger: silentLogger,
+      });
+      const observations: RerankObservation[] = [];
+      const pending = adapter.rerank(
+        'q',
+        ['candidate'],
+        1,
+        collector(observations)
+      );
+      await jest.advanceTimersByTimeAsync(10_001);
+      expect(signal?.aborted).toBe(true);
+      expect(rerank).toHaveBeenCalledTimes(1);
+      expect(rerank.mock.calls[0][0]).not.toHaveProperty('timeoutMs');
+      expect(await pending).toEqual([{ text: 'candidate', score: 0 }]);
+      expect(observations).toHaveLength(1);
+      expect(observations[0].reason).toBe('error');
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   it('maps indices to text and records one metric while capping highlights', async () => {
     const reranker: Reranker = {
       id: 'host',

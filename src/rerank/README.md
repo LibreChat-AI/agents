@@ -6,7 +6,7 @@
 
 `createSearchTool({ reranker })` now honors an injected `SearchReranker` before constructing its configured built-in reranker. Hosts can supply a plain `{ provider, rerank(query, documents, topK?, metrics?) }` object. Extending `BaseReranker` is not required. Existing Jina, Cohere, rag_api, Infinity, and `none` selection stays unchanged when there is no injection.
 
-For an index-based `Reranker`, `createWebSearchReranker(reranker, { timeoutMs?, logger? })` maps indices to highlights, validates ordering/ranges/duplicates, and records exactly one observation per attempt. Invalid or failed rankings fall back to input order with neutral scores. Error metrics never copy provider exception text. Empty inputs and zero result limits require no provider work.
+For an index-based `Reranker`, `createWebSearchReranker(reranker, { timeoutMs?, logger? })` maps indices to highlights, validates ordering/ranges/duplicates, and records exactly one observation per attempt. Invalid or failed rankings fall back to input order with neutral scores. Error metrics never copy provider exception text. Empty inputs and zero result limits require no provider work. Without an explicit adapter `timeoutMs`, the wrapper retains its own 10-second outer bound but does not override the injected ranker's configured deadline. An explicit adapter timeout is forwarded as a request override.
 
 ## Experimental System One adapter
 

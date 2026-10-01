@@ -39,7 +39,9 @@ export function createWebSearchReranker(
                 documents: candidates,
                 topK,
                 signal,
-                timeoutMs: options.timeoutMs ?? 10_000,
+                ...(options.timeoutMs !== undefined && {
+                  timeoutMs: options.timeoutMs,
+                }),
               })
             )
         );
