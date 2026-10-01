@@ -559,6 +559,48 @@ describe('strict structured-chat decisionModel', () => {
     );
   });
 
+  it.each(['question', 'criterion'] as const)(
+    'sanitizes a throwing %s getter before provider invocation',
+    async (source) => {
+      const calls: ProviderCall[] = [];
+      const model = openAIModel({ answers: { q: { decision: true } } }, calls);
+      const decisionModel = createStructuredChatDecisionModel({
+        model,
+        modelId: 'gpt-4o-mini',
+        method: 'jsonSchema',
+      });
+      const fail = (): never => {
+        throw new Error('private question text and API key');
+      };
+      const questions =
+        source === 'question'
+          ? {
+              get q(): DecisionQuestion {
+                return fail();
+              },
+            }
+          : {
+              q: choiceQuestion('Which?', {
+                get a(): string {
+                  return fail();
+                },
+                b: 'B',
+              }),
+            };
+      try {
+        await decisionModel.decide({ state: 'test', questions });
+        throw new Error('expected sanitized preparation failure');
+      } catch (error) {
+        expect(error).toMatchObject({
+          failure: 'bad_request',
+          provider: 'structured-chat',
+        });
+        expect(String(error)).not.toContain('private');
+      }
+      expect(calls).toHaveLength(0);
+    }
+  );
+
   it('checks a pre-aborted signal before reading dynamic questions', async () => {
     const model = openAIModel({ answers: { q: { decision: true } } }, []);
     const decisionModel = createStructuredChatDecisionModel({

@@ -271,20 +271,24 @@ export function createStructuredChatDecisionModel(
         request.timeoutMs ?? timeoutMs,
         request.signal,
         async (signal, waitFor) => {
-          const entries = questionsForChat(
-            request.questions,
-            provider,
-            maxQuestions
-          );
+          let entries: Array<[string, DecisionQuestion]>;
           let input: string;
           try {
+            entries = questionsForChat(
+              request.questions,
+              provider,
+              maxQuestions
+            );
             input =
               DECISION_PROMPT_PREFIX +
               JSON.stringify({
                 state: request.state,
                 questions: Object.fromEntries(entries),
               });
-          } catch {
+          } catch (error) {
+            if (error instanceof DecisionError) {
+              throw error;
+            }
             throw new DecisionError(
               'bad_request',
               'invalid decision model request',
