@@ -2486,6 +2486,10 @@ export class SubagentExecutor {
     signal: AbortSignal,
     error: unknown
   ): SubagentExecuteResult {
+    const resumeExecution =
+      this.humanInTheLoop?.enabled === true && this.checkpointer != null
+        ? execution.resumeExecution
+        : undefined;
     const detail = logSubagentResolutionFailure(
       phase,
       params.subagentType,
@@ -2497,10 +2501,14 @@ export class SubagentExecutor {
         parentToolCallId: params.parentToolCallId,
         threadId: params.threadId,
         childRunId:
-          execution.identity?.childRunId ?? execution.address.currentChildRunId,
+          execution.identity?.childRunId ??
+          resumeExecution?.childRunId ??
+          execution.address.currentChildRunId,
         childThreadId:
           execution.identity?.childThreadId ??
-          execution.address.baseChildThreadId,
+          (resumeExecution == null
+            ? execution.address.baseChildThreadId
+            : execution.address.branchChildThreadId),
         taskId: params.taskRuntime?.taskId,
       },
       this.onResolutionFailure

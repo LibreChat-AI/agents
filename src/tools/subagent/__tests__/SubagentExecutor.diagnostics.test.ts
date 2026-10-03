@@ -7,11 +7,14 @@ import type {
   StandardGraphInput,
 } from '@/types';
 import type { SubagentResolutionFailureHandler } from '../diagnostics';
+import type { SubagentResumeExecution } from '../SubagentReplay';
 import {
   getSubagentResolutionFailureMessage,
   SubagentResolutionError,
 } from '../diagnostics';
+import { SubagentExecutionRegistry } from '../SubagentExecutionRegistry';
 import { InMemorySubagentTaskStore } from '../InMemorySubagentTaskStore';
+import { SUBAGENT_RESUME_MANIFEST_CONFIG_KEY } from '../SubagentReplay';
 import { SubagentExecutor } from '../SubagentExecutor';
 import { createGraph } from '@/graphs';
 import { Providers } from '@/common';
@@ -133,6 +136,135 @@ describe('SubagentExecutor startup failure delivery', () => {
     expect(JSON.stringify(result)).not.toContain('private');
     instance.clearHeavyState();
   });
+
+  it.each([
+    'missing checkpoint',
+    'source read',
+    'target write',
+    'config resolver',
+  ] as const)(
+    'correlates reconstructed child startup failures during %s',
+    async (failureStage) => {
+      const sourceThreadId = 'persisted-child-thread';
+      class ForkFailureSaver extends MemorySaver {
+        override getTuple(
+          request: RunnableConfig
+        ): ReturnType<MemorySaver['getTuple']> {
+          if (
+            failureStage === 'source read' &&
+            request.configurable?.thread_id === sourceThreadId
+          ) {
+            return Promise.reject(new Error(secret));
+          }
+          return super.getTuple(request);
+        }
+
+        override put(
+          ...args: Parameters<MemorySaver['put']>
+        ): ReturnType<MemorySaver['put']> {
+          if (
+            failureStage === 'target write' &&
+            args[0].configurable?.thread_id !== sourceThreadId
+          ) {
+            return Promise.reject(new Error(secret));
+          }
+          return super.put(...args);
+        }
+      }
+      const checkpointer = new ForkFailureSaver();
+      const checkpointId = '00000000-0000-0000-0000-000000000001';
+      if (failureStage !== 'missing checkpoint') {
+        await checkpointer.put(
+          { configurable: { thread_id: sourceThreadId, checkpoint_ns: '' } },
+          {
+            v: 4,
+            id: checkpointId,
+            ts: new Date().toISOString(),
+            channel_values: {},
+            channel_versions: {},
+            versions_seen: {},
+          },
+          { source: 'loop', step: 0, parents: {} }
+        );
+      }
+      const resumeExecution: SubagentResumeExecution = {
+        parentToolCallId: params.parentToolCallId,
+        childRunId: 'persisted-child-run',
+        subagentType: config.type,
+        configId: config.configId,
+        approvalExecutionScope: 'persisted-child-run',
+        checkpoints: [
+          { threadId: sourceThreadId, checkpointId, checkpointNs: '' },
+        ],
+        graphState: {
+          toolCallSteps: [],
+          toolSessions: [],
+          toolNodes: [],
+          eagerToolUsage: [],
+          eagerToolSuppressions: [],
+        },
+        approvalReplays: [],
+      };
+      const parentConfigurable = {
+        thread_id: params.threadId,
+        checkpoint_id: 'parent-checkpoint',
+        [SUBAGENT_RESUME_MANIFEST_CONFIG_KEY]: {
+          version: 1,
+          executions: [resumeExecution],
+        },
+      };
+      const { address } = new SubagentExecutionRegistry({
+        parentRunId: 'rebuilt-parent-run',
+        parentAgentId: 'parent-agent',
+        durable: true,
+      }).open({ ...params, parentConfigurable });
+      const hook = jest.fn<SubagentResolutionFailureHandler>(
+        () => 'configuration_changed'
+      );
+      const resolver = jest.fn(config.resolveAgentInputs);
+      const createChildGraph = jest.fn((input: StandardGraphInput) =>
+        createGraph({ kind: 'standard', input })
+      );
+      const instance = new SubagentExecutor({
+        configs: new Map([
+          [config.type, { ...config, resolveAgentInputs: resolver }],
+        ]),
+        parentRunId: 'rebuilt-parent-run',
+        parentAgentId: 'parent-agent',
+        checkpointer,
+        humanInTheLoop: { enabled: true },
+        createChildGraph,
+        onResolutionFailure: hook,
+      });
+      try {
+        const result = await instance.execute({
+          ...params,
+          parentConfigurable,
+        });
+
+        expect(hook).toHaveBeenCalledTimes(1);
+        expect(hook.mock.calls[0][0]).toMatchObject({
+          phase: failureStage === 'config resolver' ? 'config' : 'identity',
+          parentRunId: 'rebuilt-parent-run',
+          parentAgentId: 'parent-agent',
+          threadId: params.threadId,
+          parentToolCallId: params.parentToolCallId,
+          childRunId: resumeExecution.childRunId,
+          childThreadId: address.branchChildThreadId,
+        });
+        expect(address.currentChildRunId).not.toBe(resumeExecution.childRunId);
+        expect(address.branchChildThreadId).not.toBe(address.baseChildThreadId);
+        expect(resolver).toHaveBeenCalledTimes(
+          failureStage === 'config resolver' ? 1 : 0
+        );
+        expect(createChildGraph).not.toHaveBeenCalled();
+        expect(result.resolutionFailure?.cause).toBe('configuration_changed');
+        expect(JSON.stringify(result)).not.toContain('private');
+      } finally {
+        instance.clearHeavyState();
+      }
+    }
+  );
 
   it('reports an aborted resolver safely through the host sink', async () => {
     const controller = new AbortController();
