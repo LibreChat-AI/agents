@@ -9,8 +9,8 @@ import {
 import { createKeenableAPI } from './keenable-search';
 import { createTavilyAPI } from './tavily-search';
 import { createSearchMetrics } from './metrics';
+import { getDefaultRanking } from './rerankers';
 import { createCrwAPI } from './crw-search';
-import { BaseReranker, getDefaultRanking } from './rerankers';
 
 /** Engines queried when `searxngSearchOptions.engines` is not configured. */
 const DEFAULT_SEARXNG_ENGINES = 'google,bing,duckduckgo';
@@ -169,7 +169,7 @@ const getHighlights = async ({
 }: {
   content: string;
   query: string;
-  reranker?: BaseReranker;
+  reranker?: t.SearchReranker;
   metrics: t.SearchMetrics;
   topResults?: number;
   maxContentLength?: number;
@@ -453,7 +453,7 @@ const createSearXNGAPI = (
       const organicResults = (data.results ?? [])
         .slice(0, numResults)
         .map((result: t.SearXNGResult, index: number) => {
-          let attribution = '';
+          let attribution: string;
           try {
             attribution = new URL(result.url ?? '').hostname;
           } catch {
@@ -486,7 +486,7 @@ const createSearXNGAPI = (
       const newsResults = (data.results ?? [])
         .filter(isNewsResult)
         .map((result: t.SearXNGResult, index: number) => {
-          let attribution = '';
+          let attribution: string;
           try {
             attribution = new URL(result.url ?? '').hostname;
           } catch {

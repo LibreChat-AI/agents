@@ -120,3 +120,4 @@ export type {
   StreamLimitKind,
 } from './llm/streamLimits';
 export * from './decisions';
+export * from './rerank';
