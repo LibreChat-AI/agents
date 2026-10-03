@@ -19,3 +19,14 @@ export type {
 } from './SubagentExecutor';
 export { InMemorySubagentTaskStore } from './InMemorySubagentTaskStore';
 export type { InMemorySubagentTaskStoreOptions } from './InMemorySubagentTaskStore';
+export {
+  SubagentResolutionError,
+  getSubagentResolutionFailureMessage,
+} from './diagnostics';
+export type {
+  SubagentResolutionPhase,
+  SubagentResolutionCause,
+  SubagentResolutionContext,
+  SubagentResolutionDiagnostic,
+  SubagentResolutionFailureHandler,
+} from './diagnostics';

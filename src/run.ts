@@ -480,6 +480,7 @@ export class Run<_T extends t.BaseGraphState> {
   private streamLimits?: t.StreamLimits;
   private subagentTasks?: t.SubagentTaskConfig;
   private subagentContext?: t.SubagentContextAdapter;
+  private onSubagentResolutionFailure?: t.StandardGraphInput['onSubagentResolutionFailure'];
   private indexTokenCountMap?: Record<string, number>;
   calibrationRatio: number = 1;
   fadingTier?: t.FadingTier;
@@ -571,6 +572,7 @@ export class Run<_T extends t.BaseGraphState> {
     this.subagentUsageSink = config.subagentUsageSink;
     this.subagentTasks = config.subagentTasks;
     this.subagentContext = config.subagentContext;
+    this.onSubagentResolutionFailure = config.onSubagentResolutionFailure;
     this.preemption = config.preemption;
     this.maxStopContinuations = resolveMaxStopContinuations(
       config.maxStopContinuations
@@ -673,6 +675,7 @@ export class Run<_T extends t.BaseGraphState> {
         subagentUsageSink: this.subagentUsageSink,
         subagentTasks: this.subagentTasks,
         subagentContext: this.subagentContext,
+        onSubagentResolutionFailure: this.onSubagentResolutionFailure,
         preemption: this.preemption,
         streamLimits: this.streamLimits,
         toolExecution: this.toolExecution,
@@ -719,6 +722,7 @@ export class Run<_T extends t.BaseGraphState> {
         subagentUsageSink: this.subagentUsageSink,
         subagentTasks: this.subagentTasks,
         subagentContext: this.subagentContext,
+        onSubagentResolutionFailure: this.onSubagentResolutionFailure,
         preemption: this.preemption,
         streamLimits: this.streamLimits,
         toolExecution: this.toolExecution,

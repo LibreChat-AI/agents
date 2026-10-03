@@ -300,6 +300,8 @@ export type RunConfig = {
   subagentTasks?: SubagentTaskConfig;
   /** Authorizes and supplies host-owned context to isolated child runs. */
   subagentContext?: g.SubagentContextAdapter;
+  /** Host diagnostic sink for foreground, detached, and nested startup failures. */
+  onSubagentResolutionFailure?: g.StandardGraphInput['onSubagentResolutionFailure'];
   /**
    * Pre-constructed hook registry for this run. Hooks fire at lifecycle
    * points in `processStream` (RunStart, UserPromptSubmit, Stop,
