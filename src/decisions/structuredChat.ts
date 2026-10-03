@@ -6,7 +6,9 @@ import type {
   DecisionResult,
   DecisionRequest,
 } from './types';
+import type { DecisionOutputMethod } from './structuredOutput';
 import { DecisionError, isDecisionObject, readDecisionUsage } from './types';
+import { withDecisionStructuredOutput } from './structuredOutput';
 import { failureForStatus, retryAfterMs } from './transport';
 import { validateDecisionQuestions } from './questions';
 import { DECISION_PROMPT_PREFIX } from './traceMarker';
@@ -86,8 +88,8 @@ export interface StructuredChatDecisionModelOptions {
   model: BaseChatModel;
   modelId: string;
   providerId?: string;
-  /** Verified OpenAI strict modes or Anthropic strict tool calling; other adapters fail closed. */
-  method: 'jsonSchema' | 'functionCalling';
+  /** Verified OpenAI/Azure strict modes or Anthropic strict tools; other paths fail closed. */
+  method: DecisionOutputMethod;
   timeoutMs?: number;
   maxQuestions?: number;
   onAnswered?: (label: string, ms: number) => void;
@@ -299,19 +301,11 @@ export function createStructuredChatDecisionModel(
           }
           let structured: ReturnType<typeof model.withStructuredOutput>;
           try {
-            const adapter = model._llmType();
-            if (
-              adapter !== 'openai' &&
-              (adapter !== 'anthropic' || method !== 'functionCalling')
-            ) {
-              throw new Error('unverified strict decision model adapter');
-            }
-            structured = model.withStructuredOutput(decisionSchema(entries), {
-              name: 'DecideQuestions',
-              method,
-              strict: true,
-              includeRaw: true,
-            });
+            structured = withDecisionStructuredOutput(
+              model,
+              decisionSchema(entries),
+              method
+            );
           } catch {
             throw new DecisionError(
               'unsupported_mode',
