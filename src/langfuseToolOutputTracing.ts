@@ -23,8 +23,8 @@ import {
   shouldDropLangfuseSpan,
 } from '@/langfuseTraceShaping';
 import { resolveToolOutputTracingConfigForSpan } from '@/langfuseRuntimeScope';
-import { DECISION_PROMPT_PREFIX } from '@/decisions/traceMarker';
 import { LANGFUSE_OPERATION_METADATA_KEY } from '@/langfuseOperation';
+import { DECISION_PROMPT_PREFIX } from '@/decisions/traceMarker';
 
 export { LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT, resolveLangfuseConfig };
 
@@ -901,6 +901,17 @@ const PRESERVED_TRACE_IDENTITY_KEYS = [
   LANGFUSE_OPERATION_METADATA_KEY,
 ] as const;
 
+/** Identifiers are scalars; a nested value under an identity key is content. */
+function isTraceIdentityValue(
+  value: unknown
+): value is string | number | boolean {
+  return (
+    typeof value === 'string' ||
+    typeof value === 'boolean' ||
+    (typeof value === 'number' && Number.isFinite(value))
+  );
+}
+
 function preserveTraceIdentity(value: unknown, redactionText: string): string {
   if (typeof value !== 'string') {
     return redactionText;
@@ -921,7 +932,7 @@ function preserveTraceIdentity(value: unknown, redactionText: string): string {
   const source = parsed as Record<string, unknown>;
   const preserved: Record<string, unknown> = {};
   for (const key of PRESERVED_TRACE_IDENTITY_KEYS) {
-    if (key in source) {
+    if (isTraceIdentityValue(source[key])) {
       preserved[key] = source[key];
     }
   }
