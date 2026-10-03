@@ -5549,11 +5549,17 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       if (this.summarizeOnlyAgentId != null) {
         return END;
       }
+      const { messages } = state as t.BaseGraphState;
+      const last = messages[messages.length - 1] as AIMessageChunk | undefined;
+      const calls = last?.getType() === 'ai' ? last.tool_calls ?? [] : [];
+      const hasOnlyExternalCalls =
+        calls.length > 0 &&
+        calls.every((call) => (call as t.CustomToolCall).execution?.mode === 'external');
+      if (hasOnlyExternalCalls) {
+        return END;
+      }
       const delegatedNames = this.clientDelegatedToolNames;
       if (delegatedNames != null && delegatedNames.size > 0) {
-        const { messages } = state as t.BaseGraphState;
-        const last = messages[messages.length - 1] as AIMessageChunk | undefined;
-        const calls = last?.getType() === 'ai' ? last.tool_calls ?? [] : [];
         if (calls.some((call) => delegatedNames.has(call.name))) {
           if (
             calls.some(

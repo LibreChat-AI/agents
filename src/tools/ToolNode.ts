@@ -1805,6 +1805,14 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     config: RunnableConfig,
     batchContext: RunToolBatchContext<T> = {}
   ): Promise<BaseMessage | Command> {
+    const execution = (call as t.CustomToolCall).execution;
+    if (execution?.mode === 'external') {
+      return new ToolMessage({
+        content: '',
+        name: call.name,
+        tool_call_id: call.id!,
+      });
+    }
     const {
       batchIndex,
       turn,
@@ -3443,6 +3451,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         id: toolCallId,
         output: contentString,
         progress: 1,
+        execution: (call as t.CustomToolCall).execution,
         ...(outcome != null && { outcome }),
       };
 

@@ -120,8 +120,13 @@ type OpenAICompletionParam =
 type OpenAIClientConfig = NonNullable<
   ConstructorParameters<typeof OpenAIClient>[0]
 >;
+type ExternalToolExecutionConfig = {
+  enabled: boolean;
+  acceptedProviders?: string[];
+};
 type LibreChatOpenAIFields = t.ChatOpenAIFields & {
   _lc_stream_delay?: number;
+  externalToolExecution?: ExternalToolExecutionConfig;
   firstPartyEndpoint?: boolean;
   includeReasoningContent?: boolean;
   includeReasoningDetails?: boolean;
@@ -146,6 +151,10 @@ type OpenAIDeltaWithLibreChatFields = Record<string, unknown> & {
   reasoning?: unknown;
   reasoning_details?: unknown;
   provider_specific_fields?: unknown;
+};
+type OpenAIToolCallWithExecution = {
+  index?: number;
+  execution?: { mode?: unknown; provider?: unknown };
 };
 type OpenAIClientOwner = {
   client?: OpenAIClient;
@@ -1329,7 +1338,8 @@ async function completionWithFilteredOpenAIStream(
 
 function attachLibreChatDeltaFields(
   chunk: BaseMessageChunk,
-  delta: Record<string, unknown>
+  delta: Record<string, unknown>,
+  externalToolExecution?: ExternalToolExecutionConfig
 ): BaseMessageChunk {
   if (!AIMessageChunk.isInstance(chunk)) {
     return chunk;
@@ -1349,6 +1359,40 @@ function attachLibreChatDeltaFields(
   if (libreChatDelta.provider_specific_fields != null) {
     chunk.additional_kwargs.provider_specific_fields =
       libreChatDelta.provider_specific_fields;
+  }
+  const toolCalls = libreChatDelta.tool_calls as OpenAIToolCallWithExecution[] | undefined;
+  const toolCallChunks = (chunk as BaseMessageChunk & {
+    tool_call_chunks?: Array<Record<string, unknown>>;
+  }).tool_call_chunks;
+  if (externalToolExecution?.enabled !== true || !Array.isArray(toolCalls) || !Array.isArray(toolCallChunks)) {
+    return chunk;
+  }
+  for (const toolCall of toolCalls) {
+    const execution = toolCall.execution;
+    if (
+      execution?.mode !== 'external' ||
+      (externalToolExecution.acceptedProviders != null &&
+        (typeof execution.provider !== 'string' ||
+          !externalToolExecution.acceptedProviders.includes(execution.provider)))
+    ) {
+      continue;
+    }
+    const index = toolCall.index ?? 0;
+    const normalizedExecution = {
+      mode: 'external' as const,
+      ...(typeof execution.provider === 'string' ? { provider: execution.provider } : {}),
+    };
+    for (const toolCallChunk of toolCallChunks) {
+      if (toolCallChunk.index === index) {
+        toolCallChunk.execution = normalizedExecution;
+      }
+    }
+    const parsedToolCall = (chunk as BaseMessageChunk & {
+      tool_calls?: Array<Record<string, unknown>>;
+    }).tool_calls?.[index];
+    if (parsedToolCall != null) {
+      parsedToolCall.execution = normalizedExecution;
+    }
   }
   return chunk;
 }
@@ -1859,6 +1903,7 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
     return astraRulesApply(this.model, this.firstPartyEndpoint);
   }
 
+  private externalToolExecution?: ExternalToolExecutionConfig;
   private includeReasoningContent?: boolean;
   private includeReasoningDetails?: boolean;
   private convertReasoningDetailsToContent?: boolean;
@@ -1868,6 +1913,7 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
 
   constructor(fields?: LibreChatOpenAIFields) {
     super(fields);
+    this.externalToolExecution = fields?.externalToolExecution;
     this.includeReasoningContent = fields?.includeReasoningContent;
     this.includeReasoningDetails = fields?.includeReasoningDetails;
     this.convertReasoningDetailsToContent =
@@ -1940,7 +1986,8 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
         rawResponse,
         defaultRole
       ),
-      delta
+      delta,
+      this.externalToolExecution
     );
     if (isOfficialOpenAIBaseURL(this.clientConfig.baseURL)) {
       return stampSequentialStreamedToolCallAdapter(message);
