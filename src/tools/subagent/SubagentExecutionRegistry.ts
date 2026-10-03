@@ -425,6 +425,7 @@ export class SubagentExecutionRecord<
   TSettledOutput = never,
 > {
   private identityValue?: SubagentExecutionIdentity;
+  private attemptedIdentityValue?: SubagentExecutionIdentity;
   private bindingValue?: SubagentDefinitionBinding;
   private bindingAuthority?: 'provisional' | 'effective';
   private invocationValue?: SubagentInvocationBinding;
@@ -486,6 +487,15 @@ export class SubagentExecutionRecord<
 
   get identity(): SubagentExecutionIdentity | undefined {
     return this.identityValue;
+  }
+
+  /** Correlation only; never committed identity or resume authority. */
+  get attemptedIdentity(): SubagentExecutionIdentity | undefined {
+    return this.attemptedIdentityValue;
+  }
+
+  recordIdentityAttempt(identity: SubagentExecutionIdentity): void {
+    this.attemptedIdentityValue = Object.freeze({ ...identity });
   }
 
   get binding(): SubagentDefinitionBinding | undefined {
@@ -570,6 +580,7 @@ export class SubagentExecutionRecord<
     if (this.pendingIdentityResolution != null) {
       return this.pendingIdentityResolution;
     }
+    this.attemptedIdentityValue = undefined;
     const pending = Promise.resolve()
       .then(() => {
         this.assertCurrentIdentityResolution(pending);
@@ -929,6 +940,7 @@ export class SubagentExecutionRegistry<
     if (this.recordsByAddress.get(record.address.key) !== record) {
       throw new SubagentExecutionInvalidatedError();
     }
+    record.recordIdentityAttempt(identity);
     const checkpointKey = getPreparationResourceKey(
       'checkpoint',
       identity.childThreadId

@@ -138,21 +138,31 @@ describe('SubagentExecutor startup failure delivery', () => {
   });
 
   it.each([
-    'missing checkpoint',
-    'source read',
-    'target write',
-    'config resolver',
+    ['manifest', 'missing checkpoint'],
+    ['manifest', 'source read'],
+    ['manifest', 'target write'],
+    ['manifest', 'config resolver'],
+    ['manifest', 'aborted write'],
+    ['manifest', 'invalidated write'],
+    ['base checkpoint', 'source read'],
+    ['base checkpoint', 'target write'],
+    ['base checkpoint', 'config resolver'],
+    ['base checkpoint', 'aborted write'],
+    ['base checkpoint', 'invalidated write'],
   ] as const)(
-    'correlates reconstructed child startup failures during %s',
-    async (failureStage) => {
-      const sourceThreadId = 'persisted-child-thread';
+    'correlates %s child startup failures during %s',
+    async (reconstruction, failureStage) => {
+      let sourceThreadId = 'persisted-child-thread';
+      const checkpointId = '00000000-0000-0000-0000-000000000001';
+      const controller = new AbortController();
       class ForkFailureSaver extends MemorySaver {
         override getTuple(
           request: RunnableConfig
         ): ReturnType<MemorySaver['getTuple']> {
           if (
             failureStage === 'source read' &&
-            request.configurable?.thread_id === sourceThreadId
+            request.configurable?.thread_id === sourceThreadId &&
+            request.configurable.checkpoint_id === checkpointId
           ) {
             return Promise.reject(new Error(secret));
           }
@@ -163,30 +173,21 @@ describe('SubagentExecutor startup failure delivery', () => {
           ...args: Parameters<MemorySaver['put']>
         ): ReturnType<MemorySaver['put']> {
           if (
-            failureStage === 'target write' &&
-            args[0].configurable?.thread_id !== sourceThreadId
+            args[0].configurable?.thread_id !== sourceThreadId &&
+            (failureStage === 'target write' ||
+              failureStage === 'aborted write' ||
+              failureStage === 'invalidated write')
           ) {
+            if (failureStage === 'aborted write')
+              controller.abort(new Error(secret));
+            if (failureStage === 'invalidated write')
+              instance.clearHeavyState();
             return Promise.reject(new Error(secret));
           }
           return super.put(...args);
         }
       }
       const checkpointer = new ForkFailureSaver();
-      const checkpointId = '00000000-0000-0000-0000-000000000001';
-      if (failureStage !== 'missing checkpoint') {
-        await checkpointer.put(
-          { configurable: { thread_id: sourceThreadId, checkpoint_ns: '' } },
-          {
-            v: 4,
-            id: checkpointId,
-            ts: new Date().toISOString(),
-            channel_values: {},
-            channel_versions: {},
-            versions_seen: {},
-          },
-          { source: 'loop', step: 0, parents: {} }
-        );
-      }
       const resumeExecution: SubagentResumeExecution = {
         parentToolCallId: params.parentToolCallId,
         childRunId: 'persisted-child-run',
@@ -208,16 +209,49 @@ describe('SubagentExecutor startup failure delivery', () => {
       const parentConfigurable = {
         thread_id: params.threadId,
         checkpoint_id: 'parent-checkpoint',
-        [SUBAGENT_RESUME_MANIFEST_CONFIG_KEY]: {
-          version: 1,
-          executions: [resumeExecution],
-        },
+        ...(reconstruction === 'manifest'
+          ? {
+            [SUBAGENT_RESUME_MANIFEST_CONFIG_KEY]: {
+              version: 1,
+              executions: [resumeExecution],
+            },
+          }
+          : {}),
       };
       const { address } = new SubagentExecutionRegistry({
         parentRunId: 'rebuilt-parent-run',
         parentAgentId: 'parent-agent',
         durable: true,
       }).open({ ...params, parentConfigurable });
+      if (reconstruction === 'base checkpoint')
+        sourceThreadId = address.baseChildThreadId;
+      if (failureStage !== 'missing checkpoint') {
+        await checkpointer.put(
+          { configurable: { thread_id: sourceThreadId, checkpoint_ns: '' } },
+          {
+            v: 4,
+            id: checkpointId,
+            ts: new Date().toISOString(),
+            channel_values:
+              reconstruction === 'manifest'
+                ? {}
+                : {
+                  messages: [
+                    new HumanMessage({
+                      content: 'Paused child',
+                      additional_kwargs: {
+                        __librechat_subagent_run_id:
+                            resumeExecution.childRunId,
+                      },
+                    }),
+                  ],
+                },
+            channel_versions: {},
+            versions_seen: {},
+          },
+          { source: 'loop', step: 0, parents: {} }
+        );
+      }
       const hook = jest.fn<SubagentResolutionFailureHandler>(
         () => 'configuration_changed'
       );
@@ -240,11 +274,13 @@ describe('SubagentExecutor startup failure delivery', () => {
         const result = await instance.execute({
           ...params,
           parentConfigurable,
+          signal: controller.signal,
         });
 
         expect(hook).toHaveBeenCalledTimes(1);
         expect(hook.mock.calls[0][0]).toMatchObject({
           phase: failureStage === 'config resolver' ? 'config' : 'identity',
+          aborted: failureStage === 'aborted write',
           parentRunId: 'rebuilt-parent-run',
           parentAgentId: 'parent-agent',
           threadId: params.threadId,
