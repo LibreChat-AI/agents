@@ -32,6 +32,41 @@ describe('managed GPT-5.6 request fields', () => {
     expect(JSON.stringify(messages[0])).toContain('prompt_cache_breakpoint');
   });
 
+  it('also marks the end of a leading multi-message instruction prompt', () => {
+    /**
+     * A direct caller can split one stable prompt across several instruction
+     * messages. Marking only the first would leave the larger combined prefix
+     * unmarked once history sits between it and the current turn.
+     */
+    const messages = addChatCacheBreakpoints([
+      { role: 'system', content: 'Short preamble.' },
+      { role: 'developer', content: 'Large stable prompt.' },
+      { role: 'user', content: 'First question.' },
+      { role: 'assistant', content: 'First answer.' },
+      { role: 'user', content: 'Current question.' },
+    ]);
+
+    const marked = messages.map((message) =>
+      JSON.stringify(message).includes('prompt_cache_breakpoint')
+    );
+    expect(marked).toEqual([true, true, false, true, false]);
+  });
+
+  it('marks the leading instruction run on Responses input too', () => {
+    const input = addResponseCacheBreakpoints([
+      { type: 'message', role: 'system', content: 'Short preamble.' },
+      { type: 'message', role: 'developer', content: 'Large stable prompt.' },
+      { type: 'message', role: 'user', content: 'First question.' },
+      { type: 'message', role: 'system', content: 'Dynamic tail.' },
+      { type: 'message', role: 'user', content: 'Current question.' },
+    ]) as unknown[];
+
+    const marked = input.map((item) =>
+      JSON.stringify(item).includes('prompt_cache_breakpoint')
+    );
+    expect(marked).toEqual([true, true, false, true, false]);
+  });
+
   it('places cache breakpoints after instructions and the prior history prefix', () => {
     const messages = addChatCacheBreakpoints([
       { role: 'system', content: 'Stable instructions.' },

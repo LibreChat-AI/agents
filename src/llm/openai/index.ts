@@ -364,32 +364,45 @@ function selectCacheBreakpointIndexes(
   roles: Array<string | undefined>,
   cacheable: boolean[]
 ): number[] {
-  let instructionIndex = -1;
+  let firstInstructionIndex = -1;
+  let leadingInstructionIndex = -1;
+  let inLeadingInstructions = true;
   let latestUserIndex = -1;
   for (let index = 0; index < roles.length; index++) {
     const role = roles[index];
-    /**
-     * The first instruction message, not the last. The stable prefix is built
-     * first and the volatile tail follows it in its own system message, so
-     * marking the last one would put the breakpoint behind content that turns
-     * over every turn — the invalidation this breakpoint exists to avoid.
-     * With a single system message the two are the same message.
-     */
-    if (
-      (role === 'system' || role === 'developer') &&
-      cacheable[index] &&
-      instructionIndex === -1
-    ) {
-      instructionIndex = index;
+    const isInstruction = role === 'system' || role === 'developer';
+    if (!isInstruction) {
+      inLeadingInstructions = false;
+    }
+    if (isInstruction && cacheable[index]) {
+      if (firstInstructionIndex === -1) {
+        firstInstructionIndex = index;
+      }
+      if (inLeadingInstructions) {
+        leadingInstructionIndex = index;
+      }
     }
     if (role === 'user') {
       latestUserIndex = index;
     }
   }
 
+  /**
+   * Two instruction boundaries, which coincide whenever there is a single
+   * instruction message. The first one is the stable prefix `AgentContext`
+   * builds when it relocates the volatile tail into its own system message;
+   * marking only the last would put the breakpoint behind content that turns
+   * over every turn. The end of the leading instruction run covers callers
+   * that split one stable prompt across several instruction messages. With
+   * the history breakpoint below that is at most three, inside the four an
+   * explicit request may write.
+   */
   const indexes = new Set<number>();
-  if (instructionIndex >= 0) {
-    indexes.add(instructionIndex);
+  if (firstInstructionIndex >= 0) {
+    indexes.add(firstInstructionIndex);
+  }
+  if (leadingInstructionIndex >= 0) {
+    indexes.add(leadingInstructionIndex);
   }
   for (let index = latestUserIndex - 1; index >= 0; index--) {
     if (cacheable[index]) {

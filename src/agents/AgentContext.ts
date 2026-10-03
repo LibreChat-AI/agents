@@ -941,8 +941,8 @@ export class AgentContext {
 
     const promptCacheProvider = this.getPromptCacheProvider();
     /**
-     * GPT-5.6 explicit caching needs the same structural split as Anthropic —
-     * a stable system message with the volatile tail moved behind it — but
+     * GPT-5.6 explicit caching needs the same structural split as Anthropic,
+     * a stable system message with the volatile tail moved behind it, but
      * none of the Anthropic marker stamping: its breakpoints are attached to
      * the serialized request later, in the OpenAI client. So it drives the
      * relocation flag while leaving `promptCacheProvider` undefined.
@@ -1178,10 +1178,10 @@ export class AgentContext {
    *
    * Unlike the providers above this adds no marker to the message content
    * here: `prompt_cache_breakpoint` is attached to the serialized request in
-   * the OpenAI client, which selects the last system/developer message. That
+   * the OpenAI client, which marks the first system/developer message. That
    * selection is only worth anything if the system message stops at the
    * stable instructions, so this exists to drive the same dynamic-tail
-   * relocation — nothing else.
+   * relocation, nothing else.
    */
   private usesOpenAIExplicitPromptCache(): boolean {
     if (
