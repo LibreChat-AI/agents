@@ -443,6 +443,50 @@ describe('AgentContext', () => {
       }
     );
 
+    it('keeps the summary ahead of history and only the tail behind it under explicit caching', async () => {
+      /**
+       * In the tail the summary would move behind each new turn and take the
+       * history prefix in front of it out of the cache. Ahead of history it
+       * changes only on re-summarization, as it does without explicit caching.
+       */
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.OPENAI,
+          clientOptions: {
+            model: 'gpt-5.6',
+            promptCacheExplicit: true,
+          } as t.OpenAIClientOptions,
+          instructions: 'Stable instructions',
+          additional_instructions: 'Dynamic instructions',
+        },
+      });
+      ctx.setSummary('Rotating summary', 7, { precedesMessages: true });
+
+      const result = await ctx.systemRunnable!.invoke([
+        new HumanMessage('Hello'),
+        new AIMessage('Hi'),
+        new HumanMessage('Second'),
+      ]);
+
+      expect(result.map((message) => message.getType())).toEqual([
+        'system',
+        'human',
+        'human',
+        'ai',
+        'system',
+        'human',
+      ]);
+      expect(result[0].content).toBe('Stable instructions');
+      expect(result[1].content).toContain('Rotating summary');
+      expect(result[4].content).toBe('Dynamic instructions');
+      expect(result[5].content).toBe('Second');
+      expect(
+        result.filter((message) =>
+          JSON.stringify(message.content).includes('Rotating summary')
+        )
+      ).toHaveLength(1);
+    });
+
     it('leaves the Anthropic relocated tail on the role it already shipped with', async () => {
       /** Not this change's to alter: Anthropic relocated to a HumanMessage before it. */
       const ctx = createBasicContext({

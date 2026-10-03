@@ -981,13 +981,20 @@ export class AgentContext {
         this.summaryText != null &&
         this.summaryText !== '';
 
+      /**
+       * The summary rides the relocated tail only where markers are stamped
+       * here. On the OpenAI explicit path it stays ahead of history, where it
+       * changes only on re-summarization: in the tail it would move every turn
+       * and take the history prefix behind it out of the cache.
+       */
+      const summaryRidesTail = promptCacheProvider != null;
       const bodyWithSummary =
-        hasSummaryBody && !splitsDynamicInstructions
+        hasSummaryBody && !summaryRidesTail
           ? [this.buildSummaryHumanMessage(promptCacheProvider), ...messages]
           : messages;
       const dynamicTail = this.buildPromptCacheDynamicTail({
         dynamicInstructions,
-        hasSummaryBody,
+        hasSummaryBody: hasSummaryBody && summaryRidesTail,
         splitsDynamicInstructions,
         shouldMoveDynamicInstructions,
         keepsInstructionRole:
@@ -1086,7 +1093,9 @@ export class AgentContext {
     }
 
     const tailIndex =
-      this._summaryLocation === 'user_message' && this.summaryPrecedesMessages
+      promptCacheProvider != null &&
+      this._summaryLocation === 'user_message' &&
+      this.summaryPrecedesMessages
         ? 0
         : this.getPromptCacheDynamicTailIndex(messages, promptCacheProvider);
     const stablePrefix = messages.slice(0, tailIndex);

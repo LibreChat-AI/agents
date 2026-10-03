@@ -393,9 +393,7 @@ function selectCacheBreakpointIndexes(
    * builds when it relocates the volatile tail into its own system message;
    * marking only the last would put the breakpoint behind content that turns
    * over every turn. The end of the leading instruction run covers callers
-   * that split one stable prompt across several instruction messages. With
-   * the history breakpoint below that is at most three, inside the four an
-   * explicit request may write.
+   * that split one stable prompt across several instruction messages.
    */
   const indexes = new Set<number>();
   if (firstInstructionIndex >= 0) {
@@ -408,6 +406,29 @@ function selectCacheBreakpointIndexes(
     if (cacheable[index]) {
       indexes.add(index);
       break;
+    }
+  }
+
+  /**
+   * Instructions right before the current turn after earlier history are the
+   * tail `AgentContext` relocates there. That position moves every turn, so a
+   * prefix ending at it never recurs; the history in front of it does, and
+   * gets its own breakpoint. Four at most, the most an explicit request may
+   * write.
+   */
+  let tailStart = latestUserIndex;
+  while (
+    tailStart > 0 &&
+    (roles[tailStart - 1] === 'system' || roles[tailStart - 1] === 'developer')
+  ) {
+    tailStart--;
+  }
+  if (tailStart < latestUserIndex && tailStart > leadingInstructionIndex + 1) {
+    for (let index = tailStart - 1; index > leadingInstructionIndex; index--) {
+      if (cacheable[index]) {
+        indexes.add(index);
+        break;
+      }
     }
   }
   return [...indexes];

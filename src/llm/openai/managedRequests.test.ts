@@ -64,7 +64,40 @@ describe('managed GPT-5.6 request fields', () => {
     const marked = input.map((item) =>
       JSON.stringify(item).includes('prompt_cache_breakpoint')
     );
-    expect(marked).toEqual([true, true, false, true, false]);
+    expect(marked).toEqual([true, true, true, true, false]);
+  });
+
+  it('marks the history in front of a relocated tail, not only the tail', () => {
+    /**
+     * The tail moves behind each new turn, so a prefix ending at it never
+     * recurs. The history before it does and keeps its own breakpoint; the
+     * tail keeps one too, for tool-loop calls within the same turn.
+     */
+    const messages = addChatCacheBreakpoints([
+      { role: 'system', content: 'Stable instructions.' },
+      { role: 'user', content: 'First question.' },
+      { role: 'assistant', content: 'First answer.' },
+      { role: 'system', content: 'Dynamic tail.' },
+      { role: 'user', content: 'Current question.' },
+    ]);
+
+    const marked = messages.map((message) =>
+      JSON.stringify(message).includes('prompt_cache_breakpoint')
+    );
+    expect(marked).toEqual([true, false, true, true, false]);
+  });
+
+  it('adds no history breakpoint for a first turn with no history', () => {
+    const messages = addChatCacheBreakpoints([
+      { role: 'system', content: 'Stable instructions.' },
+      { role: 'system', content: 'Dynamic tail.' },
+      { role: 'user', content: 'Current question.' },
+    ]);
+
+    const marked = messages.map((message) =>
+      JSON.stringify(message).includes('prompt_cache_breakpoint')
+    );
+    expect(marked).toEqual([true, true, false]);
   });
 
   it('places cache breakpoints after instructions and the prior history prefix', () => {
