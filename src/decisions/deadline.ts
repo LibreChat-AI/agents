@@ -1,0 +1,92 @@
+import { DecisionError } from './types';
+
+export type AwaitWithinDeadline = <T>(task: Promise<T>) => Promise<T>;
+
+/** Bounds even non-cooperative credential minters, fetches, body reads, and model calls. */
+export async function withDecisionDeadline<T>(
+  provider: string,
+  timeoutMs: number,
+  callerSignal: AbortSignal | undefined,
+  operation: (signal: AbortSignal, waitFor: AwaitWithinDeadline) => Promise<T>
+): Promise<T> {
+  if (
+    !Number.isSafeInteger(timeoutMs) ||
+    timeoutMs <= 0 ||
+    timeoutMs > 3_600_000
+  ) {
+    throw new DecisionError('bad_request', 'invalid decision model timeout', {
+      provider,
+    });
+  }
+  if (callerSignal?.aborted === true) {
+    throw new DecisionError('aborted', 'caller aborted the request', {
+      provider,
+    });
+  }
+
+  const expiresAt = performance.now() + timeoutMs;
+  const deadline = new AbortController();
+  const signal = callerSignal
+    ? AbortSignal.any([callerSignal, deadline.signal])
+    : deadline.signal;
+  const timer = setTimeout(() => deadline.abort(), timeoutMs);
+  const expired = (): boolean => {
+    if (performance.now() >= expiresAt) {
+      deadline.abort();
+    }
+    return signal.aborted;
+  };
+  const abortError = (): DecisionError => {
+    if (callerSignal?.aborted === true) {
+      return new DecisionError('aborted', 'caller aborted the request', {
+        provider,
+      });
+    }
+    return new DecisionError('timeout', 'decision model deadline exceeded', {
+      provider,
+    });
+  };
+
+  const waitFor: AwaitWithinDeadline = <U>(task: Promise<U>): Promise<U> =>
+    new Promise<U>((resolve, reject) => {
+      if (expired()) {
+        void task.catch(() => {});
+        reject(abortError());
+        return;
+      }
+      const onAbort = (): void => {
+        signal.removeEventListener('abort', onAbort);
+        reject(abortError());
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+      if (expired()) {
+        onAbort();
+      }
+      task.then(
+        (value) => {
+          signal.removeEventListener('abort', onAbort);
+          if (expired()) {
+            reject(abortError());
+          } else {
+            resolve(value);
+          }
+        },
+        (error: unknown) => {
+          signal.removeEventListener('abort', onAbort);
+          reject(expired() ? abortError() : error);
+        }
+      );
+    });
+
+  try {
+    return await waitFor(operation(signal, waitFor));
+  } catch (error) {
+    if (expired()) {
+      throw abortError();
+    }
+    throw error;
+  } finally {
+    expired();
+    clearTimeout(timer);
+  }
+}
