@@ -1,5 +1,5 @@
-import { MemorySaver } from '@langchain/langgraph';
-import { HumanMessage } from '@langchain/core/messages';
+import { MemorySaver, GraphInterrupt } from '@langchain/langgraph';
+import { HumanMessage, ToolMessage } from '@langchain/core/messages';
 import { describe, expect, it, jest, afterEach } from '@jest/globals';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type {
@@ -7,6 +7,7 @@ import type {
   StandardGraphInput,
 } from '@/types';
 import type { SubagentResolutionFailureHandler } from '../diagnostics';
+import type { SubagentExecutorOptions } from '../SubagentExecutor';
 import type { SubagentResumeExecution } from '../SubagentReplay';
 import {
   getSubagentResolutionFailureMessage,
@@ -15,6 +16,7 @@ import {
 import { SubagentExecutionRegistry } from '../SubagentExecutionRegistry';
 import { InMemorySubagentTaskStore } from '../InMemorySubagentTaskStore';
 import { SUBAGENT_RESUME_MANIFEST_CONFIG_KEY } from '../SubagentReplay';
+import { StreamLimitExceededError } from '@/llm/streamLimits';
 import { SubagentExecutor } from '../SubagentExecutor';
 import { createGraph } from '@/graphs';
 import { Providers } from '@/common';
@@ -37,7 +39,10 @@ const params = {
   threadId: 'conversation-thread',
 };
 
-function executor(onResolutionFailure?: SubagentResolutionFailureHandler) {
+function executor(
+  onResolutionFailure?: SubagentResolutionFailureHandler,
+  overrides: Partial<SubagentExecutorOptions> = {}
+) {
   const createChildGraph = jest.fn((input: StandardGraphInput) =>
     createGraph({ kind: 'standard', input })
   );
@@ -49,6 +54,7 @@ function executor(onResolutionFailure?: SubagentResolutionFailureHandler) {
       parentAgentId: 'parent-agent',
       createChildGraph,
       onResolutionFailure,
+      ...overrides,
     }),
   };
 }
@@ -391,6 +397,289 @@ describe('SubagentExecutor startup failure delivery', () => {
     });
     expect(failure?.stack).not.toContain('private');
     instance.clearHeavyState();
+  });
+
+  it.each([
+    ['standard', 'workspace_unavailable'],
+    ['standard', 'agent_unavailable'],
+    ['standard', 'model_unavailable'],
+    ['standard', 'configuration_changed'],
+    ['standard', 'unknown'],
+    ['multi-agent', 'workspace_unavailable'],
+  ] as const)(
+    'reports %s graph preflight failures with safe %s causes',
+    async (kind, cause) => {
+      class OfflineChildSaver extends MemorySaver {
+        override getTuple(
+          request: RunnableConfig
+        ): ReturnType<MemorySaver['getTuple']> {
+          const threadId = request.configurable?.thread_id;
+          if (
+            typeof threadId === 'string' &&
+            threadId.startsWith('subagent:')
+          ) {
+            return Promise.reject(new Error(secret));
+          }
+          return super.getTuple(request);
+        }
+      }
+      const checkpointer = new OfflineChildSaver();
+      const hook = jest.fn<SubagentResolutionFailureHandler>(() => cause);
+      const execute = jest.spyOn(SubagentExecutor.prototype, 'execute');
+      const resolver = jest.fn(config.resolveAgentInputs);
+      const parent = {
+        agentId: 'parent',
+        provider: Providers.OPENAI,
+        clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'unused' },
+        maxContextTokens: 8000,
+        subagentConfigs: [{ ...config, resolveAgentInputs: resolver }],
+      };
+      const run = await Run.create({
+        runId: 'parent-run',
+        humanInTheLoop: { enabled: true },
+        onSubagentResolutionFailure: hook,
+        graphConfig:
+          kind === 'standard'
+            ? {
+              type: 'standard',
+              agents: [parent],
+              compileOptions: { checkpointer },
+            }
+            : {
+              type: 'multi-agent',
+              agents: [parent],
+              edges: [],
+              entryAgentId: 'parent',
+              compileOptions: { checkpointer },
+            },
+      });
+      const graph = run.Graph;
+      if (graph == null) throw new Error('Missing graph');
+      graph.overrideTestModel(['Starting reviewer', 'Finished'], 0, [
+        {
+          name: 'subagent',
+          id: 'spawn-reviewer',
+          type: 'tool_call',
+          args: { subagent_type: 'reviewer', description: 'Review code.' },
+        },
+      ]);
+      try {
+        const state = await graph
+          .createWorkflow()
+          .invoke(
+            { messages: [new HumanMessage('Review this code.')] },
+            { configurable: { thread_id: 'conversation-thread' } }
+          );
+        const output = state.messages.find(
+          (message) => message instanceof ToolMessage
+        );
+        expect(output).toMatchObject({
+          content: getSubagentResolutionFailureMessage(cause),
+          status: 'error',
+        });
+        expect(hook).toHaveBeenCalledTimes(1);
+        expect(hook.mock.calls[0][0]).toMatchObject({
+          phase: 'identity',
+          subagentType: 'reviewer',
+          aborted: false,
+          parentRunId: 'parent-run',
+          parentAgentId: 'parent',
+          parentToolCallId: 'spawn-reviewer',
+          threadId: 'conversation-thread',
+          childRunId: expect.any(String),
+          childThreadId: expect.any(String),
+        });
+        expect(execute).not.toHaveBeenCalled();
+        expect(resolver).not.toHaveBeenCalled();
+        expect(JSON.stringify(state.messages)).not.toContain('private');
+        expect(JSON.stringify(state.messages)).not.toContain('api_key');
+      } finally {
+        graph.clearHeavyState();
+      }
+    }
+  );
+
+  it.each([
+    ['string', secret],
+    [
+      'UndescribableError',
+      new Proxy(
+        {},
+        {
+          getPrototypeOf: () => {
+            throw new Error(secret);
+          },
+        }
+      ),
+    ],
+  ] as const)(
+    'redacts a %s replay-preparation rejection',
+    async (type, reason) => {
+      class RejectingSaver extends MemorySaver {
+        override getTuple(
+          _request: RunnableConfig
+        ): ReturnType<MemorySaver['getTuple']> {
+          return Promise.reject(reason);
+        }
+      }
+      const hook = jest.fn<SubagentResolutionFailureHandler>();
+      const { instance } = executor(hook, {
+        checkpointer: new RejectingSaver(),
+        humanInTheLoop: { enabled: true },
+      });
+      try {
+        const result = await instance.getSettledToolOutput(
+          {
+            id: params.parentToolCallId,
+            name: 'subagent',
+            args: { subagent_type: config.type },
+          },
+          { configurable: { thread_id: params.threadId } }
+        );
+        expect(result?.output).toMatchObject({
+          content: getSubagentResolutionFailureMessage('unknown'),
+          status: 'error',
+        });
+        expect(hook).toHaveBeenCalledTimes(1);
+        expect(hook.mock.calls[0][0]).toMatchObject({
+          phase: 'identity',
+          type,
+        });
+        expect(JSON.stringify(result)).not.toContain('private');
+      } finally {
+        instance.clearHeavyState();
+      }
+    }
+  );
+
+  it.each([
+    new GraphInterrupt([]),
+    new StreamLimitExceededError({
+      kind: 'tool_call_args',
+      limit: 10,
+      observed: 11,
+    }),
+  ])('preserves replay framework control flow', async (reason) => {
+    class RejectingSaver extends MemorySaver {
+      override getTuple(
+        _request: RunnableConfig
+      ): ReturnType<MemorySaver['getTuple']> {
+        return Promise.reject(reason);
+      }
+    }
+    const hook = jest.fn<SubagentResolutionFailureHandler>();
+    const { instance } = executor(hook, {
+      checkpointer: new RejectingSaver(),
+      humanInTheLoop: { enabled: true },
+    });
+    try {
+      await expect(
+        instance.getSettledToolOutput(
+          {
+            id: params.parentToolCallId,
+            name: 'subagent',
+            args: { subagent_type: config.type },
+          },
+          { configurable: { thread_id: params.threadId } }
+        )
+      ).rejects.toBe(reason);
+      expect(hook).not.toHaveBeenCalled();
+    } finally {
+      instance.clearHeavyState();
+    }
+  });
+
+  it('reports aborted replay preparation while retaining safe cancellation text', async () => {
+    const controller = new AbortController();
+    class AbortingSaver extends MemorySaver {
+      override getTuple(
+        _request: RunnableConfig
+      ): ReturnType<MemorySaver['getTuple']> {
+        controller.abort(new Error(secret));
+        return Promise.reject(new Error(secret));
+      }
+    }
+    const hook = jest.fn<SubagentResolutionFailureHandler>(
+      () => 'configuration_changed'
+    );
+    const { instance } = executor(hook, {
+      checkpointer: new AbortingSaver(),
+      humanInTheLoop: { enabled: true },
+    });
+    try {
+      await expect(
+        instance.getSettledToolOutput(
+          {
+            id: params.parentToolCallId,
+            name: 'subagent',
+            args: { subagent_type: config.type },
+          },
+          {
+            configurable: { thread_id: params.threadId },
+            signal: controller.signal,
+          }
+        )
+      ).rejects.toMatchObject({
+        name: 'SubagentResolutionError',
+        message: getSubagentResolutionFailureMessage('configuration_changed'),
+      });
+      expect(hook).toHaveBeenCalledTimes(1);
+      expect(hook.mock.calls[0][0]).toMatchObject({
+        phase: 'identity',
+        aborted: true,
+      });
+    } finally {
+      instance.clearHeavyState();
+    }
+  });
+
+  it('reports identity failure during settlement without exposing the original rejection', async () => {
+    class OfflineSaver extends MemorySaver {
+      override getTuple(
+        _request: RunnableConfig
+      ): ReturnType<MemorySaver['getTuple']> {
+        return Promise.reject(new Error(secret));
+      }
+    }
+    const hook = jest.fn<SubagentResolutionFailureHandler>(
+      () => 'workspace_unavailable'
+    );
+    const { instance } = executor(hook, {
+      checkpointer: new OfflineSaver(),
+      humanInTheLoop: { enabled: true },
+    });
+    try {
+      await expect(
+        instance.persistSettledToolOutput(
+          {
+            id: params.parentToolCallId,
+            name: 'subagent',
+            args: { subagent_type: config.type },
+          },
+          { configurable: { thread_id: params.threadId } },
+          {
+            output: new ToolMessage({
+              content: 'Safe result',
+              name: 'subagent',
+              tool_call_id: params.parentToolCallId,
+            }),
+            additionalContexts: [],
+          }
+        )
+      ).rejects.toMatchObject({
+        name: 'SubagentResolutionError',
+        message: getSubagentResolutionFailureMessage('workspace_unavailable'),
+        resolutionCause: 'workspace_unavailable',
+      });
+      expect(hook).toHaveBeenCalledTimes(1);
+      expect(hook.mock.calls[0][0]).toMatchObject({
+        phase: 'identity',
+        parentToolCallId: params.parentToolCallId,
+        threadId: params.threadId,
+      });
+    } finally {
+      instance.clearHeavyState();
+    }
   });
 
   it.each(['standard', 'multi-agent'] as const)(

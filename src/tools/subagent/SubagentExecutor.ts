@@ -97,6 +97,7 @@ import type {
   SubagentResolutionCause,
   SubagentResolutionFailureHandler,
 } from './diagnostics';
+import type { RunBreakerScope } from '@/llm/streamLimits';
 import type { GraphFactory } from '@/graphs/graphFactory';
 import type { StandardGraph } from '@/graphs/Graph';
 import {
@@ -174,6 +175,14 @@ const SUBAGENT_CONFIG_CHANGED_MESSAGE =
   'Subagent error: Subagent configuration changed since this execution was paused.';
 const SUBAGENT_INVOCATION_CHANGED_MESSAGE =
   'Subagent error: Subagent invocation changed for this execution.';
+
+function isSubagentResolutionControlFlow(error: unknown): boolean {
+  try {
+    return error instanceof StreamLimitExceededError || isGraphInterrupt(error);
+  } catch {
+    return false;
+  }
+}
 
 function seedChildGraphSessions(
   childGraph: StandardGraph,
@@ -2105,9 +2114,10 @@ export class SubagentExecutor {
     config: RunnableConfig
   ): Promise<SettledSubagentToolOutput | undefined> {
     const parentToolCallId = call.id;
+    const checkpointer = this.checkpointer;
     if (
       this.humanInTheLoop?.enabled !== true ||
-      this.checkpointer == null ||
+      checkpointer == null ||
       parentToolCallId == null ||
       parentToolCallId === ''
     ) {
@@ -2122,6 +2132,44 @@ export class SubagentExecutor {
       parentToolCallId,
       parentConfigurable,
     });
+    const signal = this.getReplaySignal(config);
+    try {
+      return await this.restoreSettledToolOutput(
+        call,
+        parentConfigurable,
+        parentToolCallId,
+        execution,
+        checkpointer
+      );
+    } catch (error) {
+      if (isSubagentResolutionControlFlow(error)) throw error;
+      const failure = this.createReplayResolutionError(
+        call,
+        config,
+        execution,
+        signal,
+        error
+      );
+      if (signal.aborted) throw failure;
+      return {
+        output: new ToolMessage({
+          content: failure.message,
+          name: call.name,
+          tool_call_id: parentToolCallId,
+          status: 'error',
+        }),
+        additionalContexts: [],
+      };
+    }
+  }
+
+  private async restoreSettledToolOutput(
+    call: ToolCall,
+    parentConfigurable: Record<string, unknown> | undefined,
+    parentToolCallId: string,
+    execution: DurableExecutionRecord,
+    checkpointer: BaseCheckpointSaver
+  ): Promise<SettledSubagentToolOutput | undefined> {
     const { resumeExecution } = execution;
     const inProcessSettledOutput = execution.settledOutput;
     if (inProcessSettledOutput != null) {
@@ -2180,7 +2228,7 @@ export class SubagentExecutor {
     const { childThreadId } =
       await this.resolveChildExecutionIdentity(execution);
     if (marker == null) {
-      const checkpoint = await this.checkpointer.getTuple({
+      const checkpoint = await checkpointer.getTuple({
         configurable: { thread_id: childThreadId },
       });
       messages = getCheckpointMessages(
@@ -2332,8 +2380,20 @@ export class SubagentExecutor {
         },
         persistedOutput,
         async (): Promise<void> => {
-          const { childRunId, childThreadId } =
-            await this.resolveChildExecutionIdentity(execution);
+          let identity: SubagentExecutionIdentity;
+          try {
+            identity = await this.resolveChildExecutionIdentity(execution);
+          } catch (error) {
+            if (isSubagentResolutionControlFlow(error)) throw error;
+            throw this.createReplayResolutionError(
+              call,
+              config,
+              execution,
+              this.getReplaySignal(config),
+              error
+            );
+          }
+          const { childRunId, childThreadId } = identity;
           const activeChildRun = execution.activeRun;
           if (activeChildRun != null) {
             await this.persistChildCheckpointMarker(
@@ -2479,6 +2539,49 @@ export class SubagentExecutor {
     }
   }
 
+  private getReplaySignal(config: RunnableConfig): AbortSignal {
+    const scope = config.configurable?.[RUN_BREAKER_SCOPE_CONFIG_KEY] as
+      | RunBreakerScope
+      | undefined;
+    return this.composeChildSignal(
+      scope?.controller ?? this.resolveBreakerController(),
+      config.signal
+    );
+  }
+
+  private createReplayResolutionError(
+    call: ToolCall,
+    config: RunnableConfig,
+    execution: DurableExecutionRecord,
+    signal: AbortSignal,
+    error: unknown
+  ): SubagentResolutionError {
+    const selectedType =
+      execution.binding?.subagentType ??
+      execution.resumeExecution?.subagentType ??
+      getSubagentType(call);
+    const threadId = config.configurable?.thread_id;
+    const failure = this.createResolutionFailure(
+      'identity',
+      {
+        subagentType:
+          selectedType == null
+            ? 'unknown'
+            : (this.configs.get(selectedType)?.type ?? 'unknown'),
+        description: DEFAULT_SUBAGENT_DESCRIPTION,
+        parentToolCallId: call.id,
+        threadId: typeof threadId === 'string' ? threadId : undefined,
+      },
+      execution,
+      signal,
+      error
+    );
+    return new SubagentResolutionError(
+      'identity',
+      failure.resolutionFailure?.cause ?? 'unknown'
+    );
+  }
+
   private createResolutionFailure(
     phase: SubagentResolutionPhase,
     params: SubagentExecuteParams,
@@ -2487,6 +2590,10 @@ export class SubagentExecutor {
     error: unknown
   ): SubagentExecuteResult {
     const identity = execution.identity ?? execution.attemptedIdentity;
+    const resumeExecution =
+      this.humanInTheLoop?.enabled === true && this.checkpointer != null
+        ? execution.resumeExecution
+        : undefined;
     const detail = logSubagentResolutionFailure(
       phase,
       params.subagentType,
@@ -2497,9 +2604,15 @@ export class SubagentExecutor {
         parentAgentId: this.parentAgentId,
         parentToolCallId: params.parentToolCallId,
         threadId: params.threadId,
-        childRunId: identity?.childRunId ?? execution.address.currentChildRunId,
+        childRunId:
+          identity?.childRunId ??
+          resumeExecution?.childRunId ??
+          execution.address.currentChildRunId,
         childThreadId:
-          identity?.childThreadId ?? execution.address.baseChildThreadId,
+          identity?.childThreadId ??
+          (resumeExecution == null
+            ? execution.address.baseChildThreadId
+            : execution.address.branchChildThreadId),
         taskId: params.taskRuntime?.taskId,
       },
       this.onResolutionFailure
@@ -2543,7 +2656,7 @@ export class SubagentExecutor {
       identity = await this.resolveChildExecutionIdentity(execution);
       execution.assertUsable(childSignal);
     } catch (error) {
-      if (error instanceof StreamLimitExceededError) {
+      if (isSubagentResolutionControlFlow(error)) {
         throw error;
       }
       return this.createResolutionFailure(
@@ -2579,7 +2692,7 @@ export class SubagentExecutor {
       });
       execution.assertUsable(childSignal);
     } catch (error) {
-      if (error instanceof StreamLimitExceededError) {
+      if (isSubagentResolutionControlFlow(error)) {
         throw error;
       }
       return this.createResolutionFailure(

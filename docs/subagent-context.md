@@ -91,9 +91,15 @@ A callback returning nothing preserves the unknown fallback. If no callback is
 provided, or it throws, the SDK uses `console.warn` with only safe diagnostics.
 A callback failure never replaces the child failure.
 
-Foreground results include `resolutionFailure: { phase, cause }`. Detached
+Direct executor results include `resolutionFailure: { phase, cause }`. Detached
 execution throws `SubagentResolutionError` with the same safe `phase`,
 `resolutionCause`, and fixed message. Hosts can recognize this class when
 mapping background failures instead of exposing arbitrary `Error.message`.
 The SDK does not infer host-specific workspace, agent-access, or provider
 failures from free text. Those mappings belong to the host.
+
+Graph replay preparation uses the same diagnostic boundary before invoking the
+subagent tool. Ordinary preparation failures return a safe error `ToolMessage`
+without starting child work. Framework interrupts and stream limits retain their
+control-flow semantics. Aborted preparation and settlement identity failures
+throw `SubagentResolutionError`; neither exposes the original rejection.
