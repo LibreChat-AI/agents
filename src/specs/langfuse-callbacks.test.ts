@@ -20,7 +20,11 @@ import {
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type * as t from '@/types';
 import { handleConverseStreamMetadata } from '@/llm/bedrock/utils/message_outputs';
+import { initializeLangfuseTracing } from '@/instrumentation';
 import { traceIdFromSeed } from '@/langfuseRuntimeContext';
+import { createLangfuseHandler } from '@/langfuse';
+import { UsageBearingError } from '@/llm/errors';
+import { traceModelInvocation } from '@/tracing';
 import { Constants, Providers } from '@/common';
 import { ToolNode } from '@/tools/ToolNode';
 import { askUserQuestion } from '@/hitl';
@@ -140,6 +144,185 @@ describe('Langfuse callback composition', () => {
     delete process.env.LANGFUSE_BASE_URL;
     delete process.env.LANGFUSE_BASEURL;
     delete process.env.LANGFUSE_FORCE_FLUSH_ON_DISPOSE;
+  });
+
+  it('traces external model invocations through the public lifecycle with isolated tenant destinations', async () => {
+    const tenants = ['host-a', 'host-b'];
+    await Promise.all(
+      tenants.map((tenant) =>
+        traceModelInvocation(
+          {
+            langfuse: {
+              publicKey: `pk-${tenant}`,
+              secretKey: `sk-${tenant}`,
+              deterministicTraceId: true,
+            },
+            runId: tenant,
+            traceIdSeed: tenant,
+            sessionId: `session-${tenant}`,
+            userId: tenant,
+            provider: 'external',
+            model: 'image-model',
+          },
+          async (callbacks) => {
+            expect(callbacks).toBeUndefined();
+            return tenant;
+          },
+          () => ({
+            generations: [
+              [
+                {
+                  text: '[Output omitted]',
+                  message: new AIMessage({
+                    content: '[Output omitted]',
+                    usage_metadata: {
+                      input_tokens: 3,
+                      output_tokens: 5,
+                      total_tokens: 8,
+                    },
+                  }),
+                },
+              ],
+            ],
+          })
+        )
+      )
+    );
+    expect(mockSpansStarted).toBe(2);
+    expect(mockSpansEnded).toBe(2);
+    expect(
+      new Set(mockProcessorStarts.map(({ traceId }) => traceId)).size
+    ).toBe(2);
+    expect(mockProcessorStarts).toEqual(
+      expect.arrayContaining(
+        tenants.map((tenant) =>
+          expect.objectContaining({
+            params: expect.objectContaining({
+              publicKey: `pk-${tenant}`,
+              secretKey: `sk-${tenant}`,
+            }),
+            traceId: traceIdFromSeed(tenant),
+          })
+        )
+      )
+    );
+  });
+
+  it('preserves paid results and original errors when an external trace projection fails', async () => {
+    const params = {
+      langfuse: { publicKey: 'pk-lifecycle', secretKey: 'sk-lifecycle' },
+      runId: 'host-lifecycle',
+      provider: 'external',
+      model: 'image-model',
+    };
+    const work = jest.fn(async () => 'paid-result');
+    await expect(
+      traceModelInvocation(params, work, () => {
+        throw new Error('projection');
+      })
+    ).resolves.toBe('paid-result');
+    const failure = new Error('private-provider-prompt');
+    await expect(
+      traceModelInvocation(
+        { ...params, runId: 'failed-lifecycle' },
+        async () => {
+          throw failure;
+        },
+        () => ({ generations: [] })
+      )
+    ).rejects.toBe(failure);
+    expect(work).toHaveBeenCalledTimes(1);
+    expect(mockSpansStarted).toBe(2);
+    expect(mockSpansEnded).toBe(2);
+    expect(JSON.stringify(mockEndedSpanAttributes)).not.toContain(
+      failure.message
+    );
+    expect(JSON.stringify(mockEndedSpanAttributes)).toContain(
+      'Model invocation failed.'
+    );
+  });
+
+  it('passes callbacks to model clients without synthesizing a second generation', async () => {
+    const result = await traceModelInvocation(
+      {
+        langfuse: { publicKey: 'pk-client', secretKey: 'sk-client' },
+        runId: 'client-lifecycle',
+        provider: 'openai',
+        model: 'title-model',
+      },
+      async (callbacks) => {
+        expect(Array.isArray(callbacks)).toBe(true);
+        return 'title';
+      }
+    );
+    expect(result).toBe('title');
+    expect(mockSpansStarted).toBe(0);
+    expect(mockSpansEnded).toBe(0);
+  });
+
+  it('keeps provider-neutral failure usage on each tenant generation without reporting successful output', async () => {
+    const failures = [
+      { tenant: 'native-a', input: 11, output: 1290 },
+      { tenant: 'native-b', input: 22, output: 2580 },
+    ];
+    const handlers = failures.map(({ tenant }) => {
+      const langfuse = {
+        publicKey: `pk-${tenant}`,
+        secretKey: `sk-${tenant}`,
+        deterministicTraceId: true,
+      };
+      initializeLangfuseTracing(langfuse);
+      return createLangfuseHandler({
+        langfuse,
+        runId: tenant,
+        traceIdSeed: tenant,
+      });
+    });
+    await Promise.all(
+      handlers.map((handler, index) =>
+        handler?.handleChatModelStart(
+          { lc: 1, type: 'constructor', id: ['NativeGoogle'], kwargs: {} },
+          [[new HumanMessage(failures[index].tenant)]],
+          'model-run'
+        )
+      )
+    );
+    for (let index = handlers.length - 1; index >= 0; index--) {
+      const failure = failures[index];
+      await handlers[index]?.handleLLMError(
+        new UsageBearingError(new Error('Storage unavailable'), {
+          input_tokens: failure.input,
+          output_tokens: failure.output,
+          total_tokens: failure.input + failure.output,
+          input_token_details: { cache_read: 3 },
+        }),
+        'model-run'
+      );
+    }
+    expect(mockSpansStarted).toBe(2);
+    expect(mockSpansEnded).toBe(2);
+    expect(mockEndedSpanAttributes).toEqual(
+      failures.toReversed().map((failure) =>
+        expect.objectContaining({
+          [LangfuseOtelSpanAttributes.OBSERVATION_LEVEL]: 'ERROR',
+          [LangfuseOtelSpanAttributes.OBSERVATION_STATUS_MESSAGE]:
+            'Error: Storage unavailable',
+          [LangfuseOtelSpanAttributes.OBSERVATION_USAGE_DETAILS]:
+            JSON.stringify({
+              input: failure.input - 3,
+              output: failure.output,
+              total: failure.input + failure.output,
+              input_cache_read: 3,
+            }),
+        })
+      )
+    );
+    expect(
+      mockEndedSpanAttributes.every(
+        (attributes) =>
+          attributes[LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT] == null
+      )
+    ).toBe(true);
   });
 
   it('runs explicit per-agent tracing when callbacks is a CallbackManager', async () => {
