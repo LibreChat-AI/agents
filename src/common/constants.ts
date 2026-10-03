@@ -79,3 +79,11 @@ export const COMPACTION_SEMANTIC_INDEX_LIMITS = Object.freeze({
   maxIdentityChars: 512,
   maxSourceContentIndex: 4_095,
 } as const);
+
+/**
+ * Whether this build enforces `LangfuseConfig.privacy` (content redaction
+ * and media suppression on exported traces). Hosts gate on it to fail
+ * closed: with an older runtime that ignores the field, a privacy mode must
+ * disable export rather than silently send unmasked content.
+ */
+export const LANGFUSE_PRIVACY_ENFORCEMENT_SUPPORTED = true;
