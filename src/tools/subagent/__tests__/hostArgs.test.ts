@@ -165,7 +165,6 @@ describe('subagent host argument declarations', () => {
         },
         worktree: {
           description: 'Linked worktree to use.',
-          pattern: '\\.worktrees/[a-z0-9-]+',
           maxLength: 80,
         },
       },
@@ -187,8 +186,8 @@ describe('subagent host argument declarations', () => {
       type: 'string',
       description: 'Linked worktree to use.',
       maxLength: 80,
-      pattern: '\\.worktrees/[a-z0-9-]+',
     });
+    expect(params.schema.properties?.worktree).not.toHaveProperty('pattern');
     expect(params.schema.required).toEqual(['description', 'subagent_type']);
     expect(params.description).toContain('OPTIONAL ARGUMENTS');
     expect(params.description).toContain(
@@ -234,14 +233,14 @@ describe('subagent host argument declarations', () => {
       'control characters',
     ],
     [
-      'enum combined with a pattern',
-      { machine: { description: 'Machine.', enum: ['a'], pattern: 'a' } },
+      'enum combined with maxLength',
+      { machine: { description: 'Machine.', enum: ['a'], maxLength: 4 } },
       'cannot combine',
     ],
     [
-      'an invalid pattern',
-      { worktree: { description: 'Worktree.', pattern: '(' } },
-      'not a valid regular expression',
+      'a pattern, which would run model input through a host regex',
+      { worktree: { description: 'Worktree.', pattern: '(a+)+$' } },
+      'cannot declare a pattern',
     ],
     [
       'an oversized maxLength',
@@ -318,7 +317,6 @@ describe('subagent host argument values', () => {
       machine: MACHINE,
       worktree: {
         description: 'Worktree.',
-        pattern: '\\.worktrees/[a-z0-9-]+',
         maxLength: 40,
       },
     },
@@ -360,10 +358,12 @@ describe('subagent host argument values', () => {
         'Error: "machine" for subagent "reviewer" must be one of: laptop, buildbox. Omit "machine" to let the host choose.',
     });
     expect(
-      resolveSubagentHostArgs(config, { worktree: '../escape' })
+      resolveSubagentHostArgs(config, { worktree: '.worktrees/a\nb' })
     ).toMatchObject({
       ok: false,
-      message: expect.stringContaining('in the declared format'),
+      message: expect.stringContaining(
+        'must be at most 40 characters without control characters'
+      ),
     });
     expect(
       resolveSubagentHostArgs(config, {

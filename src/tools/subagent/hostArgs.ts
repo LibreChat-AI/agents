@@ -13,7 +13,6 @@ export const SUBAGENT_HOST_ARG_LIMITS = Object.freeze({
   enumValues: 64,
   valueLength: 256,
   descriptionLength: 1024,
-  patternLength: 512,
 });
 
 const HOST_ARG_NAME_PATTERN = /^[a-z][a-z0-9_]{0,63}$/;
@@ -43,10 +42,7 @@ type MergedHostArg = {
   seenValues: Set<string>;
   freeForm: boolean;
   maxLength: number;
-  patterns: Set<string | undefined>;
 };
-
-const compiledPatterns = new WeakMap<SubagentHostArgSpec, RegExp>();
 
 function isHostArgName(name: string): boolean {
   return HOST_ARG_NAME_PATTERN.test(name) && !RESERVED_HOST_ARG_NAMES.has(name);
@@ -73,10 +69,6 @@ function isBoundedText(value: unknown, maxLength: number): value is string {
 
 function getFreeFormMaxLength(spec: SubagentHostArgSpec): number {
   return spec.maxLength ?? SUBAGENT_HOST_ARG_LIMITS.valueLength;
-}
-
-function compilePattern(pattern: string): RegExp {
-  return new RegExp(`^(?:${pattern})$`, 'u');
 }
 
 function validateEnum(label: string, values: readonly string[]): void {
@@ -114,23 +106,6 @@ function validateFreeForm(label: string, spec: SubagentHostArgSpec): void {
       `${label} maxLength must be an integer from 1 to ${SUBAGENT_HOST_ARG_LIMITS.valueLength}.`
     );
   }
-  if (spec.pattern == null) {
-    return;
-  }
-  if (
-    typeof spec.pattern !== 'string' ||
-    spec.pattern.length === 0 ||
-    spec.pattern.length > SUBAGENT_HOST_ARG_LIMITS.patternLength
-  ) {
-    throw new Error(
-      `${label} pattern must be a non-empty string of at most ${SUBAGENT_HOST_ARG_LIMITS.patternLength} characters.`
-    );
-  }
-  try {
-    compiledPatterns.set(spec, compilePattern(spec.pattern));
-  } catch {
-    throw new Error(`${label} pattern is not a valid regular expression.`);
-  }
 }
 
 function validateSpec(
@@ -147,6 +122,11 @@ function validateSpec(
   if (spec == null) {
     throw new Error(`${label} must be an object.`);
   }
+  if ((spec as { pattern?: unknown }).pattern !== undefined) {
+    throw new Error(
+      `${label} cannot declare a pattern; validate the format in the resolver.`
+    );
+  }
   if (
     typeof spec.description !== 'string' ||
     spec.description.trim().length === 0 ||
@@ -160,8 +140,8 @@ function validateSpec(
     validateFreeForm(label, spec);
     return;
   }
-  if (spec.pattern != null || spec.maxLength != null) {
-    throw new Error(`${label} cannot combine enum with pattern or maxLength.`);
+  if (spec.maxLength != null) {
+    throw new Error(`${label} cannot combine enum with maxLength.`);
   }
   validateEnum(label, spec.enum);
 }
@@ -223,17 +203,14 @@ function mergeSpec(
       seenValues: new Set(),
       freeForm: false,
       maxLength: 0,
-      patterns: new Set(),
     };
     merged.set(name, entry);
   }
   if (spec.enum == null) {
     entry.freeForm = true;
     entry.maxLength = Math.max(entry.maxLength, getFreeFormMaxLength(spec));
-    entry.patterns.add(spec.pattern);
     return;
   }
-  entry.patterns.add(undefined);
   for (const value of spec.enum) {
     entry.maxLength = Math.max(entry.maxLength, value.length);
     if (!entry.seenValues.has(value)) {
@@ -251,12 +228,10 @@ function toPropertySchema(entry: MergedHostArg): JsonSchemaType {
       enum: entry.values,
     };
   }
-  const [pattern] = entry.patterns;
   return {
     type: 'string',
     description: entry.description,
     maxLength: entry.maxLength,
-    ...(entry.patterns.size === 1 && pattern != null ? { pattern } : {}),
   };
 }
 
@@ -349,19 +324,9 @@ function checkValue(
       : `Error: "${name}" for subagent "${type}" must be one of: ${spec.enum.join(', ')}. ${omit}`;
   }
   const maxLength = getFreeFormMaxLength(spec);
-  const pattern =
-    spec.pattern == null
-      ? undefined
-      : (compiledPatterns.get(spec) ?? compilePattern(spec.pattern));
-  if (
-    isBoundedText(value, maxLength) &&
-    (pattern == null || pattern.test(value))
-  ) {
-    return undefined;
-  }
-  return `Error: "${name}" for subagent "${type}" must be at most ${maxLength} characters${
-    pattern == null ? '' : ' in the declared format'
-  }. ${omit}`;
+  return isBoundedText(value, maxLength)
+    ? undefined
+    : `Error: "${name}" for subagent "${type}" must be at most ${maxLength} characters without control characters. ${omit}`;
 }
 
 /**

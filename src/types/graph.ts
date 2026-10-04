@@ -584,11 +584,12 @@ export interface SubagentResolveConfigurable {
 export interface SubagentHostArgSpec {
   /** Model-facing explanation of the argument and when to pass it. */
   description: string;
-  /** Values this subagent accepts. Omit to accept a bounded free-form string. */
+  /**
+   * Values this subagent accepts. Omit to accept a bounded free-form string,
+   * whose format the resolver must check.
+   */
   enum?: readonly string[];
-  /** ECMAScript (`u` flag) pattern a free-form value must fully match. */
-  pattern?: string;
-  /** Maximum length of a free-form value. */
+  /** Maximum length of a free-form value (at most 256). */
   maxLength?: number;
 }
 
