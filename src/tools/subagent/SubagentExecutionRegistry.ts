@@ -495,6 +495,15 @@ export class SubagentExecutionRecord<
   }
 
   recordIdentityAttempt(identity: SubagentExecutionIdentity): void {
+    const current = this.attemptedIdentityValue;
+    if (
+      current != null &&
+      current.childRunId === identity.childRunId &&
+      current.childThreadId === identity.childThreadId &&
+      current.approvalExecutionScope === identity.approvalExecutionScope
+    ) {
+      return;
+    }
     this.attemptedIdentityValue = Object.freeze({ ...identity });
   }
 

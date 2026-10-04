@@ -184,6 +184,9 @@ describe('SubagentExecutionRegistry', () => {
     expect(record.identity).toBeUndefined();
     expect(record.attemptedIdentity).toEqual(identity);
     expect(Object.isFrozen(record.attemptedIdentity)).toBe(true);
+    const attemptedIdentity = record.attemptedIdentity;
+    record.recordIdentityAttempt({ ...identity });
+    expect(record.attemptedIdentity).toBe(attemptedIdentity);
     expect(record.snapshot).not.toHaveProperty('identity');
     expect(record.snapshot).not.toHaveProperty('attemptedIdentity');
     expect(registry.selectForResume()).toEqual([]);

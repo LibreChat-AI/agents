@@ -1693,13 +1693,6 @@ export class SubagentExecutor {
         ),
       });
     }
-    const sourceCheckpoints =
-      await this.getLatestCheckpointSnapshot(baseChildThreadId);
-    if (sourceCheckpoints.length === 0) {
-      throw new Error(
-        `Cannot fork subagent checkpoint thread "${baseChildThreadId}" without a checkpoint ID.`
-      );
-    }
     const childRunId = persistedChildRunId ?? currentChildRunId;
     const identity = {
       childRunId,
@@ -1709,6 +1702,14 @@ export class SubagentExecutor {
         resumeAttemptId
       ),
     };
+    execution.recordIdentityAttempt(identity);
+    const sourceCheckpoints =
+      await this.getLatestCheckpointSnapshot(baseChildThreadId);
+    if (sourceCheckpoints.length === 0) {
+      throw new Error(
+        `Cannot fork subagent checkpoint thread "${baseChildThreadId}" without a checkpoint ID.`
+      );
+    }
     const lease = this.executions.beginIdentityPreparation(execution, identity);
     await this.prepareCheckpointFork(
       sourceCheckpoints,

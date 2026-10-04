@@ -151,6 +151,8 @@ describe('SubagentExecutor startup failure delivery', () => {
     ['manifest', 'aborted write'],
     ['manifest', 'invalidated write'],
     ['base checkpoint', 'source read'],
+    ['base checkpoint', 'source list'],
+    ['base replay', 'source list'],
     ['base checkpoint', 'target write'],
     ['base checkpoint', 'config resolver'],
     ['base checkpoint', 'aborted write'],
@@ -173,6 +175,18 @@ describe('SubagentExecutor startup failure delivery', () => {
             return Promise.reject(new Error(secret));
           }
           return super.getTuple(request);
+        }
+
+        override async *list(
+          ...args: Parameters<MemorySaver['list']>
+        ): ReturnType<MemorySaver['list']> {
+          if (
+            failureStage === 'source list' &&
+            args[0].configurable?.thread_id === sourceThreadId
+          ) {
+            throw new Error(secret);
+          }
+          yield* super.list(...args);
         }
 
         override put(
@@ -229,7 +243,7 @@ describe('SubagentExecutor startup failure delivery', () => {
         parentAgentId: 'parent-agent',
         durable: true,
       }).open({ ...params, parentConfigurable });
-      if (reconstruction === 'base checkpoint')
+      if (reconstruction !== 'manifest')
         sourceThreadId = address.baseChildThreadId;
       if (failureStage !== 'missing checkpoint') {
         await checkpointer.put(
@@ -277,11 +291,26 @@ describe('SubagentExecutor startup failure delivery', () => {
         onResolutionFailure: hook,
       });
       try {
-        const result = await instance.execute({
-          ...params,
-          parentConfigurable,
-          signal: controller.signal,
-        });
+        const result =
+          reconstruction === 'base replay'
+            ? (
+              await instance.getSettledToolOutput(
+                {
+                  id: params.parentToolCallId,
+                  name: 'subagent',
+                  args: { subagent_type: config.type },
+                },
+                {
+                  configurable: parentConfigurable,
+                  signal: controller.signal,
+                }
+              )
+            )?.output
+            : await instance.execute({
+              ...params,
+              parentConfigurable,
+              signal: controller.signal,
+            });
 
         expect(hook).toHaveBeenCalledTimes(1);
         expect(hook.mock.calls[0][0]).toMatchObject({
@@ -300,7 +329,18 @@ describe('SubagentExecutor startup failure delivery', () => {
           failureStage === 'config resolver' ? 1 : 0
         );
         expect(createChildGraph).not.toHaveBeenCalled();
-        expect(result.resolutionFailure?.cause).toBe('configuration_changed');
+        if (result instanceof ToolMessage) {
+          expect(result).toMatchObject({
+            status: 'error',
+            content: getSubagentResolutionFailureMessage(
+              'configuration_changed'
+            ),
+          });
+        } else {
+          expect(result?.resolutionFailure?.cause).toBe(
+            'configuration_changed'
+          );
+        }
         expect(JSON.stringify(result)).not.toContain('private');
       } finally {
         instance.clearHeavyState();
