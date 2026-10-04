@@ -1,4 +1,6 @@
 import { performance } from 'node:perf_hooks';
+import { PreparedSubagentError } from '@/tools/preparedSubagents';
+import { StreamLimitExceededError } from '@/llm/streamLimits';
 
 export const PROVIDER_TEXT_PROTECTION_VERSION = 1;
 
@@ -72,8 +74,9 @@ export function isProviderTextRestartCancellation(error: unknown): boolean {
   return error instanceof ProviderTextProtectionError && restartCancellations.has(error);
 }
 
-function protectionAbortError(parent?: AbortSignal): ProviderTextProtectionError {
+function protectionAbortError(parent?: AbortSignal): ProviderTextProtectionError | StreamLimitExceededError | PreparedSubagentError {
   const reason: unknown = parent?.reason;
+  if (reason instanceof StreamLimitExceededError || reason instanceof PreparedSubagentError) return reason;
   if (reason instanceof ProviderTextProtectionError) {
     return isProviderTextRestartCancellation(reason) ? reason : new ProviderTextProtectionError(reason.code);
   }

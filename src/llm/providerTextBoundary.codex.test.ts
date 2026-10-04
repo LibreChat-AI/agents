@@ -6,6 +6,7 @@ import { HumanMessage, AIMessageChunk } from '@langchain/core/messages';
 import type { ProviderTextProtection } from '@/protection/providerText';
 import type { ChatModel, EventHandler } from '@/types';
 import { PreparedSubagentError } from '@/tools/preparedSubagents';
+import { ProviderTextAttempt } from '@/protection/providerText';
 import { StreamLimitExceededError } from '@/llm/streamLimits';
 import { CustomChatGoogleGenerativeAI } from '@/llm/google';
 import { GraphEvents, Providers } from '@/common';
@@ -273,4 +274,90 @@ it.each([
   let inspected = false;
   await expect(attemptInvoke({ model, messages: [], provider: Providers.OPENAI, onChunk: () => {}, providerTextProtection: policy(() => { inspected = true; return approve(canonical); }) })).rejects.toMatchObject({ code: 'unsupported' });
   expect(inspected).toBe(false);
+});
+
+it.each([
+  { label: 'stream limit', reason: new StreamLimitExceededError({ kind: 'tool_call_args', limit: 10, observed: 11 }) },
+  { label: 'prepared subagent', reason: new PreparedSubagentError('Delegated work already started') },
+].flatMap((entry) => ['pre-aborted', 'producer', 'policy'].flatMap((phase) => [false, true].map((native) => ({ ...entry, phase, native })))))('preserves bound $label identity ($phase/native=$native)', async ({ reason, phase, native }) => {
+  const breaker = new AbortController();
+  const outer = new AbortController();
+  const started = Promise.withResolvers<void>();
+  const producer = Promise.withResolvers<void>();
+  const decision = Promise.withResolvers<ReturnType<typeof approve>>();
+  const model = new FakeListChatModel({ responses: [raw] });
+  model.disableStreaming = native;
+  let produced = false;
+  if (phase === 'producer') {
+    if (native) {
+      model._generate = async () => { produced = true; started.resolve(); await producer.promise; return { generations: [{ text: raw, message: new AIMessageChunk(raw) }] }; };
+    } else {
+      const original = model._streamResponseChunks.bind(model);
+      model._streamResponseChunks = async function* (messages, options, runManager) {
+        produced = true; started.resolve(); await producer.promise;
+        yield* original(messages, options, runManager);
+      };
+    }
+  }
+  const observed: string[] = [];
+  let inspected = false;
+  const protection = policy(({ content }) => {
+    inspected = true;
+    if (phase === 'policy') { started.resolve(); return decision.promise; }
+    return approve(content);
+  });
+  if (phase === 'pre-aborted') breaker.abort(reason);
+  const task = attemptInvoke({ model: model.withConfig({ signal: breaker.signal }), messages: [new HumanMessage('Allowed control')], provider: Providers.OPENAI, providerTextProtection: protection, onChunk: (chunk) => { observed.push(JSON.stringify(chunk)); } }, { signal: outer.signal });
+  const outcome = task.catch((error: Error) => error);
+  try {
+    if (phase !== 'pre-aborted') { await started.promise; breaker.abort(reason); }
+    expect(await outcome).toBe(reason);
+    expect(outer.signal.aborted).toBe(false);
+    if (reason instanceof StreamLimitExceededError) expect(await outcome).toMatchObject({ kind: 'tool_call_args', limit: 10, observed: 11 });
+    if (phase !== 'policy') expect(inspected).toBe(false);
+    if (phase === 'pre-aborted') expect(produced).toBe(false);
+  } finally {
+    producer.resolve(); decision.resolve(approve('Late approved control'));
+    if (!breaker.signal.aborted) breaker.abort(reason);
+    await outcome;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  expect(observed.join('')).not.toContain(raw);
+  expect(observed.join('')).not.toContain('Late approved control');
+});
+
+it.each([
+  { label: 'stream limit', reason: new StreamLimitExceededError({ kind: 'tool_call_args', limit: 10, observed: 11 }) },
+  { label: 'prepared subagent', reason: new PreparedSubagentError('Delegated work already started') },
+].flatMap((entry) => [false, true].map((preAborted) => ({ ...entry, preAborted }))))('preserves effective $label inside the gate (pre-aborted=$preAborted)', async ({ reason, preAborted }) => {
+  const parent = new AbortController();
+  if (preAborted) {
+    parent.abort(reason);
+    const create = () => new ProviderTextAttempt(policy((input) => approve(input.content)), parent.signal);
+    let caught: Error | undefined;
+    try { create(); } catch (error) { caught = error as Error; }
+    expect(caught).toBe(reason);
+    return;
+  }
+  const work = Promise.withResolvers<string>();
+  const attempt = new ProviderTextAttempt(policy((input) => approve(input.content)), parent.signal);
+  try {
+    const waiting = attempt.wait(work.promise);
+    parent.abort(reason);
+    await expect(waiting).rejects.toBe(reason);
+    expect(attempt.signal.reason).toBe(reason);
+    expect(() => attempt.check()).toThrow(reason);
+  } finally { work.resolve('Late approved control'); attempt.finish(); }
+});
+
+it('still normalizes an unrecognized effective-provider abort without its private detail', async () => {
+  const parent = new AbortController();
+  const work = Promise.withResolvers<string>();
+  const attempt = new ProviderTextAttempt(policy((input) => approve(input.content)), parent.signal);
+  try {
+    const waiting = attempt.wait(work.promise).catch((error: Error) => error);
+    parent.abort(new Error('a1.alice@example.invalid private abort'));
+    expect(await waiting).toMatchObject({ code: 'cancelled' });
+    expect(String(await waiting)).not.toContain('a1.alice@example.invalid');
+  } finally { work.resolve('Late approved control'); attempt.finish(); }
 });
