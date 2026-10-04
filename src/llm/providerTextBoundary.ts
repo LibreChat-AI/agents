@@ -119,6 +119,7 @@ function validateMetadata(metadata: AIMessageChunk['response_metadata']): void {
 class Candidate {
   private block?: TextBlock;
   private stringContent = false;
+  private readonly toolInputIndices = new Set<number>();
 
   constructor(private readonly attempt: ProviderTextAttempt) {}
 
@@ -150,8 +151,7 @@ class Candidate {
         if (typeof block === 'string')
           throw new ProviderTextProtectionError('unsupported');
         if (block.type !== 'text') {
-          if (!controlBlocks.has(block.type))
-            throw new ProviderTextProtectionError('unsupported');
+          this.admitControl(block, message);
           content.push(block);
           continue;
         }
@@ -176,6 +176,31 @@ class Candidate {
       message: copyMessage(message, content),
       generationInfo: generation.generationInfo,
     });
+  }
+
+  private admitControl(block: MessageContentComplex, message: AIMessageChunk): void {
+    const control: { type?: string; index?: unknown; input?: unknown; id?: unknown; name?: unknown } = block;
+    const { type, index, input, id, name } = control;
+    if (!Object.hasOwn(block, 'type')) {
+      if (!hasKeys(block, ['index', 'input']) || typeof index !== 'number' ||
+          !Number.isSafeInteger(index) || index < 0 || typeof input !== 'string' ||
+          !this.toolInputIndices.has(index) ||
+          message.tool_call_chunks?.some((call) => call.index === index && call.args === input) !== true) {
+        throw new ProviderTextProtectionError('unsupported');
+      }
+      return;
+    }
+    if (type == null || !controlBlocks.has(type)) throw new ProviderTextProtectionError('unsupported');
+    if (type === 'tool_use' && index != null) {
+      if (typeof index !== 'number' || !Number.isSafeInteger(index) || index < 0 ||
+          message.tool_call_chunks?.some((call) => call.index === index && call.id === id && call.name === name) !== true) {
+        throw new ProviderTextProtectionError('unsupported');
+      }
+      if (!this.toolInputIndices.has(index)) {
+        this.attempt.observeChunk();
+        this.toolInputIndices.add(index);
+      }
+    }
   }
 
   async canonical(): Promise<ChatGenerationChunk | undefined> {

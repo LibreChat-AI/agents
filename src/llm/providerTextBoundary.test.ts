@@ -865,3 +865,83 @@ it('still permits effective streaming through the guarded provider iterator', as
   expect(result.messages?.[0].content).toBe('Guarded control');
   expect(JSON.stringify(result)).not.toContain(fixtures.canaries[0]);
 });
+
+it.each([false, true])('preserves real Anthropic tool-input fragments in Run dispatch (registered=%s)', async (registered) => {
+  const executed: number[] = [];
+  const lookup = new DynamicStructuredTool({ name: 'lookup', description: 'Returns a control.', schema: z.object({ count: z.number() }), func: async ({ count }) => { executed.push(count); return `Tool control ${count}`; } });
+  const frames = [
+    { type: 'message_start', message: { id: 'anthropic-tool-control', type: 'message', role: 'assistant', model: 'claude-test', content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 10, output_tokens: 0 } } },
+    { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+    ...fixtures.cases[0].chunks.map((text) => ({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } })),
+    { type: 'content_block_stop', index: 0 },
+    { type: 'content_block_start', index: 1, content_block: { type: 'tool_use', id: 'anthropic-call-1', name: 'lookup', input: {} } },
+    { type: 'content_block_delta', index: 1, delta: { type: 'input_json_delta', partial_json: '{"count":' } },
+    { type: 'content_block_start', index: 2, content_block: { type: 'tool_use', id: 'anthropic-call-2', name: 'lookup', input: {} } },
+    { type: 'content_block_delta', index: 2, delta: { type: 'input_json_delta', partial_json: '{"count":43}' } },
+    { type: 'content_block_stop', index: 2 },
+    { type: 'content_block_delta', index: 1, delta: { type: 'input_json_delta', partial_json: '42}' } },
+    { type: 'content_block_stop', index: 1 },
+    { type: 'message_delta', delta: { stop_reason: 'tool_use', stop_sequence: null }, usage: { output_tokens: 5 } },
+    { type: 'message_stop' },
+  ];
+  const finalFrames = [
+    { type: 'message_start', message: { id: 'anthropic-final-control', type: 'message', role: 'assistant', model: 'claude-test', content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 10, output_tokens: 0 } } },
+    { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+    { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Final control' } },
+    { type: 'content_block_stop', index: 0 },
+    { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: 5 } },
+    { type: 'message_stop' },
+  ];
+  let requests = 0;
+  const model = new CustomAnthropic({ anthropicApiKey: 'synthetic-test-key', model: 'claude-test', streaming: true, _lc_stream_delay: 0, clientOptions: { fetch: async () => {
+    const responseFrames = requests++ === 0 ? frames : finalFrames;
+    return new Response(responseFrames.map((frame) => `event: ${frame.type}\ndata: ${JSON.stringify(frame)}\n\n`).join(''), { headers: { 'content-type': 'text/event-stream' } });
+  } } });
+  const inspected: string[] = [];
+  const events: string[] = [];
+  const handlers: Record<string, EventHandler> = registered ? { [GraphEvents.CHAT_MODEL_STREAM]: new ChatModelStreamHandler() } : {};
+  const run = await Run.create({ runId: `anthropic-tools-${registered}`, graphConfig: { type: 'standard', llmConfig: { provider: Providers.ANTHROPIC, streaming: true }, instructions: 'Allowed instructions.', tools: [lookup] }, providerTextProtection: policy({ inspect: ({ content }) => { inspected.push(content); return approved(content === fixtures.cases[0].chunks.join('') ? fixtures.cases[0].expected.content! : content); } }), returnContent: true, skipCleanup: true, customHandlers: { ...handlers, [GraphEvents.ON_MESSAGE_DELTA]: { handle: (_event, data): void => { events.push(JSON.stringify(data)); } } } });
+  run.Graph!.overrideModel = model.bindTools([lookup]);
+  await run.processStream({ messages: [new HumanMessage('control')] }, { version: 'v2', configurable: { thread_id: `anthropic-tools-${registered}` } });
+  expect(executed.sort()).toEqual([42, 43]);
+  expect(requests).toBe(2);
+  expect(inspected).toEqual([fixtures.cases[0].chunks.join(''), 'Final control']);
+  const messages = run.Graph!.getRunMessages()!;
+  const toolTurn = messages.find((message) => message.getType() === 'ai' && JSON.stringify(message).includes('anthropic-call-1')) as AIMessageChunk;
+  expect(toolTurn.tool_calls).toEqual(expect.arrayContaining([{ id: 'anthropic-call-1', name: 'lookup', args: { count: 42 }, type: 'tool_call' }, { id: 'anthropic-call-2', name: 'lookup', args: { count: 43 }, type: 'tool_call' }]));
+  expect(JSON.stringify(toolTurn.content)).toContain('tool_use');
+  expect(events.join('')).toContain('Contact [EMAIL_1].');
+  expect(JSON.stringify(messages)).toContain('Final control');
+  for (const canary of fixtures.canaries) { expect(events.join('')).not.toContain(canary); expect(JSON.stringify(messages)).not.toContain(canary); }
+});
+
+it.each(['classify', 'inspect'])('fails closed when synchronous %s work outlives its deadline', async (callback) => {
+  const events: string[] = [];
+  const observer = BaseCallbackHandler.fromMethods({ handleLLMNewToken: (token): void => { if (token) events.push(token); }, handleLLMEnd: (output): void => { events.push(JSON.stringify(output)); } });
+  observer.awaitHandlers = true;
+  const blockingWork = (): void => { const end = performance.now() + 35; while (performance.now() < end) { /* bounded synchronous fixture */ } };
+  let inspected = false;
+  const protection = policy({ timeoutMs: 10, classify: () => { if (callback === 'classify') blockingWork(); return 'prose'; }, inspect: () => { inspected = true; if (callback === 'inspect') blockingWork(); return approved('Late control'); } });
+  await expect(invoke(new Transport([new AIMessageChunk(fixtures.canaries[0])]), protection, [observer])).rejects.toMatchObject({ code: 'timeout' });
+  if (callback === 'classify') expect(inspected).toBe(false);
+  expect(events).toEqual([]);
+});
+
+it.each(['orphan', 'wrong-index', 'wrong-args', 'alias'])('rejects unbound Anthropic input fragments (%s)', async (kind) => {
+  const start = new AIMessageChunk({ content: [{ type: 'tool_use', index: 1, id: 'call-control', name: 'lookup', input: '' }], tool_call_chunks: [{ index: 1, id: 'call-control', name: 'lookup', args: '' }] });
+  const delta = { type: 'tool_use', index: kind === 'wrong-index' ? 2 : 1, input: '{"count":42}', ...(kind === 'alias' ? { raw: fixtures.canaries[0] } : {}) };
+  Reflect.deleteProperty(delta, 'type');
+  const chunk = new AIMessageChunk({ content: [delta], tool_call_chunks: [{ index: delta.index, args: kind === 'wrong-args' ? '{"count":43}' : delta.input }] });
+  await expect(invoke(new Transport(kind === 'orphan' ? [chunk] : [start, chunk]), policy())).rejects.toMatchObject({ code: 'unsupported' });
+});
+
+it('bounds fragments within a coalesced text event', async () => {
+  const content = Array.from({ length: 100 }, () => ({ type: 'text', index: 0, text: 'x' }));
+  await expect(invoke(new Transport([new AIMessageChunk({ content })]), policy({ maxAttemptBytes: 4096 }))).rejects.toMatchObject({ code: 'overflow' });
+});
+
+it('bounds admitted tool-index bookkeeping within a coalesced control event', async () => {
+  const content = Array.from({ length: 100 }, (_value, index) => ({ type: 'tool_use', index, id: `call-${index}`, name: 'lookup', input: '' }));
+  const tool_call_chunks = content.map((block) => ({ index: block.index, id: block.id, name: block.name, args: '' }));
+  await expect(invoke(new Transport([new AIMessageChunk({ content, tool_call_chunks })]), policy({ maxAttemptBytes: 4096 }))).rejects.toMatchObject({ code: 'overflow' });
+});

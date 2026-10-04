@@ -28,7 +28,8 @@ policy is rejected. Custom high-level model/stream overrides are not certified.
 Missing handlers, invalid versions/limits/results, deadline exhaustion, buffer overflow and
 Stop fail closed. Classification/handler errors become stable SDK error codes, never original
 exception details. No failed-attempt prefix is released. Retry/fallback has a fresh candidate.
-Policy failures are terminal, not fallback triggers. Late decisions cannot release cancelled text.
+Policy failures are terminal, not fallback triggers. Late decisions cannot release cancelled text. A monotonic elapsed-time check enforces the
+deadline even when synchronous policy work prevents the abort timer from running.
 
 ## Ordering and supported surface
 
@@ -43,7 +44,8 @@ The gate runs **before** LangChain's native aggregation/end callbacks, `attemptI
 String prose and a single indexed text block are supported. Reasoning, signatures, tool arguments,
 IDs, usage and control chunks keep their values and are not buffered behind prose. Anthropic
 lifecycle fields, Bedrock block indices/seals and official OpenAI tool-adapter controls are
-validated and preserved; unknown aliases still fail closed. Unknown content
+validated and preserved. Anthropic untyped tool-input fragments must match an admitted
+tool block/index and its argument delta; their JSON is never rewritten. Unknown aliases still fail closed. Unknown content
 blocks, additional-output aliases, cached models, multiple prose block indices and custom runnable
 shells fail `unsupported`. Non-streaming responses are inspected before native callbacks/state;
 transport response allocation itself is provider-owned, not an SDK gate buffer. Native nonstreaming

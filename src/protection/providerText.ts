@@ -1,3 +1,5 @@
+import { performance } from 'node:perf_hooks';
+
 export const PROVIDER_TEXT_PROTECTION_VERSION = 1;
 
 export type ProviderTextProtectionErrorCode =
@@ -101,6 +103,7 @@ export function validateProviderTextProtection(
 export class ProviderTextAttempt {
   private readonly controller = new AbortController();
   private readonly budget: { bytes: number };
+  private readonly deadline: number;
   private bytes = 0;
   private readonly fragments: string[] = [];
   private readonly pending = new Set<Promise<unknown>>();
@@ -113,6 +116,7 @@ export class ProviderTextAttempt {
     private readonly parent?: AbortSignal
   ) {
     validateProviderTextProtection(policy);
+    this.deadline = performance.now() + policy.timeoutMs;
     this.budget = budgets.get(policy) ?? { bytes: 0 };
     budgets.set(policy, this.budget);
     if (parent?.aborted === true) throw new ProviderTextProtectionError('cancelled');
@@ -134,6 +138,10 @@ export class ProviderTextAttempt {
     if (this.signal.aborted) throw this.signal.reason;
     if (this.parent?.aborted === true)
       throw new ProviderTextProtectionError('cancelled');
+    if (performance.now() >= this.deadline) {
+      this.controller.abort(new ProviderTextProtectionError('timeout'));
+      throw this.signal.reason;
+    }
   }
 
   private charge(bytes: number): void {
@@ -152,7 +160,7 @@ export class ProviderTextAttempt {
     this.check();
     if (!text) return;
     const bytes = text.length * 2;
-    this.charge(bytes * 2);
+    this.charge(bytes * 2 + 64);
     this.fragments.push(text);
   }
 
@@ -187,7 +195,9 @@ export class ProviderTextAttempt {
     if (!content) return '';
     let result: ProviderTextProtectionResult;
     try {
-      if (this.policy.classify(content) !== 'prose') {
+      const treatment = this.policy.classify(content);
+      this.check();
+      if (treatment !== 'prose') {
         throw new ProviderTextProtectionError('unsupported');
       }
       result = await this.wait(
@@ -201,11 +211,13 @@ export class ProviderTextAttempt {
         )
       );
     } catch (error) {
+      this.check();
       if (error instanceof ProviderTextProtectionError) throw new ProviderTextProtectionError(error.code);
       throw new ProviderTextProtectionError('unavailable');
     }
     this.check();
     const canonical = validateResult(result);
+    this.check();
     this.charge(canonical.length * 2);
     return canonical;
   }
