@@ -2926,6 +2926,11 @@ export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
     super(fields);
     this.completions = new LibreChatAzureOpenAICompletions(fields);
     this.responses = new LibreChatAzureOpenAIResponses(fields);
+    this.fields = {
+      ...this.fields,
+      completions: this.completions,
+      responses: this.responses,
+    };
     this._lc_stream_delay = resolveStreamDelay(fields?._lc_stream_delay);
     this.firstPartyEndpoint = fields?.firstPartyEndpoint;
   }
