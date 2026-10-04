@@ -60,6 +60,7 @@ import type {
   SubagentTaskConfig,
   SubagentTaskRuntime,
   SubagentResolveConfigurable,
+  SubagentHostArgs,
   SubagentResolveRequestContext,
   SubagentResolveUserContext,
   StepCompleted,
@@ -81,6 +82,12 @@ import type {
   SubagentExecutionRecord,
 } from './SubagentExecutionRegistry';
 import type {
+  SubagentResolutionPhase,
+  SubagentResolutionCause,
+  SubagentHostArgumentFailure,
+  SubagentResolutionFailureHandler,
+} from './diagnostics';
+import type {
   SubagentResumeExecution,
   SubagentResumeManifest,
   SubagentCheckpointReference,
@@ -92,11 +99,6 @@ import type {
   PreemptBoundaryHookOutput,
   ToolApprovalReplaySnapshot,
 } from '@/hooks';
-import type {
-  SubagentResolutionPhase,
-  SubagentResolutionCause,
-  SubagentResolutionFailureHandler,
-} from './diagnostics';
 import type { RunBreakerScope } from '@/llm/streamLimits';
 import type { GraphFactory } from '@/graphs/graphFactory';
 import type { StandardGraph } from '@/graphs/Graph';
@@ -115,6 +117,18 @@ import {
   SUBAGENT_RESUME_MANIFEST_CONFIG_KEY,
 } from './SubagentReplay';
 import {
+  logSubagentResolutionFailure,
+  SubagentResolutionError,
+  getSubagentHostArgumentFailure,
+  getSubagentHostArgumentFailureMessage,
+} from './diagnostics';
+import {
+  getSubagentHostArgSpecs,
+  resolveSubagentHostArgs,
+  pickSubagentHostArgInput,
+  getSubagentHostArgsDigest,
+} from './hostArgs';
+import {
   rebindToolBatchReplayScope,
   rebindToolBatchReplayPayload,
   restoreToolReplayConfig,
@@ -132,10 +146,6 @@ import {
   DEFAULT_SUBAGENT_MAX_TURNS,
   SUBAGENT_RECURSION_MULTIPLIER,
 } from './runtimeLimits';
-import {
-  logSubagentResolutionFailure,
-  SubagentResolutionError,
-} from './diagnostics';
 import {
   ContentTypes,
   Constants,
@@ -179,7 +189,11 @@ const SUBAGENT_INVOCATION_CHANGED_MESSAGE =
 
 function isSubagentResolutionControlFlow(error: unknown): boolean {
   try {
-    return error instanceof StreamLimitExceededError || error instanceof ProviderTextProtectionError || isGraphInterrupt(error);
+    return (
+      error instanceof StreamLimitExceededError ||
+      error instanceof ProviderTextProtectionError ||
+      isGraphInterrupt(error)
+    );
   } catch {
     return false;
   }
@@ -679,7 +693,8 @@ function getSettlementFingerprint(output: PersistedToolOutput): string {
 function getBackgroundTaskFingerprint(
   description: string,
   subagentType: string,
-  threadId?: string
+  threadId?: string,
+  hostArgsDigest?: string
 ): string {
   return createHash('sha256')
     .update(
@@ -687,9 +702,27 @@ function getBackgroundTaskFingerprint(
         description,
         subagentType,
         ...(threadId == null || threadId === '' ? {} : { threadId }),
+        ...(hostArgsDigest == null ? {} : { hostArgsDigest }),
       })
     )
     .digest('hex');
+}
+
+/** Host-argument digest of persisted lifecycle args, when they are well formed. */
+function getHostArgsDigestFromArgs(
+  config: ExecutableSubagentConfigEntry | undefined,
+  args: unknown
+): string | undefined {
+  if (config == null || !isObjectLike(args)) {
+    return undefined;
+  }
+  const names = new Set(getSubagentHostArgSpecs(config).map(([name]) => name));
+  const picked = pickSubagentHostArgInput(args, names);
+  if (!picked.ok) {
+    return undefined;
+  }
+  const resolved = resolveSubagentHostArgs(config, picked.hostArgs);
+  return resolved.ok ? getSubagentHostArgsDigest(resolved.hostArgs) : undefined;
 }
 
 function getBackgroundTaskHookSessionId(
@@ -878,6 +911,11 @@ export type SubagentExecuteParams = {
   taskRuntime?: SubagentTaskRuntime;
   /** Host-restored child transcript for a fresh continuation run. @internal */
   initialMessages?: BaseMessage[];
+  /**
+   * Values for the selected subagent's declared `hostArgs`. Checked against
+   * the declaration before an execution opens, then bound to it.
+   */
+  hostArgs?: SubagentHostArgs;
 };
 
 export type SubagentExecuteResult = SubagentContextResult & {
@@ -887,6 +925,7 @@ export type SubagentExecuteResult = SubagentContextResult & {
   resolutionFailure?: {
     phase: SubagentResolutionPhase;
     cause: SubagentResolutionCause;
+    hostArgument?: SubagentHostArgumentFailure;
   };
   /** Completed child work whose host projection must be retried without re-execution. */
   retryableDelivery?: true;
@@ -1152,6 +1191,18 @@ export class SubagentExecutor {
         message: `Unknown subagent type "${params.subagentType}".`,
       });
     }
+    const hostArgResult = resolveSubagentHostArgs(
+      executableConfig,
+      params.hostArgs
+    );
+    if (!hostArgResult.ok) {
+      return JSON.stringify({
+        status: 'rejected',
+        tool: Constants.SUBAGENT,
+        message: hostArgResult.message,
+      });
+    }
+    const { hostArgs } = hostArgResult;
     if (this.maxDepth <= 0) {
       return JSON.stringify({
         status: 'rejected',
@@ -1217,7 +1268,8 @@ export class SubagentExecutor {
       requestFingerprint: getBackgroundTaskFingerprint(
         params.description,
         params.subagentType,
-        subagentThreadId
+        subagentThreadId,
+        getSubagentHostArgsDigest(hostArgs)
       ),
       ...(subagentThreadId == null || subagentThreadId === ''
         ? {}
@@ -1232,6 +1284,7 @@ export class SubagentExecutor {
         this.executeDetached(
           {
             ...params,
+            hostArgs,
             ...(initialMessages == null ? {} : { initialMessages }),
           },
           runtime,
@@ -1402,7 +1455,8 @@ export class SubagentExecutor {
         if (result.resolutionFailure != null) {
           throw new SubagentResolutionError(
             result.resolutionFailure.phase,
-            result.resolutionFailure.cause
+            result.resolutionFailure.cause,
+            result.resolutionFailure.hostArgument
           );
         }
         throw new Error(result.error);
@@ -1466,6 +1520,7 @@ export class SubagentExecutor {
       threadId?: string;
       parentToolCallId?: string;
       parentConfigurable?: Record<string, unknown>;
+      hostArgs?: SubagentHostArgs;
     }
   ): Promise<ResolvedSubagentConfigEntry> {
     if (isGraphSubagentConfig(config) || config.agentInputs != null) {
@@ -1494,6 +1549,9 @@ export class SubagentExecutor {
                 context.parentConfigurable == null
                   ? undefined
                   : sanitizeResolverConfigurable(context.parentConfigurable),
+              ...(context.hostArgs == null
+                ? {}
+                : { hostArgs: context.hostArgs }),
             }),
           context.childSignal
         ).then(
@@ -1942,7 +2000,7 @@ export class SubagentExecutor {
     }
     const executions: SubagentResumeExecution[] = [];
     for (const record of records) {
-      const { identity, binding, activeRun } = record.snapshot;
+      const { identity, binding, invocation, activeRun } = record.snapshot;
       if (identity == null) {
         continue;
       }
@@ -1986,6 +2044,9 @@ export class SubagentExecutor {
           ? {}
           : { subagentType: binding.subagentType }),
         ...(binding?.configId == null ? {} : { configId: binding.configId }),
+        ...(invocation?.hostArgsDigest == null
+          ? {}
+          : { hostArgsDigest: invocation.hostArgsDigest }),
         approvalExecutionScope: identity.approvalExecutionScope,
         checkpoints,
         graphState,
@@ -2338,6 +2399,22 @@ export class SubagentExecutor {
     ) {
       return;
     }
+    const resolvedHostArgsDigest =
+      settled.resolvedArgs == null
+        ? undefined
+        : getHostArgsDigestFromArgs(
+          this.configs.get(
+            resolvedSubagentType ?? execution.binding?.subagentType ?? ''
+          ),
+          settled.resolvedArgs
+        );
+    if (
+      boundInvocation != null &&
+      settled.resolvedArgs != null &&
+      resolvedHostArgsDigest !== boundInvocation.hostArgsDigest
+    ) {
+      return;
+    }
     const description =
       boundInvocation?.description ??
       resolvedDescription ??
@@ -2369,10 +2446,15 @@ export class SubagentExecutor {
       return;
     }
     const persistedOutput = serializeToolOutput(settled);
+    const hostArgsDigest =
+      settled.resolvedArgs == null
+        ? getHostArgsDigestFromArgs(executableConfig, call.args)
+        : resolvedHostArgsDigest;
     const invocation = boundInvocation ?? {
       description,
       subagentType,
       ...(configId == null ? {} : { configId }),
+      ...(hostArgsDigest == null ? {} : { hostArgsDigest }),
     };
     try {
       await execution.settle(
@@ -2489,6 +2571,15 @@ export class SubagentExecutor {
         )
       );
     }
+    const hostArgResult = resolveSubagentHostArgs(
+      executableConfig,
+      params.hostArgs
+    );
+    if (!hostArgResult.ok) {
+      return Promise.resolve(createSubagentFailure(hostArgResult.message));
+    }
+    const { hostArgs } = hostArgResult;
+    const hostArgsDigest = getSubagentHostArgsDigest(hostArgs);
     if (this.maxDepth <= 0) {
       return Promise.resolve(
         createSubagentFailure('Error: Maximum subagent nesting depth exceeded.')
@@ -2527,8 +2618,10 @@ export class SubagentExecutor {
           ...(executableConfig.configId == null
             ? {}
             : { configId: executableConfig.configId }),
+          ...(hostArgsDigest == null ? {} : { hostArgsDigest }),
         },
-        () => this.executeOnce(params, execution, executableConfig)
+        () =>
+          this.executeOnce({ ...params, hostArgs }, execution, executableConfig)
       );
     } catch (error) {
       if (error instanceof SubagentDefinitionBindingError) {
@@ -2623,6 +2716,16 @@ export class SubagentExecutor {
       },
       this.onResolutionFailure
     );
+    const hostArgument =
+      phase === 'config' ? getSubagentHostArgumentFailure(error) : undefined;
+    if (hostArgument != null) {
+      return {
+        ...createSubagentFailure(
+          getSubagentHostArgumentFailureMessage(hostArgument)
+        ),
+        resolutionFailure: { phase, cause: detail.cause, hostArgument },
+      };
+    }
     return {
       ...createSubagentFailure(detail.message),
       resolutionFailure: { phase, cause: detail.cause },
@@ -2656,6 +2759,14 @@ export class SubagentExecutor {
     ) {
       this.executions.remove(execution);
       return createSubagentFailure(SUBAGENT_CONFIG_CHANGED_MESSAGE);
+    }
+    if (
+      resumeExecution != null &&
+      resumeExecution.hostArgsDigest !==
+        getSubagentHostArgsDigest(params.hostArgs)
+    ) {
+      this.executions.remove(execution);
+      return createSubagentFailure(SUBAGENT_INVOCATION_CHANGED_MESSAGE);
     }
     let identity: SubagentExecutionIdentity;
     try {
@@ -2695,6 +2806,7 @@ export class SubagentExecutor {
         threadId,
         parentToolCallId,
         parentConfigurable: params.parentConfigurable,
+        hostArgs: params.hostArgs,
       });
       execution.assertUsable(childSignal);
     } catch (error) {
@@ -3283,7 +3395,10 @@ export class SubagentExecutor {
        * quota for that entire interval. Trips the ENTRY-captured controller:
        * after a reset, a straggler must break its own dead run, not the
        * current one. */
-      if (error instanceof StreamLimitExceededError || error instanceof ProviderTextProtectionError) {
+      if (
+        error instanceof StreamLimitExceededError ||
+        error instanceof ProviderTextProtectionError
+      ) {
         childBreaker.abort(error);
       }
       const errorMessage = truncateErrorMessage(error);
@@ -3322,7 +3437,10 @@ export class SubagentExecutor {
        * fired. Rethrown here and passed through ToolNode's error conversion,
        * so the parent run rejects with the child's limit error.
        */
-      if (error instanceof StreamLimitExceededError || error instanceof ProviderTextProtectionError) {
+      if (
+        error instanceof StreamLimitExceededError ||
+        error instanceof ProviderTextProtectionError
+      ) {
         throw error;
       }
       return createSubagentFailure(

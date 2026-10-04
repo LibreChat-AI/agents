@@ -9,7 +9,36 @@ import { describeCodeApiError } from '@/tools/diagnostics';
 /** Which step of child start-up failed: execution identity, then host config resolution. */
 export type SubagentResolutionPhase = 'identity' | 'config';
 
+/** Why a host resolver refused a declared host argument value. */
+export type SubagentHostArgumentRejection = 'unavailable' | 'not_allowed';
+
+const HOST_ARGUMENT_NAME_PATTERN = /^[a-z][a-z0-9_]{0,63}$/;
+
+/**
+ * Thrown by a lazy resolver to refuse one declared host argument value. The
+ * parent model receives a fixed message naming the argument; the value and
+ * any error text stay private.
+ */
+export class SubagentHostArgumentError extends Error {
+  readonly argument: string;
+  readonly rejection: SubagentHostArgumentRejection;
+
+  constructor(argument: string, rejection: SubagentHostArgumentRejection) {
+    super('Subagent host argument was rejected.');
+    this.name = 'SubagentHostArgumentError';
+    this.argument = argument;
+    this.rejection = rejection;
+  }
+}
+
+/** Safe host-argument refusal retained across the detached delivery boundary. */
+export type SubagentHostArgumentFailure = {
+  argument: string;
+  rejection: SubagentHostArgumentRejection;
+};
+
 const SUBAGENT_ERROR_TYPES = [
+  ['SubagentHostArgumentError', SubagentHostArgumentError],
   ['SubagentExecutionInvalidatedError', SubagentExecutionInvalidatedError],
   ['SubagentDefinitionBindingError', SubagentDefinitionBindingError],
   ['SubagentInvocationBindingError', SubagentInvocationBindingError],
@@ -27,6 +56,8 @@ const SUBAGENT_RESOLUTION_MESSAGES = {
   model_unavailable: 'Subagent error: Model or provider unavailable.',
   configuration_changed:
     'Subagent error: Subagent configuration changed. Start a new execution.',
+  host_argument_rejected:
+    'Subagent error: A requested subagent argument is not available. Omit it to let the host choose, or pass another listed value.',
   unknown: 'Subagent error: Unable to initialize the selected subagent.',
 } as const;
 
@@ -67,6 +98,7 @@ function normalizeResolutionCause(
   case 'agent_unavailable':
   case 'model_unavailable':
   case 'configuration_changed':
+  case 'host_argument_rejected':
     return cause;
   default:
     return 'unknown';
@@ -79,16 +111,63 @@ export function getSubagentResolutionFailureMessage(
   return SUBAGENT_RESOLUTION_MESSAGES[normalizeResolutionCause(cause)];
 }
 
+/** Returns a resolver's typed host-argument refusal when its name is safe to show. */
+export function getSubagentHostArgumentFailure(
+  error: unknown
+): SubagentHostArgumentFailure | undefined {
+  try {
+    if (!(error instanceof SubagentHostArgumentError)) {
+      return undefined;
+    }
+    const { argument, rejection } = error;
+    if (
+      typeof argument !== 'string' ||
+      !HOST_ARGUMENT_NAME_PATTERN.test(argument)
+    ) {
+      return undefined;
+    }
+    return {
+      argument,
+      rejection: rejection === 'unavailable' ? 'unavailable' : 'not_allowed',
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+/** Model-facing message for a refused host argument. */
+export function getSubagentHostArgumentFailureMessage(
+  failure: SubagentHostArgumentFailure
+): string {
+  const { argument } = failure;
+  const omit = `Omit "${argument}" to let the host choose, or pass another listed value.`;
+  return failure.rejection === 'unavailable'
+    ? `Subagent error: The requested "${argument}" is unavailable right now. ${omit}`
+    : `Subagent error: The requested "${argument}" is not allowed for this subagent. ${omit}`;
+}
+
 /** Safe typed failure retained when detached execution crosses the host boundary. */
 export class SubagentResolutionError extends Error {
   readonly phase: SubagentResolutionPhase;
   readonly resolutionCause: SubagentResolutionCause;
+  readonly hostArgument?: SubagentHostArgumentFailure;
 
-  constructor(phase: SubagentResolutionPhase, cause: SubagentResolutionCause) {
-    super(getSubagentResolutionFailureMessage(cause));
+  constructor(
+    phase: SubagentResolutionPhase,
+    cause: SubagentResolutionCause,
+    hostArgument?: SubagentHostArgumentFailure
+  ) {
+    super(
+      hostArgument == null
+        ? getSubagentResolutionFailureMessage(cause)
+        : getSubagentHostArgumentFailureMessage(hostArgument)
+    );
     this.name = 'SubagentResolutionError';
     this.phase = phase;
     this.resolutionCause = normalizeResolutionCause(cause);
+    if (hostArgument != null) {
+      this.hostArgument = hostArgument;
+    }
   }
 }
 
@@ -122,11 +201,17 @@ export function logSubagentResolutionFailure(
     cause: 'unknown',
     message: SUBAGENT_RESOLUTION_MESSAGES.unknown,
   };
+  const hostArgumentRejected = getSubagentHostArgumentFailure(error) != null;
+  if (hostArgumentRejected) {
+    detail.cause = 'host_argument_rejected';
+    detail.message = SUBAGENT_RESOLUTION_MESSAGES.host_argument_rejected;
+  }
   if (onResolutionFailure != null) {
     try {
-      const cause = normalizeResolutionCause(
-        onResolutionFailure(Object.freeze(detail), error)
-      );
+      const reported = onResolutionFailure(Object.freeze({ ...detail }), error);
+      const cause = hostArgumentRejected
+        ? detail.cause
+        : normalizeResolutionCause(reported);
       return {
         ...detail,
         cause,
