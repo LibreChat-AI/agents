@@ -9,6 +9,7 @@ import { tool } from '@langchain/core/tools';
 import { AIMessage } from '@langchain/core/messages';
 import { describe, it, expect } from '@jest/globals';
 import type { StructuredToolInterface } from '@langchain/core/tools';
+import { ProviderTextProtectionError } from '@/protection/providerText';
 import { StreamLimitExceededError } from '@/llm/streamLimits';
 import { ToolNode } from '@/tools/ToolNode';
 
@@ -45,6 +46,15 @@ describe('ToolNode stream-limit passthrough', () => {
         configurable: { run_id: 'limit-run' },
       })
     ).rejects.toBeInstanceOf(StreamLimitExceededError);
+  });
+
+  it.each(['blocked', 'timeout'] as const)('rethrows child protection errors without error-handler conversion (%s)', async (code) => {
+    const trip = new ProviderTextProtectionError(code);
+    let errorHandled = false;
+    const child = tool(async () => { throw trip; }, { name: 'child', description: 'Protected child.', schema: z.object({ command: z.string() }) });
+    const node = new ToolNode({ tools: [child], errorHandler: async () => { errorHandled = true; return true; } });
+    await expect(node.invoke(stateWith('child'), { configurable: { run_id: 'protected-child' } })).rejects.toBe(trip);
+    expect(errorHandled).toBe(false);
   });
 
   it('still converts ordinary tool errors to error ToolMessages', async () => {

@@ -33,8 +33,9 @@ export type LegacyGraphConfig = BaseGraphConfig & {
     g.StandardGraphInput,
     /** `streamLimits` is excluded because legacy graphs receive limits only
      * via the top-level `RunConfig.streamLimits`; accepting the field here
-     * would type-check but be silently ignored by `createLegacyGraph`. */
-    'provider' | 'clientOptions' | 'agents' | 'streamLimits'
+     * would type-check but be silently ignored by `createLegacyGraph`.
+     * Required provider-text protection also belongs only to RunConfig. */
+    'provider' | 'clientOptions' | 'agents' | 'streamLimits' | 'providerTextProtection'
   > &
   Omit<g.AgentInputs, 'provider' | 'clientOptions' | 'agentId'>;
 
@@ -336,6 +337,7 @@ export type RunConfig = {
    * tool-call argument byte cap is ON by default, the per-turn event cap is
    * opt-in. See {@link StreamLimits}.
    */
+  providerTextProtection?: g.StandardGraphInput['providerTextProtection'];
   streamLimits?: StreamLimits;
   returnContent?: boolean;
   tokenCounter?: TokenCounter;

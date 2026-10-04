@@ -14,6 +14,7 @@ import type { ToolCall } from '@langchain/core/messages/tool';
 import type { BaseMessage } from '@langchain/core/messages';
 import type { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import type { PreparedProviderRequest } from '@/llm/prepareProviderRequest';
+import type { ProviderTextProtection } from '@/protection/providerText';
 import type { ContextOverflowContext } from '@/utils/errors';
 import type { StreamLimitState } from '@/llm/streamLimits';
 import type { PreemptAction } from '@/llm/preempt';
@@ -28,6 +29,12 @@ import {
   STREAM_LIMIT_REDISPATCH_KEY,
   STREAM_LIMIT_ATTEMPT_KEY,
 } from '@/llm/streamLimits';
+import {
+  validateProviderTextProtection,
+  ProviderTextProtectionError,
+  createProviderTextRestartCancellation,
+  isProviderTextRestartCancellation,
+} from '@/protection/providerText';
 import {
   inspectProviderMessageProjection,
   ProviderMessageProjectionInvariantError,
@@ -56,6 +63,7 @@ import {
 } from '@/llm/providers';
 import { ChatModelStreamHandler, dispatchesChatModelStream } from '@/stream';
 import { Constants, ContentTypes, GraphEvents, Providers } from '@/common';
+import { withProviderTextBoundary } from '@/llm/providerTextBoundary';
 import { PreparedSubagentError } from '@/tools/preparedSubagents';
 import { assertNotTruncatedToolCall } from '@/llm/truncation';
 import { resolveClientOptionsModel } from '@/llm/request';
@@ -623,6 +631,7 @@ function appendStreamChunk({
  */
 interface AttemptInvokeCommonParams {
   context?: InvokeContext;
+  providerTextProtection?: ProviderTextProtection;
   onChunk?: OnChunk;
   /**
    * The agent lane this attempt belongs to, as the model node names it. Only
@@ -697,6 +706,9 @@ export async function attemptInvoke(
   params: AttemptInvokeParams,
   config?: RunnableConfig
 ): Promise<Partial<t.BaseGraphState>> {
+  const policy =
+    params.providerTextProtection ?? params.context?.providerTextProtection;
+  if (policy != null) validateProviderTextProtection(policy);
   const provider = resolveAttemptProvider(params);
   const providerStampedConfig: RunnableConfig = {
     ...config,
@@ -707,7 +719,14 @@ export async function attemptInvoke(
       resolvedProvider: provider,
     },
   };
-  const request = resolveAttemptRequest(params, providerStampedConfig);
+  const preparedRequest = resolveAttemptRequest(params, providerStampedConfig);
+  const request =
+    policy == null
+      ? preparedRequest
+      : {
+        ...preparedRequest,
+        model: withProviderTextBoundary(preparedRequest.model, policy),
+      };
   const configuredModel =
     providerStampedConfig.metadata?.[Constants.INVOKED_MODEL];
   const modelId =
@@ -763,6 +782,7 @@ export async function attemptInvoke(
         context: params.context,
         onChunk: params.onChunk,
         preemptAgentId: params.preemptAgentId,
+        providerTextProtection: policy,
       },
       stampedConfig
     );
@@ -775,6 +795,12 @@ export async function attemptInvoke(
     prepared?.finish(preparedAttempt, calls);
     return result;
   } catch (error) {
+    if (policy != null && config?.signal?.aborted === true) {
+      const reason: unknown = config.signal.reason;
+      const cancelled = new ProviderTextProtectionError(reason instanceof ProviderTextProtectionError ? reason.code : 'cancelled');
+      prepared?.finish(preparedAttempt, undefined, cancelled);
+      throw cancelled;
+    }
     prepared?.finish(preparedAttempt, undefined, error);
     throw error;
   } finally {
@@ -799,9 +825,10 @@ async function attemptInvokeBody(
     context,
     onChunk,
     preemptAgentId,
+    providerTextProtection,
   }: Pick<
     AttemptInvokeCommonParams,
-    'context' | 'onChunk' | 'preemptAgentId'
+    'context' | 'onChunk' | 'preemptAgentId' | 'providerTextProtection'
   > & {
     request: PreparedProviderRequest;
   },
@@ -1068,7 +1095,7 @@ async function attemptInvokeBody(
         notePreemptRestartedRun(sealedRunId, finalChunk);
       }
       restartRoute = 'aborted';
-      restartController.abort();
+      restartController.abort(providerTextProtection == null ? undefined : createProviderTextRestartCancellation());
       return true;
     };
     const unsubscribeWake =
@@ -1085,7 +1112,8 @@ async function attemptInvokeBody(
       if (
         signal?.aborted === true &&
         (signal.reason instanceof StreamLimitExceededError ||
-          signal.reason instanceof PreparedSubagentError)
+          signal.reason instanceof PreparedSubagentError ||
+          signal.reason instanceof ProviderTextProtectionError)
       ) {
         throw signal.reason;
       }
@@ -1334,6 +1362,7 @@ async function attemptInvokeBody(
         restartRoute === 'aborted' &&
         !(error instanceof StreamLimitExceededError) &&
         !(error instanceof PreparedSubagentError) &&
+        (!(error instanceof ProviderTextProtectionError) || isProviderTextRestartCancellation(error)) &&
         config.signal?.aborted !== true;
       if (!ownAbort) {
         throw error;
@@ -1561,6 +1590,7 @@ export async function tryFallbackProviders({
   context,
   onChunk,
   streamLimitState,
+  providerTextProtection,
   preemptAgentId,
   overflowContext,
   prepareProviderRequest: prepareFallbackRequest,
@@ -1576,6 +1606,7 @@ export async function tryFallbackProviders({
   /** Accounting-lease owner forwarded to each fallback attempt (see
    * `AttemptInvokeParams.streamLimitState`). */
   streamLimitState?: StreamLimitState;
+  providerTextProtection?: ProviderTextProtection;
   /** Forwarded so a fallback-served attempt records a discarded turn in the
    * SAME lane the primary would have (see
    * `AttemptInvokeParams.preemptAgentId`). Dropping it here would leave the
@@ -1610,6 +1641,7 @@ export async function tryFallbackProviders({
     config?: RunnableConfig;
   }) => BaseMessage[] | Promise<BaseMessage[]>;
 }): Promise<Partial<t.BaseGraphState> | undefined> {
+  if (primaryError instanceof ProviderTextProtectionError) throw primaryError;
   const isOverflow = (
     error: unknown,
     contextOverride = overflowContext
@@ -1686,7 +1718,8 @@ export async function tryFallbackProviders({
       if (
         config?.signal?.aborted === true &&
         (config.signal.reason instanceof StreamLimitExceededError ||
-          config.signal.reason instanceof PreparedSubagentError)
+          config.signal.reason instanceof PreparedSubagentError ||
+          config.signal.reason instanceof ProviderTextProtectionError)
       ) {
         throw config.signal.reason;
       }
@@ -1697,6 +1730,7 @@ export async function tryFallbackProviders({
             context,
             onChunk,
             streamLimitState,
+            providerTextProtection,
             preemptAgentId,
           },
           fbConfig
@@ -1710,6 +1744,7 @@ export async function tryFallbackProviders({
           context,
           onChunk,
           streamLimitState,
+          providerTextProtection,
           preemptAgentId,
         },
         fbConfig
@@ -1723,7 +1758,8 @@ export async function tryFallbackProviders({
       if (
         e instanceof StreamLimitExceededError ||
         e instanceof PreparedSubagentError ||
-        e instanceof InvalidModelToolCallError
+        e instanceof InvalidModelToolCallError ||
+        e instanceof ProviderTextProtectionError
       ) {
         throw e;
       }
@@ -1734,7 +1770,8 @@ export async function tryFallbackProviders({
       if (
         config?.signal?.aborted === true &&
         (config.signal.reason instanceof StreamLimitExceededError ||
-          config.signal.reason instanceof PreparedSubagentError)
+          config.signal.reason instanceof PreparedSubagentError ||
+          config.signal.reason instanceof ProviderTextProtectionError)
       ) {
         throw config.signal.reason;
       }
