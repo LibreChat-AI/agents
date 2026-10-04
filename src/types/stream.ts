@@ -13,7 +13,7 @@ import type Anthropic from '@anthropic-ai/sdk';
 import type { AnthropicContentBlock } from '@/llm/anthropic/types';
 import type { AssistantTextPhase } from '@/types/assistantPhase';
 import type { SummarizeCompleteEvent } from '@/types/summarize';
-import type { ToolEndEvent } from '@/types/tools';
+import type { ToolEndEvent, ToolExecution } from '@/types/tools';
 import { StepTypes, ContentTypes, GraphEvents } from '@/common/enum';
 
 /** One accepted model result, detached from execution state before host dispatch.
@@ -236,6 +236,7 @@ export type ToolEndCallback = (
 
 export type ProcessedToolCall = {
   name: string;
+  execution?: ToolExecution;
   args: string | Record<string, unknown>;
   id: string;
   output: string;

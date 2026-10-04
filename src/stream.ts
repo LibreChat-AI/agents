@@ -2052,13 +2052,29 @@ hasToolCallChunks: ${hasToolCallChunks}
       return;
     }
 
-    /* Note: tool call chunks may have non-empty content that matches the current tool chunk generation */
+    /** A custom OpenAI-compatible endpoint can emit final assistant text after
+     * an externally executed tool call in the same response. Keep actual text,
+     * while still discarding chunks that merely mirror streamed tool arguments. */
+    const contentMatchesToolCallArgs =
+      hasToolCallChunks && (chunk.tool_call_chunks?.some((tc) => tc.args === content) ?? false);
     if (typeof content === 'string' && runStep.type === StepTypes.TOOL_CALLS) {
+      if (contentMatchesToolCallArgs) {
+        return;
+      }
+      stepId = await dispatchMessageCreationStep({ graph, stepKey, content, metadata });
+      runStep = graph.getRunStep(stepId);
+      if (runStep == null) {
+        return;
+      }
+      await graph.dispatchMessageDelta(
+        stepId,
+        {
+          content: [{ type: ContentTypes.TEXT, text: content }],
+        },
+        metadata
+      );
       return;
-    } else if (
-      hasToolCallChunks &&
-      (chunk.tool_call_chunks?.some((tc) => tc.args === content) ?? false)
-    ) {
+    } else if (contentMatchesToolCallArgs) {
       return;
     } else if (typeof content === 'string') {
       if (agentContext.currentTokenType === ContentTypes.TEXT) {
@@ -2723,6 +2739,7 @@ export function createContentAggregator(): t.ContentAggregatorResult {
                 args: toolCall.args,
                 name: toolCall.name,
                 id: toolCallId,
+                execution: (toolCall as t.CustomToolCall).execution,
               },
             };
 
@@ -2851,6 +2868,7 @@ export function createContentAggregator(): t.ContentAggregatorResult {
               args: toolCallDelta.args ?? '',
               name: toolCallDelta.name,
               id: toolCallId,
+              execution: (toolCallDelta as t.CustomToolCall).execution,
               auth: runStepDelta.delta.auth,
               expires_at: runStepDelta.delta.expires_at,
             },

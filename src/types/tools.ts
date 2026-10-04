@@ -18,6 +18,12 @@ import type { HandoffRouting } from '@/graphs/handoff';
 import type { HumanInTheLoopConfig } from './hitl';
 import type { HookRegistry } from '@/hooks';
 
+/** Execution owner for a tool call. Omitted values use the local executor. */
+export type ToolExecution = {
+  mode: 'local' | 'external';
+  provider?: string;
+};
+
 /** Replacement type for `import type { ToolCall } from '@langchain/core/messages/tool'` in order to have stringified args typed */
 export type CustomToolCall = {
   name: string;
@@ -26,6 +32,7 @@ export type CustomToolCall = {
   id?: string;
   type?: 'tool_call';
   output?: string;
+  execution?: ToolExecution;
 };
 
 export type GenericTool = (StructuredToolInterface | RunnableToolLike) & {
