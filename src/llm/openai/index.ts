@@ -63,6 +63,7 @@ import {
   hasToolCallChunks,
   getReasoningKwargsText,
 } from '@/llm/stream/chunkAdapters';
+import { registerProviderTextChunkConstructor } from '@/llm/providerTextChunk';
 import { isReasoningModel, _convertMessagesToOpenAIParams } from './utils';
 import { smoothStream, resolveStreamDelay } from '@/llm/stream/smoother';
 import { INTENT_ARG, isIntentLabelProperty } from '@/tools/intentArg';
@@ -854,6 +855,8 @@ class ResponsesReplayAIMessageChunk extends AIMessageChunk {
     return combined;
   }
 }
+
+registerProviderTextChunkConstructor(ResponsesReplayAIMessageChunk);
 
 function makeResponsesReplayAggregationSafe(
   chunk: ChatGenerationChunk

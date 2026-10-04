@@ -196,3 +196,81 @@ it.each([false, true])('reuses canonical Responses prose and exact function IDs 
   expect(requests[1]).not.toContain('a1.alice@example.invalid');
   expect(JSON.stringify(run.Graph!.getRunMessages())).toContain('Final control');
 });
+
+it.each([false, true])('preserves sealed Responses reasoning and subsequent reuse (terminal=%s)', async (terminal) => {
+  const first = { id: 'reason-first', type: 'reasoning', status: 'completed', summary: [{ type: 'summary_text', text: 'First reasoning control' }], encrypted_content: 'SIGNED_FIRST' };
+  const second = { id: 'reason-second', type: 'reasoning', status: 'completed', summary: [{ type: 'summary_text', text: 'Second reasoning control' }], encrypted_content: 'SIGNED_SECOND' };
+  const frames = [
+    { type: 'response.created', response: { ...response, output: [], status: 'in_progress' } },
+    { type: 'response.output_item.added', output_index: 0, item: { ...first, status: 'in_progress', summary: [], encrypted_content: undefined } },
+    { type: 'response.reasoning_summary_text.delta', item_id: first.id, output_index: 0, summary_index: 0, delta: first.summary[0].text },
+    { type: 'response.output_item.done', output_index: 0, item: first },
+    { type: 'response.output_item.added', output_index: 1, item: { ...second, status: 'in_progress', summary: [], encrypted_content: undefined } },
+    { type: 'response.reasoning_summary_text.delta', item_id: second.id, output_index: 1, summary_index: 0, delta: second.summary[0].text },
+    { type: 'response.output_item.done', output_index: 1, item: second },
+    { type: 'response.output_item.added', output_index: 2, item: { id: 'reason-unsealed', type: 'reasoning', status: 'in_progress', summary: [] } },
+    { type: 'response.reasoning_summary_text.delta', item_id: 'reason-unsealed', output_index: 2, summary_index: 0, delta: 'Unsealed reasoning control' },
+    { type: 'response.output_text.delta', item_id: 'msg-control', output_index: 3, content_index: 0, delta: raw },
+    ...(terminal ? [{ type: 'response.completed', response: { ...response, output: [first, second, { id: 'reason-unsealed', type: 'reasoning', status: 'incomplete', summary: [{ type: 'summary_text', text: 'Unsealed reasoning control' }] }, response.output[0]] } }] : []),
+  ];
+  const makeModel = (requests: string[]) => new ChatOpenAI({ model: 'synthetic-model', apiKey: 'synthetic-test-key', useResponsesApi: true, streaming: true, configuration: { apiKey: 'synthetic-test-key', fetch: async (_url, init) => {
+    requests.push(typeof init?.body === 'string' ? init.body : '');
+    const events = requests.length > 1 ? [{ type: 'response.output_text.delta', item_id: 'msg-next', output_index: 0, content_index: 0, delta: 'Next control' }] : frames;
+    return new Response(events.map((frame) => `event: ${frame.type}\ndata: ${JSON.stringify(frame)}\n\n`).join(''), { headers: { 'content-type': 'text/event-stream' } });
+  } } });
+  const baseline = await attemptInvoke({ model: makeModel([]), messages: [new HumanMessage('Allowed control')], provider: Providers.OPENAI, onChunk: () => {} });
+  expect(baseline.messages?.[0].additional_kwargs.reasoning).toMatchObject({ id: second.id, encrypted_content: second.encrypted_content, status: second.status });
+  const requests: string[] = [];
+  const model = makeModel(requests);
+  const native: Array<AIMessageChunk['additional_kwargs']> = [];
+  const observer = BaseCallbackHandler.fromMethods({ handleLLMEnd: (output): void => {
+    const generation = output.generations[0][0];
+    if (!('message' in generation) || !(generation.message instanceof AIMessageChunk)) throw new Error('Expected chat generation');
+    native.push(generation.message.additional_kwargs);
+  } });
+  observer.awaitHandlers = true;
+  const protection = policy(({ content }) => approve(content === raw ? canonical : content));
+  const result = await attemptInvoke({ model, messages: [new HumanMessage('Allowed control')], provider: Providers.OPENAI, providerTextProtection: protection, onChunk: () => {} }, { callbacks: [observer] });
+  const message = result.messages?.[0] as AIMessageChunk;
+  expect(message.additional_kwargs.reasoning).toEqual(baseline.messages?.[0].additional_kwargs.reasoning);
+  expect(native[0].reasoning).toEqual(baseline.messages?.[0].additional_kwargs.reasoning);
+  expect(JSON.stringify(message)).not.toContain('SIGNED_FIRSTSIGNED_SECOND');
+  expect(JSON.stringify(message)).not.toContain('completedcompleted');
+  if (terminal) {
+    expect(message.response_metadata.output).toEqual([first, second, { id: 'reason-unsealed', type: 'reasoning', status: 'incomplete', summary: [{ type: 'summary_text', text: 'Unsealed reasoning control' }] }, { ...response.output[0], content: [{ ...response.output[0].content[0], text: canonical }] }]);
+    expect(message.additional_kwargs.__openai_responses_active_reasoning_id__).toBeUndefined();
+    expect(message.additional_kwargs.__openai_responses_replay_positions__).toBeUndefined();
+  } else expect(message.response_metadata.output).toBeUndefined();
+  expect(message.toJSON().id).toEqual(baseline.messages?.[0].toJSON().id);
+  expect(JSON.stringify(message)).toContain(canonical);
+  expect(JSON.stringify(message)).not.toContain('a1.alice@example.invalid');
+  await attemptInvoke({ model, messages: [new HumanMessage('Allowed control'), message, new HumanMessage('Follow-up control')], provider: Providers.OPENAI, providerTextProtection: protection, onChunk: () => {} });
+  expect(requests).toHaveLength(2);
+  expect(requests[1]).toContain('SIGNED_SECOND');
+  if (!terminal) expect(requests[1]).not.toContain('SIGNED_FIRST');
+  expect(requests[1]).not.toContain('SIGNED_FIRSTSIGNED_SECOND');
+  expect(requests[1]).not.toContain('a1.alice@example.invalid');
+});
+
+it.each([false, true])('admits inert Responses logprobs while retaining canonical prose (native=%s)', async (native) => {
+  const terminal = { ...response, top_logprobs: 0, output: [{ ...response.output[0], content: [{ ...response.output[0].content[0], logprobs: [] }] }] };
+  const frames = [{ type: 'response.output_text.delta', item_id: 'msg-control', output_index: 0, content_index: 0, delta: raw }, { type: 'response.completed', response: terminal }];
+  const model = new ChatOpenAI({ model: 'synthetic-model', apiKey: 'synthetic-test-key', useResponsesApi: true, streaming: !native, configuration: { apiKey: 'synthetic-test-key', fetch: async () => new Response(native ? JSON.stringify(terminal) : frames.map((frame) => `event: ${frame.type}\ndata: ${JSON.stringify(frame)}\n\n`).join(''), { headers: { 'content-type': native ? 'application/json' : 'text/event-stream' } }) } });
+  model.disableStreaming = native;
+  const result = await attemptInvoke({ model, messages: [], provider: Providers.OPENAI, onChunk: () => {}, providerTextProtection: policy(() => approve(canonical)) });
+  const message = result.messages?.[0] as AIMessageChunk;
+  expect(message.response_metadata.output).toEqual([{ ...terminal.output[0], content: [{ ...terminal.output[0].content[0], text: canonical }] }]);
+  if (!native) expect(message.response_metadata.top_logprobs).toBe(0);
+  expect(JSON.stringify(message)).not.toContain('a1.alice@example.invalid');
+});
+
+it.each([
+  { label: 'token logprobs', change: { output: [{ ...response.output[0], content: [{ ...response.output[0].content[0], logprobs: [{ token: raw, logprob: -1, top_logprobs: [] }] }] }] } },
+  { label: 'positive top_logprobs', change: { top_logprobs: 1 } },
+])('keeps uncertified Responses $label gated', async ({ change }) => {
+  const frames = [{ type: 'response.output_text.delta', item_id: 'msg-control', output_index: 0, content_index: 0, delta: raw }, { type: 'response.completed', response: { ...response, ...change } }];
+  const model = new ChatOpenAI({ model: 'synthetic-model', apiKey: 'synthetic-test-key', useResponsesApi: true, streaming: true, configuration: { apiKey: 'synthetic-test-key', fetch: async () => new Response(frames.map((frame) => `event: ${frame.type}\ndata: ${JSON.stringify(frame)}\n\n`).join(''), { headers: { 'content-type': 'text/event-stream' } }) } });
+  let inspected = false;
+  await expect(attemptInvoke({ model, messages: [], provider: Providers.OPENAI, onChunk: () => {}, providerTextProtection: policy(() => { inspected = true; return approve(canonical); }) })).rejects.toMatchObject({ code: 'unsupported' });
+  expect(inspected).toBe(false);
+});

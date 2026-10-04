@@ -18,6 +18,7 @@ import {
   ProviderTextProtectionError,
 } from '@/protection/providerText';
 import { isProviderTextInput } from '@/protection/providerTextInput';
+import { createProviderTextChunk } from '@/llm/providerTextChunk';
 import { getChatModelClass } from '@/llm/providers';
 import { Providers } from '@/common';
 
@@ -71,7 +72,7 @@ function copyMessage(
   message: AIMessage | AIMessageChunk,
   content: AIMessageChunk['content']
 ): AIMessageChunk {
-  const copied = new AIMessageChunk({
+  const copied = createProviderTextChunk(message, {
     content,
     id: message.id,
     name: message.name,

@@ -42,6 +42,7 @@ interface OutputText {
   type: 'output_text';
   text: string;
   annotations: [];
+  logprobs?: [];
 }
 interface MessageOutput {
   type: 'message';
@@ -58,8 +59,9 @@ function messageOutput(value: unknown): value is MessageOutput {
       (value.phase != null && !['commentary', 'final_answer'].includes(String(value.phase))) ||
       !Array.isArray(value.content) || value.content.length !== 1) return false;
   const part: unknown = value.content[0];
-  return keys(part, ['type', 'text', 'annotations']) && part.type === 'output_text' &&
-    typeof part.text === 'string' && Array.isArray(part.annotations) && part.annotations.length === 0;
+  return keys(part, ['type', 'text', 'annotations', 'logprobs']) && part.type === 'output_text' &&
+    typeof part.text === 'string' && Array.isArray(part.annotations) && part.annotations.length === 0 &&
+    (part.logprobs === undefined || (Array.isArray(part.logprobs) && part.logprobs.length === 0));
 }
 
 /** One certified prose output. Unknown structured outputs and alternate aliases stay gated. */
@@ -92,7 +94,8 @@ export class ResponsesTextProjection {
     for (const [key, value] of Object.entries(metadata)) {
       let valid: boolean;
       if (key === 'output' || key === 'output_text') continue;
-      if (key === 'usage') valid = numericTree(value);
+      if (key === 'top_logprobs') valid = value == null || value === 0;
+      else if (key === 'usage') valid = numericTree(value);
       else if (key === 'text') valid = keys(value, ['format', 'verbosity']) && keys(value.format, ['type']) && value.format.type === 'text' &&
         (value.verbosity == null || ['low', 'medium', 'high'].includes(String(value.verbosity)));
       else if (key === 'tools') valid = Array.isArray(value) && value.length <= 32 && value.every(responseTool);
