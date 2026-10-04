@@ -54,7 +54,8 @@ tool block/index and its argument delta; their JSON is never rewritten. Unknown 
 blocks, additional-output aliases, cached models, multiple prose block indices and custom runnable
 shells fail `unsupported`. Non-streaming responses are inspected before native callbacks/state;
 transport response allocation itself is provider-owned, not an SDK gate buffer. Native nonstreaming
-lifecycle/usage metadata is validated without rewriting. Invoke configured to aggregate internal
+lifecycle/usage metadata and malformed-tool diagnostics are preserved without rewriting.
+Invalid calls keep the existing paired-error and model-recovery route after canonicalization. Invoke configured to aggregate internal
 streaming, including effective request parameters/model kwargs and OpenAI delegates, fails `unsupported` before production; use the guarded
 stream path or native nonstreaming instead.
 

@@ -1,7 +1,7 @@
-import { AIMessageChunk } from '@langchain/core/messages';
 import { ChatGenerationChunk } from '@langchain/core/outputs';
 import { BaseChatModel } from '@langchain/core/language_models/chat_models';
 import { RunnableBinding, RunnableSequence } from '@langchain/core/runnables';
+import { AIMessage, AIMessageChunk, mergeContent } from '@langchain/core/messages';
 import type { MessageContentComplex } from '@langchain/core/messages';
 import type { ChatResult } from '@langchain/core/outputs';
 import type { ProviderTextProtection } from '@/protection/providerText';
@@ -59,20 +59,24 @@ type TextBlock = MessageContentComplex & {
 };
 
 function copyMessage(
-  message: AIMessageChunk,
+  message: AIMessage | AIMessageChunk,
   content: AIMessageChunk['content']
 ): AIMessageChunk {
-  return new AIMessageChunk({
+  const copied = new AIMessageChunk({
     content,
     id: message.id,
     name: message.name,
     additional_kwargs: message.additional_kwargs,
     response_metadata: message.response_metadata,
     tool_calls: message.tool_calls,
-    tool_call_chunks: message.tool_call_chunks,
+    tool_call_chunks: message instanceof AIMessageChunk ? message.tool_call_chunks : undefined,
     invalid_tool_calls: message.invalid_tool_calls,
     usage_metadata: message.usage_metadata,
   });
+  // Core resets native diagnostics when no argument chunks are present.
+  copied.invalid_tool_calls = message.invalid_tool_calls ?? [];
+  copied.lc_kwargs.invalid_tool_calls = copied.invalid_tool_calls;
+  return copied;
 }
 
 function numericMetadata(value: unknown, depth = 4): boolean {
@@ -385,19 +389,20 @@ export function withProviderTextBoundary(
       if (result.generations.length !== 1)
         throw new ProviderTextProtectionError('unsupported');
       const generation = result.generations[0];
-      const message = generation.message instanceof AIMessageChunk ? generation.message : new AIMessageChunk(generation.message);
+      if (!(generation.message instanceof AIMessage)) throw new ProviderTextProtectionError('unsupported');
+      const message = generation.message instanceof AIMessageChunk ? generation.message : copyMessage(generation.message, generation.message.content);
       const candidate = new Candidate(attempt);
       const stripped = candidate.strip(
         new ChatGenerationChunk({ ...generation, message })
       );
       const canonical = await candidate.canonical();
       attempt.check();
-      return {
-        ...result,
-        generations: [
-          canonical == null ? stripped : stripped.concat(canonical),
-        ],
-      };
+      const released = canonical == null ? stripped : new ChatGenerationChunk({
+        text: canonical.text,
+        message: copyMessage(message, mergeContent(stripped.message.content, canonical.message.content)),
+        generationInfo: stripped.generationInfo,
+      });
+      return { ...result, generations: [released] };
     } finally {
       attempt.finish();
     }

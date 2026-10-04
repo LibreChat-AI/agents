@@ -1042,3 +1042,61 @@ it('preserves only SDK-owned restart cancellation provenance through a protected
     work.resolve('Late control');
   } finally { attempt.finish(); }
 });
+
+it.each([
+  { label: 'invalid-only empty', prose: '', valid: false },
+  { label: 'invalid-only prose', prose: fixtures.canaries[0], valid: false },
+  { label: 'mixed valid/invalid prose', prose: fixtures.canaries[0], valid: true },
+])('preserves native OpenAI diagnostics and paired recovery ($label)', async ({ prose, valid }) => {
+  const malformed = { id: 'native-bad-call', type: 'function', function: { name: 'lookup', arguments: '{"count":' } };
+  const makeResponse = (recovered: boolean) => ({
+    id: recovered ? 'native-recovered' : 'native-diagnostics', object: 'chat.completion', created: 1, model: 'synthetic-model',
+    choices: [{ index: 0, finish_reason: recovered ? 'stop' : 'tool_calls', logprobs: null, message: {
+      role: 'assistant', content: recovered ? 'Recovery control' : prose, refusal: null,
+      ...(recovered ? {} : { tool_calls: [malformed, ...(valid ? [{ id: 'native-valid-call', type: 'function', function: { name: 'lookup', arguments: '{"count":42}' } }] : [])] }),
+    } }],
+    usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+  });
+  const standalone = new ChatOpenAI({ apiKey: 'synthetic-test-key', model: 'synthetic-model', streaming: false, maxRetries: 0, configuration: { apiKey: 'synthetic-test-key', fetch: async () => new Response(JSON.stringify(makeResponse(false)), { headers: { 'content-type': 'application/json' } }) } });
+  standalone.disableStreaming = true;
+  const baseline = await standalone.invoke([new HumanMessage('Allowed control')]);
+  expect(baseline.invalid_tool_calls).toHaveLength(1);
+  const protection = policy({ inspect: ({ content }) => approved(content === fixtures.canaries[0] ? '[EMAIL_1]' : content) });
+  const observed: string[] = [];
+  const diagnostics: AIMessageChunk['invalid_tool_calls'][] = [];
+  const observer = BaseCallbackHandler.fromMethods({ handleLLMEnd: (output): void => {
+    observed.push(JSON.stringify(output));
+    const generation = output.generations[0]?.[0];
+    if (!('message' in generation) || !(generation.message instanceof AIMessageChunk)) throw new Error('Expected chat generation');
+    diagnostics.push(generation.message.invalid_tool_calls);
+  } });
+  observer.awaitHandlers = true;
+  const result = await invoke(standalone, protection, [observer]);
+  expect((result.messages?.[0] as AIMessageChunk).invalid_tool_calls).toEqual(baseline.invalid_tool_calls);
+  expect(diagnostics).toEqual([baseline.invalid_tool_calls]);
+  expect(JSON.stringify(result)).not.toContain(fixtures.canaries[0]);
+  expect(observed.join('')).not.toContain(fixtures.canaries[0]);
+
+  const requests: string[] = [];
+  let executed = 0;
+  const lookup = new DynamicStructuredTool({ name: 'lookup', description: 'Returns an allowed control.', schema: z.object({ count: z.number() }), func: async ({ count }) => { executed++; expect(count).toBe(42); return 'Tool control'; } });
+  const model = new ChatOpenAI({ apiKey: 'synthetic-test-key', model: 'synthetic-model', streaming: false, maxRetries: 0, configuration: { apiKey: 'synthetic-test-key', fetch: async (_url, init) => {
+    requests.push(typeof init?.body === 'string' ? init.body : '');
+    return new Response(JSON.stringify(makeResponse(requests.length > 1)), { headers: { 'content-type': 'application/json' } });
+  } } });
+  model.disableStreaming = true;
+  const run = await Run.create({ runId: `native-recovery-${valid}-${prose.length}`, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, instructions: 'Allowed instructions.', tools: [lookup] }, providerTextProtection: protection, returnContent: true, skipCleanup: true });
+  run.Graph!.overrideModel = model;
+  await run.processStream({ messages: [new HumanMessage('Allowed control')] }, { version: 'v2', configurable: { thread_id: `native-recovery-${valid}-${prose.length}` } });
+  expect(requests).toHaveLength(2);
+  expect(executed).toBe(valid ? 1 : 0);
+  expect(requests[1]).toContain('native-bad-call');
+  expect(requests[1]).toContain('The tool call input could not be parsed');
+  expect(requests[1]).not.toContain(fixtures.canaries[0]);
+  if (prose) expect(requests[1]).toContain('[EMAIL_1]');
+  const messages = run.Graph!.getRunMessages()!;
+  const badResult = messages.find((message) => message.getType() === 'tool' && JSON.stringify(message).includes('native-bad-call'));
+  expect(badResult).toMatchObject({ status: 'error', tool_call_id: 'native-bad-call' });
+  expect(JSON.stringify(messages)).toContain('Recovery control');
+  expect(JSON.stringify(messages)).not.toContain(fixtures.canaries[0]);
+});
