@@ -16,6 +16,7 @@ import {
   RUN_BREAKER_SCOPE_CONFIG_KEY,
 } from '@/llm/streamLimits';
 import { SUBAGENT_REPLAY_CONTROLLER } from '@/tools/subagent/SubagentReplay';
+import { ProviderTextProtectionError } from '@/protection/providerText';
 import * as events from '@/utils/events';
 import { GraphEvents } from '@/common';
 import { HookRegistry } from '@/hooks';
@@ -476,14 +477,11 @@ describe('ToolNode breaker signal composition', () => {
     expect(toolExecuteCalls).toHaveLength(0);
   });
 
-  it('stops a direct tool when the breaker trips during its PreToolUse hook', async () => {
+  it.each([
+    { label: 'stream limit', trip: new StreamLimitExceededError({ kind: 'tool_call_args', limit: 10, observed: 11, toolName: 'db_query' }) },
+    { label: 'protection', trip: new ProviderTextProtectionError('blocked') },
+  ])('stops a direct tool when the breaker trips during its PreToolUse hook ($label)', async ({ trip }) => {
     const breaker = new AbortController();
-    const trip = new StreamLimitExceededError({
-      kind: 'tool_call_args',
-      limit: 10,
-      observed: 11,
-      toolName: 'db_query',
-    });
     let toolRan = false;
     const sideEffect = createSignalBlindTool('send_email', async () => {
       toolRan = true;
@@ -512,14 +510,11 @@ describe('ToolNode breaker signal composition', () => {
     expect(toolRan).toBe(false);
   });
 
-  it('stops the host batch when the breaker trips during approval hooks', async () => {
+  it.each([
+    { label: 'stream limit', trip: new StreamLimitExceededError({ kind: 'tool_call_args', limit: 10, observed: 11, toolName: 'db_query' }) },
+    { label: 'protection', trip: new ProviderTextProtectionError('blocked') },
+  ])('stops the host batch when the breaker trips during approval hooks ($label)', async ({ trip }) => {
     const breaker = new AbortController();
-    const trip = new StreamLimitExceededError({
-      kind: 'tool_call_args',
-      limit: 10,
-      observed: 11,
-      toolName: 'db_query',
-    });
     const { toolExecuteCalls } = installToolExecuteResponder();
     const registry = new HookRegistry();
     registry.register('PreToolUse', {
@@ -612,5 +607,42 @@ describe('ToolNode breaker signal composition', () => {
 
     breaker.abort(new Error('stream limit breach'));
     expect(signal?.aborted).toBe(true);
+  });
+});
+
+describe('required protection tool admission', () => {
+  afterEach(() => { jest.restoreAllMocks(); });
+  it.each(['blocked', 'timeout'] as const)('stops an awaiting host approval after a sibling protection trip (%s)', async (code) => {
+    const breaker = new AbortController();
+    const trip = new ProviderTextProtectionError(code);
+    let resume!: () => void;
+    let markStarted!: () => void;
+    const hold = new Promise<void>((resolve) => { resume = resolve; });
+    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    const hooks = new HookRegistry();
+    hooks.register('PreToolUse', { hooks: [async () => { markStarted(); await hold; return { decision: 'allow' }; }] });
+    const { toolExecuteCalls } = installToolExecuteResponder();
+    const node = new ToolNode({ tools: [], eventDrivenMode: true, hookRegistry: hooks, toolCallStepIds: new Map([['call_1', 'step_1']]), getBreakerSignal: () => breaker.signal });
+    const execution = node.invoke({ messages: [createToolCallMessage('call_1', 'remote_tool')] });
+    const outcome = execution.catch((error: Error) => error);
+    await started;
+    breaker.abort(trip);
+    resume();
+    expect(await outcome).toBe(trip);
+    expect(toolExecuteCalls).toHaveLength(0);
+  });
+
+  it('rejects an already tripped event batch before observational hooks or host dispatch', async () => {
+    const breaker = new AbortController();
+    const trip = new ProviderTextProtectionError('blocked');
+    breaker.abort(trip);
+    let hookRan = false;
+    const hooks = new HookRegistry();
+    hooks.register('PreToolUse', { hooks: [async () => { hookRan = true; return { decision: 'allow' }; }] });
+    const { toolExecuteCalls } = installToolExecuteResponder();
+    const node = new ToolNode({ tools: [], eventDrivenMode: true, hookRegistry: hooks, getBreakerSignal: () => breaker.signal });
+    await expect(node.invoke({ messages: [createToolCallMessage('call_1', 'remote_tool')] })).rejects.toBe(trip);
+    expect(hookRan).toBe(false);
+    expect(toolExecuteCalls).toHaveLength(0);
   });
 });

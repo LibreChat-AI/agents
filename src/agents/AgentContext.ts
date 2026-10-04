@@ -58,6 +58,7 @@ import {
 import { isTokenCounterCacheCompatible } from '@/llm/tokenCounterCacheCompatibility';
 import { snapshotCompactionSemanticIndex } from '@/summarization/semanticIndex';
 import { createExactTokenCountCache } from '@/llm/contextPressureMeter';
+import { markProviderTextInput } from '@/protection/providerTextInput';
 import { buildSummaryCarrierText } from '@/summarization/shared';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { apportionTokenCounts } from '@/utils/tokens';
@@ -960,7 +961,7 @@ export class AgentContext {
         : 0;
     }
 
-    return RunnableLambda.from((messages: BaseMessage[]) => {
+    return markProviderTextInput(RunnableLambda.from((messages: BaseMessage[]) => {
       const prefix: BaseMessage[] = systemMessage ? [systemMessage] : [];
 
       // Build the non-system portion (summary + conversation), then apply
@@ -998,7 +999,7 @@ export class AgentContext {
         );
       }
       return [...prefix, ...body];
-    }).withConfig({ runName: 'prompt' });
+    })).withConfig({ runName: 'prompt' });
   }
 
   private buildSummaryHumanMessage(

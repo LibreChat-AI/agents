@@ -1,3 +1,5 @@
+import { isProtectedProviderTextSignal } from '@/protection/providerText';
+
 export const DEFAULT_STREAM_DELAY = 25;
 export const SMOOTH_TARGET_LATENCY_MS = 250;
 export const MAX_STREAM_QUEUE_CHUNKS = 256;
@@ -204,8 +206,8 @@ export async function* smoothStream<TEmit>({
   signal?: AbortSignal;
   abortUpstream?: () => void;
 }): AsyncGenerator<TEmit> {
-  if (!(delayMs > 0)) {
-    /** Disabled smoothing preserves fully lazy streaming: no background
+  if (!(delayMs > 0) || isProtectedProviderTextSignal(signal)) {
+    /** Disabled/protected smoothing preserves fully lazy streaming: no background
      * producer, no read-ahead — each provider chunk is pulled only when the
      * consumer asks, exactly like the pre-engine pass-through paths. */
     for await (const item of source) {

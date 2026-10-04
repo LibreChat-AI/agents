@@ -132,6 +132,10 @@ import {
   resolveToolOutputTracingConfig,
 } from '@/langfuseConfig';
 import {
+  ProviderTextProtectionError,
+  validateProviderTextProtection,
+} from '@/protection/providerText';
+import {
   annotateMessagesForLLM,
   ToolOutputReferenceRegistry,
 } from '@/tools/toolOutputReferences';
@@ -1378,6 +1382,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    * these on every streamed chunk event.
    */
   streamLimits: ResolvedStreamLimits;
+  /** Default-off mandatory provider prose release. */
+  providerTextProtection?: t.StandardGraphInput['providerTextProtection'];
   /**
    * Cumulative streamed argument bytes per in-flight tool call, keyed by
    * generation key + chunk index (see `resolveGenerationKey`). Per-run
@@ -1423,25 +1429,27 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    * attempt lease; spans resets on purpose. */
   activeStreamLimitGenerations?: Set<string>;
 
-  /** The stream-limit error behind an already-fired breaker, whether this
+  /** The safety error behind an already-fired breaker, whether this
    * graph's own controller tripped or a parent run's breaker arrived through
    * the composed constructor signal (child graphs own separate controllers).
    * Providers can translate either abort into a generic error, and recovery
    * paths must not run in that state. */
   protected resolveTrippedBreakerReason(
     breakerSignal: AbortSignal = this.breakerAbort.signal
-  ): StreamLimitExceededError | PreparedSubagentError | undefined {
+  ): StreamLimitExceededError | PreparedSubagentError | ProviderTextProtectionError | undefined {
     if (
       breakerSignal.aborted &&
       (breakerSignal.reason instanceof StreamLimitExceededError ||
-        breakerSignal.reason instanceof PreparedSubagentError)
+        breakerSignal.reason instanceof PreparedSubagentError ||
+        breakerSignal.reason instanceof ProviderTextProtectionError)
     ) {
       return breakerSignal.reason;
     }
     if (
       this.signal?.aborted === true &&
       (this.signal.reason instanceof StreamLimitExceededError ||
-        this.signal.reason instanceof PreparedSubagentError)
+        this.signal.reason instanceof PreparedSubagentError ||
+        this.signal.reason instanceof ProviderTextProtectionError)
     ) {
       return this.signal.reason;
     }
@@ -1551,6 +1559,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       onSubagentResolutionFailure,
       preemption,
       streamLimits,
+      providerTextProtection,
       toolExecution,
       clientDelegatedToolNames,
     }: t.StandardGraphInput,
@@ -1580,6 +1589,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     this.onSubagentResolutionFailure = onSubagentResolutionFailure;
     this.preemption = preemption;
     this.streamLimits = resolveStreamLimits(streamLimits);
+    if (providerTextProtection != null)
+      validateProviderTextProtection(providerTextProtection);
+    this.providerTextProtection = providerTextProtection;
     this.toolExecution = toolExecution;
     if (clientDelegatedToolNames != null && clientDelegatedToolNames.length > 0) {
       if (agents.length !== 1) {
@@ -4404,7 +4416,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
          * succeeding fallback would resolve a run the public contract says
          * must reject. Rethrow before any recovery path.
          */
-        if (primaryError instanceof InvalidModelToolCallError) {
+        if (
+          primaryError instanceof InvalidModelToolCallError ||
+          primaryError instanceof ProviderTextProtectionError
+        ) {
+          if (primaryError instanceof ProviderTextProtectionError) attemptBreaker.abort(primaryError);
           throw primaryError;
         }
         if (
@@ -4747,7 +4763,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               })
           );
         } catch (fallbackError) {
-          if (fallbackError instanceof InvalidModelToolCallError) {
+          if (
+            fallbackError instanceof InvalidModelToolCallError ||
+            fallbackError instanceof ProviderTextProtectionError
+          ) {
+            if (fallbackError instanceof ProviderTextProtectionError) attemptBreaker.abort(fallbackError);
             throw fallbackError;
           }
           if (
@@ -5347,6 +5367,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           subagentContext: this.subagentContext,
           onResolutionFailure: this.onSubagentResolutionFailure,
           streamLimits: this.streamLimits,
+          providerTextProtection: this.providerTextProtection,
           humanInTheLoop: this.humanInTheLoop,
           checkpointer: this.compileOptions?.checkpointer,
           maxDepth: effectiveSubagentDepth,

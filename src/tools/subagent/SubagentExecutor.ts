@@ -147,6 +147,7 @@ import {
   createChildGraphPlan,
   isGraphSubagentConfig,
 } from './childGraphConfig';
+import { ProviderTextProtectionError } from '@/protection/providerText';
 import { stripRunStepResumeState } from '@/tools/runStepResume';
 import { seedAgentInitialSessions } from '@/utils/toolSessions';
 import { stableStringify } from '@/tools/eagerEventExecution';
@@ -178,7 +179,7 @@ const SUBAGENT_INVOCATION_CHANGED_MESSAGE =
 
 function isSubagentResolutionControlFlow(error: unknown): boolean {
   try {
-    return error instanceof StreamLimitExceededError || isGraphInterrupt(error);
+    return error instanceof StreamLimitExceededError || error instanceof ProviderTextProtectionError || isGraphInterrupt(error);
   } catch {
     return false;
   }
@@ -957,6 +958,7 @@ export type SubagentExecutorOptions = {
    * graph's own resolved limits; without this the child would silently
    * revert to the defaults.
    */
+  providerTextProtection?: StandardGraphInput['providerTextProtection'];
   streamLimits?: StandardGraphInput['streamLimits'];
   humanInTheLoop?: HumanInTheLoopConfig;
   /** Shared durable saver used to recover outer tool lifecycle results before
@@ -1034,6 +1036,7 @@ export class SubagentExecutor {
   private readonly executionContext: SubagentExecutionContext;
   private readonly langfuse?: StandardGraphInput['langfuse'];
   private readonly tokenCounter?: TokenCounter;
+  private readonly providerTextProtection?: StandardGraphInput['providerTextProtection'];
   private readonly streamLimits?: StandardGraphInput['streamLimits'];
   private readonly humanInTheLoop?: HumanInTheLoopConfig;
   private readonly checkpointer?: BaseCheckpointSaver;
@@ -1074,6 +1077,7 @@ export class SubagentExecutor {
     this.langfuse = options.langfuse;
     this.tokenCounter = options.tokenCounter;
     this.streamLimits = options.streamLimits;
+    this.providerTextProtection = options.providerTextProtection;
     this.humanInTheLoop = options.humanInTheLoop;
     this.checkpointer = isCheckpointSaver(options.checkpointer)
       ? options.checkpointer
@@ -1344,6 +1348,7 @@ export class SubagentExecutor {
       subagentContext: this.subagentContext,
       onResolutionFailure: this.onResolutionFailure,
       streamLimits: this.streamLimits,
+      providerTextProtection: this.providerTextProtection,
       humanInTheLoop:
         this.humanInTheLoop?.enabled === true ||
         this.humanInTheLoop?.backgroundPausePolicy === 'deny'
@@ -2831,6 +2836,7 @@ export class SubagentExecutor {
       langfuse: this.langfuse,
       tokenCounter: this.tokenCounter,
       streamLimits: this.streamLimits,
+      providerTextProtection: this.providerTextProtection,
       subagentScope: true,
       subagentExecutionContext: childExecutionContext,
       subagentContext: this.subagentContext,
@@ -3277,7 +3283,7 @@ export class SubagentExecutor {
        * quota for that entire interval. Trips the ENTRY-captured controller:
        * after a reset, a straggler must break its own dead run, not the
        * current one. */
-      if (error instanceof StreamLimitExceededError) {
+      if (error instanceof StreamLimitExceededError || error instanceof ProviderTextProtectionError) {
         childBreaker.abort(error);
       }
       const errorMessage = truncateErrorMessage(error);
@@ -3316,7 +3322,7 @@ export class SubagentExecutor {
        * fired. Rethrown here and passed through ToolNode's error conversion,
        * so the parent run rejects with the child's limit error.
        */
-      if (error instanceof StreamLimitExceededError) {
+      if (error instanceof StreamLimitExceededError || error instanceof ProviderTextProtectionError) {
         throw error;
       }
       return createSubagentFailure(

@@ -273,6 +273,7 @@ async function createRestartRun(options: {
   hook: HookCallback<'PreemptBoundary'>;
   preemption: t.StreamPreemption;
   model: FakeChatModel;
+  protectedText?: boolean;
 }): Promise<Run<t.IState>> {
   const registry = new HookRegistry();
   registry.register('PreemptBoundary', { hooks: [options.hook] });
@@ -288,6 +289,11 @@ async function createRestartRun(options: {
       instructions: 'Answer plainly.',
     },
     hooks: registry,
+    ...(options.protectedText === true ? { providerTextProtection: {
+      version: 1 as const, timeoutMs: 10000, maxAttemptBytes: 65536, maxBufferedBytes: 262144,
+      classify: (): 'prose' => 'prose',
+      inspect: ({ content }: { content: string }) => ({ version: 1 as const, ok: true as const, value: { content, replacements: 0, categories: [] } }),
+    } } : {}),
     preemption: options.preemption,
     /**
      * Required for a discarded turn to report usage at all: a turn that ends
@@ -323,7 +329,7 @@ function userTexts(messages: BaseMessage[]): string[] {
 }
 
 describe('cooperative restart (end-to-end via Run)', () => {
-  it('discards a silent turn and re-issues it with the steer appended', async () => {
+  it.each([false, true])('discards a silent turn and re-issues it with the steer appended (protected=%s)', async (protectedText) => {
     const host = createHost(0);
     /**
      * The screenshot case: the provider has accepted the request and gone
@@ -334,7 +340,8 @@ describe('cooperative restart (end-to-end via Run)', () => {
       responses: [RESTARTED_RESPONSE],
     });
     const run = await createRestartRun({
-      runId: 'restart-silent',
+      runId: `restart-silent-${protectedText}`,
+      protectedText,
       preemption: host.preemption,
       model,
       hook: () => {
@@ -346,7 +353,7 @@ describe('cooperative restart (end-to-end via Run)', () => {
         };
       },
     });
-    model.onFirstStream = host.arm;
+    model.onFirstStream = protectedText ? () => { setImmediate(host.arm); } : host.arm;
 
     await run.processStream(
       { messages: [new HumanMessage('tell me a long story')] },
@@ -369,13 +376,14 @@ describe('cooperative restart (end-to-end via Run)', () => {
     ).toBe(false);
   });
 
-  it('discards a thinking-only turn once the request outlives the grace', async () => {
+  it.each([false, true])('discards a thinking-only turn once the request outlives the grace (protected=%s)', async (protectedText) => {
     const host = createHost(0);
     const model = new ThinkingThenAnsweringModel({
       responses: [RESTARTED_RESPONSE],
     });
     const run = await createRestartRun({
-      runId: 'restart-thinking',
+      runId: `restart-thinking-${protectedText}`,
+      protectedText,
       preemption: host.preemption,
       model,
       hook: () => {
@@ -385,7 +393,7 @@ describe('cooperative restart (end-to-end via Run)', () => {
         };
       },
     });
-    model.onFirstStream = host.arm;
+    model.onFirstStream = protectedText ? () => { setImmediate(host.arm); } : host.arm;
 
     await run.processStream(
       { messages: [new HumanMessage('think it through')] },

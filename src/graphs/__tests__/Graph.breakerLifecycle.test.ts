@@ -1,6 +1,7 @@
 import { describe, it, expect, jest } from '@jest/globals';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type * as t from '@/types';
+import { ProviderTextProtectionError } from '@/protection/providerText';
 import { StreamLimitExceededError } from '@/llm/streamLimits';
 import { StandardGraph } from '../Graph';
 import { Providers } from '@/common';
@@ -259,6 +260,15 @@ describe('run breaker lifecycle', () => {
         {} as RunnableConfig
       )
     ).rejects.toBe(trip);
+  });
+
+  it.each(['own', 'parent'])('rejects model entry after a protection trip in the %s breaker', async (scope) => {
+    const controller = new AbortController();
+    const trip = new ProviderTextProtectionError('blocked');
+    const graph = new StandardGraph({ runId: 'protection-entry', agents: [makeAgent('agent')], signal: scope === 'parent' ? controller.signal : undefined });
+    if (scope === 'own') graph.breakerAbort.abort(trip);
+    else controller.abort(trip);
+    await expect(graph.createCallModel('agent')({ messages: [] } as t.AgentSubgraphState, {})).rejects.toBe(trip);
   });
 
   it('lets a model node proceed past entry when the breaker is live', async () => {

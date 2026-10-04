@@ -13,6 +13,7 @@ import {
   createSummarizeNode,
 } from '@/summarization/node';
 import { setFreshProviderMessageProvenance } from '@/messages/provenance';
+import { ProviderTextProtectionError } from '@/protection/providerText';
 import { createTokenCounter, encodingForModel } from '@/utils/tokens';
 import { StreamLimitExceededError } from '@/llm/streamLimits';
 import { convertInjectedMessages } from '@/messages/injected';
@@ -2360,13 +2361,10 @@ describe('summarize node breaker capture', () => {
     expect(modelClassSpy).not.toHaveBeenCalled();
   });
 
-  it('rethrows a parent trip on the config signal instead of degrading to the stub', async () => {
-    const trip = new StreamLimitExceededError({
-      kind: 'tool_call_args',
-      limit: 10,
-      observed: 11,
-      toolName: 'db_query',
-    });
+  it.each([
+    { label: 'stream limit', trip: new StreamLimitExceededError({ kind: 'tool_call_args', limit: 10, observed: 11, toolName: 'db_query' }) },
+    { label: 'protection', trip: new ProviderTextProtectionError('blocked') },
+  ])('rethrows a parent trip on the config signal instead of degrading to the stub ($label)', async ({ trip }) => {
     /** Child graph's own breaker stays live: in a subagent, a ROOT
      * sibling's trip arrives only through the composed invocation signal. */
     const childBreaker = new AbortController();
@@ -2410,13 +2408,10 @@ describe('summarize node breaker capture', () => {
     ).rejects.toBe(trip);
   });
 
-  it('rejects at entry when the breaker has already tripped', async () => {
-    const trip = new StreamLimitExceededError({
-      kind: 'tool_call_args',
-      limit: 10,
-      observed: 11,
-      toolName: 'db_query',
-    });
+  it.each([
+    { label: 'stream limit', trip: new StreamLimitExceededError({ kind: 'tool_call_args', limit: 10, observed: 11, toolName: 'db_query' }) },
+    { label: 'protection', trip: new ProviderTextProtectionError('blocked') },
+  ])('rejects at entry when the breaker has already tripped ($label)', async ({ trip }) => {
     const entryBreaker = new AbortController();
     entryBreaker.abort(trip);
 
@@ -2456,6 +2451,49 @@ describe('summarize node breaker capture', () => {
 
     expect(graph.contentData).toHaveLength(0);
     expect(modelClassSpy).not.toHaveBeenCalled();
+  });
+
+  it.each(['reject', 'return'] as const)('does not fallback, complete or commit a summary after an inherited protection trip (%s)', async (mode) => {
+    const trip = new ProviderTextProtectionError('blocked');
+    const parent = new AbortController();
+    const events = captureEvents();
+    const invoke = jest.fn(async () => {
+      parent.abort(trip);
+      if (mode === 'reject') throw new Error('Generic provider abort');
+      return new AIMessage('Late summary');
+    });
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(class { constructor() { return { invoke }; } } as never);
+    const context = createAgentContext();
+    const complete = jest.fn();
+    const node = createSummarizeNode({ agentContext: context, graph: { ...mockGraph(complete), getBreakerSignal: () => new AbortController().signal }, generateStepId });
+    await expect(node({ messages: [new HumanMessage('Hello'), new AIMessage('World')], summarizationRequest: { remainingContextTokens: 1000, agentId: 'agent_0', reason: 'trigger' } }, { signal: parent.signal })).rejects.toBe(trip);
+    expect(context.hasSummary()).toBe(false);
+    expect(complete).not.toHaveBeenCalled();
+    expect(events.some((entry) => entry.event === GraphEvents.ON_SUMMARIZE_COMPLETE)).toBe(false);
+    expect(invoke).toHaveBeenCalledTimes(1);
+  });
+
+  it('rethrows an inherited protection trip from the fallback instead of committing a periodic stub', async () => {
+    const trip = new ProviderTextProtectionError('blocked');
+    const parent = new AbortController();
+    const events = captureEvents();
+    let calls = 0;
+    const invoke = jest.fn(async () => {
+      if (++calls === 1) throw new Error('Primary unavailable');
+      parent.abort(trip);
+      throw new Error('Fallback provider aborted');
+    });
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(class { constructor() { return { invoke }; } } as never);
+    const context = createAgentContext();
+    const clientOptions = { model: 'summary-test', ...context.clientOptions, fallbacks: [{ provider: Providers.OPENAI, clientOptions: {} }] };
+    context.clientOptions = clientOptions;
+    const complete = jest.fn();
+    const node = createSummarizeNode({ agentContext: context, graph: { ...mockGraph(complete), getBreakerSignal: () => new AbortController().signal }, generateStepId });
+    await expect(node({ messages: [new HumanMessage('Hello'), new AIMessage('World')], summarizationRequest: { remainingContextTokens: 1000, agentId: 'agent_0', reason: 'trigger' } }, { signal: parent.signal })).rejects.toBe(trip);
+    expect(calls).toBe(2);
+    expect(context.hasSummary()).toBe(false);
+    expect(complete).not.toHaveBeenCalled();
+    expect(events.some((entry) => entry.event === GraphEvents.ON_SUMMARIZE_COMPLETE)).toBe(false);
   });
 
   it('binds the model call to the breaker signal read at node entry', async () => {

@@ -58,6 +58,7 @@ import {
 import { createToolCallsDispatchedEvent, safeDispatchCustomEvent } from '@/utils/events';
 import { resolveToolOutcome, outcomeFieldsFromResult } from '@/tools/intentArg';
 import { snapshotValidatedModelChunk } from '@/graphs/acceptedModelResponse';
+import { ProviderTextProtectionError } from '@/protection/providerText';
 import { TOOL_OUTPUT_REF_PATTERN } from '@/tools/toolOutputReferences';
 import { formatToolErrorContent } from '@/tools/toolErrorContent';
 import { PreparedSubagentError } from '@/tools/preparedSubagents';
@@ -1687,6 +1688,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
       graph.breakerAbort instanceof AbortController
         ? graph.breakerAbort
         : undefined;
+    const entrySignals = [eventBreaker?.signal, graph.signal, graph.config.signal];
     /** Immutable scope captured at handler entry. A reset while this
      * handler is suspended in an await replaces the object, so ONE
      * reference comparison proves the event still belongs to the live run
@@ -1695,13 +1697,16 @@ export class ChatModelStreamHandler implements t.EventHandler {
     const runScopeInvalidated = (): boolean =>
       entryRunScope != null && graph.runScope !== entryRunScope;
     const throwIfRunBreakerTripped = (): void => {
-      if (
-        eventBreaker != null &&
-        eventBreaker.signal.aborted &&
-        (eventBreaker.signal.reason instanceof StreamLimitExceededError ||
-          eventBreaker.signal.reason instanceof PreparedSubagentError)
-      ) {
-        throw eventBreaker.signal.reason;
+      for (const signal of entrySignals) {
+        if (signal?.aborted === true &&
+            (signal.reason instanceof StreamLimitExceededError ||
+              signal.reason instanceof PreparedSubagentError ||
+              signal.reason instanceof ProviderTextProtectionError)) {
+          throw signal.reason;
+        }
+        if (signal?.aborted === true && graph.providerTextProtection != null) {
+          throw new ProviderTextProtectionError('cancelled');
+        }
       }
     };
 
@@ -1797,6 +1802,8 @@ export class ChatModelStreamHandler implements t.EventHandler {
       metadata,
       agentContext,
     });
+    if (runScopeInvalidated()) return;
+    throwIfRunBreakerTripped();
     if (skipHandling) {
       return;
     }
@@ -1831,6 +1838,8 @@ export class ChatModelStreamHandler implements t.EventHandler {
         content,
         metadata,
       });
+      if (runScopeInvalidated()) return;
+      throwIfRunBreakerTripped();
     }
 
     if (
@@ -2031,6 +2040,23 @@ export class ChatModelStreamHandler implements t.EventHandler {
         content,
         metadata,
       });
+      runStep = graph.getRunStep(stepId);
+    }
+    if (
+      graph.providerTextProtection != null &&
+      runStep?.type === StepTypes.TOOL_CALLS &&
+      agentContext.currentTokenType === ContentTypes.TEXT &&
+      (typeof content === 'string' || content.every(isTextContentPart))
+    ) {
+      stepId = await dispatchMessageCreationStep({
+        graph,
+        stepKey,
+        content,
+        contentType: ContentTypes.TEXT,
+        metadata,
+      });
+      if (runScopeInvalidated()) return;
+      throwIfRunBreakerTripped();
       runStep = graph.getRunStep(stepId);
     }
     if (!runStep) {

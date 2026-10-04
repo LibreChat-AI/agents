@@ -1,3 +1,4 @@
+import type { SmoothItem, SmoothPiece } from './smoother';
 import {
   smoothStream,
   resolveStreamDelay,
@@ -12,7 +13,7 @@ import {
   SMOOTH_TARGET_LATENCY_MS,
   MAX_STREAM_QUEUE_TEXT_CHARS,
 } from './smoother';
-import type { SmoothItem, SmoothPiece } from './smoother';
+import { ProviderTextAttempt } from '@/protection/providerText';
 
 type Emitted = SmoothPiece & { tag: string; at: number };
 
@@ -516,4 +517,17 @@ describe('smoothStream', () => {
     expect(pieces.map((p) => p.text).join('')).toBe(chunk.repeat(12));
     expect(lag).toBeLessThan(SMOOTH_TARGET_LATENCY_MS * 2.5);
   });
+});
+
+it('keeps protected positive-delay streams fully lazy without read-ahead or splitting', async () => {
+  const attempt = new ProviderTextAttempt({ version: 1, timeoutMs: 10000, maxAttemptBytes: 1024, maxBufferedBytes: 1024, classify: () => 'prose', inspect: ({ content }) => ({ version: 1, ok: true, value: { content, replacements: 0, categories: [] } }) });
+  const yielded: number[] = [];
+  const source = arraySource([makeItem('first', 'Some allowed control text.', true), makeItem('second', 'Later control', true)], (i) => yielded.push(i));
+  const stream = smoothStream({ source, delayMs: 25, signal: attempt.signal });
+  try {
+    const first = await stream.next();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(yielded).toEqual([0]);
+    expect(first.value).toMatchObject({ text: 'Some allowed control text.', isFirst: true, isLast: true });
+  } finally { await stream.return(undefined); attempt.finish(); }
 });
