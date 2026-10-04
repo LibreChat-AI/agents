@@ -3,8 +3,11 @@ import { getEventListeners } from 'node:events';
 import { DynamicStructuredTool } from '@langchain/core/tools';
 import { ChatGenerationChunk } from '@langchain/core/outputs';
 import { FakeListChatModel } from '@langchain/core/utils/testing';
+import { StringOutputParser } from '@langchain/core/output_parsers';
 import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
 import { AIMessageChunk, HumanMessage } from '@langchain/core/messages';
+import { RunnableBinding, RunnableLambda } from '@langchain/core/runnables';
+import { BaseChatModel } from '@langchain/core/language_models/chat_models';
 import type { ConverseStreamCommandOutput, ConverseStreamOutput } from '@aws-sdk/client-bedrock-runtime';
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
 import type { BaseMessage } from '@langchain/core/messages';
@@ -14,10 +17,12 @@ import type {
 } from '@/protection/providerText';
 import type { RuntimeProviderName, ChatModel, StreamEventData, EventHandler } from '@/types';
 import { ProviderTextAttempt, ProviderTextProtectionError } from '@/protection/providerText';
+import { withProviderTextBoundary } from '@/llm/providerTextBoundary';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import fixtures from '@/protection/__tests__/fixtures/a1.json';
 import { registerProvider } from '@/provider-registration';
 import { CustomChatBedrockConverse } from '@/llm/bedrock';
+import { AgentContext } from '@/agents/AgentContext';
 import { CustomAnthropic } from '@/llm/anthropic';
 import { ChatModelStreamHandler } from '@/stream';
 import { GraphEvents, Providers } from '@/common';
@@ -703,4 +708,99 @@ it('releases a failed synchronous transport creation lease before a fresh attemp
   const protection = policy({ maxAttemptBytes: 1024, maxBufferedBytes: 1024 });
   await expect(invoke(model, protection)).rejects.toThrow('Transport creation failed');
   expect((await invoke(new Transport([new AIMessageChunk('Control')]), protection)).messages?.[0].content).toBe('Control');
+});
+
+it('rejects a multi-provider sequence before either producer or native callback starts', async () => {
+  const first = new Transport([new AIMessageChunk(fixtures.canaries[0])]);
+  const second = new Transport([new AIMessageChunk('Final control')]);
+  const observed: string[] = [];
+  const observer = BaseCallbackHandler.fromMethods({ handleLLMNewToken: (token): void => { observed.push(token); } });
+  observer.awaitHandlers = true;
+  const sequence = first.pipe(new StringOutputParser()).pipe(second);
+  await expect(invoke(sequence, policy(), [observer])).rejects.toMatchObject({ code: 'unsupported' });
+  expect(first.calls).toBe(0);
+  expect(second.calls).toBe(0);
+  expect(observed).toEqual([]);
+});
+
+it('rejects opaque prefix callbacks that could run an unchecked producer', async () => {
+  let started = false;
+  const prefix = RunnableLambda.from(async () => { started = true; return 'unchecked'; });
+  await expect(invoke(prefix.pipe(new Transport([new AIMessageChunk('Control')])), policy())).rejects.toMatchObject({ code: 'unsupported' });
+  expect(started).toBe(false);
+});
+
+it.each(['anthropic', 'openai'])('rejects %s internally streaming invoke before producer allocation', async (provider) => {
+  let requests = 0;
+  const fetch = async (): Promise<Response> => { requests++; throw new Error('Producer must not start'); };
+  const model = provider === 'anthropic'
+    ? new CustomAnthropic({ anthropicApiKey: 'synthetic-test-key', model: 'claude-test', disableStreaming: true, streaming: true, maxRetries: 0, clientOptions: { fetch } })
+    : new ChatOpenAI({ apiKey: 'synthetic-test-key', model: 'synthetic-model', disableStreaming: true, streaming: true, maxRetries: 0, configuration: { apiKey: 'synthetic-test-key', fetch } });
+  model.disableStreaming = true;
+  model.streaming = true;
+  const protection = policy({ maxAttemptBytes: 512, maxBufferedBytes: 512 });
+  await expect(invoke(model, protection)).rejects.toMatchObject({ code: 'unsupported' });
+  expect(requests).toBe(0);
+  const attempts = await Promise.allSettled([invoke(model, protection), invoke(model, protection)]);
+  expect(attempts.map((attempt) => attempt.status)).toEqual(['rejected', 'rejected']);
+  expect(requests).toBe(0);
+});
+
+it('preserves validated native Anthropic nonstreaming lifecycle metadata before release', async () => {
+  const response = { id: 'msg-nonstream-control', type: 'message', role: 'assistant', model: 'claude-test', content: [{ type: 'text', text: fixtures.canaries[0] }], stop_reason: 'end_turn', stop_sequence: null, usage: { input_tokens: 10, output_tokens: 5 } };
+  const model = new CustomAnthropic({ anthropicApiKey: 'synthetic-test-key', model: 'claude-test', disableStreaming: true, streaming: false, clientOptions: { fetch: async () => new Response(JSON.stringify(response), { headers: { 'content-type': 'application/json' } }) } });
+  const observed: string[] = [];
+  const observer = BaseCallbackHandler.fromMethods({ handleLLMEnd: (output): void => { observed.push(JSON.stringify(output)); } });
+  observer.awaitHandlers = true;
+  model.disableStreaming = true;
+  const result = await invoke(model, policy({ inspect: ({ content }) => { expect(content).toBe(fixtures.canaries[0]); return approved('Native control'); } }), [observer]);
+  const message = result.messages?.[0] as AIMessageChunk;
+  expect(message.content).toBe('Native control');
+  expect(message.id).toBe('msg-nonstream-control');
+  expect(message.response_metadata).toMatchObject({ id: 'msg-nonstream-control', model: 'claude-test', stop_reason: 'end_turn', stop_sequence: null, usage: { input_tokens: 10, output_tokens: 5 } });
+  expect(message.usage_metadata).toMatchObject({ input_tokens: 10, output_tokens: 5, total_tokens: 15 });
+  expect(observed.join('')).toContain('Native control');
+  for (const canary of fixtures.canaries) expect(observed.join('')).not.toContain(canary);
+});
+
+it('rejects OpenAI internal streaming delegates even when the facade streaming flag is false', async () => {
+  let requests = 0;
+  const model = new ChatOpenAI({ apiKey: 'synthetic-test-key', model: 'synthetic-model', streaming: false, maxRetries: 0, configuration: { apiKey: 'synthetic-test-key', fetch: async () => { requests++; throw new Error('Producer must not start'); } } });
+  model.disableStreaming = true;
+  const delegate: unknown = Reflect.get(model, 'completions');
+  expect(delegate).toBeInstanceOf(BaseChatModel);
+  Object.defineProperty(delegate, 'streaming', { value: true });
+  await expect(invoke(model, policy())).rejects.toMatchObject({ code: 'unsupported' });
+  expect(requests).toBe(0);
+});
+
+it('rejects invoke selected without a streaming callback before internal aggregation', async () => {
+  let requests = 0;
+  const model = new CustomAnthropic({ anthropicApiKey: 'synthetic-test-key', model: 'claude-test', streaming: true, maxRetries: 0, clientOptions: { fetch: async () => { requests++; throw new Error('Producer must not start'); } } });
+  const protectedModel = withProviderTextBoundary(model, policy());
+  await expect(protectedModel.invoke([new HumanMessage('control')])).rejects.toMatchObject({ code: 'unsupported' });
+  expect(requests).toBe(0);
+});
+
+it('rejects mutated bindings and callback config factories before any producer starts', async () => {
+  const model = new Transport([new AIMessageChunk('Control')]);
+  const bound = model.withConfig({ runName: 'bound' });
+  Object.defineProperty(bound, 'stream', { value: model.stream.bind(model) });
+  await expect(invoke(bound, policy())).rejects.toMatchObject({ code: 'unsupported' });
+  let factoryStarted = false;
+  const factory = model.withListeners({ onStart: () => { factoryStarted = true; } });
+  await expect(invoke(factory, policy())).rejects.toMatchObject({ code: 'unsupported' });
+  expect(model.calls).toBe(0);
+  expect(factoryStarted).toBe(false);
+});
+
+it.each(['function', 'prototype'])('rejects a modified SDK instruction prefix (%s)', async (mutation) => {
+  const context = AgentContext.fromConfig({ agentId: 'control', provider: Providers.OPENAI, instructions: 'Allowed instructions.' });
+  const prefix = context.systemRunnable;
+  if (!(prefix instanceof RunnableBinding)) throw new Error('Expected SDK instruction binding');
+  if (mutation === 'function') Object.defineProperty(prefix.bound, 'func', { value: async () => 'Unchecked prefix' });
+  else Object.setPrototypeOf(prefix.bound, Object.create(Object.getPrototypeOf(prefix.bound)));
+  const model = new Transport([new AIMessageChunk('Control')]);
+  await expect(invoke(prefix.pipe(model), policy())).rejects.toMatchObject({ code: 'unsupported' });
+  expect(model.calls).toBe(0);
 });

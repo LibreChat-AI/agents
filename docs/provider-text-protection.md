@@ -32,8 +32,10 @@ Policy failures are terminal, not fallback triggers. Late decisions cannot relea
 
 ## Ordering and supported surface
 
-The boundary clones standard LangChain binding/sequence shells and intercepts the underlying
-`BaseChatModel` generation methods. Provider prose callbacks are withheld until canonical release. Completed waits remove their
+The boundary clones standard LangChain shells and intercepts `BaseChatModel` generation methods.
+Sequences admit only SDK-created, unchanged instruction transforms before one terminal provider.
+Multiple-provider sequences, arbitrary prefix callbacks, custom shell overrides and binding
+configuration factories fail before any producer starts. Provider prose callbacks are withheld until canonical release. Completed waits remove their
 cancellation listeners; every chunk, including empty/control chunks, consumes bounded overhead.
 The gate runs **before** LangChain's native aggregation/end callbacks, `attemptInvoke` aggregation,
 `ChatModelStreamHandler`, run state and subsequent model/tool reuse. Shared providers are not mutated.
@@ -44,7 +46,10 @@ lifecycle fields, Bedrock block indices/seals and official OpenAI tool-adapter c
 validated and preserved; unknown aliases still fail closed. Unknown content
 blocks, additional-output aliases, cached models, multiple prose block indices and custom runnable
 shells fail `unsupported`. Non-streaming responses are inspected before native callbacks/state;
-transport response allocation itself is provider-owned, not an SDK gate buffer.
+transport response allocation itself is provider-owned, not an SDK gate buffer. Native nonstreaming
+lifecycle/usage metadata is validated without rewriting. Invoke configured to aggregate internal
+streaming, including OpenAI delegates, fails `unsupported` before production; use the guarded
+stream path or native nonstreaming instead.
 
 Native event-stream overrides use the protected chunk bridge. Direct provider use outside
 `attemptInvoke` is **not** protected by this run-level contract. Summaries, titles, tool results,
@@ -68,7 +73,6 @@ trace sinks remain D1's independent responsibility. Runtime release is not trace
 ## Release prerequisite
 
 B2 requires an approved SDK release containing this PR, a check of exported
-`PROVIDER_TEXT_PROTECTION_VERSION === 1`,
-a pin to that release, and its own classification/policy adapter. Old SDK + required consumer and
+`PROVIDER_TEXT_PROTECTION_VERSION === 1`, a pin to that release, and its own classification/policy adapter. Old SDK + required consumer and
 required SDK + uncertified consumer must stay gated. No version bump, npm publication or app/YAML
 activation is included. Drain protected attempts before rollback; never retry them without policy.

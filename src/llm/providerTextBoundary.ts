@@ -16,6 +16,7 @@ import {
   ProviderTextAttempt,
   ProviderTextProtectionError,
 } from '@/protection/providerText';
+import { isProviderTextInput } from '@/protection/providerTextInput';
 import { getChatModelClass } from '@/llm/providers';
 import { Providers } from '@/common';
 
@@ -40,6 +41,7 @@ const additionalControls: Readonly<Partial<Record<string, (value: unknown) => bo
   model: (value) => typeof value === 'string',
   stop_reason: (value) => value == null || typeof value === 'string',
   stop_sequence: (value) => value == null || typeof value === 'string',
+  usage: (value) => numericMetadata(value),
 };
 
 const controlBlocks = new Set([
@@ -90,7 +92,9 @@ function validateMetadata(metadata: AIMessageChunk['response_metadata']): void {
   for (const key of Object.keys(metadata)) {
     const value: unknown = metadata[key];
     let valid: boolean;
-    if (key === 'contentBlockIndex') {
+    if (additionalControls[key] != null) {
+      valid = additionalControls[key](value);
+    } else if (key === 'contentBlockIndex') {
       valid = typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
     } else if (key === STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY) {
       valid = getStreamedToolCallAdapter(metadata) != null;
@@ -102,7 +106,7 @@ function validateMetadata(metadata: AIMessageChunk['response_metadata']): void {
       valid = hasKeys(value, ['stopReason']) && typeof value.stopReason === 'string';
     } else if (key === 'metadata') {
       valid = hasKeys(value, ['usage', 'metrics']) && numericMetadata(value);
-    } else if (key === 'usage' || key === 'tokenUsage') {
+    } else if (key === 'usage' || key === 'tokenUsage' || key === 'estimatedTokenUsage') {
       valid = numericMetadata(value);
     } else {
       valid = metadataKeys.has(key) && (value == null || typeof value === 'string' ||
@@ -194,6 +198,34 @@ function clone<T extends object>(value: T): T {
   ) as T;
 }
 
+function assertBindingShell(model: RunnableBinding<never, unknown>): void {
+  if (model.constructor !== RunnableBinding || (model.configFactories?.length ?? 0) > 0 ||
+      model.invoke !== RunnableBinding.prototype.invoke || model.batch !== RunnableBinding.prototype.batch ||
+      model.stream !== RunnableBinding.prototype.stream || model.transform !== RunnableBinding.prototype.transform ||
+      model._streamIterator !== RunnableBinding.prototype._streamIterator) {
+    throw new ProviderTextProtectionError('unsupported');
+  }
+}
+
+function assertInputStep(input: object): void {
+  if (isProviderTextInput(input)) return;
+  if (input instanceof RunnableBinding) {
+    assertBindingShell(input);
+    assertInputStep(input.bound);
+    return;
+  }
+  throw new ProviderTextProtectionError('unsupported');
+}
+
+function usesInternalStreaming(model: BaseChatModel): boolean {
+  if ('streaming' in model && model.streaming === true) return true;
+  for (const key of ['completions', 'responses'] as const) {
+    const delegate: unknown = Reflect.get(model, key);
+    if (delegate instanceof BaseChatModel && 'streaming' in delegate && delegate.streaming === true) return true;
+  }
+  return false;
+}
+
 /** Clone only known runnable shells. Never mutate a shared provider or its callback configuration. */
 export function withProviderTextBoundary(
   model: ChatModel,
@@ -201,15 +233,21 @@ export function withProviderTextBoundary(
 ): ChatModel {
   const protectedModel = clone(model);
   if (model instanceof RunnableBinding) {
-    if (model.constructor !== RunnableBinding) throw new ProviderTextProtectionError('unsupported');
+    assertBindingShell(model);
     Object.defineProperty(protectedModel, 'bound', {
       value: withProviderTextBoundary(model.bound as ChatModel, policy),
     });
     return protectedModel;
   }
   if (model instanceof RunnableSequence) {
-    if (model.constructor !== RunnableSequence) throw new ProviderTextProtectionError('unsupported');
+    if (model.constructor !== RunnableSequence ||
+        model.invoke !== RunnableSequence.prototype.invoke || model.batch !== RunnableSequence.prototype.batch ||
+        model.stream !== RunnableSequence.prototype.stream || model.transform !== RunnableSequence.prototype.transform ||
+        model._streamIterator !== RunnableSequence.prototype._streamIterator) {
+      throw new ProviderTextProtectionError('unsupported');
+    }
     const steps = model.steps;
+    for (let index = 0; index < steps.length - 1; index++) assertInputStep(steps[index]);
     Object.defineProperty(protectedModel, 'last', {
       value: withProviderTextBoundary(
         steps[steps.length - 1] as ChatModel,
@@ -232,6 +270,9 @@ export function withProviderTextBoundary(
     if (model.stream !== openAI.prototype.stream || model.invoke !== openAI.prototype.invoke) {
       throw new ProviderTextProtectionError('unsupported');
     }
+  }
+  if (model.disableStreaming && usesInternalStreaming(model)) {
+    throw new ProviderTextProtectionError('unsupported');
   }
   const protectedChat = clone(model);
   protectedChat._streamResponseChunks = async function* (
@@ -288,6 +329,7 @@ export function withProviderTextBoundary(
   protectedChat._streamChatModelEvents =
     BaseChatModel.prototype._streamChatModelEvents;
   protectedChat._generate = async function (messages, options): Promise<ChatResult> {
+    if (usesInternalStreaming(model)) throw new ProviderTextProtectionError('unsupported');
     const attempt = new ProviderTextAttempt(policy, options.signal);
     try {
       const result = await attempt.wait(
@@ -298,9 +340,7 @@ export function withProviderTextBoundary(
         )
       );
       attempt.check();
-      if (result.llmOutput != null && !numericMetadata(result.llmOutput)) {
-        throw new ProviderTextProtectionError('unsupported');
-      }
+      if (result.llmOutput != null) validateMetadata(result.llmOutput);
       if (result.generations.length !== 1)
         throw new ProviderTextProtectionError('unsupported');
       const generation = result.generations[0];
