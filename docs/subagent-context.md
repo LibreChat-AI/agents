@@ -52,3 +52,54 @@ inherited runtime hints or direct tool implementations from bypassing that
 workspace. Published files and any private artifact recovery remain the host's
 responsibility. The host must reconstruct its adapter and authorization when resuming. The SDK
 does not replay private artifacts to the host when restoring a checkpoint.
+
+## Startup diagnostics
+
+Pass `onSubagentResolutionFailure` to `Run.create` or a graph input. Direct
+`SubagentExecutor` callers use `onResolutionFailure`. Detached executors and
+nested child graphs inherit the callback.
+
+The synchronous callback receives:
+
+- A read-only diagnostic: `phase` (`identity` or `config`), `subagentType`,
+  `aborted`, a closed error `type`, and an SDK-owned `cause` and `message`.
+- Correlation IDs: `parentRunId`, `parentAgentId`, `parentToolCallId`, parent
+  `threadId`, `childRunId`, `childThreadId`, and detached `taskId` when available.
+- The original rejection as a **private second argument**. Use trusted error
+  classes or codes to classify it. Never log its message, name, stack, or body.
+
+Return one of `workspace_unavailable`, `agent_unavailable`, `model_unavailable`,
+`configuration_changed`, or `unknown`. The SDK builds the parent message from
+fixed text; arbitrary runtime return values also fall back to `unknown`.
+The input diagnostic starts with `cause: 'unknown'`. Log the mapped cause and
+`getSubagentResolutionFailureMessage(cause)` in the host callback:
+
+```ts
+onSubagentResolutionFailure: (detail, error) => {
+  const cause = classifyStartupError(error); // Host-owned class/code mapping.
+  logger.log(detail.aborted ? 'warn' : 'error', 'Subagent resolution failed', {
+    ...detail,
+    conversationId,
+    cause,
+    message: getSubagentResolutionFailureMessage(cause),
+  });
+  return cause;
+},
+```
+
+A callback returning nothing preserves the unknown fallback. If no callback is
+provided, or it throws, the SDK uses `console.warn` with only safe diagnostics.
+A callback failure never replaces the child failure.
+
+Direct executor results include `resolutionFailure: { phase, cause }`. Detached
+execution throws `SubagentResolutionError` with the same safe `phase`,
+`resolutionCause`, and fixed message. Hosts can recognize this class when
+mapping background failures instead of exposing arbitrary `Error.message`.
+The SDK does not infer host-specific workspace, agent-access, or provider
+failures from free text. Those mappings belong to the host.
+
+Graph replay preparation uses the same diagnostic boundary before invoking the
+subagent tool. Ordinary preparation failures return a safe error `ToolMessage`
+without starting child work. Framework interrupts and stream limits retain their
+control-flow semantics. Aborted preparation and settlement identity failures
+throw `SubagentResolutionError`; neither exposes the original rejection.

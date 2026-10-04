@@ -92,6 +92,12 @@ import type {
   PreemptBoundaryHookOutput,
   ToolApprovalReplaySnapshot,
 } from '@/hooks';
+import type {
+  SubagentResolutionPhase,
+  SubagentResolutionCause,
+  SubagentResolutionFailureHandler,
+} from './diagnostics';
+import type { RunBreakerScope } from '@/llm/streamLimits';
 import type { GraphFactory } from '@/graphs/graphFactory';
 import type { StandardGraph } from '@/graphs/Graph';
 import {
@@ -127,6 +133,10 @@ import {
   SUBAGENT_RECURSION_MULTIPLIER,
 } from './runtimeLimits';
 import {
+  logSubagentResolutionFailure,
+  SubagentResolutionError,
+} from './diagnostics';
+import {
   ContentTypes,
   Constants,
   GraphEvents,
@@ -141,7 +151,6 @@ import { stripRunStepResumeState } from '@/tools/runStepResume';
 import { seedAgentInitialSessions } from '@/utils/toolSessions';
 import { stableStringify } from '@/tools/eagerEventExecution';
 import { convertInjectedMessages } from '@/messages/injected';
-import { logSubagentResolutionFailure } from './diagnostics';
 import { resolveClientOptionsModel } from '@/llm/request';
 import { isBackgroundDenyMode } from '@/types/hitl';
 import { composeAbortSignals } from '@/utils/misc';
@@ -162,12 +171,18 @@ const MAX_QUEUED_SUBAGENT_UPDATES = 64;
 const MAX_BACKGROUND_SUBAGENT_SEALS = 32;
 const SUBAGENT_UPDATE_HANDLER_TIMEOUT_MS = 5_000;
 const TEXT_DELTA_CONTENT_TYPE = `${ContentTypes.TEXT}_delta`;
-const SUBAGENT_RESOLUTION_ERROR_MESSAGE =
-  'Subagent error: Unable to initialize the selected subagent.';
 const SUBAGENT_CONFIG_CHANGED_MESSAGE =
   'Subagent error: Subagent configuration changed since this execution was paused.';
 const SUBAGENT_INVOCATION_CHANGED_MESSAGE =
   'Subagent error: Subagent invocation changed for this execution.';
+
+function isSubagentResolutionControlFlow(error: unknown): boolean {
+  try {
+    return error instanceof StreamLimitExceededError || isGraphInterrupt(error);
+  } catch {
+    return false;
+  }
+}
 
 function seedChildGraphSessions(
   childGraph: StandardGraph,
@@ -867,6 +882,11 @@ export type SubagentExecuteParams = {
 export type SubagentExecuteResult = SubagentContextResult & {
   /** Tagged internal failure; foreground callers retain the legacy content. */
   error?: string;
+  /** Safe startup classification retained for detached host delivery. */
+  resolutionFailure?: {
+    phase: SubagentResolutionPhase;
+    cause: SubagentResolutionCause;
+  };
   /** Completed child work whose host projection must be retried without re-execution. */
   retryableDelivery?: true;
 };
@@ -986,6 +1006,8 @@ export type SubagentExecutorOptions = {
   /** Host-owned process-local task namespace for detached execution. */
   taskConfig?: SubagentTaskConfig;
   subagentContext?: SubagentContextAdapter;
+  /** Host diagnostic sink and safe cause classifier for startup failures. */
+  onResolutionFailure?: SubagentResolutionFailureHandler;
 };
 
 type DurableExecutionRecord = SubagentExecutionRecord<
@@ -1024,6 +1046,7 @@ export class SubagentExecutor {
   private readonly usageSink?: SubagentUsageSink;
   private readonly taskConfig?: SubagentTaskConfig;
   private readonly subagentContext?: SubagentContextAdapter;
+  private readonly onResolutionFailure?: SubagentResolutionFailureHandler;
   private readonly executions: SubagentExecutionRegistry<
     SubagentExecuteResult,
     ResolvedSubagentConfig,
@@ -1069,6 +1092,7 @@ export class SubagentExecutor {
     this.usageSink = options.usageSink;
     this.taskConfig = options.taskConfig;
     this.subagentContext = options.subagentContext;
+    this.onResolutionFailure = options.onResolutionFailure;
     const rawRegistry = options.parentHandlerRegistry;
     if (typeof rawRegistry === 'function') {
       this.resolveParentHandlerRegistry = rawRegistry;
@@ -1318,6 +1342,7 @@ export class SubagentExecutor {
       tokenCounter: this.tokenCounter,
       usageSink: this.usageSink,
       subagentContext: this.subagentContext,
+      onResolutionFailure: this.onResolutionFailure,
       streamLimits: this.streamLimits,
       humanInTheLoop:
         this.humanInTheLoop?.enabled === true ||
@@ -1369,6 +1394,12 @@ export class SubagentExecutor {
         result = await executeAttempt();
       }
       if (result.error != null) {
+        if (result.resolutionFailure != null) {
+          throw new SubagentResolutionError(
+            result.resolutionFailure.phase,
+            result.resolutionFailure.cause
+          );
+        }
         throw new Error(result.error);
       }
       if (this.humanInTheLoop?.enabled === true) {
@@ -1662,13 +1693,6 @@ export class SubagentExecutor {
         ),
       });
     }
-    const sourceCheckpoints =
-      await this.getLatestCheckpointSnapshot(baseChildThreadId);
-    if (sourceCheckpoints.length === 0) {
-      throw new Error(
-        `Cannot fork subagent checkpoint thread "${baseChildThreadId}" without a checkpoint ID.`
-      );
-    }
     const childRunId = persistedChildRunId ?? currentChildRunId;
     const identity = {
       childRunId,
@@ -1678,6 +1702,14 @@ export class SubagentExecutor {
         resumeAttemptId
       ),
     };
+    execution.recordIdentityAttempt(identity);
+    const sourceCheckpoints =
+      await this.getLatestCheckpointSnapshot(baseChildThreadId);
+    if (sourceCheckpoints.length === 0) {
+      throw new Error(
+        `Cannot fork subagent checkpoint thread "${baseChildThreadId}" without a checkpoint ID.`
+      );
+    }
     const lease = this.executions.beginIdentityPreparation(execution, identity);
     await this.prepareCheckpointFork(
       sourceCheckpoints,
@@ -2083,9 +2115,10 @@ export class SubagentExecutor {
     config: RunnableConfig
   ): Promise<SettledSubagentToolOutput | undefined> {
     const parentToolCallId = call.id;
+    const checkpointer = this.checkpointer;
     if (
       this.humanInTheLoop?.enabled !== true ||
-      this.checkpointer == null ||
+      checkpointer == null ||
       parentToolCallId == null ||
       parentToolCallId === ''
     ) {
@@ -2100,6 +2133,44 @@ export class SubagentExecutor {
       parentToolCallId,
       parentConfigurable,
     });
+    const signal = this.getReplaySignal(config);
+    try {
+      return await this.restoreSettledToolOutput(
+        call,
+        parentConfigurable,
+        parentToolCallId,
+        execution,
+        checkpointer
+      );
+    } catch (error) {
+      if (isSubagentResolutionControlFlow(error)) throw error;
+      const failure = this.createReplayResolutionError(
+        call,
+        config,
+        execution,
+        signal,
+        error
+      );
+      if (signal.aborted) throw failure;
+      return {
+        output: new ToolMessage({
+          content: failure.message,
+          name: call.name,
+          tool_call_id: parentToolCallId,
+          status: 'error',
+        }),
+        additionalContexts: [],
+      };
+    }
+  }
+
+  private async restoreSettledToolOutput(
+    call: ToolCall,
+    parentConfigurable: Record<string, unknown> | undefined,
+    parentToolCallId: string,
+    execution: DurableExecutionRecord,
+    checkpointer: BaseCheckpointSaver
+  ): Promise<SettledSubagentToolOutput | undefined> {
     const { resumeExecution } = execution;
     const inProcessSettledOutput = execution.settledOutput;
     if (inProcessSettledOutput != null) {
@@ -2158,7 +2229,7 @@ export class SubagentExecutor {
     const { childThreadId } =
       await this.resolveChildExecutionIdentity(execution);
     if (marker == null) {
-      const checkpoint = await this.checkpointer.getTuple({
+      const checkpoint = await checkpointer.getTuple({
         configurable: { thread_id: childThreadId },
       });
       messages = getCheckpointMessages(
@@ -2310,8 +2381,20 @@ export class SubagentExecutor {
         },
         persistedOutput,
         async (): Promise<void> => {
-          const { childRunId, childThreadId } =
-            await this.resolveChildExecutionIdentity(execution);
+          let identity: SubagentExecutionIdentity;
+          try {
+            identity = await this.resolveChildExecutionIdentity(execution);
+          } catch (error) {
+            if (isSubagentResolutionControlFlow(error)) throw error;
+            throw this.createReplayResolutionError(
+              call,
+              config,
+              execution,
+              this.getReplaySignal(config),
+              error
+            );
+          }
+          const { childRunId, childThreadId } = identity;
           const activeChildRun = execution.activeRun;
           if (activeChildRun != null) {
             await this.persistChildCheckpointMarker(
@@ -2457,6 +2540,90 @@ export class SubagentExecutor {
     }
   }
 
+  private getReplaySignal(config: RunnableConfig): AbortSignal {
+    const scope = config.configurable?.[RUN_BREAKER_SCOPE_CONFIG_KEY] as
+      | RunBreakerScope
+      | undefined;
+    return this.composeChildSignal(
+      scope?.controller ?? this.resolveBreakerController(),
+      config.signal
+    );
+  }
+
+  private createReplayResolutionError(
+    call: ToolCall,
+    config: RunnableConfig,
+    execution: DurableExecutionRecord,
+    signal: AbortSignal,
+    error: unknown
+  ): SubagentResolutionError {
+    const selectedType =
+      execution.binding?.subagentType ??
+      execution.resumeExecution?.subagentType ??
+      getSubagentType(call);
+    const threadId = config.configurable?.thread_id;
+    const failure = this.createResolutionFailure(
+      'identity',
+      {
+        subagentType:
+          selectedType == null
+            ? 'unknown'
+            : (this.configs.get(selectedType)?.type ?? 'unknown'),
+        description: DEFAULT_SUBAGENT_DESCRIPTION,
+        parentToolCallId: call.id,
+        threadId: typeof threadId === 'string' ? threadId : undefined,
+      },
+      execution,
+      signal,
+      error
+    );
+    return new SubagentResolutionError(
+      'identity',
+      failure.resolutionFailure?.cause ?? 'unknown'
+    );
+  }
+
+  private createResolutionFailure(
+    phase: SubagentResolutionPhase,
+    params: SubagentExecuteParams,
+    execution: DurableExecutionRecord,
+    signal: AbortSignal,
+    error: unknown
+  ): SubagentExecuteResult {
+    const identity = execution.identity ?? execution.attemptedIdentity;
+    const resumeExecution =
+      this.humanInTheLoop?.enabled === true && this.checkpointer != null
+        ? execution.resumeExecution
+        : undefined;
+    const detail = logSubagentResolutionFailure(
+      phase,
+      params.subagentType,
+      signal,
+      error,
+      {
+        parentRunId: this.parentRunId,
+        parentAgentId: this.parentAgentId,
+        parentToolCallId: params.parentToolCallId,
+        threadId: params.threadId,
+        childRunId:
+          identity?.childRunId ??
+          resumeExecution?.childRunId ??
+          execution.address.currentChildRunId,
+        childThreadId:
+          identity?.childThreadId ??
+          (resumeExecution == null
+            ? execution.address.baseChildThreadId
+            : execution.address.branchChildThreadId),
+        taskId: params.taskRuntime?.taskId,
+      },
+      this.onResolutionFailure
+    );
+    return {
+      ...createSubagentFailure(detail.message),
+      resolutionFailure: { phase, cause: detail.cause },
+    };
+  }
+
   private async executeOnce(
     params: SubagentExecuteParams,
     execution: DurableExecutionRecord,
@@ -2490,16 +2657,16 @@ export class SubagentExecutor {
       identity = await this.resolveChildExecutionIdentity(execution);
       execution.assertUsable(childSignal);
     } catch (error) {
-      if (error instanceof StreamLimitExceededError) {
+      if (isSubagentResolutionControlFlow(error)) {
         throw error;
       }
-      logSubagentResolutionFailure(
+      return this.createResolutionFailure(
         'identity',
-        executableConfig.type,
+        params,
+        execution,
         childSignal,
         error
       );
-      return createSubagentFailure(SUBAGENT_RESOLUTION_ERROR_MESSAGE);
     }
     const { childRunId, childThreadId, approvalExecutionScope } = identity;
     const bound = this.bindExecutionDefinition(
@@ -2526,16 +2693,16 @@ export class SubagentExecutor {
       });
       execution.assertUsable(childSignal);
     } catch (error) {
-      if (error instanceof StreamLimitExceededError) {
+      if (isSubagentResolutionControlFlow(error)) {
         throw error;
       }
-      logSubagentResolutionFailure(
+      return this.createResolutionFailure(
         'config',
-        executableConfig.type,
+        params,
+        execution,
         childSignal,
         error
       );
-      return createSubagentFailure(SUBAGENT_RESOLUTION_ERROR_MESSAGE);
     }
 
     const parentRegistry = this.getParentHandlerRegistry();
@@ -2667,6 +2834,7 @@ export class SubagentExecutor {
       subagentScope: true,
       subagentExecutionContext: childExecutionContext,
       subagentContext: this.subagentContext,
+      onSubagentResolutionFailure: this.onResolutionFailure,
       ...(resumeExecution?.graphState.fadingTier == null
         ? {}
         : { fadingTier: resumeExecution.graphState.fadingTier }),

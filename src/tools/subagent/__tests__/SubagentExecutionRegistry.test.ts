@@ -163,6 +163,90 @@ describe('SubagentExecutionRegistry', () => {
     expect(resolveStale).toHaveBeenCalledTimes(1);
   });
 
+  it('retains failed identity attempts without committing or persisting them', async () => {
+    const registry = createRegistry();
+    const record = registry.open(createInput());
+    const identity = {
+      childRunId: 'attempted-run',
+      childThreadId: 'attempted-thread',
+      approvalExecutionScope: 'attempted-scope',
+    };
+    const failure = new Error('Preparation failed');
+    await expect(
+      record.resolveIdentity(async () => {
+        const lease = registry.beginIdentityPreparation(record, identity);
+        expect(record.identity).toBeUndefined();
+        expect(record.attemptedIdentity).toEqual(identity);
+        return lease.rollback(failure);
+      })
+    ).rejects.toBe(failure);
+
+    expect(record.identity).toBeUndefined();
+    expect(record.attemptedIdentity).toEqual(identity);
+    expect(Object.isFrozen(record.attemptedIdentity)).toBe(true);
+    const attemptedIdentity = record.attemptedIdentity;
+    record.recordIdentityAttempt({ ...identity });
+    expect(record.attemptedIdentity).toBe(attemptedIdentity);
+    expect(record.snapshot).not.toHaveProperty('identity');
+    expect(record.snapshot).not.toHaveProperty('attemptedIdentity');
+    expect(registry.selectForResume()).toEqual([]);
+
+    await expect(
+      record.resolveIdentity(async () => {
+        expect(record.attemptedIdentity).toBeUndefined();
+        throw failure;
+      })
+    ).rejects.toBe(failure);
+    expect(record.attemptedIdentity).toBeUndefined();
+
+    const nextIdentity = { ...identity, childRunId: 'retry-run' };
+    await expect(
+      record.resolveIdentity(async () => ({
+        identity: nextIdentity,
+        lease: registry.beginIdentityPreparation(record, nextIdentity),
+      }))
+    ).resolves.toEqual(nextIdentity);
+    expect(record.identity).toEqual(nextIdentity);
+    expect(record.attemptedIdentity).toEqual(nextIdentity);
+  });
+
+  it('retains an invalidated attempt for its pending failure without leaking to a replacement record', async () => {
+    const registry = createRegistry();
+    const record = registry.open(createInput());
+    const identity = {
+      childRunId: 'stale-run',
+      childThreadId: 'stale-thread',
+      approvalExecutionScope: 'stale-scope',
+    };
+    let started = (): void => undefined;
+    let finish = (): void => undefined;
+    const preparationStarted = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    const pending = record.resolveIdentity(async () => {
+      const lease = registry.beginIdentityPreparation(record, identity);
+      started();
+      await gate;
+      return { identity, lease };
+    });
+    await preparationStarted;
+    registry.clear();
+    const replacement = registry.open(createInput());
+    expect(record.identity).toBeUndefined();
+    expect(record.attemptedIdentity).toEqual(identity);
+    expect(replacement.attemptedIdentity).toBeUndefined();
+    finish();
+    await expect(pending).rejects.toBeInstanceOf(
+      SubagentExecutionInvalidatedError
+    );
+    expect(record.identity).toBeUndefined();
+    expect(record.attemptedIdentity).toEqual(identity);
+    expect(replacement.identity).toBeUndefined();
+  });
+
   it('coalesces identity resolution before binding the resolved identity', async () => {
     const registry = createRegistry();
     const record = registry.open(createInput());

@@ -1369,6 +1369,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   /** See {@link t.StandardGraphInput.subagentExecutionContext}. */
   readonly subagentExecutionContext?: t.SubagentExecutionContext;
   private readonly subagentContext?: t.SubagentContextAdapter;
+  private readonly onSubagentResolutionFailure?: t.StandardGraphInput['onSubagentResolutionFailure'];
   /** See {@link t.StandardGraphInput.preemption}. */
   preemption?: t.StreamPreemption;
   /**
@@ -1547,6 +1548,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       subagentScope,
       subagentExecutionContext,
       subagentContext,
+      onSubagentResolutionFailure,
       preemption,
       streamLimits,
       toolExecution,
@@ -1575,6 +1577,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     this.subagentScope = subagentScope === true;
     this.subagentExecutionContext = subagentExecutionContext;
     this.subagentContext = subagentContext;
+    this.onSubagentResolutionFailure = onSubagentResolutionFailure;
     this.preemption = preemption;
     this.streamLimits = resolveStreamLimits(streamLimits);
     this.toolExecution = toolExecution;
@@ -5342,6 +5345,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           usageSink: this.subagentUsageSink,
           taskConfig: this.subagentTasks,
           subagentContext: this.subagentContext,
+          onResolutionFailure: this.onSubagentResolutionFailure,
           streamLimits: this.streamLimits,
           humanInTheLoop: this.humanInTheLoop,
           checkpointer: this.compileOptions?.checkpointer,

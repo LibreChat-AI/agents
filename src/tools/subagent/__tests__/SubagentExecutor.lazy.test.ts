@@ -228,12 +228,12 @@ describe('SubagentExecutor lazy selected-subagent resolution', () => {
     expect(warn).toHaveBeenCalledTimes(1);
     expect(warn).toHaveBeenCalledWith(
       '[SubagentExecutor] Subagent resolution failed',
-      {
+      expect.objectContaining({
         phase: 'config',
         subagentType: 'failing',
         aborted: false,
         type: 'Error',
-      }
+      })
     );
     expect(JSON.stringify(warn.mock.calls)).not.toContain('oauth-token');
     warn.mockRestore();

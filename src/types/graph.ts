@@ -44,6 +44,7 @@ import type {
   StreamPreemption,
   TokenBudgetBreakdown,
 } from '@/types/run';
+import type { SubagentResolutionFailureHandler } from '@/tools/subagent/diagnostics';
 import type { SubagentTaskConfig } from '@/types/subagentTasks';
 import type { StandardGraph, MultiAgentGraph } from '@/graphs';
 import type { ProviderClientOptionsConfig } from '@/types/llm';
@@ -441,6 +442,8 @@ export type StandardGraphInput = {
   subagentTasks?: SubagentTaskConfig;
   /** Host-owned context and result projection for each isolated child execution. */
   subagentContext?: SubagentContextAdapter;
+  /** Receives private startup errors; returns only an SDK-owned public cause. */
+  onSubagentResolutionFailure?: SubagentResolutionFailureHandler;
   /**
    * True when this graph IS a subagent child run (set by `SubagentExecutor`
    * when it constructs the child graph). Drives the hook-input `agentId`
