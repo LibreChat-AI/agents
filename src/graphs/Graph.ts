@@ -1429,25 +1429,27 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    * attempt lease; spans resets on purpose. */
   activeStreamLimitGenerations?: Set<string>;
 
-  /** The stream-limit error behind an already-fired breaker, whether this
+  /** The safety error behind an already-fired breaker, whether this
    * graph's own controller tripped or a parent run's breaker arrived through
    * the composed constructor signal (child graphs own separate controllers).
    * Providers can translate either abort into a generic error, and recovery
    * paths must not run in that state. */
   protected resolveTrippedBreakerReason(
     breakerSignal: AbortSignal = this.breakerAbort.signal
-  ): StreamLimitExceededError | PreparedSubagentError | undefined {
+  ): StreamLimitExceededError | PreparedSubagentError | ProviderTextProtectionError | undefined {
     if (
       breakerSignal.aborted &&
       (breakerSignal.reason instanceof StreamLimitExceededError ||
-        breakerSignal.reason instanceof PreparedSubagentError)
+        breakerSignal.reason instanceof PreparedSubagentError ||
+        breakerSignal.reason instanceof ProviderTextProtectionError)
     ) {
       return breakerSignal.reason;
     }
     if (
       this.signal?.aborted === true &&
       (this.signal.reason instanceof StreamLimitExceededError ||
-        this.signal.reason instanceof PreparedSubagentError)
+        this.signal.reason instanceof PreparedSubagentError ||
+        this.signal.reason instanceof ProviderTextProtectionError)
     ) {
       return this.signal.reason;
     }

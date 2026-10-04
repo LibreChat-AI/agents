@@ -58,6 +58,7 @@ import {
 import { createToolCallsDispatchedEvent, safeDispatchCustomEvent } from '@/utils/events';
 import { resolveToolOutcome, outcomeFieldsFromResult } from '@/tools/intentArg';
 import { snapshotValidatedModelChunk } from '@/graphs/acceptedModelResponse';
+import { ProviderTextProtectionError } from '@/protection/providerText';
 import { TOOL_OUTPUT_REF_PATTERN } from '@/tools/toolOutputReferences';
 import { formatToolErrorContent } from '@/tools/toolErrorContent';
 import { PreparedSubagentError } from '@/tools/preparedSubagents';
@@ -1699,7 +1700,8 @@ export class ChatModelStreamHandler implements t.EventHandler {
         eventBreaker != null &&
         eventBreaker.signal.aborted &&
         (eventBreaker.signal.reason instanceof StreamLimitExceededError ||
-          eventBreaker.signal.reason instanceof PreparedSubagentError)
+          eventBreaker.signal.reason instanceof PreparedSubagentError ||
+          eventBreaker.signal.reason instanceof ProviderTextProtectionError)
       ) {
         throw eventBreaker.signal.reason;
       }
@@ -1797,6 +1799,8 @@ export class ChatModelStreamHandler implements t.EventHandler {
       metadata,
       agentContext,
     });
+    if (runScopeInvalidated()) return;
+    throwIfRunBreakerTripped();
     if (skipHandling) {
       return;
     }
@@ -1831,6 +1835,8 @@ export class ChatModelStreamHandler implements t.EventHandler {
         content,
         metadata,
       });
+      if (runScopeInvalidated()) return;
+      throwIfRunBreakerTripped();
     }
 
     if (

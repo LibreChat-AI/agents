@@ -1107,7 +1107,8 @@ async function attemptInvokeBody(
       if (
         signal?.aborted === true &&
         (signal.reason instanceof StreamLimitExceededError ||
-          signal.reason instanceof PreparedSubagentError)
+          signal.reason instanceof PreparedSubagentError ||
+          signal.reason instanceof ProviderTextProtectionError)
       ) {
         throw signal.reason;
       }
@@ -1356,6 +1357,7 @@ async function attemptInvokeBody(
         restartRoute === 'aborted' &&
         !(error instanceof StreamLimitExceededError) &&
         !(error instanceof PreparedSubagentError) &&
+        !(error instanceof ProviderTextProtectionError) &&
         config.signal?.aborted !== true;
       if (!ownAbort) {
         throw error;
@@ -1711,7 +1713,8 @@ export async function tryFallbackProviders({
       if (
         config?.signal?.aborted === true &&
         (config.signal.reason instanceof StreamLimitExceededError ||
-          config.signal.reason instanceof PreparedSubagentError)
+          config.signal.reason instanceof PreparedSubagentError ||
+          config.signal.reason instanceof ProviderTextProtectionError)
       ) {
         throw config.signal.reason;
       }
@@ -1762,7 +1765,8 @@ export async function tryFallbackProviders({
       if (
         config?.signal?.aborted === true &&
         (config.signal.reason instanceof StreamLimitExceededError ||
-          config.signal.reason instanceof PreparedSubagentError)
+          config.signal.reason instanceof PreparedSubagentError ||
+          config.signal.reason instanceof ProviderTextProtectionError)
       ) {
         throw config.signal.reason;
       }

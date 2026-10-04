@@ -945,3 +945,58 @@ it('bounds admitted tool-index bookkeeping within a coalesced control event', as
   const tool_call_chunks = content.map((block) => ({ index: block.index, id: block.id, name: block.name, args: '' }));
   await expect(invoke(new Transport([new AIMessageChunk({ content, tool_call_chunks })]), policy({ maxAttemptBytes: 4096 }))).rejects.toMatchObject({ code: 'overflow' });
 });
+
+it('stops a real queued eager dispatcher after the protected producer rejects', async () => {
+  const publishing = deferred<void>();
+  const resumePublication = deferred<void>();
+  const inspected = deferred<void>();
+  const controller = new AbortController();
+  let toolDispatches = 0;
+  const lookup = new DynamicStructuredTool({ name: 'lookup', description: 'Allowed control.', schema: z.object({ count: z.number() }), func: async () => 'Tool control' });
+  const trip = new ProviderTextProtectionError('blocked');
+  const run = await Run.create({ runId: 'queued-protection-trip', graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, tools: [lookup] }, skipCleanup: true,
+    eagerEventToolExecution: { enabled: true }, providerTextProtection: policy({ inspect: async () => { await publishing.promise; inspected.resolve(); return { version: 1, ok: false, error: { code: 'blocked' } }; } }),
+    customHandlers: {
+      [GraphEvents.CHAT_MODEL_STREAM]: new ChatModelStreamHandler(),
+      [GraphEvents.ON_RUN_STEP]: { handle: async (_event, data): Promise<void> => {
+        if (JSON.stringify(data).includes('queued-lookup')) { publishing.resolve(); await resumePublication.promise; }
+      } },
+      [GraphEvents.ON_TOOL_EXECUTE]: { handle: (): void => { toolDispatches++; } },
+    },
+  });
+  const graph = run.Graph!;
+  const tripped = deferred<void>();
+  graph.overrideModel = new Transport([
+    new AIMessageChunk({ content: '', tool_calls: [{ id: 'queued-lookup', name: 'lookup', args: { count: 42 }, type: 'tool_call' }], response_metadata: { finish_reason: 'tool_calls' } }),
+    new AIMessageChunk(fixtures.canaries[0]),
+  ]);
+  const task = run.processStream({ messages: [new HumanMessage('control')] }, { signal: controller.signal, version: 'v2', configurable: { thread_id: 'queued-protection-trip' } });
+  const taskOutcome = task.catch((error: Error) => error);
+  graph.breakerAbort.signal.addEventListener('abort', () => tripped.resolve(), { once: true });
+  try {
+    await inspected.promise;
+    await tripped.promise;
+    expect(graph.breakerAbort.signal.reason).toMatchObject({ code: trip.code });
+    resumePublication.resolve();
+    const outcome = await taskOutcome;
+    expect(outcome).toBeInstanceOf(ProviderTextProtectionError);
+    expect(toolDispatches).toBe(0);
+    expect(JSON.stringify(graph.getRunMessages())).not.toContain(fixtures.canaries[0]);
+  } finally { resumePublication.resolve(); controller.abort(); await taskOutcome; }
+});
+
+it('does not enter a fallback producer when protection trips during request preparation', async () => {
+  const dispose = registerProvider({ provider: 'b1-fallback-breaker', model: FallbackTransport });
+  const producer = jest.spyOn(Transport.prototype, '_streamResponseChunks');
+  const controller = new AbortController();
+  const trip = new ProviderTextProtectionError('blocked');
+  try {
+    await expect(tryFallbackProviders({
+      fallbacks: [{ provider: 'b1-fallback-breaker' as RuntimeProviderName, clientOptions: {} }],
+      messages: [new HumanMessage('Allowed control')], primaryError: new Error('Primary transport failed'),
+      providerTextProtection: policy(), config: { signal: controller.signal },
+      prepareProviderMessages: async ({ messages }) => { controller.abort(trip); return messages; },
+    })).rejects.toBe(trip);
+    expect(producer).not.toHaveBeenCalled();
+  } finally { producer.mockRestore(); dispose(); }
+});

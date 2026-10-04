@@ -28,7 +28,9 @@ policy is rejected. Custom high-level model/stream overrides are not certified.
 Missing handlers, invalid versions/limits/results, deadline exhaustion, buffer overflow and
 Stop fail closed. Classification/handler errors become stable SDK error codes, never original
 exception details. No failed-attempt prefix is released. Retry/fallback has a fresh candidate.
-Policy failures are terminal, not fallback triggers. Late decisions cannot release cancelled text. A monotonic elapsed-time check enforces the
+Policy failures are terminal, not fallback triggers. Queued stream consumers and post-await
+eager-tool guards honor protection breaker trips before dispatch; child-entry and fallback
+admission cannot restart work after the trip. Late decisions cannot release cancelled text. A monotonic elapsed-time check enforces the
 deadline even when synchronous policy work prevents the abort timer from running.
 
 ## Ordering and supported surface
