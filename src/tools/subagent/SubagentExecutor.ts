@@ -2714,10 +2714,13 @@ export class SubagentExecutor {
             : execution.address.branchChildThreadId),
         taskId: params.taskRuntime?.taskId,
       },
-      this.onResolutionFailure
+      this.onResolutionFailure,
+      params.hostArgs
     );
     const hostArgument =
-      phase === 'config' ? getSubagentHostArgumentFailure(error) : undefined;
+      phase === 'config'
+        ? getSubagentHostArgumentFailure(error, params.hostArgs)
+        : undefined;
     if (hostArgument != null) {
       return {
         ...createSubagentFailure(

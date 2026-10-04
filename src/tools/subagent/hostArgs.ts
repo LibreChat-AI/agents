@@ -11,11 +11,14 @@ export const SUBAGENT_HOST_ARG_LIMITS = Object.freeze({
   argsPerSubagent: 8,
   distinctArgs: 16,
   enumValues: 64,
+  mergedEnumValues: 256,
   valueLength: 256,
   descriptionLength: 1024,
 });
 
 const HOST_ARG_NAME_PATTERN = /^[a-z][a-z0-9_]{0,63}$/;
+/** Advertises the runtime's no-control-character rule; fixed and linear-time. */
+const FREE_FORM_SCHEMA_PATTERN = '^[^\\u0000-\\u001f\\u007f]*$';
 const RESERVED_HOST_ARG_NAMES: ReadonlySet<string> = new Set([
   'intent',
   'description',
@@ -228,6 +231,11 @@ function mergeSpec(
       entry.values.push(value);
     }
   }
+  if (entry.values.length > SUBAGENT_HOST_ARG_LIMITS.mergedEnumValues) {
+    throw new Error(
+      `Subagent host argument "${name}" lists more than ${SUBAGENT_HOST_ARG_LIMITS.mergedEnumValues} distinct values across subagents.`
+    );
+  }
 }
 
 function toPropertySchema(entry: MergedHostArg): JsonSchemaType {
@@ -242,6 +250,7 @@ function toPropertySchema(entry: MergedHostArg): JsonSchemaType {
     type: 'string',
     description: entry.description,
     maxLength: entry.maxLength,
+    pattern: FREE_FORM_SCHEMA_PATTERN,
   };
 }
 

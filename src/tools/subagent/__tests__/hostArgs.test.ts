@@ -186,8 +186,14 @@ describe('subagent host argument declarations', () => {
       type: 'string',
       description: 'Linked worktree to use.',
       maxLength: 80,
+      pattern: '^[^\\u0000-\\u001f\\u007f]*$',
     });
-    expect(params.schema.properties?.worktree).not.toHaveProperty('pattern');
+    const advertised = new RegExp(
+      params.schema.properties?.worktree.pattern ?? '',
+      'u'
+    );
+    expect(advertised.test('.worktrees/fix-1')).toBe(true);
+    expect(advertised.test('.worktrees/a\nb')).toBe(false);
     expect(params.schema.required).toEqual(['description', 'subagent_type']);
     expect(params.description).toContain('OPTIONAL ARGUMENTS');
     expect(params.description).toContain(
@@ -263,6 +269,26 @@ describe('subagent host argument declarations', () => {
       hostArgs: hostArgs as LazySingleAgentSubagentConfig['hostArgs'],
     });
     expect(() => buildSubagentToolParams([config])).toThrow(message);
+  });
+
+  it('caps the enum merged across subagents', () => {
+    const configs = Array.from({ length: 5 }, (_, configIndex) =>
+      makeLazyConfig(`child_${configIndex}`, async () => makeAgent(), {
+        hostArgs: {
+          machine: {
+            description: 'Machine.',
+            enum: Array.from(
+              { length: SUBAGENT_HOST_ARG_LIMITS.enumValues },
+              (_, index) => `m${configIndex}_${index}`
+            ),
+          },
+        },
+      })
+    );
+    expect(() => buildSubagentToolParams(configs.slice(0, 4))).not.toThrow();
+    expect(() => buildSubagentToolParams(configs)).toThrow(
+      `more than ${SUBAGENT_HOST_ARG_LIMITS.mergedEnumValues} distinct values`
+    );
   });
 
   it('rejects more declarations than the per-subagent bound', () => {
@@ -709,10 +735,10 @@ describe('SubagentExecutor host arguments', () => {
     });
 
     expect(unavailable.content).toBe(
-      'Subagent error: The requested "machine" is unavailable right now. Omit "machine" to let the host choose, or pass another listed value.'
+      'Subagent error: The requested "machine" is unavailable right now. Omit "machine" to let the host choose, or pass a different value.'
     );
     expect(notAllowed.content).toBe(
-      'Subagent error: The requested "machine" is not allowed for this subagent. Omit "machine" to let the host choose, or pass another listed value.'
+      'Subagent error: The requested "machine" is not allowed for this subagent. Omit "machine" to let the host choose, or pass a different value.'
     );
     expect(unavailable.resolutionFailure).toEqual({
       phase: 'config',
@@ -727,6 +753,39 @@ describe('SubagentExecutor host arguments', () => {
       expect.any(SubagentHostArgumentError)
     );
     expect(unavailable.content).not.toContain('buildbox');
+  });
+
+  it('honors a refusal only for an argument this call supplied', async () => {
+    const config = makeLazyConfig(
+      'reviewer',
+      async () => {
+        throw new SubagentHostArgumentError('workspace', 'unavailable');
+      },
+      {
+        hostArgs: {
+          machine: MACHINE,
+          workspace: { description: 'Workspace.', enum: ['agents'] },
+        },
+      }
+    );
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const executor = createExecutor([config]);
+
+    const result = await executor.execute({
+      description: 'Review.',
+      subagentType: 'reviewer',
+      parentToolCallId: 'call_unsupplied_refusal',
+      hostArgs: { machine: 'laptop' },
+    });
+
+    expect(result.content).toBe(
+      'Subagent error: Unable to initialize the selected subagent.'
+    );
+    expect(result.resolutionFailure).toEqual({
+      phase: 'config',
+      cause: 'unknown',
+    });
+    warn.mockRestore();
   });
 
   it('does not let a refusal name a built-in argument', async () => {

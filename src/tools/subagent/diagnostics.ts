@@ -1,3 +1,4 @@
+import type { SubagentHostArgs } from '@/types/graph';
 import {
   SubagentSettlementBindingError,
   SubagentDefinitionBindingError,
@@ -56,7 +57,7 @@ const SUBAGENT_RESOLUTION_MESSAGES = {
   configuration_changed:
     'Subagent error: Subagent configuration changed. Start a new execution.',
   host_argument_rejected:
-    'Subagent error: A requested subagent argument is not available. Omit it to let the host choose, or pass another listed value.',
+    'Subagent error: A requested subagent argument is not available. Omit it to let the host choose, or pass a different value.',
   unknown: 'Subagent error: Unable to initialize the selected subagent.',
 } as const;
 
@@ -112,14 +113,22 @@ export function getSubagentResolutionFailureMessage(
 
 /** Returns a resolver's typed host-argument refusal when its name is safe to show. */
 export function getSubagentHostArgumentFailure(
-  error: unknown
+  error: unknown,
+  suppliedHostArgs: SubagentHostArgs | undefined
 ): SubagentHostArgumentFailure | undefined {
   try {
-    if (!(error instanceof SubagentHostArgumentError)) {
+    if (
+      !(error instanceof SubagentHostArgumentError) ||
+      suppliedHostArgs == null
+    ) {
       return undefined;
     }
     const { argument, rejection } = error;
-    if (typeof argument !== 'string' || !isSubagentHostArgName(argument)) {
+    if (
+      typeof argument !== 'string' ||
+      !isSubagentHostArgName(argument) ||
+      !Object.prototype.hasOwnProperty.call(suppliedHostArgs, argument)
+    ) {
       return undefined;
     }
     return {
@@ -136,7 +145,7 @@ export function getSubagentHostArgumentFailureMessage(
   failure: SubagentHostArgumentFailure
 ): string {
   const { argument } = failure;
-  const omit = `Omit "${argument}" to let the host choose, or pass another listed value.`;
+  const omit = `Omit "${argument}" to let the host choose, or pass a different value.`;
   return failure.rejection === 'unavailable'
     ? `Subagent error: The requested "${argument}" is unavailable right now. ${omit}`
     : `Subagent error: The requested "${argument}" is not allowed for this subagent. ${omit}`;
@@ -186,7 +195,8 @@ export function logSubagentResolutionFailure(
   signal: AbortSignal,
   error: unknown,
   context?: SubagentResolutionContext,
-  onResolutionFailure?: SubagentResolutionFailureHandler
+  onResolutionFailure?: SubagentResolutionFailureHandler,
+  suppliedHostArgs?: SubagentHostArgs
 ): SubagentResolutionDiagnostic {
   const detail: SubagentResolutionDiagnostic = {
     ...context,
@@ -197,7 +207,8 @@ export function logSubagentResolutionFailure(
     cause: 'unknown',
     message: SUBAGENT_RESOLUTION_MESSAGES.unknown,
   };
-  const hostArgumentRejected = getSubagentHostArgumentFailure(error) != null;
+  const hostArgumentRejected =
+    getSubagentHostArgumentFailure(error, suppliedHostArgs) != null;
   if (hostArgumentRejected) {
     detail.cause = 'host_argument_rejected';
     detail.message = SUBAGENT_RESOLUTION_MESSAGES.host_argument_rejected;

@@ -553,6 +553,7 @@ export type JsonSchemaType = {
   properties?: Record<string, JsonSchemaType>;
   required?: string[];
   description?: string;
+  pattern?: string;
   maxLength?: number;
   additionalProperties?: boolean | JsonSchemaType;
 };
