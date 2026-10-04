@@ -5,14 +5,13 @@ import {
   SubagentExecutionInvalidatedError,
 } from './SubagentExecutionRegistry';
 import { describeCodeApiError } from '@/tools/diagnostics';
+import { isSubagentHostArgName } from './hostArgs';
 
 /** Which step of child start-up failed: execution identity, then host config resolution. */
 export type SubagentResolutionPhase = 'identity' | 'config';
 
 /** Why a host resolver refused a declared host argument value. */
 export type SubagentHostArgumentRejection = 'unavailable' | 'not_allowed';
-
-const HOST_ARGUMENT_NAME_PATTERN = /^[a-z][a-z0-9_]{0,63}$/;
 
 /**
  * Thrown by a lazy resolver to refuse one declared host argument value. The
@@ -120,10 +119,7 @@ export function getSubagentHostArgumentFailure(
       return undefined;
     }
     const { argument, rejection } = error;
-    if (
-      typeof argument !== 'string' ||
-      !HOST_ARGUMENT_NAME_PATTERN.test(argument)
-    ) {
+    if (typeof argument !== 'string' || !isSubagentHostArgName(argument)) {
       return undefined;
     }
     return {

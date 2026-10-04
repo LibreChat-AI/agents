@@ -194,7 +194,7 @@ describe('subagent host argument declarations', () => {
       '- "reviewer" (reviewer worker): Handles reviewer tasks. [optional machine: laptop | buildbox; workspace: agents]'
     );
     expect(params.description).toContain(
-      '- "coder" (coder worker): Handles coder tasks. [optional machine: buildbox | gpu; worktree: text]'
+      '- "coder" (coder worker): Handles coder tasks. [optional machine: buildbox | gpu; worktree: any text up to 80 characters]'
     );
     expect(params.description).toContain(
       '- "researcher" (Researcher): Finds facts.\n'
@@ -231,6 +231,11 @@ describe('subagent host argument declarations', () => {
       'a control character',
       { machine: { description: 'Machine.', enum: ['a\nb'] } },
       'control characters',
+    ],
+    [
+      'a blank enum value, which input extraction would treat as omitted',
+      { machine: { description: 'Machine.', enum: ['a', '  '] } },
+      'non-blank',
     ],
     [
       'enum combined with maxLength',
@@ -337,6 +342,33 @@ describe('subagent host argument values', () => {
     expect(
       pickSubagentHostArgInput({ machine: 'laptop', other: 'x' }, names)
     ).toEqual({ ok: true, hostArgs: { machine: 'laptop' } });
+  });
+
+  it('ignores inherited properties when reading optional arguments', () => {
+    expect(
+      pickSubagentHostArgInput(
+        { description: 'x' },
+        new Set(['constructor', 'to_string', 'machine'])
+      )
+    ).toEqual({ ok: true });
+    expect(
+      pickSubagentHostArgInput(
+        Object.assign(Object.create({ machine: 'inherited' }) as object, {}),
+        names
+      )
+    ).toEqual({ ok: true });
+  });
+
+  it('counts free-form length in code points, as JSON Schema does', () => {
+    const emoji = makeLazyConfig('emoji', async () => makeAgent(), {
+      hostArgs: { label: { description: 'Label.', maxLength: 2 } },
+    });
+    expect(resolveSubagentHostArgs(emoji, { label: '😀😀' })).toMatchObject({
+      ok: true,
+    });
+    expect(resolveSubagentHostArgs(emoji, { label: '😀😀😀' })).toMatchObject({
+      ok: false,
+    });
   });
 
   it('accepts declared values and returns them frozen', () => {
@@ -695,6 +727,31 @@ describe('SubagentExecutor host arguments', () => {
       expect.any(SubagentHostArgumentError)
     );
     expect(unavailable.content).not.toContain('buildbox');
+  });
+
+  it('does not let a refusal name a built-in argument', async () => {
+    const config = makeLazyConfig(
+      'reviewer',
+      async () => {
+        throw new SubagentHostArgumentError('subagent_type', 'not_allowed');
+      },
+      { hostArgs: { machine: MACHINE } }
+    );
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const executor = createExecutor([config]);
+
+    const result = await executor.execute({
+      description: 'Review.',
+      subagentType: 'reviewer',
+      parentToolCallId: 'call_reserved_refusal',
+      hostArgs: { machine: 'laptop' },
+    });
+
+    expect(result.content).toBe(
+      'Subagent error: Unable to initialize the selected subagent.'
+    );
+    expect(result.resolutionFailure?.hostArgument).toBeUndefined();
+    warn.mockRestore();
   });
 
   describe('background execution', () => {

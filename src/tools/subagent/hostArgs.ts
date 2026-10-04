@@ -44,8 +44,18 @@ type MergedHostArg = {
   maxLength: number;
 };
 
-function isHostArgName(name: string): boolean {
+/** A name a host may declare: lowercase snake case, not a built-in subagent argument. */
+export function isSubagentHostArgName(name: string): boolean {
   return HOST_ARG_NAME_PATTERN.test(name) && !RESERVED_HOST_ARG_NAMES.has(name);
+}
+
+/** Length in Unicode code points, the unit JSON Schema `maxLength` counts. */
+function countCodePoints(value: string): number {
+  let count = 0;
+  for (const _ of value) {
+    count += 1;
+  }
+  return count;
 }
 
 function hasControlCharacter(value: string): boolean {
@@ -61,8 +71,8 @@ function hasControlCharacter(value: string): boolean {
 function isBoundedText(value: unknown, maxLength: number): value is string {
   return (
     typeof value === 'string' &&
-    value.length > 0 &&
-    value.length <= maxLength &&
+    value.trim().length > 0 &&
+    countCodePoints(value) <= maxLength &&
     !hasControlCharacter(value)
   );
 }
@@ -85,7 +95,7 @@ function validateEnum(label: string, values: readonly string[]): void {
   for (const value of values) {
     if (!isBoundedText(value, SUBAGENT_HOST_ARG_LIMITS.valueLength)) {
       throw new Error(
-        `${label} enum values must be non-empty strings of at most ${SUBAGENT_HOST_ARG_LIMITS.valueLength} characters without control characters.`
+        `${label} enum values must be non-blank strings of at most ${SUBAGENT_HOST_ARG_LIMITS.valueLength} characters without control characters.`
       );
     }
     if (seen.has(value)) {
@@ -114,7 +124,7 @@ function validateSpec(
   spec: SubagentHostArgSpec | undefined
 ): asserts spec is SubagentHostArgSpec {
   const label = `Subagent "${type}" host argument "${name}"`;
-  if (!isHostArgName(name)) {
+  if (!isSubagentHostArgName(name)) {
     throw new Error(
       `${label} must match ${HOST_ARG_NAME_PATTERN.source} and must not reuse a built-in subagent argument name.`
     );
@@ -212,7 +222,7 @@ function mergeSpec(
     return;
   }
   for (const value of spec.enum) {
-    entry.maxLength = Math.max(entry.maxLength, value.length);
+    entry.maxLength = Math.max(entry.maxLength, countCodePoints(value));
     if (!entry.seenValues.has(value)) {
       entry.seenValues.add(value);
       entry.values.push(value);
@@ -239,7 +249,11 @@ function summarizeSpecs(entries: readonly HostArgEntry[]): string {
   return entries
     .map(
       ([name, spec]) =>
-        `${name}: ${spec.enum == null ? 'text' : spec.enum.join(' | ')}`
+        `${name}: ${
+          spec.enum == null
+            ? `any text up to ${getFreeFormMaxLength(spec)} characters`
+            : spec.enum.join(' | ')
+        }`
     )
     .join('; ');
 }
@@ -295,6 +309,9 @@ export function pickSubagentHostArgInput(
   const picked: Record<string, string> = {};
   let count = 0;
   for (const name of names) {
+    if (!Object.prototype.hasOwnProperty.call(values, name)) {
+      continue;
+    }
     const value = values[name];
     if (value == null) {
       continue;
@@ -352,7 +369,7 @@ export function resolveSubagentHostArgs(
     if (spec == null) {
       return {
         ok: false,
-        message: isHostArgName(name)
+        message: isSubagentHostArgName(name)
           ? `Error: Subagent "${config.type}" does not accept "${name}". Omit it for this subagent type.`
           : `Error: Subagent "${config.type}" received an unsupported argument.`,
       };

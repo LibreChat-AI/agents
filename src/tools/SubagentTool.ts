@@ -35,7 +35,7 @@ const SUBAGENT_THREAD_PROP_DESCRIPTION =
   'Continue a host-owned child thread using a fresh execution lease. The saved thread must belong to this scope and subagent type. Only available with run_in_background.';
 
 const HOST_ARGS_DESCRIPTION =
-  '\n\nOPTIONAL ARGUMENTS:\n- Some types accept extra arguments, listed in brackets after the type. Each is optional: omit it to let the host choose, and pass only a value listed for the selected type.';
+  '\n\nOPTIONAL ARGUMENTS:\n- Some types accept extra arguments, listed in brackets after the type. Each is optional: omit it to let the host choose. Where values are listed, pass one listed for the selected type; where it says any text, pass a short value of your own.';
 
 export const SubagentToolSchema = {
   type: 'object',
