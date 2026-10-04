@@ -860,6 +860,7 @@ it('checks the effective per-invocation parameters before original generation', 
 it('still permits effective streaming through the guarded provider iterator', async () => {
   const frames = fixtures.cases[0].chunks.map((content, index) => ({ id: 'safe-stream-control', object: 'chat.completion.chunk', created: 1, model: 'synthetic-model', choices: [{ index: 0, delta: { content, ...(index === 0 ? { role: 'assistant' } : {}) }, finish_reason: null }] }));
   const model = new ChatOpenAI({ apiKey: 'synthetic-test-key', model: 'synthetic-model', streaming: false, modelKwargs: { stream: true }, streamUsage: false, _lc_stream_delay: 0, configuration: { apiKey: 'synthetic-test-key', fetch: async () => new Response(frames.map((frame) => `data: ${JSON.stringify(frame)}\n\n`).join('') + 'data: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } }) } });
+  model.disableStreaming = false;
   const result = await invoke(model, policy({ inspect: ({ content }) => { expect(content).toBe(fixtures.cases[0].chunks.join('')); return approved('Guarded control'); } }));
   expect(result.messages?.[0].content).toBe('Guarded control');
   expect(JSON.stringify(result)).not.toContain(fixtures.canaries[0]);
