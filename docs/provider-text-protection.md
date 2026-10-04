@@ -34,7 +34,7 @@ Policy failures are terminal, not fallback triggers. Late decisions cannot relea
 
 The boundary clones standard LangChain shells and intercepts `BaseChatModel` generation methods.
 Sequences admit only SDK-created, unchanged instruction transforms before one terminal provider.
-Multiple-provider sequences, arbitrary prefix callbacks, custom shell overrides and binding
+Multiple-provider sequences, arbitrary prefix callbacks, custom provider transforms/shell overrides and binding
 configuration factories fail before any producer starts. Provider prose callbacks are withheld until canonical release. Completed waits remove their
 cancellation listeners; every chunk, including empty/control chunks, consumes bounded overhead.
 The gate runs **before** LangChain's native aggregation/end callbacks, `attemptInvoke` aggregation,
@@ -48,7 +48,7 @@ blocks, additional-output aliases, cached models, multiple prose block indices a
 shells fail `unsupported`. Non-streaming responses are inspected before native callbacks/state;
 transport response allocation itself is provider-owned, not an SDK gate buffer. Native nonstreaming
 lifecycle/usage metadata is validated without rewriting. Invoke configured to aggregate internal
-streaming, including OpenAI delegates, fails `unsupported` before production; use the guarded
+streaming, including effective request parameters/model kwargs and OpenAI delegates, fails `unsupported` before production; use the guarded
 stream path or native nonstreaming instead.
 
 Native event-stream overrides use the protected chunk bridge. Direct provider use outside

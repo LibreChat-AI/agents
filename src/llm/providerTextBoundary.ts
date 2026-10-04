@@ -217,11 +217,26 @@ function assertInputStep(input: object): void {
   throw new ProviderTextProtectionError('unsupported');
 }
 
-function usesInternalStreaming(model: BaseChatModel): boolean {
+function hasStreamingInvocation(
+  model: BaseChatModel,
+  options?: BaseChatModel['ParsedCallOptions']
+): boolean {
   if ('streaming' in model && model.streaming === true) return true;
+  const params: unknown = model.invocationParams(options);
+  if (params == null || typeof params !== 'object' || Array.isArray(params)) {
+    throw new ProviderTextProtectionError('unsupported');
+  }
+  return 'stream' in params && params.stream != null && params.stream !== false;
+}
+
+function usesInternalStreaming(
+  model: BaseChatModel,
+  options?: BaseChatModel['ParsedCallOptions']
+): boolean {
+  if (hasStreamingInvocation(model, options)) return true;
   for (const key of ['completions', 'responses'] as const) {
     const delegate: unknown = Reflect.get(model, key);
-    if (delegate instanceof BaseChatModel && 'streaming' in delegate && delegate.streaming === true) return true;
+    if (delegate instanceof BaseChatModel && hasStreamingInvocation(delegate, options)) return true;
   }
   return false;
 }
@@ -259,7 +274,8 @@ export function withProviderTextBoundary(
   if (!(model instanceof BaseChatModel) || model.cache != null) {
     throw new ProviderTextProtectionError('unsupported');
   }
-  if (model._streamIterator !== BaseChatModel.prototype._streamIterator ||
+  if (model.transform !== BaseChatModel.prototype.transform ||
+      model._streamIterator !== BaseChatModel.prototype._streamIterator ||
       model.generate !== BaseChatModel.prototype.generate ||
       model.generatePrompt !== BaseChatModel.prototype.generatePrompt ||
       model._generateUncached !== BaseChatModel.prototype._generateUncached) {
@@ -329,7 +345,7 @@ export function withProviderTextBoundary(
   protectedChat._streamChatModelEvents =
     BaseChatModel.prototype._streamChatModelEvents;
   protectedChat._generate = async function (messages, options): Promise<ChatResult> {
-    if (usesInternalStreaming(model)) throw new ProviderTextProtectionError('unsupported');
+    if (usesInternalStreaming(model, options)) throw new ProviderTextProtectionError('unsupported');
     const attempt = new ProviderTextAttempt(policy, options.signal);
     try {
       const result = await attempt.wait(

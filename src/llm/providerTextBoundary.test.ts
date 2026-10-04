@@ -804,3 +804,63 @@ it.each(['function', 'prototype'])('rejects a modified SDK instruction prefix (%
   await expect(invoke(prefix.pipe(model), policy())).rejects.toMatchObject({ code: 'unsupported' });
   expect(model.calls).toBe(0);
 });
+
+it('rejects a terminal provider custom transform before Run publication or state', async () => {
+  const model = new Transport([new AIMessageChunk(fixtures.canaries[0])]);
+  let transformed = false;
+  model.transform = async function* () {
+    transformed = true;
+    yield new AIMessageChunk(fixtures.canaries[0]);
+  };
+  let inspected = false;
+  const events: string[] = [];
+  const run = await Run.create({
+    runId: 'b1-transform-admission',
+    graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, instructions: 'Allowed prefix.' },
+    providerTextProtection: policy({ inspect: () => { inspected = true; return { version: 1, ok: false, error: { code: 'blocked' } }; } }),
+    skipCleanup: true,
+    customHandlers: { [GraphEvents.ON_MESSAGE_DELTA]: { handle: (_event, data): void => { events.push(JSON.stringify(data)); } } },
+  });
+  run.Graph!.overrideModel = model;
+  await expect(run.processStream({ messages: [new HumanMessage('control')] }, { version: 'v2', configurable: { thread_id: 'b1-transform-admission' } })).rejects.toMatchObject({ code: 'unsupported' });
+  expect(transformed).toBe(false);
+  expect(model.calls).toBe(0);
+  expect(inspected).toBe(false);
+  expect(events.join('')).not.toContain(fixtures.canaries[0]);
+  expect(JSON.stringify(run.Graph?.getRunMessages())).not.toContain(fixtures.canaries[0]);
+});
+
+it.each([true, 'truthy'])('rejects OpenAI effective internal streaming from modelKwargs (%s)', async (stream) => {
+  let requests = 0;
+  const model = new ChatOpenAI({
+    apiKey: 'synthetic-test-key', model: 'synthetic-model', streaming: false, modelKwargs: { stream }, maxRetries: 0,
+    configuration: { apiKey: 'synthetic-test-key', fetch: async () => { requests++; throw new Error('Producer must not start'); } },
+  });
+  model.disableStreaming = true;
+  const protection = policy({ maxAttemptBytes: 512, maxBufferedBytes: 512 });
+  await expect(invoke(model, protection)).rejects.toMatchObject({ code: 'unsupported' });
+  expect(requests).toBe(0);
+  const attempts = await Promise.allSettled([invoke(model, protection), invoke(model, protection)]);
+  expect(attempts.map((attempt) => attempt.status)).toEqual(['rejected', 'rejected']);
+  expect(requests).toBe(0);
+});
+
+it('checks the effective per-invocation parameters before original generation', async () => {
+  const model = new Transport([]);
+  let generated = false;
+  model._generate = async () => { generated = true; return { generations: [{ text: 'unchecked', message: new AIMessageChunk('unchecked') }] }; };
+  model.invocationParams = (options) => ({ stream: options?.stop?.[0] === 'internal-stream' });
+  model.disableStreaming = true;
+  const protectedModel = withProviderTextBoundary(model, policy());
+  if (!(protectedModel instanceof BaseChatModel)) throw new Error('Expected protected chat model');
+  await expect(protectedModel.invoke([new HumanMessage('control')], { stop: ['internal-stream'] })).rejects.toMatchObject({ code: 'unsupported' });
+  expect(generated).toBe(false);
+});
+
+it('still permits effective streaming through the guarded provider iterator', async () => {
+  const frames = fixtures.cases[0].chunks.map((content, index) => ({ id: 'safe-stream-control', object: 'chat.completion.chunk', created: 1, model: 'synthetic-model', choices: [{ index: 0, delta: { content, ...(index === 0 ? { role: 'assistant' } : {}) }, finish_reason: null }] }));
+  const model = new ChatOpenAI({ apiKey: 'synthetic-test-key', model: 'synthetic-model', streaming: false, modelKwargs: { stream: true }, streamUsage: false, _lc_stream_delay: 0, configuration: { apiKey: 'synthetic-test-key', fetch: async () => new Response(frames.map((frame) => `data: ${JSON.stringify(frame)}\n\n`).join('') + 'data: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } }) } });
+  const result = await invoke(model, policy({ inspect: ({ content }) => { expect(content).toBe(fixtures.cases[0].chunks.join('')); return approved('Guarded control'); } }));
+  expect(result.messages?.[0].content).toBe('Guarded control');
+  expect(JSON.stringify(result)).not.toContain(fixtures.canaries[0]);
+});
