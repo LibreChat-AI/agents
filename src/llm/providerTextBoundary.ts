@@ -7,9 +7,17 @@ import type { ChatResult } from '@langchain/core/outputs';
 import type { ProviderTextProtection } from '@/protection/providerText';
 import type { ChatModel } from '@/types';
 import {
+  getStreamedToolCallAdapter,
+  getStreamedToolCallSeal,
+  STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY,
+  STREAMED_TOOL_CALL_SEAL_METADATA_KEY,
+} from '@/tools/streamedToolCallSeals';
+import {
   ProviderTextAttempt,
   ProviderTextProtectionError,
 } from '@/protection/providerText';
+import { getChatModelClass } from '@/llm/providers';
+import { Providers } from '@/common';
 
 const additionalKeys = new Set([
   'tool_calls',
@@ -25,6 +33,15 @@ const metadataKeys = new Set([
   'system_fingerprint', 'service_tier', 'usage', 'tokenUsage', 'input_tokens', 'output_tokens',
   'total_tokens', 'index', 'prompt', 'completion', 'output_version',
 ]);
+const additionalControls: Readonly<Partial<Record<string, (value: unknown) => boolean>>> = {
+  id: (value) => typeof value === 'string',
+  type: (value) => value === 'message',
+  role: (value) => value === 'assistant',
+  model: (value) => typeof value === 'string',
+  stop_reason: (value) => value == null || typeof value === 'string',
+  stop_sequence: (value) => value == null || typeof value === 'string',
+};
+
 const controlBlocks = new Set([
   'thinking',
   'redacted_thinking',
@@ -64,6 +81,37 @@ function numericMetadata(value: unknown, depth = 4): boolean {
   return values.length <= 64 && values.every((entry) => numericMetadata(entry, depth - 1));
 }
 
+function hasKeys(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
+  return value != null && typeof value === 'object' && !Array.isArray(value) &&
+    Object.keys(value).every((key) => keys.includes(key));
+}
+
+function validateMetadata(metadata: AIMessageChunk['response_metadata']): void {
+  for (const key of Object.keys(metadata)) {
+    const value: unknown = metadata[key];
+    let valid: boolean;
+    if (key === 'contentBlockIndex') {
+      valid = typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+    } else if (key === STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY) {
+      valid = getStreamedToolCallAdapter(metadata) != null;
+    } else if (key === STREAMED_TOOL_CALL_SEAL_METADATA_KEY) {
+      valid = hasKeys(value, ['kind', 'id', 'index']) && getStreamedToolCallSeal(metadata) != null;
+    } else if (key === 'messageStart') {
+      valid = hasKeys(value, ['role']) && value.role === 'assistant';
+    } else if (key === 'messageStop') {
+      valid = hasKeys(value, ['stopReason']) && typeof value.stopReason === 'string';
+    } else if (key === 'metadata') {
+      valid = hasKeys(value, ['usage', 'metrics']) && numericMetadata(value);
+    } else if (key === 'usage' || key === 'tokenUsage') {
+      valid = numericMetadata(value);
+    } else {
+      valid = metadataKeys.has(key) && (value == null || typeof value === 'string' ||
+        (typeof value === 'number' && Number.isFinite(value)));
+    }
+    if (!valid) throw new ProviderTextProtectionError('unsupported');
+  }
+}
+
 class Candidate {
   private block?: TextBlock;
   private stringContent = false;
@@ -74,22 +122,16 @@ class Candidate {
     const message = generation.message;
     if (!(message instanceof AIMessageChunk))
       throw new ProviderTextProtectionError('unsupported');
+    this.attempt.observeChunk();
     for (const key of Object.keys(message.additional_kwargs)) {
-      if (!additionalKeys.has(key))
-        throw new ProviderTextProtectionError('unsupported');
-    }
-    for (const metadata of [message.response_metadata, generation.generationInfo ?? {}]) {
-      if (Object.keys(metadata).some((key) => !metadataKeys.has(key))) {
+      if (additionalKeys.has(key)) continue;
+      const validate = additionalControls[key];
+      if (validate == null || !validate(message.additional_kwargs[key])) {
         throw new ProviderTextProtectionError('unsupported');
       }
     }
     for (const metadata of [message.response_metadata, generation.generationInfo ?? {}]) {
-      for (const key of ['usage', 'tokenUsage']) {
-        const value = metadata[key];
-        if (value != null && !numericMetadata(value)) {
-          throw new ProviderTextProtectionError('unsupported');
-        }
-      }
+      validateMetadata(metadata);
     }
     let content: AIMessageChunk['content'];
     if (typeof message.content === 'string') {
@@ -159,12 +201,14 @@ export function withProviderTextBoundary(
 ): ChatModel {
   const protectedModel = clone(model);
   if (model instanceof RunnableBinding) {
+    if (model.constructor !== RunnableBinding) throw new ProviderTextProtectionError('unsupported');
     Object.defineProperty(protectedModel, 'bound', {
       value: withProviderTextBoundary(model.bound as ChatModel, policy),
     });
     return protectedModel;
   }
   if (model instanceof RunnableSequence) {
+    if (model.constructor !== RunnableSequence) throw new ProviderTextProtectionError('unsupported');
     const steps = model.steps;
     Object.defineProperty(protectedModel, 'last', {
       value: withProviderTextBoundary(
@@ -177,6 +221,18 @@ export function withProviderTextBoundary(
   if (!(model instanceof BaseChatModel) || model.cache != null) {
     throw new ProviderTextProtectionError('unsupported');
   }
+  if (model._streamIterator !== BaseChatModel.prototype._streamIterator ||
+      model.generate !== BaseChatModel.prototype.generate ||
+      model.generatePrompt !== BaseChatModel.prototype.generatePrompt ||
+      model._generateUncached !== BaseChatModel.prototype._generateUncached) {
+    throw new ProviderTextProtectionError('unsupported');
+  }
+  if (model.stream !== BaseChatModel.prototype.stream || model.invoke !== BaseChatModel.prototype.invoke) {
+    const openAI = getChatModelClass(Providers.OPENAI);
+    if (model.stream !== openAI.prototype.stream || model.invoke !== openAI.prototype.invoke) {
+      throw new ProviderTextProtectionError('unsupported');
+    }
+  }
   const protectedChat = clone(model);
   protectedChat._streamResponseChunks = async function* (
     messages,
@@ -185,12 +241,13 @@ export function withProviderTextBoundary(
   ): AsyncGenerator<ChatGenerationChunk> {
     const attempt = new ProviderTextAttempt(policy, options.signal);
     const candidate = new Candidate(attempt);
-    const source = model._streamResponseChunks(
-      messages,
-      { ...options, signal: attempt.signal },
-      undefined
-    );
+    let source: AsyncGenerator<ChatGenerationChunk> | undefined;
     try {
+      source = model._streamResponseChunks(
+        messages,
+        { ...options, signal: attempt.signal },
+        undefined
+      );
       for (;;) {
         const next = await attempt.wait(source.next());
         attempt.check();
@@ -221,9 +278,11 @@ export function withProviderTextBoundary(
         );
       }
     } finally {
-      const closing = source.return(undefined);
-      void attempt.wait(closing).catch(() => {});
-      attempt.finish();
+      try {
+        if (source != null) void attempt.wait(source.return(undefined)).catch(() => {});
+      } finally {
+        attempt.finish();
+      }
     }
   };
   protectedChat._streamChatModelEvents =

@@ -102,6 +102,7 @@ import {
   createTitleRunnable,
 } from '@/utils/title';
 import { applyGraphRuntimeConfig } from '@/graphs/applyGraphRuntimeConfig';
+import { ProviderTextProtectionError } from '@/protection/providerText';
 import { LANGFUSE_OPERATION_METADATA_KEY } from '@/langfuseOperation';
 import { createTokenCounter, encodingForModel } from '@/utils/tokens';
 import { stampSyntheticProviderMessage } from '@/messages/provenance';
@@ -583,6 +584,10 @@ export class Run<_T extends t.BaseGraphState> {
 
     if (!config.graphConfig) {
       throw new Error('Graph config not provided');
+    }
+    if ('providerTextProtection' in config.graphConfig &&
+        config.graphConfig.providerTextProtection != null) {
+      throw new ProviderTextProtectionError('incompatible');
     }
 
     /** Handle different graph types */

@@ -1,9 +1,11 @@
 import { z } from 'zod';
+import { getEventListeners } from 'node:events';
 import { DynamicStructuredTool } from '@langchain/core/tools';
 import { ChatGenerationChunk } from '@langchain/core/outputs';
 import { FakeListChatModel } from '@langchain/core/utils/testing';
 import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
 import { AIMessageChunk, HumanMessage } from '@langchain/core/messages';
+import type { ConverseStreamCommandOutput, ConverseStreamOutput } from '@aws-sdk/client-bedrock-runtime';
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
 import type { BaseMessage } from '@langchain/core/messages';
 import type {
@@ -11,13 +13,16 @@ import type {
   ProviderTextProtectionResult,
 } from '@/protection/providerText';
 import type { RuntimeProviderName, ChatModel, StreamEventData, EventHandler } from '@/types';
-import { ProviderTextProtectionError } from '@/protection/providerText';
+import { ProviderTextAttempt, ProviderTextProtectionError } from '@/protection/providerText';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import fixtures from '@/protection/__tests__/fixtures/a1.json';
 import { registerProvider } from '@/provider-registration';
+import { CustomChatBedrockConverse } from '@/llm/bedrock';
+import { CustomAnthropic } from '@/llm/anthropic';
 import { ChatModelStreamHandler } from '@/stream';
 import { GraphEvents, Providers } from '@/common';
 import { FakeChatModel } from '@/llm/fake';
+import { ChatOpenAI } from '@/llm/openai';
 import { Run } from '@/run';
 
 function approved(content: string): ProviderTextProtectionResult {
@@ -487,7 +492,6 @@ it('drops failed primary prefixes and protects actual fallback and retry attempt
 });
 
 it('gates the SDK OpenAI HTTP transport before token callbacks and native aggregation', async () => {
-  const { ChatOpenAI } = await import('@/llm/openai');
   const text = fixtures.cases[0].chunks;
   const frames: { id: string; object: string; created: number; model: string; choices: { index: number; delta: { content: string; role?: string }; finish_reason: string | null }[] }[] = text.map((content, index) => ({
     id: 'chatcmpl-control', object: 'chat.completion.chunk', created: 1, model: 'synthetic-model',
@@ -561,4 +565,142 @@ it('rejects raw aliases in response metadata and native non-streaming results', 
   model.disableStreaming = true;
   model._generate = async () => ({ generations: [{ text: 'Control', message: new AIMessageChunk('Control') }], llmOutput: { raw_text: fixtures.canaries[0] } });
   await expect(invoke(model, policy())).rejects.toMatchObject({ code: 'unsupported' });
+});
+
+it('rejects a BaseChatModel subclass that bypasses the certified stream iterator', async () => {
+  const model = new Transport([new AIMessageChunk('Control')]);
+  Object.defineProperty(model, '_streamIterator', { value: async function* () { yield new AIMessageChunk(fixtures.canaries[0]); } });
+  await expect(invoke(model, policy())).rejects.toMatchObject({ code: 'unsupported' });
+});
+
+it('rejects a required policy placed in a legacy graph config instead of RunConfig', async () => {
+  const graphConfig = { type: 'standard' as const, llmConfig: { provider: Providers.OPENAI }, providerTextProtection: policy() };
+  await expect(Run.create({ runId: 'misplaced-policy', graphConfig })).rejects.toMatchObject({ code: 'incompatible' });
+});
+
+it('preserves real Anthropic lifecycle controls and usage while protecting prose', async () => {
+  const text = fixtures.cases[0].chunks;
+  const frames = [
+    { type: 'message_start', message: { id: 'msg-control', type: 'message', role: 'assistant', model: 'claude-test', content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 10, output_tokens: 0, cache_read_input_tokens: 2, cache_creation_input_tokens: 0 } } },
+    { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+    ...text.map((chunk) => ({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: chunk } })),
+    { type: 'content_block_stop', index: 0 },
+    { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: 5 } },
+    { type: 'message_stop' },
+  ];
+  const model = new CustomAnthropic({ anthropicApiKey: 'synthetic-test-key', model: 'claude-test', streaming: true, _lc_stream_delay: 0, clientOptions: { fetch: async () => new Response(frames.map((frame) => `event: ${frame.type}\ndata: ${JSON.stringify(frame)}\n\n`).join(''), { headers: { 'content-type': 'text/event-stream' } }) } });
+  const observed: string[] = [];
+  const observer = BaseCallbackHandler.fromMethods({ handleLLMEnd: (output): void => { observed.push(JSON.stringify(output)); } });
+  observer.awaitHandlers = true;
+  const result = await attemptInvoke({ model, messages: [new HumanMessage('control')], provider: Providers.ANTHROPIC, onChunk: (chunk) => { observed.push(JSON.stringify(chunk)); }, providerTextProtection: policy({ inspect: ({ content }) => { expect(content).toBe(text.join('')); return approved('Anthropic control'); } }) }, { callbacks: [observer] });
+  const message = result.messages?.[0] as AIMessageChunk;
+  expect(message.content).toBe('Anthropic control');
+  expect(message.id).toBe('msg-control');
+  expect(message.additional_kwargs).toMatchObject({ id: 'msg-control', type: 'message', role: 'assistant', model: 'claude-test', stop_reason: 'end_turn' });
+  expect(message.usage_metadata).toMatchObject({ input_tokens: 12, output_tokens: 5 });
+  expect(observed.join('')).toContain('Anthropic control');
+  for (const canary of fixtures.canaries) expect(observed.join('')).not.toContain(canary);
+});
+
+it('preserves real Bedrock block indices, tool seals, lifecycle controls and usage', async () => {
+  const model = new CustomChatBedrockConverse({ model: 'anthropic.claude-test', region: 'us-east-1', credentials: { accessKeyId: 'synthetic', secretAccessKey: 'synthetic' }, _lc_stream_delay: 0 });
+  const frames: ConverseStreamOutput[] = [
+    { messageStart: { role: 'assistant' } },
+    ...fixtures.cases[0].chunks.map((text) => ({ contentBlockDelta: { contentBlockIndex: 0, delta: { text } } })),
+    { contentBlockStart: { contentBlockIndex: 1, start: { toolUse: { toolUseId: 'bedrock-call', name: 'lookup' } } } },
+    { contentBlockDelta: { contentBlockIndex: 1, delta: { toolUse: { input: '{"count":42}' } } } },
+    { contentBlockStop: { contentBlockIndex: 1 } },
+    { messageStop: { stopReason: 'tool_use' } },
+    { metadata: { usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 }, metrics: { latencyMs: 3 } } },
+  ];
+  const send = jest.spyOn(model.client, 'send').mockImplementation(async (): Promise<ConverseStreamCommandOutput> => ({ $metadata: {}, stream: (async function* () { yield* frames; })() }));
+  try {
+    const observed: string[] = [];
+    const observer = BaseCallbackHandler.fromMethods({ handleLLMEnd: (output): void => { observed.push(JSON.stringify(output)); } });
+    observer.awaitHandlers = true;
+    const result = await attemptInvoke({ model, messages: [new HumanMessage('control')], provider: Providers.BEDROCK, onChunk: (chunk) => { observed.push(JSON.stringify(chunk)); }, providerTextProtection: policy({ inspect: () => approved('Bedrock control') }) }, { callbacks: [observer] });
+    const message = result.messages?.[0] as AIMessageChunk;
+    expect(message.content).toBe('Bedrock control');
+    expect(message.tool_calls).toEqual([{ id: 'bedrock-call', name: 'lookup', args: { count: 42 }, type: 'tool_call' }]);
+    const baseline = await attemptInvoke({ model, messages: [new HumanMessage('control')], provider: Providers.BEDROCK, onChunk: async () => {} });
+    expect(message.response_metadata).toEqual(baseline.messages?.[0].response_metadata);
+    expect(message.response_metadata).toMatchObject({ lc_streamed_tool_call_seal: { kind: 'single', index: 1 }, messageStart: { role: 'assistant' }, messageStop: { stopReason: 'tool_use' } });
+    expect(observed.join('')).toContain('bedrock_converse');
+    expect(message.usage_metadata?.total_tokens).toBe(15);
+    expect(observed.join('')).toContain('Bedrock control');
+    for (const canary of fixtures.canaries) expect(observed.join('')).not.toContain(canary);
+  } finally { send.mockRestore(); }
+});
+
+it('preserves official OpenAI tool-delta adapter controls alongside protected prose', async () => {
+  const frames = [
+    ...fixtures.cases[0].chunks.map((content, index) => ({ choices: [{ index: 0, delta: { content, ...(index === 0 ? { role: 'assistant' } : {}) }, finish_reason: null }] })),
+    { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'openai-call', type: 'function', function: { name: 'lookup', arguments: '{"count":' } }] }, finish_reason: null }] },
+    { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: '42}' } }] }, finish_reason: null }] },
+    { choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] },
+  ].map((frame) => ({ ...frame, id: 'chatcmpl-control', object: 'chat.completion.chunk', created: 1, model: 'synthetic-model' }));
+  const model = new ChatOpenAI({ model: 'synthetic-model', apiKey: 'synthetic-test-key', firstPartyEndpoint: true, streaming: true, streamUsage: false, _lc_stream_delay: 0, configuration: { apiKey: 'synthetic-test-key', fetch: async () => new Response(frames.map((frame) => `data: ${JSON.stringify(frame)}\n\n`).join('') + 'data: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } }) } });
+  const observed: string[] = [];
+  const observer = BaseCallbackHandler.fromMethods({ handleLLMEnd: (output): void => { observed.push(JSON.stringify(output)); } });
+  observer.awaitHandlers = true;
+  const result = await invoke(model, policy({ inspect: () => approved('OpenAI control') }), [observer]);
+  const message = result.messages?.[0] as AIMessageChunk;
+  expect(message.tool_calls).toEqual([{ id: 'openai-call', name: 'lookup', args: { count: 42 }, type: 'tool_call' }]);
+  const baseline = await invoke(model);
+  expect(message.response_metadata).toEqual(baseline.messages?.[0].response_metadata);
+  expect(observed.join('')).toContain('openai_chat_sequential');
+  expect(message.content).toBe('OpenAI control');
+  expect(observed.join('')).toContain('OpenAI control');
+  for (const canary of fixtures.canaries) expect(observed.join('')).not.toContain(canary);
+});
+
+it('removes every completed wait listener instead of retaining losing cancellation races', async () => {
+  const attempt = new ProviderTextAttempt(policy({ maxAttemptBytes: 512, maxBufferedBytes: 512 }));
+  try {
+    for (let index = 0; index < 30_000; index++) {
+      await attempt.wait(Promise.resolve({ control: index }));
+      expect(getEventListeners(attempt.signal, 'abort')).toHaveLength(0);
+    }
+  } finally { attempt.finish(); }
+});
+
+it('charges empty and control chunks against the attempt budget', async () => {
+  const model = new Transport(Array.from({ length: 20 }, () => new AIMessageChunk('')));
+  await expect(invoke(model, policy({ maxAttemptBytes: 1024 }))).rejects.toMatchObject({ code: 'overflow' });
+});
+
+it.each([
+  { contentBlockIndex: 'unchecked alias' },
+  { lc_streamed_tool_call_adapter: 'unknown' },
+  { lc_streamed_tool_call_seal: { kind: 'all', raw: fixtures.canaries[0] } },
+  { messageStart: { role: 'assistant', raw: fixtures.canaries[0] } },
+  { metadata: { usage: { raw: fixtures.canaries[0] } } },
+])('rejects malformed or unchecked provider controls %#', async (response_metadata) => {
+  await expect(invoke(new Transport([new AIMessageChunk({ content: 'Control', response_metadata })]), policy())).rejects.toMatchObject({ code: 'unsupported' });
+});
+
+it('keeps an ignoring producer charged and quarantines its late end after cancellation', async () => {
+  const draining = deferred<void>();
+  const waiting = deferred<void>();
+  const controller = new AbortController();
+  const seen: string[] = [];
+  const protection = policy({ maxAttemptBytes: 1024, maxBufferedBytes: 1024, inspect: ({ content }) => { seen.push(content); return approved('Control'); } });
+  const model = new Transport([new AIMessageChunk(fixtures.canaries[0])], () => { waiting.resolve(); return draining.promise; });
+  const task = attemptInvoke({ model, messages: [], provider: Providers.OPENAI, onChunk: async () => {}, providerTextProtection: protection }, { signal: controller.signal });
+  await waiting.promise;
+  controller.abort();
+  await expect(task).rejects.toMatchObject({ code: 'cancelled' });
+  await expect(invoke(new Transport([new AIMessageChunk('control')]), protection)).rejects.toMatchObject({ code: 'overflow' });
+  draining.resolve();
+  await new Promise((resolve) => setImmediate(resolve));
+  expect(seen).toEqual([]);
+  expect((await invoke(new Transport([new AIMessageChunk('control')]), protection)).messages?.[0].content).toBe('Control');
+});
+
+it('releases a failed synchronous transport creation lease before a fresh attempt', async () => {
+  const model = new Transport([]);
+  model._streamResponseChunks = () => { throw new Error('Transport creation failed'); };
+  const protection = policy({ maxAttemptBytes: 1024, maxBufferedBytes: 1024 });
+  await expect(invoke(model, protection)).rejects.toThrow('Transport creation failed');
+  expect((await invoke(new Transport([new AIMessageChunk('Control')]), protection)).messages?.[0].content).toBe('Control');
 });

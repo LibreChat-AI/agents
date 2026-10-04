@@ -17,10 +17,13 @@ Default-off. This SDK supplies an awaited release boundary, not a detector or ac
 
 The same policy object shares its memory budget across concurrent attempts and inherited child
 executions. Use one immutable policy object per run. Do not replace it between parallel attempts.
-Limits include UTF-16 text, candidate-join capacity and bounded fragment/attempt overhead, not
+Limits include UTF-16 text, candidate-join capacity and bounded event/attempt overhead, not
 only transport bytes. Canonical output is charged too. A producer or handler that ignores
 cancellation keeps its lease until it settles; later attempts cannot replenish that budget.
 The host handler must honor the signal and bound its own detector allocations.
+
+Run-level policy belongs at `RunConfig`, not inside its legacy `graphConfig`; misplaced required
+policy is rejected. Custom high-level model/stream overrides are not certified.
 
 Missing handlers, invalid versions/limits/results, deadline exhaustion, buffer overflow and
 Stop fail closed. Classification/handler errors become stable SDK error codes, never original
@@ -30,12 +33,15 @@ Policy failures are terminal, not fallback triggers. Late decisions cannot relea
 ## Ordering and supported surface
 
 The boundary clones standard LangChain binding/sequence shells and intercepts the underlying
-`BaseChatModel` generation methods. Provider token callbacks are withheld until canonical release.
+`BaseChatModel` generation methods. Provider prose callbacks are withheld until canonical release. Completed waits remove their
+cancellation listeners; every chunk, including empty/control chunks, consumes bounded overhead.
 The gate runs **before** LangChain's native aggregation/end callbacks, `attemptInvoke` aggregation,
 `ChatModelStreamHandler`, run state and subsequent model/tool reuse. Shared providers are not mutated.
 
 String prose and a single indexed text block are supported. Reasoning, signatures, tool arguments,
-IDs, usage and control chunks keep their values and are not buffered behind prose. Unknown content
+IDs, usage and control chunks keep their values and are not buffered behind prose. Anthropic
+lifecycle fields, Bedrock block indices/seals and official OpenAI tool-adapter controls are
+validated and preserved; unknown aliases still fail closed. Unknown content
 blocks, additional-output aliases, cached models, multiple prose block indices and custom runnable
 shells fail `unsupported`. Non-streaming responses are inspected before native callbacks/state;
 transport response allocation itself is provider-owned, not an SDK gate buffer.

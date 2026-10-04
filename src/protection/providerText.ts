@@ -50,7 +50,9 @@ export interface ProviderTextProtection {
 
 export class ProviderTextProtectionError extends Error {
   constructor(readonly code: ProviderTextProtectionErrorCode) {
-    super(`Provider text protection: ${code}`);
+    const safeCode = errorCodes.has(code) ? code : 'incompatible';
+    super(`Provider text protection: ${safeCode}`);
+    this.code = safeCode;
     this.name = 'ProviderTextProtectionError';
   }
 }
@@ -104,7 +106,6 @@ export class ProviderTextAttempt {
   private readonly pending = new Set<Promise<unknown>>();
   private readonly timer: ReturnType<typeof setTimeout>;
   private readonly abort: () => void;
-  private readonly stopped: Promise<never>;
   private finished = false;
 
   constructor(
@@ -119,14 +120,6 @@ export class ProviderTextAttempt {
     this.abort = (): void =>
       this.controller.abort(new ProviderTextProtectionError('cancelled'));
     parent?.addEventListener('abort', this.abort, { once: true });
-    this.stopped = new Promise<never>((_resolve, reject) => {
-      const rejectAbort = (): void => reject(this.controller.signal.reason);
-      this.controller.signal.addEventListener('abort', rejectAbort, {
-        once: true,
-      });
-      if (this.controller.signal.aborted) rejectAbort();
-    });
-    void this.stopped.catch(() => {});
     this.timer = setTimeout(() => {
       this.controller.abort(new ProviderTextProtectionError('timeout'));
     }, policy.timeoutMs);
@@ -159,17 +152,33 @@ export class ProviderTextAttempt {
     this.check();
     if (!text) return;
     const bytes = text.length * 2;
-    this.charge(bytes * 2 + 128);
+    this.charge(bytes * 2);
     this.fragments.push(text);
+  }
+
+  observeChunk(): void {
+    this.check();
+    this.charge(128);
   }
 
   async wait<T>(work: Promise<T>): Promise<T> {
     this.pending.add(work);
-    void work.then(
-      () => this.pending.delete(work),
-      () => this.pending.delete(work)
-    );
-    return Promise.race([work, this.stopped]);
+    return new Promise<T>((resolve, reject) => {
+      const abort = (): void => {
+        this.signal.removeEventListener('abort', abort);
+        reject(this.signal.reason);
+      };
+      this.signal.addEventListener('abort', abort, { once: true });
+      if (this.signal.aborted) abort();
+      const settle = (): void => {
+        this.signal.removeEventListener('abort', abort);
+        this.pending.delete(work);
+      };
+      void work.then(
+        (value) => { settle(); resolve(value); },
+        (error: Error) => { settle(); reject(error); }
+      );
+    });
   }
 
   async release(): Promise<string> {
@@ -192,7 +201,7 @@ export class ProviderTextAttempt {
         )
       );
     } catch (error) {
-      if (error instanceof ProviderTextProtectionError) throw error;
+      if (error instanceof ProviderTextProtectionError) throw new ProviderTextProtectionError(error.code);
       throw new ProviderTextProtectionError('unavailable');
     }
     this.check();

@@ -1381,8 +1381,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    * {@link t.StandardGraphInput.streamLimits}. The stream handler enforces
    * these on every streamed chunk event.
    */
-  providerTextProtection?: t.StandardGraphInput['providerTextProtection'];
   streamLimits: ResolvedStreamLimits;
+  /** Default-off mandatory provider prose release. */
+  providerTextProtection?: t.StandardGraphInput['providerTextProtection'];
   /**
    * Cumulative streamed argument bytes per in-flight tool call, keyed by
    * generation key + chunk index (see `resolveGenerationKey`). Per-run
