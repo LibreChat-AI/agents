@@ -30,6 +30,12 @@ import {
   STREAM_LIMIT_ATTEMPT_KEY,
 } from '@/llm/streamLimits';
 import {
+  validateProviderTextProtection,
+  ProviderTextProtectionError,
+  createProviderTextRestartCancellation,
+  isProviderTextRestartCancellation,
+} from '@/protection/providerText';
+import {
   inspectProviderMessageProjection,
   ProviderMessageProjectionInvariantError,
   resolveProviderMessageProjectionInvariantMode,
@@ -51,10 +57,6 @@ import {
   assertPreparedProviderRequestFor,
   prepareProviderRequest,
 } from '@/llm/prepareProviderRequest';
-import {
-  validateProviderTextProtection,
-  ProviderTextProtectionError,
-} from '@/protection/providerText';
 import {
   getProviderFamily,
   providerUsesManualToolStream,
@@ -780,6 +782,7 @@ export async function attemptInvoke(
         context: params.context,
         onChunk: params.onChunk,
         preemptAgentId: params.preemptAgentId,
+        providerTextProtection: policy,
       },
       stampedConfig
     );
@@ -793,7 +796,8 @@ export async function attemptInvoke(
     return result;
   } catch (error) {
     if (policy != null && config?.signal?.aborted === true) {
-      const cancelled = new ProviderTextProtectionError('cancelled');
+      const reason: unknown = config.signal.reason;
+      const cancelled = new ProviderTextProtectionError(reason instanceof ProviderTextProtectionError ? reason.code : 'cancelled');
       prepared?.finish(preparedAttempt, undefined, cancelled);
       throw cancelled;
     }
@@ -821,9 +825,10 @@ async function attemptInvokeBody(
     context,
     onChunk,
     preemptAgentId,
+    providerTextProtection,
   }: Pick<
     AttemptInvokeCommonParams,
-    'context' | 'onChunk' | 'preemptAgentId'
+    'context' | 'onChunk' | 'preemptAgentId' | 'providerTextProtection'
   > & {
     request: PreparedProviderRequest;
   },
@@ -1090,7 +1095,7 @@ async function attemptInvokeBody(
         notePreemptRestartedRun(sealedRunId, finalChunk);
       }
       restartRoute = 'aborted';
-      restartController.abort();
+      restartController.abort(providerTextProtection == null ? undefined : createProviderTextRestartCancellation());
       return true;
     };
     const unsubscribeWake =
@@ -1357,7 +1362,7 @@ async function attemptInvokeBody(
         restartRoute === 'aborted' &&
         !(error instanceof StreamLimitExceededError) &&
         !(error instanceof PreparedSubagentError) &&
-        !(error instanceof ProviderTextProtectionError) &&
+        (!(error instanceof ProviderTextProtectionError) || isProviderTextRestartCancellation(error)) &&
         config.signal?.aborted !== true;
       if (!ownAbort) {
         throw error;

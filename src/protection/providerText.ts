@@ -59,6 +59,27 @@ export class ProviderTextProtectionError extends Error {
   }
 }
 
+const restartCancellations = new WeakSet<ProviderTextProtectionError>();
+
+/** Internal control flow, never a host policy decision or public capability. */
+export function createProviderTextRestartCancellation(): ProviderTextProtectionError {
+  const error = new ProviderTextProtectionError('cancelled');
+  restartCancellations.add(error);
+  return error;
+}
+
+export function isProviderTextRestartCancellation(error: unknown): boolean {
+  return error instanceof ProviderTextProtectionError && restartCancellations.has(error);
+}
+
+function protectionAbortError(parent?: AbortSignal): ProviderTextProtectionError {
+  const reason: unknown = parent?.reason;
+  if (reason instanceof ProviderTextProtectionError) {
+    return isProviderTextRestartCancellation(reason) ? reason : new ProviderTextProtectionError(reason.code);
+  }
+  return new ProviderTextProtectionError('cancelled');
+}
+
 const budgets = new WeakMap<ProviderTextProtection, { bytes: number }>();
 const errorCodes = new Set<ProviderTextProtectionErrorCode>([
   'blocked',
@@ -119,10 +140,10 @@ export class ProviderTextAttempt {
     this.deadline = performance.now() + policy.timeoutMs;
     this.budget = budgets.get(policy) ?? { bytes: 0 };
     budgets.set(policy, this.budget);
-    if (parent?.aborted === true) throw new ProviderTextProtectionError('cancelled');
+    if (parent?.aborted === true) throw protectionAbortError(parent);
     this.charge(512);
     this.abort = (): void =>
-      this.controller.abort(new ProviderTextProtectionError('cancelled'));
+      this.controller.abort(protectionAbortError(this.parent));
     parent?.addEventListener('abort', this.abort, { once: true });
     this.timer = setTimeout(() => {
       this.controller.abort(new ProviderTextProtectionError('timeout'));
@@ -137,7 +158,7 @@ export class ProviderTextAttempt {
   check(): void {
     if (this.signal.aborted) throw this.signal.reason;
     if (this.parent?.aborted === true)
-      throw new ProviderTextProtectionError('cancelled');
+      throw protectionAbortError(this.parent);
     if (performance.now() >= this.deadline) {
       this.controller.abort(new ProviderTextProtectionError('timeout'));
       throw this.signal.reason;
@@ -212,6 +233,7 @@ export class ProviderTextAttempt {
       );
     } catch (error) {
       this.check();
+      if (isProviderTextRestartCancellation(error)) throw error;
       if (error instanceof ProviderTextProtectionError) throw new ProviderTextProtectionError(error.code);
       throw new ProviderTextProtectionError('unavailable');
     }

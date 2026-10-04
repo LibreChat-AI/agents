@@ -147,6 +147,7 @@ import {
   createChildGraphPlan,
   isGraphSubagentConfig,
 } from './childGraphConfig';
+import { ProviderTextProtectionError } from '@/protection/providerText';
 import { stripRunStepResumeState } from '@/tools/runStepResume';
 import { seedAgentInitialSessions } from '@/utils/toolSessions';
 import { stableStringify } from '@/tools/eagerEventExecution';
@@ -178,7 +179,7 @@ const SUBAGENT_INVOCATION_CHANGED_MESSAGE =
 
 function isSubagentResolutionControlFlow(error: unknown): boolean {
   try {
-    return error instanceof StreamLimitExceededError || isGraphInterrupt(error);
+    return error instanceof StreamLimitExceededError || error instanceof ProviderTextProtectionError || isGraphInterrupt(error);
   } catch {
     return false;
   }
@@ -3282,7 +3283,7 @@ export class SubagentExecutor {
        * quota for that entire interval. Trips the ENTRY-captured controller:
        * after a reset, a straggler must break its own dead run, not the
        * current one. */
-      if (error instanceof StreamLimitExceededError) {
+      if (error instanceof StreamLimitExceededError || error instanceof ProviderTextProtectionError) {
         childBreaker.abort(error);
       }
       const errorMessage = truncateErrorMessage(error);
@@ -3321,7 +3322,7 @@ export class SubagentExecutor {
        * fired. Rethrown here and passed through ToolNode's error conversion,
        * so the parent run rejects with the child's limit error.
        */
-      if (error instanceof StreamLimitExceededError) {
+      if (error instanceof StreamLimitExceededError || error instanceof ProviderTextProtectionError) {
         throw error;
       }
       return createSubagentFailure(

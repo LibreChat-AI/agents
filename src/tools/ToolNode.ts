@@ -130,6 +130,7 @@ import {
 } from '@/tools/local';
 import { stripCodeSessionFileSummary } from '@/tools/CodeSessionFileSummary';
 import { Constants, GraphEvents, CODE_EXECUTION_TOOLS } from '@/common';
+import { ProviderTextProtectionError } from '@/protection/providerText';
 import { formatToolErrorContent } from '@/tools/toolErrorContent';
 import { PreparedSubagentError } from '@/tools/preparedSubagents';
 import { attachRunStepResumeState } from '@/tools/runStepResume';
@@ -2146,7 +2147,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
        */
       if (
         e instanceof StreamLimitExceededError ||
-        e instanceof PreparedSubagentError
+        e instanceof PreparedSubagentError ||
+        e instanceof ProviderTextProtectionError
       ) {
         throw e;
       }
@@ -3486,7 +3488,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     if (
       signal?.aborted === true &&
       (signal.reason instanceof StreamLimitExceededError ||
-        signal.reason instanceof PreparedSubagentError)
+        signal.reason instanceof PreparedSubagentError ||
+        signal.reason instanceof ProviderTextProtectionError)
     ) {
       throw signal.reason;
     }
@@ -5467,7 +5470,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     if (
       composedSignal?.aborted === true &&
       (composedSignal.reason instanceof StreamLimitExceededError ||
-        composedSignal.reason instanceof PreparedSubagentError)
+        composedSignal.reason instanceof PreparedSubagentError ||
+        composedSignal.reason instanceof ProviderTextProtectionError)
     ) {
       throw composedSignal.reason;
     }

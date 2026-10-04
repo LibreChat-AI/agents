@@ -16,16 +16,16 @@ import type {
   ProviderTextProtectionResult,
 } from '@/protection/providerText';
 import type { RuntimeProviderName, ChatModel, StreamEventData, EventHandler } from '@/types';
-import { ProviderTextAttempt, ProviderTextProtectionError } from '@/protection/providerText';
+import { ProviderTextAttempt, ProviderTextProtectionError, createProviderTextRestartCancellation, isProviderTextRestartCancellation } from '@/protection/providerText';
 import { withProviderTextBoundary } from '@/llm/providerTextBoundary';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import fixtures from '@/protection/__tests__/fixtures/a1.json';
+import { Constants, GraphEvents, Providers } from '@/common';
 import { registerProvider } from '@/provider-registration';
 import { CustomChatBedrockConverse } from '@/llm/bedrock';
 import { AgentContext } from '@/agents/AgentContext';
 import { CustomAnthropic } from '@/llm/anthropic';
 import { ChatModelStreamHandler } from '@/stream';
-import { GraphEvents, Providers } from '@/common';
 import { FakeChatModel } from '@/llm/fake';
 import { ChatOpenAI } from '@/llm/openai';
 import { Run } from '@/run';
@@ -999,4 +999,46 @@ it('does not enter a fallback producer when protection trips during request prep
     })).rejects.toBe(trip);
     expect(producer).not.toHaveBeenCalled();
   } finally { producer.mockRestore(); dispose(); }
+});
+
+it.each([{ kind: 'single', code: 'blocked' }, { kind: 'graph', code: 'blocked' }, { kind: 'single', code: 'timeout' }, { kind: 'graph', code: 'timeout' }] as const)('propagates foreground $kind child $code through ToolNode to the parent breaker', async ({ kind, code }) => {
+  const child = { agentId: 'worker', provider: Providers.OPENAI, instructions: 'Allowed child instructions.' };
+  const config = kind === 'single'
+    ? { type: 'worker', name: 'Worker', description: 'Protected child.', agentInputs: child }
+    : { kind: 'graph' as const, type: 'worker', name: 'Worker', description: 'Protected team.', agents: [child], edges: [], entryAgentId: 'worker', resultAgentId: 'worker' };
+  let inspected = 0;
+  const lateDecision = deferred<ProviderTextProtectionResult>();
+  const run = await Run.create({ runId: `protected-child-${kind}-${code}`, graphConfig: { type: 'standard', agents: [{ agentId: 'parent', provider: Providers.OPENAI, instructions: 'Allowed parent instructions.', subagentConfigs: [config] }] },
+    providerTextProtection: policy({ timeoutMs: code === 'timeout' ? 30 : 10000, inspect: () => { inspected++; return code === 'timeout' ? lateDecision.promise : { version: 1, ok: false, error: { code: 'blocked' } }; } }), returnContent: true, skipCleanup: true,
+  });
+  const graph = run.Graph!;
+  graph.setSubagentModelOverride(new Transport([new AIMessageChunk(fixtures.canaries[0])]));
+  const parent = new ReuseTransport({ responses: ['', 'Unreachable parent answer'], toolCalls: [{ id: 'protected-child-call', name: Constants.SUBAGENT, args: { description: 'Allowed task.', subagent_type: 'worker' }, type: 'tool_call' }] });
+  graph.overrideModel = parent;
+  await expect(run.processStream({ messages: [new HumanMessage('Allowed control')] }, { version: 'v2', configurable: { thread_id: `protected-child-${kind}-${code}` } })).rejects.toMatchObject({ code });
+  lateDecision.resolve(approved('Late child control'));
+  expect(inspected).toBe(1);
+  expect(parent.inputs).toHaveLength(1);
+  expect(graph.breakerAbort.signal.aborted).toBe(true);
+  expect(graph.breakerAbort.signal.reason).toBeInstanceOf(ProviderTextProtectionError);
+  const messages = graph.getRunMessages() ?? [];
+  expect(messages.some((message) => message.getType() === 'tool')).toBe(false);
+  expect(JSON.stringify(messages)).not.toContain(fixtures.canaries[0]);
+});
+
+it('preserves only SDK-owned restart cancellation provenance through a protected wait', async () => {
+  const controller = new AbortController();
+  const attempt = new ProviderTextAttempt(policy(), controller.signal);
+  const marker = createProviderTextRestartCancellation();
+  try {
+    const work = deferred<string>();
+    const waiting = attempt.wait(work.promise);
+    controller.abort(marker);
+    await expect(waiting).rejects.toBe(marker);
+    expect(isProviderTextRestartCancellation(marker)).toBe(true);
+    expect(isProviderTextRestartCancellation(new ProviderTextProtectionError('cancelled'))).toBe(false);
+    expect(isProviderTextRestartCancellation(new ProviderTextProtectionError('blocked'))).toBe(false);
+    expect(isProviderTextRestartCancellation(new ProviderTextProtectionError('timeout'))).toBe(false);
+    work.resolve('Late control');
+  } finally { attempt.finish(); }
 });

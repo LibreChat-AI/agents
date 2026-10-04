@@ -30,7 +30,10 @@ Stop fail closed. Classification/handler errors become stable SDK error codes, n
 exception details. No failed-attempt prefix is released. Retry/fallback has a fresh candidate.
 Policy failures are terminal, not fallback triggers. Queued stream consumers and post-await
 eager-tool guards honor protection breaker trips before dispatch; child-entry and fallback
-admission cannot restart work after the trip. Late decisions cannot release cancelled text. A monotonic elapsed-time check enforces the
+admission cannot restart work after the trip. Event-tool post-approval admission and child
+safety-error pass-through honor the same trips. Foreground child failures abort the captured
+parent breaker, not a replacement run. SDK-owned cooperative restart cancellation discards
+its attempt without becoming Stop or a policy decision; host cancellation remains terminal. Late decisions cannot release cancelled text. A monotonic elapsed-time check enforces the
 deadline even when synchronous policy work prevents the abort timer from running.
 
 ## Ordering and supported surface
