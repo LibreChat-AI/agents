@@ -797,6 +797,10 @@ export async function attemptInvoke(
   } catch (error) {
     if (policy != null && config?.signal?.aborted === true) {
       const reason: unknown = config.signal.reason;
+      if (reason instanceof StreamLimitExceededError || reason instanceof PreparedSubagentError) {
+        prepared?.finish(preparedAttempt, undefined, reason);
+        throw reason;
+      }
       const cancelled = new ProviderTextProtectionError(reason instanceof ProviderTextProtectionError ? reason.code : 'cancelled');
       prepared?.finish(preparedAttempt, undefined, cancelled);
       throw cancelled;

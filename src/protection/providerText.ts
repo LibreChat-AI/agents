@@ -207,6 +207,15 @@ export class ProviderTextAttempt {
     return true;
   }
 
+  matchesText(text: string): boolean {
+    return text.length === this.textLength && (text.length === 0 || this.hasCandidatePrefix(text));
+  }
+
+  retain(bytes: number): void {
+    this.check();
+    this.charge(bytes);
+  }
+
   observeChunk(): void {
     this.check();
     this.charge(128);

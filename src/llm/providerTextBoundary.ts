@@ -12,6 +12,7 @@ import {
   STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY,
   STREAMED_TOOL_CALL_SEAL_METADATA_KEY,
 } from '@/tools/streamedToolCallSeals';
+import { GEMINI_SIGNATURES, RESPONSES_POSITIONS, stringMap, safetyRatings, replayPositions, ResponsesTextProjection, keys } from '@/llm/providerTextControls';
 import {
   ProviderTextAttempt,
   ProviderTextProtectionError,
@@ -42,6 +43,14 @@ const additionalControls: Readonly<Partial<Record<string, (value: unknown) => bo
   stop_reason: (value) => value == null || typeof value === 'string',
   stop_sequence: (value) => value == null || typeof value === 'string',
   usage: (value) => numericMetadata(value),
+};
+
+const geminiControls: Readonly<Partial<Record<string, (value: unknown) => boolean>>> = {
+  [GEMINI_SIGNATURES]: stringMap,
+  finishReason: (value) => ['STOP', 'MAX_TOKENS', 'SAFETY', 'RECITATION', 'OTHER', 'MALFORMED_FUNCTION_CALL', 'FINISH_REASON_UNSPECIFIED'].includes(String(value)),
+  safetyRatings,
+  avgLogprobs: (value) => typeof value === 'number' && Number.isFinite(value),
+  index: (value) => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0,
 };
 
 const controlBlocks = new Set([
@@ -92,11 +101,13 @@ function hasKeys(value: unknown, keys: readonly string[]): value is Record<strin
     Object.keys(value).every((key) => keys.includes(key));
 }
 
-function validateMetadata(metadata: AIMessageChunk['response_metadata']): void {
+function validateMetadata(metadata: AIMessageChunk['response_metadata'], google = false): void {
   for (const key of Object.keys(metadata)) {
     const value: unknown = metadata[key];
     let valid: boolean;
-    if (additionalControls[key] != null) {
+    if (google && geminiControls[key] != null) {
+      valid = geminiControls[key](value);
+    } else if (additionalControls[key] != null) {
       valid = additionalControls[key](value);
     } else if (key === 'contentBlockIndex') {
       valid = typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
@@ -124,8 +135,9 @@ class Candidate {
   private block?: TextBlock;
   private stringContent = false;
   private readonly toolInputIndices = new Set<number>();
+  private readonly responses: ResponsesTextProjection;
 
-  constructor(private readonly attempt: ProviderTextAttempt, private readonly provider?: ProviderName) {}
+  constructor(private readonly attempt: ProviderTextAttempt, private readonly provider?: ProviderName) { this.responses = new ResponsesTextProjection(attempt); }
 
   strip(generation: ChatGenerationChunk): ChatGenerationChunk {
     const message = generation.message;
@@ -134,13 +146,12 @@ class Candidate {
     this.attempt.observeChunk();
     for (const key of Object.keys(message.additional_kwargs)) {
       if (additionalKeys.has(key)) continue;
-      const validate = additionalControls[key];
+      const validate = (this.provider === Providers.GOOGLE ? geminiControls[key] : undefined) ??
+        (key === RESPONSES_POSITIONS ? replayPositions : undefined) ??
+        (key === '__openai_function_call_ids__' ? stringMap : undefined) ?? additionalControls[key];
       if (validate == null || !validate(message.additional_kwargs[key])) {
         throw new ProviderTextProtectionError('unsupported');
       }
-    }
-    for (const metadata of [message.response_metadata, generation.generationInfo ?? {}]) {
-      validateMetadata(metadata);
     }
     let content: AIMessageChunk['content'];
     if (typeof message.content === 'string') {
@@ -164,8 +175,10 @@ class Candidate {
           typeof block.text !== 'string' ||
           this.stringContent ||
           Object.keys(block).some(
-            (key) => !['type', 'text', 'index'].includes(key)
-          )
+            (key) => !['type', 'text', 'index', 'annotations', 'phase'].includes(key)
+          ) ||
+          ('annotations' in block && (!Array.isArray(block.annotations) || block.annotations.length > 0)) ||
+          ('phase' in block && block.phase != null && !['commentary', 'final_answer'].includes(String(block.phase)))
         ) {
           throw new ProviderTextProtectionError('unsupported');
         }
@@ -176,16 +189,28 @@ class Candidate {
         this.attempt.append(block.text);
       }
     }
-    return new ChatGenerationChunk({
-      text: '',
-      message: copyMessage(message, content),
-      generationInfo: generation.generationInfo,
-    });
+    const metadata = this.responses.strip(message.response_metadata);
+    if (!Object.hasOwn(message.response_metadata, 'output')) validateMetadata(metadata, this.provider === Providers.GOOGLE);
+    validateMetadata(generation.generationInfo ?? {}, this.provider === Providers.GOOGLE);
+    const stripped = copyMessage(message, content);
+    stripped.response_metadata = metadata;
+    stripped.lc_kwargs.response_metadata = metadata;
+    return new ChatGenerationChunk({ text: '', message: stripped, generationInfo: generation.generationInfo });
   }
 
   private admitControl(block: MessageContentComplex, message: AIMessageChunk): void {
     const control: { type?: string; index?: unknown; input?: unknown; id?: unknown; name?: unknown } = block;
     const { type, index, input, id, name } = control;
+    const part: unknown = block;
+    if (this.provider === Providers.GOOGLE && keys(part, ['functionCall', 'thoughtSignature']) &&
+        keys(part.functionCall, ['name', 'args', 'id'])) {
+      const call = part.functionCall;
+      if (typeof call.name !== 'string' || (part.thoughtSignature != null && typeof part.thoughtSignature !== 'string') ||
+          message.tool_calls?.some((tool) => tool.name === call.name && JSON.stringify(tool.args) === JSON.stringify(call.args)) !== true) {
+        throw new ProviderTextProtectionError('unsupported');
+      }
+      return;
+    }
     if (!Object.hasOwn(block, 'type')) {
       if (!hasKeys(block, ['index', 'input']) || typeof index !== 'number' ||
           !Number.isSafeInteger(index) || index < 0 || typeof input !== 'string' ||
@@ -210,12 +235,14 @@ class Candidate {
 
   async canonical(): Promise<ChatGenerationChunk | undefined> {
     const content = await this.attempt.release();
-    if (!content) return undefined;
+    const metadata = this.responses.canonical(content);
+    if (!content && metadata == null) return undefined;
     return new ChatGenerationChunk({
       text: content,
       message: new AIMessageChunk({
         content:
           this.block == null ? content : [{ ...this.block, text: content }],
+        response_metadata: metadata,
       }),
     });
   }
@@ -388,7 +415,7 @@ export function withProviderTextBoundary(
         )
       );
       attempt.check();
-      if (result.llmOutput != null) validateMetadata(result.llmOutput);
+      if (result.llmOutput != null) validateMetadata(result.llmOutput, provider === Providers.GOOGLE);
       if (result.generations.length !== 1)
         throw new ProviderTextProtectionError('unsupported');
       const generation = result.generations[0];
@@ -402,9 +429,13 @@ export function withProviderTextBoundary(
       attempt.check();
       const released = canonical == null ? stripped : new ChatGenerationChunk({
         text: canonical.text,
-        message: copyMessage(message, mergeContent(stripped.message.content, canonical.message.content)),
+        message: copyMessage(stripped.message as AIMessageChunk, mergeContent(stripped.message.content, canonical.message.content)),
         generationInfo: stripped.generationInfo,
       });
+      if (canonical != null) {
+        released.message.response_metadata = { ...released.message.response_metadata, ...canonical.message.response_metadata };
+        released.message.lc_kwargs.response_metadata = released.message.response_metadata;
+      }
       return { ...result, generations: [released] };
     } finally {
       attempt.finish();

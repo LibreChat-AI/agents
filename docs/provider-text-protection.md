@@ -68,6 +68,16 @@ and replay events still consume bounded overhead. Unmarked repeated prose is not
 streaming, including effective request parameters/model kwargs and OpenAI delegates, fails `unsupported` before production; use the guarded
 stream path or native nonstreaming instead.
 
+Gemini admits validated function thought-signature maps, finish reason, safety ratings and
+numeric candidate controls. Signatures and function arguments stay unchanged. Uncertified
+grounding/media/control aliases remain gated.
+
+Responses admits one prose message plus validated reasoning/function controls. Terminal
+`output` and `output_text` prose must exactly match the buffered candidate; their retained
+metadata is charged, and only canonical prose is restored before release. IDs, status,
+usage, format/tool controls and encrypted reasoning remain unchanged. JSON formats,
+nonempty annotations, unknown aliases and uncertified server-tool outputs fail closed.
+
 Native event-stream overrides use the protected chunk bridge. Direct provider use outside
 `attemptInvoke` is **not** protected by this run-level contract. Summaries, titles, tool results,
 files/media and structured-output mutation are not B1 targets.

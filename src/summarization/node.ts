@@ -56,6 +56,7 @@ import {
   resolveClientOptionsModel,
 } from '@/llm/request';
 import { renderCompactionSemanticIndex } from '@/summarization/semanticIndex';
+import { ProviderTextProtectionError } from '@/protection/providerText';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { prepareToolsForPromptCache } from '@/llm/promptCacheTools';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
@@ -739,16 +740,6 @@ async function executeSummarizationWithFallback(params: {
     summaryText = result.text;
     summaryUsage = result.usage;
   } catch (primaryError) {
-    const primaryDescribed = describeProviderError(
-      primaryError,
-      clientConfig.provider,
-      clientConfig.modelName
-    );
-    log('error', `Summarization LLM call failed ${primaryDescribed.suffix}`, {
-      ...primaryDescribed.data,
-      messagesToRefineCount: messages.length,
-    });
-
     /**
      * A tripped stream circuit breaker is a safety abort, not a
      * summarization failure to recover from: retrying on fallback providers
@@ -758,7 +749,7 @@ async function executeSummarizationWithFallback(params: {
      * rejects the run. Rethrown so the summarize node fails the run with
      * the actionable limit error, consistent with agent turns and subagents.
      */
-    if (primaryError instanceof StreamLimitExceededError) {
+    if (primaryError instanceof StreamLimitExceededError || primaryError instanceof ProviderTextProtectionError) {
       throw primaryError;
     }
     /** A parallel branch's trip aborts the composed summarization signal,
@@ -776,6 +767,16 @@ async function executeSummarizationWithFallback(params: {
         throw trippedReason;
       }
     }
+
+    const primaryDescribed = describeProviderError(
+      primaryError,
+      clientConfig.provider,
+      clientConfig.modelName
+    );
+    log('error', `Summarization LLM call failed ${primaryDescribed.suffix}`, {
+      ...primaryDescribed.data,
+      messagesToRefineCount: messages.length,
+    });
 
     const rawFallbacks = (
       clientConfig.clientOptions as unknown as t.LLMConfig | undefined
@@ -819,7 +820,9 @@ async function executeSummarizationWithFallback(params: {
           );
         }
       } catch (fbErr) {
-        if (fbErr instanceof StreamLimitExceededError) {
+        const trip = findStreamLimitAbortReason(graph?.getBreakerSignal?.(), summarizeConfig?.signal);
+        if (trip != null) throw trip;
+        if (fbErr instanceof StreamLimitExceededError || fbErr instanceof ProviderTextProtectionError) {
           throw fbErr;
         }
         const fbDescribed = describeFallbackError(fbErr, fallbacks);
@@ -842,6 +845,8 @@ async function executeSummarizationWithFallback(params: {
     }
   }
 
+  const trip = findStreamLimitAbortReason(graph?.getBreakerSignal?.(), summarizeConfig?.signal);
+  if (trip != null) throw trip;
   return { text: summaryText, usage: summaryUsage, usedMetadataStub };
 }
 
@@ -875,6 +880,11 @@ async function dispatchCompletionEvents(params: {
     messagesAfterCount,
   } = params;
 
+  const assertNotTripped = (): void => {
+    const trip = findStreamLimitAbortReason(graph.getBreakerSignal?.(), runnableConfig?.signal);
+    if (trip != null) throw trip;
+  };
+  assertNotTripped();
   runStep.summary = summaryBlock;
   if (summaryUsage) {
     runStep.usage = {
@@ -892,6 +902,7 @@ async function dispatchCompletionEvents(params: {
     runnableConfig
   );
 
+  assertNotTripped();
   if (runnableConfig) {
     await safeDispatchCustomEvent(
       GraphEvents.ON_SUMMARIZE_COMPLETE,
@@ -904,6 +915,7 @@ async function dispatchCompletionEvents(params: {
     );
   }
 
+  assertNotTripped();
   const sessionId = graph.runId ?? '';
   if (graph.hookRegistry?.hasHookFor('PostCompact', sessionId) === true) {
     const threadId = (
@@ -1017,11 +1029,11 @@ function withBreakerSignal<T extends { signal?: AbortSignal }>(
  * child's private breaker never fires for it. */
 function findStreamLimitAbortReason(
   ...signals: Array<AbortSignal | undefined>
-): StreamLimitExceededError | undefined {
+): StreamLimitExceededError | ProviderTextProtectionError | undefined {
   for (const signal of signals) {
     if (
       signal?.aborted === true &&
-      signal.reason instanceof StreamLimitExceededError
+      (signal.reason instanceof StreamLimitExceededError || signal.reason instanceof ProviderTextProtectionError)
     ) {
       return signal.reason;
     }
@@ -1526,6 +1538,8 @@ export function createSummarizeNode({
       return { summarizationRequest: undefined };
     }
 
+    const postCallTrip = findStreamLimitAbortReason(entryBreakerSignal, config?.signal);
+    if (postCallTrip != null) throw postCallTrip;
     const summaryText = enrichSummary(rawText, messagesToRefine);
 
     const tokenCount = await computeSummaryTokenCount(
@@ -1533,6 +1547,8 @@ export function createSummarizeNode({
       agentContext
     );
 
+    const commitTrip = findStreamLimitAbortReason(entryBreakerSignal, config?.signal);
+    if (commitTrip != null) throw commitTrip;
     if (usedIntraTurnFallback) {
       agentContext.setSummary(summaryText, tokenCount, {
         precedesMessages: true,
@@ -1712,6 +1728,8 @@ export function createSummarizationChunkHandler({
         throw error;
       }
     }
+    const protectionTrip = findStreamLimitAbortReason(graph?.getBreakerController?.().signal, config.signal);
+    if (protectionTrip != null) throw protectionTrip;
     const chunkAny = chunk as Parameters<typeof getChunkContent>[0]['chunk'];
     const raw = getChunkContent({ chunk: chunkAny, provider, reasoningKey });
     if (raw == null || (typeof raw === 'string' && !raw)) {
