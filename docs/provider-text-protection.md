@@ -20,6 +20,9 @@ executions. Use one immutable policy object per run. Do not replace it between p
 Limits include UTF-16 text, candidate-join capacity and bounded event/attempt overhead, not
 only transport bytes. Canonical output is charged too. A producer or handler that ignores
 cancellation keeps its lease until it settles; later attempts cannot replenish that budget.
+Protected attempts bypass SDK read-ahead smoothing, regardless of configured delay. Only
+the gate pulls raw chunks, and an ignoring upstream keeps its lease until actual settlement,
+not the smoother close grace. Unprotected smoothing and shared model configuration are unchanged.
 The host handler must honor the signal and bound its own detector allocations.
 
 Run-level policy belongs at `RunConfig`, not inside its legacy `graphConfig`; misplaced required
@@ -29,7 +32,7 @@ Missing handlers, invalid versions/limits/results, deadline exhaustion, buffer o
 Stop fail closed. Classification/handler errors become stable SDK error codes, never original
 exception details. No failed-attempt prefix is released. Retry/fallback has a fresh candidate.
 Policy failures are terminal, not fallback triggers. Queued stream consumers and post-await
-eager-tool guards honor protection breaker trips before dispatch; child-entry and fallback
+eager-tool guards honor captured own and inherited protection signals before dispatch; child-entry and fallback
 admission cannot restart work after the trip. Event-tool post-approval admission and child
 safety-error pass-through honor the same trips. Foreground child failures abort the captured
 parent breaker, not a replacement run. SDK-owned cooperative restart cancellation discards

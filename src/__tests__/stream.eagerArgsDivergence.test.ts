@@ -745,6 +745,37 @@ describe('eager args divergence (LibreChat#14371)', () => {
     expect(toolExecuteCalls).toHaveLength(0);
   });
 
+  it.each([
+    { signalSource: 'constructor', shape: 'parsed' },
+    { signalSource: 'constructor', shape: 'seal' },
+    { signalSource: 'call', shape: 'parsed' },
+    { signalSource: 'call', shape: 'seal' },
+  ])('honors inherited $signalSource trips after awaited $shape handling', async ({ signalSource, shape }) => {
+    const parent = new AbortController();
+    const graph = createGraph(signalSource === 'constructor' ? { signal: parent.signal } : {});
+    if (signalSource === 'call') graph.config = { ...graph.config, signal: parent.signal };
+    const trip = new ProviderTextProtectionError('blocked');
+    const originalDispatch = graph.dispatchRunStep.bind(graph);
+    graph.dispatchRunStep = async (key, details, metadata): Promise<string> => {
+      const id = await originalDispatch(key, details, metadata);
+      parent.abort(trip);
+      graph.config = { ...graph.config, signal: new AbortController().signal };
+      return id;
+    };
+    const { toolExecuteCalls } = installToolExecuteResponder();
+    const chunk = shape === 'parsed'
+      ? new AIMessageChunk({ content: '', tool_calls: [{ id: 'inherited-call', name: 'db_query', args: { sql: 'SELECT 1;' }, type: 'tool_call' }], response_metadata: { finish_reason: 'tool_calls' } })
+      : new AIMessageChunk({ content: '', tool_call_chunks: [{ index: 0, id: 'inherited-call', name: 'db_query', args: '{"sql":"SELECT 1;"}' }], response_metadata: {
+        [STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY]: BEDROCK_CONVERSE_STREAMED_TOOL_CALL_ADAPTER,
+        [STREAMED_TOOL_CALL_SEAL_METADATA_KEY]: { kind: 'single', index: 0 },
+      } });
+    if (shape === 'seal') chunk.tool_calls = [];
+    await expect(new ChatModelStreamHandler().handle(GraphEvents.CHAT_MODEL_STREAM, { chunk }, { langgraph_node: 'agent' }, graph)).rejects.toBe(trip);
+    expect(graph.breakerAbort.signal.aborted).toBe(false);
+    expect(toolExecuteCalls).toHaveLength(0);
+    expect(graph.eagerEventToolExecutions.size).toBe(0);
+  });
+
   it('sends a breaker-composed abort signal with eager prestart requests', async () => {
     const graph = createGraph();
     const { toolExecuteCalls } = installToolExecuteResponder();

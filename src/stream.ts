@@ -1688,6 +1688,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
       graph.breakerAbort instanceof AbortController
         ? graph.breakerAbort
         : undefined;
+    const entrySignals = [eventBreaker?.signal, graph.signal, graph.config.signal];
     /** Immutable scope captured at handler entry. A reset while this
      * handler is suspended in an await replaces the object, so ONE
      * reference comparison proves the event still belongs to the live run
@@ -1696,14 +1697,13 @@ export class ChatModelStreamHandler implements t.EventHandler {
     const runScopeInvalidated = (): boolean =>
       entryRunScope != null && graph.runScope !== entryRunScope;
     const throwIfRunBreakerTripped = (): void => {
-      if (
-        eventBreaker != null &&
-        eventBreaker.signal.aborted &&
-        (eventBreaker.signal.reason instanceof StreamLimitExceededError ||
-          eventBreaker.signal.reason instanceof PreparedSubagentError ||
-          eventBreaker.signal.reason instanceof ProviderTextProtectionError)
-      ) {
-        throw eventBreaker.signal.reason;
+      for (const signal of entrySignals) {
+        if (signal?.aborted === true &&
+            (signal.reason instanceof StreamLimitExceededError ||
+              signal.reason instanceof PreparedSubagentError ||
+              signal.reason instanceof ProviderTextProtectionError)) {
+          throw signal.reason;
+        }
       }
     };
 

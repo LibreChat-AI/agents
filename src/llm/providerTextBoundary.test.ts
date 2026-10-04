@@ -18,7 +18,9 @@ import type {
 import type { RuntimeProviderName, ChatModel, StreamEventData, EventHandler } from '@/types';
 import { ProviderTextAttempt, ProviderTextProtectionError, createProviderTextRestartCancellation, isProviderTextRestartCancellation } from '@/protection/providerText';
 import { withProviderTextBoundary } from '@/llm/providerTextBoundary';
+import { smoothGenerationChunks } from '@/llm/stream/chunkAdapters';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
+import { PRODUCER_CLOSE_GRACE_MS } from '@/llm/stream/smoother';
 import fixtures from '@/protection/__tests__/fixtures/a1.json';
 import { Constants, GraphEvents, Providers } from '@/common';
 import { registerProvider } from '@/provider-registration';
@@ -1099,4 +1101,64 @@ it.each([
   expect(badResult).toMatchObject({ status: 'error', tool_call_id: 'native-bad-call' });
   expect(JSON.stringify(messages)).toContain('Recovery control');
   expect(JSON.stringify(messages)).not.toContain(fixtures.canaries[0]);
+});
+
+it('retains the shared lease past smoother grace until an ignoring raw producer settles', async () => {
+  const started = deferred<void>();
+  const draining = deferred<void>();
+  let rawSettled = false;
+  class SmoothedTransport extends Transport {
+    override async *_streamResponseChunks(messages: BaseMessage[], options: this['ParsedCallOptions'], runManager?: CallbackManagerForLLMRun): AsyncGenerator<ChatGenerationChunk> {
+      const source = (async function* (): AsyncGenerator<ChatGenerationChunk> {
+        try {
+          yield new ChatGenerationChunk({ text: 'x'.repeat(30), message: new AIMessageChunk('x'.repeat(30)) });
+          started.resolve();
+          await draining.promise;
+        } finally { rawSettled = true; }
+      })();
+      yield* smoothGenerationChunks({ chunks: source, delayMs: 25, signal: options.signal, runManager });
+    }
+  }
+  const protection = policy({ timeoutMs: 30, maxAttemptBytes: 1024, maxBufferedBytes: 1024 });
+  try {
+    const task = invoke(new SmoothedTransport([]), protection);
+    await started.promise;
+    await expect(task).rejects.toMatchObject({ code: 'timeout' });
+    await new Promise((resolve) => setTimeout(resolve, PRODUCER_CLOSE_GRACE_MS + 100));
+    expect(rawSettled).toBe(false);
+    await expect(invoke(new Transport([new AIMessageChunk('Control')]), protection)).rejects.toMatchObject({ code: 'overflow' });
+  } finally { draining.resolve(); }
+  await new Promise((resolve) => setImmediate(resolve));
+  expect(rawSettled).toBe(true);
+  expect((await invoke(new Transport([new AIMessageChunk('Control')]), protection)).messages?.[0].content).toBe('Control');
+});
+
+it('keeps a real Bedrock ignoring producer charged after cancellation with smoothing configured', async () => {
+  const started = deferred<void>();
+  const draining = deferred<void>();
+  let rawSettled = false;
+  const model = new CustomChatBedrockConverse({ model: 'anthropic.claude-test', region: 'us-east-1', credentials: { accessKeyId: 'synthetic', secretAccessKey: 'synthetic' }, _lc_stream_delay: 25 });
+  const rawStream = (async function* (): AsyncGenerator<ConverseStreamOutput> {
+    try {
+      yield { contentBlockDelta: { contentBlockIndex: 0, delta: { text: 'x'.repeat(30) } } };
+      started.resolve();
+      await draining.promise;
+    } finally { rawSettled = true; }
+  })();
+  const send = jest.spyOn(model.client, 'send').mockImplementation(async (): Promise<ConverseStreamCommandOutput> => ({ $metadata: {}, stream: rawStream }));
+  const protection = policy({ timeoutMs: 50, maxAttemptBytes: 1024, maxBufferedBytes: 1024 });
+  const observed: string[] = [];
+  try {
+    const task = attemptInvoke({ model, messages: [new HumanMessage('Allowed control')], provider: Providers.BEDROCK, providerTextProtection: protection, onChunk: (chunk) => { observed.push(JSON.stringify(chunk)); } });
+    await started.promise;
+    await expect(task).rejects.toMatchObject({ code: 'timeout' });
+    await new Promise((resolve) => setTimeout(resolve, PRODUCER_CLOSE_GRACE_MS + 100));
+    expect(rawSettled).toBe(false);
+    await expect(invoke(new Transport([new AIMessageChunk('Control')]), protection)).rejects.toMatchObject({ code: 'overflow' });
+    expect(observed.join('')).not.toContain('x'.repeat(30));
+    expect(model._lc_stream_delay).toBe(25);
+  } finally { draining.resolve(); send.mockRestore(); }
+  await new Promise((resolve) => setImmediate(resolve));
+  expect(rawSettled).toBe(true);
+  expect((await invoke(new Transport([new AIMessageChunk('Control')]), protection)).messages?.[0].content).toBe('Control');
 });

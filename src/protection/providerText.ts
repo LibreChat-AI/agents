@@ -80,6 +80,13 @@ function protectionAbortError(parent?: AbortSignal): ProviderTextProtectionError
   return new ProviderTextProtectionError('cancelled');
 }
 
+const protectedSignals = new WeakSet<AbortSignal>();
+
+/** Provider smoothing must stay lazy while the release boundary owns raw text. */
+export function isProtectedProviderTextSignal(signal?: AbortSignal): boolean {
+  return signal != null && protectedSignals.has(signal);
+}
+
 const budgets = new WeakMap<ProviderTextProtection, { bytes: number }>();
 const errorCodes = new Set<ProviderTextProtectionErrorCode>([
   'blocked',
@@ -142,6 +149,7 @@ export class ProviderTextAttempt {
     budgets.set(policy, this.budget);
     if (parent?.aborted === true) throw protectionAbortError(parent);
     this.charge(512);
+    protectedSignals.add(this.signal);
     this.abort = (): void =>
       this.controller.abort(protectionAbortError(this.parent));
     parent?.addEventListener('abort', this.abort, { once: true });
