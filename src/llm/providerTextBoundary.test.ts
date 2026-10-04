@@ -28,6 +28,7 @@ import { CustomChatBedrockConverse } from '@/llm/bedrock';
 import { AgentContext } from '@/agents/AgentContext';
 import { CustomAnthropic } from '@/llm/anthropic';
 import { ChatModelStreamHandler } from '@/stream';
+import { ChatOpenRouter } from '@/llm/openrouter';
 import { FakeChatModel } from '@/llm/fake';
 import { ChatOpenAI } from '@/llm/openai';
 import { Run } from '@/run';
@@ -1161,4 +1162,142 @@ it('keeps a real Bedrock ignoring producer charged after cancellation with smoot
   await new Promise((resolve) => setImmediate(resolve));
   expect(rawSettled).toBe(true);
   expect((await invoke(new Transport([new AIMessageChunk('Control')]), protection)).messages?.[0].content).toBe('Control');
+});
+
+it.each([
+  { label: 'exact replay', provider: Providers.OPENROUTER, first: ['ab', 'c'], replay: 'abc', expected: 'abc' },
+  { label: 'new suffix', provider: Providers.OPENROUTER, first: ['ab', 'c'], replay: 'abcdef', expected: 'abcdef' },
+  { label: 'Unicode prefix', provider: Providers.OPENROUTER, first: ['😀 café ', 'a1.alice@example.invalid'], replay: '😀 café a1.alice@example.invalid.', expected: '😀 café a1.alice@example.invalid.' },
+  { label: 'nonprefix', provider: Providers.OPENROUTER, first: ['abc'], replay: 'def', expected: 'abcdef' },
+  { label: 'empty prefix', provider: Providers.OPENROUTER, first: [''], replay: 'abc', expected: 'abc' },
+  { label: 'non-OpenRouter control', provider: Providers.OPENAI, first: ['abc'], replay: 'abc', expected: 'abcabc' },
+])('inspects one logical candidate for $label', async ({ provider, first, replay, expected }) => {
+  const reasoning_details = [{ type: 'reasoning.encrypted', id: 'signed-control', data: 'encrypted-control', format: 'opaque' }];
+  const inspected: string[] = [];
+  const result = await attemptInvoke({ model: new Transport([
+    ...first.map((content) => new AIMessageChunk(content)),
+    new AIMessageChunk({ content: replay, additional_kwargs: { reasoning_details } }),
+  ]), messages: [new HumanMessage('Allowed control')], provider, onChunk: async () => {},
+  providerTextProtection: policy({ inspect: ({ content }) => { inspected.push(content); return approved(content); } }) });
+  expect(inspected).toEqual([expected]);
+  expect(result.messages?.[0].content).toBe(expected);
+  expect(result.messages?.[0].additional_kwargs.reasoning_details).toEqual(reasoning_details);
+});
+
+it('retains repeated unmarked OpenRouter prose and bounds marked replay events', async () => {
+  const result = await attemptInvoke({ model: new Transport([new AIMessageChunk('abc'), new AIMessageChunk('abc')]), messages: [], provider: Providers.OPENROUTER, onChunk: async () => {}, providerTextProtection: policy() });
+  expect(result.messages?.[0].content).toBe('abcabc');
+  const chunks = [new AIMessageChunk('abc'), ...Array.from({ length: 20 }, () => new AIMessageChunk({ content: 'abc', additional_kwargs: { reasoning_details: [{ type: 'reasoning.text', text: 'Reasoning control' }] } }))];
+  await expect(attemptInvoke({ model: new Transport(chunks), messages: [], provider: Providers.OPENROUTER, onChunk: async () => {}, providerTextProtection: policy({ maxAttemptBytes: 1024 }) })).rejects.toMatchObject({ code: 'overflow' });
+});
+
+it.each([false, true])('protects real OpenRouter cumulative replay before callbacks/state/reuse (registered=%s)', async (registered) => {
+  const source = fixtures.cases[0].chunks.join('');
+  const reasoning_details = [{ type: 'reasoning.encrypted', id: 'signed-control', data: 'encrypted-control', format: 'opaque' }];
+  const frames = [
+    { choices: [{ index: 0, delta: { role: 'assistant', content: 'Contact a1.ali' }, finish_reason: null }] },
+    { choices: [{ index: 0, delta: { content: 'ce@example.invalid' }, finish_reason: null }] },
+    { choices: [{ index: 0, delta: { content: source, reasoning_details }, finish_reason: 'stop' }] },
+  ].map((frame) => ({ ...frame, id: 'openrouter-replay-control', object: 'chat.completion.chunk', created: 1, model: 'synthetic-model' }));
+  const fields = { model: 'synthetic-model', streaming: true, _lc_stream_delay: 25, streamUsage: false, configuration: { apiKey: 'synthetic-test-key', baseURL: 'https://openrouter.ai/api/v1', fetch: async () => new Response(frames.map((frame) => `data: ${JSON.stringify(frame)}\n\n`).join('') + 'data: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } }) } };
+  const model = new ChatOpenRouter(fields);
+  const inspected: string[] = [];
+  const protection = policy({ inspect: ({ content }) => { inspected.push(content); return approved(content.replace(fixtures.canaries[0], '[EMAIL_1]')); } });
+  const native: string[] = [];
+  const observer = BaseCallbackHandler.fromMethods({ handleLLMNewToken: (token): void => { if (token) native.push(token); }, handleLLMEnd: (output): void => { native.push(JSON.stringify(output)); } });
+  observer.awaitHandlers = true;
+  const baseline = await attemptInvoke({ model, messages: [new HumanMessage('Allowed control')], provider: Providers.OPENROUTER, onChunk: async () => {} });
+  expect(baseline.messages?.[0].content).toBe(source);
+  const result = await attemptInvoke({ model, messages: [new HumanMessage('Allowed control')], provider: Providers.OPENROUTER, onChunk: async () => {}, providerTextProtection: protection }, { callbacks: [observer] });
+  expect(inspected).toEqual([source]);
+  expect(result.messages?.[0].content).toBe('Contact [EMAIL_1].');
+  expect(result.messages?.[0].additional_kwargs.reasoning_details).toEqual(reasoning_details);
+  expect(native.join('')).not.toContain(fixtures.canaries[0]);
+  expect(native.join('')).toContain('Contact [EMAIL_1].');
+  const events: string[] = [];
+  const handlers: Record<string, EventHandler> = registered ? { [GraphEvents.CHAT_MODEL_STREAM]: new ChatModelStreamHandler() } : {};
+  const run = await Run.create({ runId: `openrouter-replay-${registered}`, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENROUTER, streaming: true }, instructions: 'Allowed instructions.' }, providerTextProtection: protection, returnContent: true, skipCleanup: true, customHandlers: { ...handlers, [GraphEvents.ON_MESSAGE_DELTA]: { handle: (_event, data): void => { events.push(JSON.stringify(data)); } } } });
+  run.Graph!.overrideModel = model;
+  await run.processStream({ messages: [new HumanMessage('Allowed control')] }, { version: 'v2', configurable: { thread_id: `openrouter-replay-${registered}` } });
+  expect(inspected).toEqual([source, source]);
+  const messages = JSON.stringify(run.Graph!.getRunMessages());
+  expect(messages).not.toContain(fixtures.canaries[0]);
+  expect(messages).toContain('Contact [EMAIL_1].');
+  expect(messages).not.toContain('Contact [EMAIL_1]Contact');
+  expect(events.join('')).toContain('Contact [EMAIL_1].');
+  expect(events.join('')).not.toContain(fixtures.canaries[0]);
+});
+
+it('normalizes OpenRouter fallback and retry candidates without retaining a failed primary prefix', async () => {
+  const source = fixtures.canaries[0];
+  const details = [{ type: 'reasoning.encrypted', id: 'fallback-signature', data: 'encrypted-control' }];
+  const frames = [
+    { choices: [{ index: 0, delta: { role: 'assistant', content: source }, finish_reason: null }] },
+    { choices: [{ index: 0, delta: { content: source, reasoning_details: details }, finish_reason: 'stop' }] },
+  ].map((frame) => ({ ...frame, id: 'openrouter-fallback-control', object: 'chat.completion.chunk', created: 1, model: 'synthetic-model' }));
+  const fields = { model: 'synthetic-model', streaming: true, _lc_stream_delay: 25, streamUsage: false, configuration: { apiKey: 'synthetic-test-key', baseURL: 'https://openrouter.ai/api/v1', fetch: async () => new Response(frames.map((frame) => `data: ${JSON.stringify(frame)}\n\n`).join('') + 'data: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } }) } };
+  const inspected: string[] = [];
+  const protection = policy({ inspect: ({ content }) => { inspected.push(content); return approved('[EMAIL_1]'); } });
+  const primary = new Transport([new AIMessageChunk(fixtures.canaries[1])], async () => { throw new Error('Primary transport failed'); });
+  const primaryError = await invoke(primary, protection).catch((error: Error) => error);
+  expect(inspected).toEqual([]);
+  const fallback = await tryFallbackProviders({ fallbacks: [{ provider: Providers.OPENROUTER, clientOptions: fields }], messages: [new HumanMessage('Allowed control')], primaryError, providerTextProtection: protection, onChunk: async () => {} });
+  expect(fallback?.messages?.[0].content).toBe('[EMAIL_1]');
+  const retry = await attemptInvoke({ model: new ChatOpenRouter(fields), messages: [], provider: Providers.OPENROUTER, providerTextProtection: protection, onChunk: async () => {} });
+  expect(retry.messages?.[0].content).toBe('[EMAIL_1]');
+  expect(inspected).toEqual([source, source]);
+});
+
+it('keeps parallel replay candidates independent on a shared policy budget', async () => {
+  const inspected: string[] = [];
+  const protection = policy({ inspect: ({ content }) => { inspected.push(content); return approved(content); } });
+  const replay = (text: string) => attemptInvoke({ model: new Transport([
+    new AIMessageChunk(text.slice(0, 6)), new AIMessageChunk(text.slice(6)),
+    new AIMessageChunk({ content: text, additional_kwargs: { reasoning_details: [{ type: 'reasoning.text', text: 'Reasoning control' }] } }),
+  ]), messages: [], provider: Providers.OPENROUTER, providerTextProtection: protection, onChunk: async () => {} });
+  const [a, b] = await Promise.all([replay('Tenant A control'), replay('Tenant B control')]);
+  expect(a.messages?.[0].content).toBe('Tenant A control');
+  expect(b.messages?.[0].content).toBe('Tenant B control');
+  expect(inspected.sort()).toEqual(['Tenant A control', 'Tenant B control']);
+});
+
+it('reuses one canonical OpenRouter replay value after a real tool dispatch', async () => {
+  const source = fixtures.cases[0].chunks.join('');
+  const firstFrames = [
+    { choices: [{ index: 0, delta: { role: 'assistant', content: source }, finish_reason: null }] },
+    { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'replay-lookup', type: 'function', function: { name: 'lookup', arguments: '{"count":42}' } }] }, finish_reason: null }] },
+    { choices: [{ index: 0, delta: { content: source, reasoning_details: [{ type: 'reasoning.encrypted', id: 'replay-signature', data: 'encrypted-control' }] }, finish_reason: 'tool_calls' }] },
+  ];
+  const finalFrames = [{ choices: [{ index: 0, delta: { role: 'assistant', content: 'Tool follow-up control' }, finish_reason: 'stop' }] }];
+  const requests: string[] = [];
+  const fields = { model: 'synthetic-model', streaming: true, streamUsage: false, _lc_stream_delay: 25, configuration: { apiKey: 'synthetic-test-key', baseURL: 'https://openrouter.ai/api/v1', fetch: async (_url: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    requests.push(typeof init?.body === 'string' ? init.body : '');
+    const frames = (requests.length === 1 ? firstFrames : finalFrames).map((frame) => ({ ...frame, id: `replay-turn-${requests.length}`, object: 'chat.completion.chunk', created: 1, model: 'synthetic-model' }));
+    return new Response(frames.map((frame) => `data: ${JSON.stringify(frame)}\n\n`).join('') + 'data: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } });
+  } } };
+  let executed = 0;
+  const lookup = new DynamicStructuredTool({ name: 'lookup', description: 'Allowed control.', schema: z.object({ count: z.number() }), func: async ({ count }) => { executed++; expect(count).toBe(42); return 'Tool control'; } });
+  const inspected: string[] = [];
+  const run = await Run.create({ runId: 'openrouter-replay-reuse', graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENROUTER, streaming: true }, instructions: 'Allowed instructions.', tools: [lookup] }, providerTextProtection: policy({ inspect: ({ content }) => { inspected.push(content); return approved(content.replace(fixtures.canaries[0], '[EMAIL_1]')); } }), returnContent: true, skipCleanup: true });
+  class CapturingOpenRouter extends ChatOpenRouter {
+    readonly inputs: BaseMessage[][] = [];
+    override async *_streamResponseChunks(messages: BaseMessage[], options: this['ParsedCallOptions'], runManager?: CallbackManagerForLLMRun): AsyncGenerator<ChatGenerationChunk> {
+      this.inputs.push(messages);
+      yield* super._streamResponseChunks(messages, options, runManager);
+    }
+  }
+  const model = new CapturingOpenRouter(fields);
+  run.Graph!.overrideModel = model;
+  await run.processStream({ messages: [new HumanMessage('Allowed control')] }, { version: 'v2', configurable: { thread_id: 'openrouter-replay-reuse' } });
+  expect(requests).toHaveLength(2);
+  expect(executed).toBe(1);
+  expect(inspected).toEqual([source, 'Tool follow-up control']);
+  expect(requests[1]).not.toContain(fixtures.canaries[0]);
+  expect(model.inputs).toHaveLength(2);
+  const assistant = model.inputs[1].find((message) => message.getType() === 'ai');
+  expect(assistant?.content).toBe('Contact [EMAIL_1].');
+  expect(JSON.stringify(assistant)).not.toContain(fixtures.canaries[0]);
+  expect(requests[1]).toContain('replay-lookup');
+  expect(requests[1]).toContain('Tool control');
+  expect(JSON.stringify(run.Graph!.getRunMessages())).toContain('Tool follow-up control');
 });

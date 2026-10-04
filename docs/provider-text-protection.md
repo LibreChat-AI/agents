@@ -58,7 +58,10 @@ blocks, additional-output aliases, cached models, multiple prose block indices a
 shells fail `unsupported`. Non-streaming responses are inspected before native callbacks/state;
 transport response allocation itself is provider-owned, not an SDK gate buffer. Native nonstreaming
 lifecycle/usage metadata and malformed-tool diagnostics are preserved without rewriting.
-Invalid calls keep the existing paired-error and model-recovery route after canonicalization. Invoke configured to aggregate internal
+Invalid calls keep the existing paired-error and model-recovery route after canonicalization.
+OpenRouter final reasoning replays are normalized against buffered string fragments before
+inspection; only the new prose suffix is appended. Reasoning/signatures remain unchanged,
+and replay events still consume bounded overhead. Unmarked repeated prose is not deduplicated. Invoke configured to aggregate internal
 streaming, including effective request parameters/model kwargs and OpenAI delegates, fails `unsupported` before production; use the guarded
 stream path or native nonstreaming instead.
 

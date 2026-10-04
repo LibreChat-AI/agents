@@ -5,7 +5,7 @@ import { AIMessage, AIMessageChunk, mergeContent } from '@langchain/core/message
 import type { MessageContentComplex } from '@langchain/core/messages';
 import type { ChatResult } from '@langchain/core/outputs';
 import type { ProviderTextProtection } from '@/protection/providerText';
-import type { ChatModel } from '@/types';
+import type { ChatModel, ProviderName } from '@/types';
 import {
   getStreamedToolCallAdapter,
   getStreamedToolCallSeal,
@@ -125,7 +125,7 @@ class Candidate {
   private stringContent = false;
   private readonly toolInputIndices = new Set<number>();
 
-  constructor(private readonly attempt: ProviderTextAttempt) {}
+  constructor(private readonly attempt: ProviderTextAttempt, private readonly provider?: ProviderName) {}
 
   strip(generation: ChatGenerationChunk): ChatGenerationChunk {
     const message = generation.message;
@@ -147,7 +147,8 @@ class Candidate {
       if (message.content && this.block != null)
         throw new ProviderTextProtectionError('unsupported');
       this.stringContent ||= message.content.length > 0;
-      this.attempt.append(message.content);
+      const details = message.additional_kwargs.reasoning_details;
+      this.attempt.append(message.content, this.provider === Providers.OPENROUTER && Array.isArray(details) && details.length > 0);
       content = '';
     } else {
       content = [];
@@ -273,13 +274,14 @@ function usesInternalStreaming(
 /** Clone only known runnable shells. Never mutate a shared provider or its callback configuration. */
 export function withProviderTextBoundary(
   model: ChatModel,
-  policy: ProviderTextProtection
+  policy: ProviderTextProtection,
+  provider?: ProviderName
 ): ChatModel {
   const protectedModel = clone(model);
   if (model instanceof RunnableBinding) {
     assertBindingShell(model);
     Object.defineProperty(protectedModel, 'bound', {
-      value: withProviderTextBoundary(model.bound as ChatModel, policy),
+      value: withProviderTextBoundary(model.bound as ChatModel, policy, provider),
     });
     return protectedModel;
   }
@@ -295,7 +297,8 @@ export function withProviderTextBoundary(
     Object.defineProperty(protectedModel, 'last', {
       value: withProviderTextBoundary(
         steps[steps.length - 1] as ChatModel,
-        policy
+        policy,
+        provider
       ),
     });
     return protectedModel;
@@ -326,7 +329,7 @@ export function withProviderTextBoundary(
     runManager
   ): AsyncGenerator<ChatGenerationChunk> {
     const attempt = new ProviderTextAttempt(policy, options.signal);
-    const candidate = new Candidate(attempt);
+    const candidate = new Candidate(attempt, provider);
     let source: AsyncGenerator<ChatGenerationChunk> | undefined;
     try {
       source = model._streamResponseChunks(
@@ -391,7 +394,7 @@ export function withProviderTextBoundary(
       const generation = result.generations[0];
       if (!(generation.message instanceof AIMessage)) throw new ProviderTextProtectionError('unsupported');
       const message = generation.message instanceof AIMessageChunk ? generation.message : copyMessage(generation.message, generation.message.content);
-      const candidate = new Candidate(attempt);
+      const candidate = new Candidate(attempt, provider);
       const stripped = candidate.strip(
         new ChatGenerationChunk({ ...generation, message })
       );

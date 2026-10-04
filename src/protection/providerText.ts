@@ -133,6 +133,7 @@ export class ProviderTextAttempt {
   private readonly budget: { bytes: number };
   private readonly deadline: number;
   private bytes = 0;
+  private textLength = 0;
   private readonly fragments: string[] = [];
   private readonly pending = new Set<Promise<unknown>>();
   private readonly timer: ReturnType<typeof setTimeout>;
@@ -185,12 +186,25 @@ export class ProviderTextAttempt {
     this.budget.bytes += bytes;
   }
 
-  append(text: string): void {
+  append(text: string, cumulativeReplay = false): void {
     this.check();
+    if (cumulativeReplay && this.hasCandidatePrefix(text)) text = text.slice(this.textLength);
     if (!text) return;
     const bytes = text.length * 2;
     this.charge(bytes * 2 + 64);
     this.fragments.push(text);
+    this.textLength += text.length;
+  }
+
+  /** Compare buffered fragments without allocating an uncharged joined copy. */
+  private hasCandidatePrefix(text: string): boolean {
+    if (this.textLength === 0 || text.length < this.textLength) return false;
+    let offset = 0;
+    for (const fragment of this.fragments) {
+      if (!text.startsWith(fragment, offset)) return false;
+      offset += fragment.length;
+    }
+    return true;
   }
 
   observeChunk(): void {

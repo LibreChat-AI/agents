@@ -725,7 +725,7 @@ export async function attemptInvoke(
       ? preparedRequest
       : {
         ...preparedRequest,
-        model: withProviderTextBoundary(preparedRequest.model, policy),
+        model: withProviderTextBoundary(preparedRequest.model, policy, provider),
       };
   const configuredModel =
     providerStampedConfig.metadata?.[Constants.INVOKED_MODEL];
