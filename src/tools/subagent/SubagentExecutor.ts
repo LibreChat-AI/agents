@@ -957,6 +957,7 @@ export type SubagentExecutorOptions = {
    * graph's own resolved limits; without this the child would silently
    * revert to the defaults.
    */
+  providerTextProtection?: StandardGraphInput['providerTextProtection'];
   streamLimits?: StandardGraphInput['streamLimits'];
   humanInTheLoop?: HumanInTheLoopConfig;
   /** Shared durable saver used to recover outer tool lifecycle results before
@@ -1034,6 +1035,7 @@ export class SubagentExecutor {
   private readonly executionContext: SubagentExecutionContext;
   private readonly langfuse?: StandardGraphInput['langfuse'];
   private readonly tokenCounter?: TokenCounter;
+  private readonly providerTextProtection?: StandardGraphInput['providerTextProtection'];
   private readonly streamLimits?: StandardGraphInput['streamLimits'];
   private readonly humanInTheLoop?: HumanInTheLoopConfig;
   private readonly checkpointer?: BaseCheckpointSaver;
@@ -1074,6 +1076,7 @@ export class SubagentExecutor {
     this.langfuse = options.langfuse;
     this.tokenCounter = options.tokenCounter;
     this.streamLimits = options.streamLimits;
+    this.providerTextProtection = options.providerTextProtection;
     this.humanInTheLoop = options.humanInTheLoop;
     this.checkpointer = isCheckpointSaver(options.checkpointer)
       ? options.checkpointer
@@ -1344,6 +1347,7 @@ export class SubagentExecutor {
       subagentContext: this.subagentContext,
       onResolutionFailure: this.onResolutionFailure,
       streamLimits: this.streamLimits,
+      providerTextProtection: this.providerTextProtection,
       humanInTheLoop:
         this.humanInTheLoop?.enabled === true ||
         this.humanInTheLoop?.backgroundPausePolicy === 'deny'
@@ -2831,6 +2835,7 @@ export class SubagentExecutor {
       langfuse: this.langfuse,
       tokenCounter: this.tokenCounter,
       streamLimits: this.streamLimits,
+      providerTextProtection: this.providerTextProtection,
       subagentScope: true,
       subagentExecutionContext: childExecutionContext,
       subagentContext: this.subagentContext,

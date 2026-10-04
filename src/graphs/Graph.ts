@@ -132,6 +132,10 @@ import {
   resolveToolOutputTracingConfig,
 } from '@/langfuseConfig';
 import {
+  ProviderTextProtectionError,
+  validateProviderTextProtection,
+} from '@/protection/providerText';
+import {
   annotateMessagesForLLM,
   ToolOutputReferenceRegistry,
 } from '@/tools/toolOutputReferences';
@@ -1377,6 +1381,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    * {@link t.StandardGraphInput.streamLimits}. The stream handler enforces
    * these on every streamed chunk event.
    */
+  providerTextProtection?: t.StandardGraphInput['providerTextProtection'];
   streamLimits: ResolvedStreamLimits;
   /**
    * Cumulative streamed argument bytes per in-flight tool call, keyed by
@@ -1551,6 +1556,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       onSubagentResolutionFailure,
       preemption,
       streamLimits,
+      providerTextProtection,
       toolExecution,
       clientDelegatedToolNames,
     }: t.StandardGraphInput,
@@ -1580,6 +1586,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     this.onSubagentResolutionFailure = onSubagentResolutionFailure;
     this.preemption = preemption;
     this.streamLimits = resolveStreamLimits(streamLimits);
+    if (providerTextProtection != null)
+      validateProviderTextProtection(providerTextProtection);
+    this.providerTextProtection = providerTextProtection;
     this.toolExecution = toolExecution;
     if (clientDelegatedToolNames != null && clientDelegatedToolNames.length > 0) {
       if (agents.length !== 1) {
@@ -4404,7 +4413,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
          * succeeding fallback would resolve a run the public contract says
          * must reject. Rethrow before any recovery path.
          */
-        if (primaryError instanceof InvalidModelToolCallError) {
+        if (
+          primaryError instanceof InvalidModelToolCallError ||
+          primaryError instanceof ProviderTextProtectionError
+        ) {
+          if (primaryError instanceof ProviderTextProtectionError) attemptBreaker.abort(primaryError);
           throw primaryError;
         }
         if (
@@ -4747,7 +4760,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               })
           );
         } catch (fallbackError) {
-          if (fallbackError instanceof InvalidModelToolCallError) {
+          if (
+            fallbackError instanceof InvalidModelToolCallError ||
+            fallbackError instanceof ProviderTextProtectionError
+          ) {
+            if (fallbackError instanceof ProviderTextProtectionError) attemptBreaker.abort(fallbackError);
             throw fallbackError;
           }
           if (
@@ -5347,6 +5364,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           subagentContext: this.subagentContext,
           onResolutionFailure: this.onSubagentResolutionFailure,
           streamLimits: this.streamLimits,
+          providerTextProtection: this.providerTextProtection,
           humanInTheLoop: this.humanInTheLoop,
           checkpointer: this.compileOptions?.checkpointer,
           maxDepth: effectiveSubagentDepth,

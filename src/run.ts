@@ -477,6 +477,7 @@ export class Run<_T extends t.BaseGraphState> {
   private subagentUsageSink?: t.SubagentUsageSink;
   private preemption?: t.StreamPreemption;
   private maxStopContinuations: number;
+  private providerTextProtection?: t.StandardGraphInput['providerTextProtection'];
   private streamLimits?: t.StreamLimits;
   private subagentTasks?: t.SubagentTaskConfig;
   private subagentContext?: t.SubagentContextAdapter;
@@ -578,6 +579,7 @@ export class Run<_T extends t.BaseGraphState> {
       config.maxStopContinuations
     );
     this.streamLimits = config.streamLimits;
+    this.providerTextProtection = config.providerTextProtection;
 
     if (!config.graphConfig) {
       throw new Error('Graph config not provided');
@@ -678,6 +680,7 @@ export class Run<_T extends t.BaseGraphState> {
         onSubagentResolutionFailure: this.onSubagentResolutionFailure,
         preemption: this.preemption,
         streamLimits: this.streamLimits,
+        providerTextProtection: this.providerTextProtection,
         toolExecution: this.toolExecution,
         clientDelegatedToolNames: this.clientDelegatedToolNames,
       },
@@ -725,6 +728,7 @@ export class Run<_T extends t.BaseGraphState> {
         onSubagentResolutionFailure: this.onSubagentResolutionFailure,
         preemption: this.preemption,
         streamLimits: this.streamLimits,
+        providerTextProtection: this.providerTextProtection,
         toolExecution: this.toolExecution,
       },
     });

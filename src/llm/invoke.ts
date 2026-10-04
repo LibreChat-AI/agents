@@ -14,6 +14,7 @@ import type { ToolCall } from '@langchain/core/messages/tool';
 import type { BaseMessage } from '@langchain/core/messages';
 import type { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import type { PreparedProviderRequest } from '@/llm/prepareProviderRequest';
+import type { ProviderTextProtection } from '@/protection/providerText';
 import type { ContextOverflowContext } from '@/utils/errors';
 import type { StreamLimitState } from '@/llm/streamLimits';
 import type { PreemptAction } from '@/llm/preempt';
@@ -51,11 +52,16 @@ import {
   prepareProviderRequest,
 } from '@/llm/prepareProviderRequest';
 import {
+  validateProviderTextProtection,
+  ProviderTextProtectionError,
+} from '@/protection/providerText';
+import {
   getProviderFamily,
   providerUsesManualToolStream,
 } from '@/llm/providers';
 import { ChatModelStreamHandler, dispatchesChatModelStream } from '@/stream';
 import { Constants, ContentTypes, GraphEvents, Providers } from '@/common';
+import { withProviderTextBoundary } from '@/llm/providerTextBoundary';
 import { PreparedSubagentError } from '@/tools/preparedSubagents';
 import { assertNotTruncatedToolCall } from '@/llm/truncation';
 import { resolveClientOptionsModel } from '@/llm/request';
@@ -623,6 +629,7 @@ function appendStreamChunk({
  */
 interface AttemptInvokeCommonParams {
   context?: InvokeContext;
+  providerTextProtection?: ProviderTextProtection;
   onChunk?: OnChunk;
   /**
    * The agent lane this attempt belongs to, as the model node names it. Only
@@ -697,6 +704,9 @@ export async function attemptInvoke(
   params: AttemptInvokeParams,
   config?: RunnableConfig
 ): Promise<Partial<t.BaseGraphState>> {
+  const policy =
+    params.providerTextProtection ?? params.context?.providerTextProtection;
+  if (policy != null) validateProviderTextProtection(policy);
   const provider = resolveAttemptProvider(params);
   const providerStampedConfig: RunnableConfig = {
     ...config,
@@ -707,7 +717,14 @@ export async function attemptInvoke(
       resolvedProvider: provider,
     },
   };
-  const request = resolveAttemptRequest(params, providerStampedConfig);
+  const preparedRequest = resolveAttemptRequest(params, providerStampedConfig);
+  const request =
+    policy == null
+      ? preparedRequest
+      : {
+        ...preparedRequest,
+        model: withProviderTextBoundary(preparedRequest.model, policy),
+      };
   const configuredModel =
     providerStampedConfig.metadata?.[Constants.INVOKED_MODEL];
   const modelId =
@@ -775,6 +792,11 @@ export async function attemptInvoke(
     prepared?.finish(preparedAttempt, calls);
     return result;
   } catch (error) {
+    if (policy != null && config?.signal?.aborted === true) {
+      const cancelled = new ProviderTextProtectionError('cancelled');
+      prepared?.finish(preparedAttempt, undefined, cancelled);
+      throw cancelled;
+    }
     prepared?.finish(preparedAttempt, undefined, error);
     throw error;
   } finally {
@@ -1561,6 +1583,7 @@ export async function tryFallbackProviders({
   context,
   onChunk,
   streamLimitState,
+  providerTextProtection,
   preemptAgentId,
   overflowContext,
   prepareProviderRequest: prepareFallbackRequest,
@@ -1576,6 +1599,7 @@ export async function tryFallbackProviders({
   /** Accounting-lease owner forwarded to each fallback attempt (see
    * `AttemptInvokeParams.streamLimitState`). */
   streamLimitState?: StreamLimitState;
+  providerTextProtection?: ProviderTextProtection;
   /** Forwarded so a fallback-served attempt records a discarded turn in the
    * SAME lane the primary would have (see
    * `AttemptInvokeParams.preemptAgentId`). Dropping it here would leave the
@@ -1610,6 +1634,7 @@ export async function tryFallbackProviders({
     config?: RunnableConfig;
   }) => BaseMessage[] | Promise<BaseMessage[]>;
 }): Promise<Partial<t.BaseGraphState> | undefined> {
+  if (primaryError instanceof ProviderTextProtectionError) throw primaryError;
   const isOverflow = (
     error: unknown,
     contextOverride = overflowContext
@@ -1697,6 +1722,7 @@ export async function tryFallbackProviders({
             context,
             onChunk,
             streamLimitState,
+            providerTextProtection,
             preemptAgentId,
           },
           fbConfig
@@ -1710,6 +1736,7 @@ export async function tryFallbackProviders({
           context,
           onChunk,
           streamLimitState,
+          providerTextProtection,
           preemptAgentId,
         },
         fbConfig
@@ -1723,7 +1750,8 @@ export async function tryFallbackProviders({
       if (
         e instanceof StreamLimitExceededError ||
         e instanceof PreparedSubagentError ||
-        e instanceof InvalidModelToolCallError
+        e instanceof InvalidModelToolCallError ||
+        e instanceof ProviderTextProtectionError
       ) {
         throw e;
       }

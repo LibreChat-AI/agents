@@ -336,6 +336,7 @@ export type RunConfig = {
    * tool-call argument byte cap is ON by default, the per-turn event cap is
    * opt-in. See {@link StreamLimits}.
    */
+  providerTextProtection?: g.StandardGraphInput['providerTextProtection'];
   streamLimits?: StreamLimits;
   returnContent?: boolean;
   tokenCounter?: TokenCounter;
