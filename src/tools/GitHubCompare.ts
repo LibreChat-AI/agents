@@ -245,6 +245,7 @@ export async function compareGitHubCommits(
     timeoutMs
   );
   timer.unref();
+  let pendingResponse: Response | undefined;
   const requestSignal =
     signal == null ? timeout.signal : AbortSignal.any([signal, timeout.signal]);
   try {
@@ -265,7 +266,9 @@ export async function compareGitHubCommits(
             }
           )
           .then((response) => {
+            pendingResponse = response;
             if (requestSignal.aborted) {
+              pendingResponse = undefined;
               cancelBody(response);
               requestSignal.throwIfAborted();
             }
@@ -274,13 +277,13 @@ export async function compareGitHubCommits(
       requestSignal
     );
     if (!response.ok) {
-      cancelBody(response);
       throw new GitHubComparisonError(
         'HTTP_ERROR',
         `GitHub comparison unavailable (HTTP ${response.status}).`,
         response.status
       );
     }
+    pendingResponse = undefined;
     const text = await readResponse(response, requestSignal);
     requestSignal.throwIfAborted();
     return parseComparison(text, input);
@@ -294,6 +297,9 @@ export async function compareGitHubCommits(
       'GitHub comparison transport failed.'
     );
   } finally {
+    if (pendingResponse != null) {
+      cancelBody(pendingResponse);
+    }
     clearTimeout(timer);
   }
 }

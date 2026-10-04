@@ -36,7 +36,7 @@ const comparison = {
 const response = (data: object = metadata): Response =>
   new Response(JSON.stringify(data));
 const transport = (): jest.Mock<Promise<Response>, Parameters<typeof fetch>> =>
-  jest.fn(async () => response());
+  jest.fn<Promise<Response>, Parameters<typeof fetch>>(async () => response());
 
 function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
   let resolve!: (value: T) => void;
@@ -290,25 +290,34 @@ test('cancels an uncooperative transport and discards its late response', async 
   expect(cancel).toHaveBeenCalledTimes(1);
 });
 
-test('cancels a stalled body read and releases the reader', async () => {
-  const abort = new AbortController();
-  const reading = deferred<void>();
-  const cancel = jest.fn();
-  const body = new ReadableStream<Uint8Array>({
-    pull() {
-      reading.resolve();
-    },
-    cancel,
-  });
-  const fetch = jest.fn(async () => new Response(body));
-  const result = compareGitHubCommits(input, { fetch }, abort.signal);
-  await reading.promise;
-  const reason = new DOMException('Stopped.', 'AbortError');
-  abort.abort(reason);
-  await expect(result).rejects.toBe(reason);
-  expect(cancel).toHaveBeenCalledTimes(1);
-  expect(body.locked).toBe(false);
-});
+test.each([
+  ['body read', 0],
+  ['header receipt', 1],
+] as const)(
+  'cancels a stalled response at %s and releases its reader',
+  async (_phase, highWaterMark) => {
+    const abort = new AbortController();
+    const reading = deferred<void>();
+    const cancel = jest.fn();
+    const body = new ReadableStream<Uint8Array>(
+      {
+        pull() {
+          reading.resolve();
+        },
+        cancel,
+      },
+      { highWaterMark }
+    );
+    const fetch = jest.fn(async () => new Response(body));
+    const result = compareGitHubCommits(input, { fetch }, abort.signal);
+    await reading.promise;
+    const reason = new DOMException('Stopped.', 'AbortError');
+    abort.abort(reason);
+    await expect(result).rejects.toBe(reason);
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(body.locked).toBe(false);
+  }
+);
 
 test('bounds a stalled transport by the request timeout', async () => {
   jest.useFakeTimers();
