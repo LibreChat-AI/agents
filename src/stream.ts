@@ -1704,6 +1704,9 @@ export class ChatModelStreamHandler implements t.EventHandler {
               signal.reason instanceof ProviderTextProtectionError)) {
           throw signal.reason;
         }
+        if (signal?.aborted === true && graph.providerTextProtection != null) {
+          throw new ProviderTextProtectionError('cancelled');
+        }
       }
     };
 
@@ -2037,6 +2040,23 @@ export class ChatModelStreamHandler implements t.EventHandler {
         content,
         metadata,
       });
+      runStep = graph.getRunStep(stepId);
+    }
+    if (
+      graph.providerTextProtection != null &&
+      runStep?.type === StepTypes.TOOL_CALLS &&
+      agentContext.currentTokenType === ContentTypes.TEXT &&
+      (typeof content === 'string' || content.every(isTextContentPart))
+    ) {
+      stepId = await dispatchMessageCreationStep({
+        graph,
+        stepKey,
+        content,
+        contentType: ContentTypes.TEXT,
+        metadata,
+      });
+      if (runScopeInvalidated()) return;
+      throwIfRunBreakerTripped();
       runStep = graph.getRunStep(stepId);
     }
     if (!runStep) {

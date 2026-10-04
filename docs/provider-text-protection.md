@@ -50,7 +50,10 @@ The gate runs **before** LangChain's native aggregation/end callbacks, `attemptI
 `ChatModelStreamHandler`, run state and subsequent model/tool reuse. Shared providers are not mutated.
 
 String prose and a single indexed text block are supported. Reasoning, signatures, tool arguments,
-IDs, usage and control chunks keep their values and are not buffered behind prose. Anthropic
+IDs, usage and control chunks keep their values and are not buffered behind prose.
+When tool controls precede canonical prose, the dispatcher opens a message-creation step
+for that prose so live deltas and state both receive it once. Stop during the awaited
+step creation prevents the subsequent prose delta. Anthropic
 lifecycle fields, Bedrock block indices/seals and official OpenAI tool-adapter controls are
 validated and preserved. Anthropic untyped tool-input fragments must match an admitted
 tool block/index and its argument delta; their JSON is never rewritten. Unknown aliases still fail closed. Unknown content

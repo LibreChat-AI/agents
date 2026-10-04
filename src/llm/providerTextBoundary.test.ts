@@ -1301,3 +1301,81 @@ it('reuses one canonical OpenRouter replay value after a real tool dispatch', as
   expect(requests[1]).toContain('Tool control');
   expect(JSON.stringify(run.Graph!.getRunMessages())).toContain('Tool follow-up control');
 });
+
+it.each([
+  { registered: false, native: false },
+  { registered: true, native: false },
+  { registered: false, native: true },
+  { registered: true, native: true },
+])('publishes delayed canonical prose once after OpenAI tool controls ($registered/$native)', async ({ registered, native }) => {
+  const source = fixtures.cases[0].chunks.join('');
+  const frames = [
+    { choices: [{ index: 0, delta: { role: 'assistant', content: source.slice(0, 13) }, finish_reason: null }] },
+    { choices: [{ index: 0, delta: { content: source.slice(13) }, finish_reason: null }] },
+    { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'mixed-lookup', type: 'function', function: { name: 'lookup', arguments: '{"count":' } }] }, finish_reason: null }] },
+    { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: '42}' } }] }, finish_reason: null }] },
+    { choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] },
+  ];
+  const response = { id: 'mixed-native', object: 'chat.completion', created: 1, model: 'synthetic-model', choices: [{ index: 0, finish_reason: 'tool_calls', logprobs: null, message: { role: 'assistant', content: source, refusal: null, tool_calls: [{ id: 'mixed-lookup', type: 'function', function: { name: 'lookup', arguments: '{"count":42}' } }] } }], usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 } };
+  let requests = 0;
+  const fields = { apiKey: 'synthetic-test-key', model: 'synthetic-model', streaming: !native, _lc_stream_delay: 25, streamUsage: false, configuration: { apiKey: 'synthetic-test-key', fetch: async (): Promise<Response> => {
+    requests++;
+    if (native) return new Response(JSON.stringify(response), { headers: { 'content-type': 'application/json' } });
+    return new Response(frames.map((frame) => `data: ${JSON.stringify({ ...frame, id: 'mixed-stream', object: 'chat.completion.chunk', created: 1, model: 'synthetic-model' })}\n\n`).join('') + 'data: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } });
+  } } };
+  const model = new ChatOpenAI(fields);
+  model.disableStreaming = native;
+  const prose: string[] = [];
+  const order: string[] = [];
+  const steps: string[] = [];
+  let inspected = false;
+  let executed = 0;
+  const lookup = new DynamicStructuredTool({ name: 'lookup', description: 'Allowed control.', schema: z.object({ count: z.number() }), func: async ({ count }) => { executed++; expect(inspected).toBe(true); expect(count).toBe(42); return 'Tool control'; } });
+  const handlers: Record<string, EventHandler> = registered ? { [GraphEvents.CHAT_MODEL_STREAM]: new ChatModelStreamHandler() } : {};
+  const run = await Run.create({ runId: `mixed-publication-${registered}-${native}`, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, instructions: 'Allowed instructions.', tools: [lookup], toolEnd: true }, providerTextProtection: policy({ inspect: ({ content }) => { expect(content).toBe(source); inspected = true; order.push('inspection'); return approved('Contact [EMAIL_1].'); } }), returnContent: true, skipCleanup: true, customHandlers: {
+    ...handlers,
+    [GraphEvents.ON_RUN_STEP]: { handle: (_event, data): void => { steps.push(JSON.stringify(data)); if (JSON.stringify(data).includes('mixed-lookup')) order.push('tool-control'); } },
+    [GraphEvents.ON_MESSAGE_DELTA]: { handle: (_event, data): void => { expect(inspected).toBe(true); prose.push(JSON.stringify(data)); order.push('prose'); } },
+  } });
+  run.Graph!.overrideModel = model;
+  await run.processStream({ messages: [new HumanMessage('Allowed control')] }, { version: 'v2', configurable: { thread_id: `mixed-publication-${registered}-${native}` } });
+  expect(requests).toBe(1);
+  expect(executed).toBe(1);
+  expect(prose.join('')).toContain('Contact [EMAIL_1].');
+  expect(prose.join('').match(/Contact \[EMAIL_1\]\./g)).toHaveLength(1);
+  expect(prose.join('')).not.toContain(fixtures.canaries[0]);
+  expect(order.filter((entry) => entry === 'tool-control')).not.toHaveLength(0);
+  if (!native) expect(order.indexOf('prose')).toBeGreaterThan(order.indexOf('tool-control'));
+  if (!native && !registered) expect(order.indexOf('inspection')).toBeGreaterThan(order.indexOf('tool-control'));
+  const allSteps = steps.join('');
+  expect(allSteps).toContain('message_creation');
+  expect(allSteps).toContain('mixed-lookup');
+  expect(JSON.stringify(run.Graph!.getRunMessages())).toContain('Contact [EMAIL_1].');
+  expect(JSON.stringify(run.Graph!.getRunMessages())).not.toContain(fixtures.canaries[0]);
+});
+
+it('does not publish delayed canonical prose if Stop lands during its message-step creation', async () => {
+  const controller = new AbortController();
+  let inspected = false;
+  let stopped = false;
+  let executed = 0;
+  const prose: string[] = [];
+  const lookup = new DynamicStructuredTool({ name: 'lookup', description: 'Allowed control.', schema: z.object({ count: z.number() }), func: async () => { executed++; return 'Tool control'; } });
+  const run = await Run.create({ runId: 'stop-delayed-message-step', graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, tools: [lookup], toolEnd: true }, providerTextProtection: policy({ inspect: () => { inspected = true; return approved('Delayed approved control'); } }), skipCleanup: true, customHandlers: {
+    [GraphEvents.ON_RUN_STEP]: { handle: async (_event, data): Promise<void> => {
+      if (inspected && JSON.stringify(data).includes('message_creation')) { stopped = true; controller.abort(); await Promise.resolve(); }
+    } },
+    [GraphEvents.ON_MESSAGE_DELTA]: { handle: (_event, data): void => { prose.push(JSON.stringify(data)); } },
+  } });
+  run.Graph!.overrideModel = new Transport([
+    new AIMessageChunk(fixtures.canaries[0]),
+    new AIMessageChunk({ content: '', tool_calls: [{ id: 'stop-lookup', name: 'lookup', args: { count: 42 }, type: 'tool_call' }], response_metadata: { finish_reason: 'tool_calls' } }),
+  ]);
+  const outcome = await run.processStream({ messages: [new HumanMessage('Allowed control')] }, { signal: controller.signal, version: 'v2', configurable: { thread_id: 'stop-delayed-message-step' } }).catch((error: Error) => error);
+  expect(outcome).toBeInstanceOf(Error);
+  await new Promise((resolve) => setImmediate(resolve));
+  expect(stopped).toBe(true);
+  expect(executed).toBe(0);
+  expect(prose).toEqual([]);
+  expect(JSON.stringify(run.Graph!.getRunMessages())).not.toContain(fixtures.canaries[0]);
+});
