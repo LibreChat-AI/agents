@@ -13,17 +13,19 @@ import {
   END,
   isInterrupted,
 } from '@langchain/langgraph';
-import type { Runnable } from '@langchain/core/runnables';
+import type { RunnableConfig, Runnable } from '@langchain/core/runnables';
+import type { ToolCall } from '@langchain/core/messages/tool';
 import type { AddressInfo } from 'node:net';
-import type {
-  ToolResultProtection,
-  ToolResultProtectionResult,
-} from '@/protection/toolResult';
 import type {
   ToolExecuteBatchRequest,
   ToolExecuteResult,
   EventHandler,
+  ProgrammaticCache,
 } from '@/types';
+import type {
+  ToolResultProtection,
+  ToolResultProtectionResult,
+} from '@/protection/toolResult';
 import {
   createCloudflareProgrammaticToolCallingTool,
   createCloudflareBashProgrammaticToolCallingTool,
@@ -42,6 +44,7 @@ import { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import { ToolResultProtectionError } from '@/protection/toolResult';
 import { PreparedSubagentError } from '@/tools/preparedSubagents';
 import fixtures from '@/protection/__tests__/fixtures/a1.json';
+import { StreamLimitExceededError } from '@/llm/streamLimits';
 import { Constants, GraphEvents, Providers } from '@/common';
 import { ChatModelStreamHandler } from '@/stream';
 import { ToolNode } from '@/tools/ToolNode';
@@ -2122,4 +2125,33 @@ it('copies retained producer metadata before canonical native publication', asyn
   const node = new ToolNode({ trace: true, tools: [direct(() => original)], toolResultProtection: policy() });
   const result = await node.invoke(state(), { callbacks: [callback] }) as { messages: ToolMessage[] };
   expect(result.messages[0]).toMatchObject({ id: 'call-control', status: 'success', content: '[EMAIL_1]' }); assertNoCanary(result);
+});
+
+it.each((['text', 'json'] as const).flatMap((mode) => (['ordinary', 'string', 'typed', 'prepared', 'stream'] as const).map((reasonKind) => [mode, reasonKind] as const)))('normalizes and latches local bridge cancellation before the %s/%s response', async (mode, reasonKind) => {
+  const responses: string[] = []; let executions = 0; let inspections = 0; const received = deferred<void>();
+  const audit = createServer((request, response) => {
+    let body = '';
+    request.on('data', (chunk: Buffer): void => { body += chunk.toString(); });
+    request.on('end', (): void => { responses.push(body); response.end('Allowed audit control'); received.resolve(); });
+  });
+  await new Promise<void>((resolve) => audit.listen(0, '127.0.0.1', resolve));
+  let reason: Error | string = new Error(fixtures.canaries[0]);
+  if (reasonKind === 'string') reason = fixtures.canaries[0];
+  if (reasonKind === 'typed') { reason = new ToolResultProtectionError('blocked'); reason.message = fixtures.canaries[0]; }
+  if (reasonKind === 'prepared') reason = new PreparedSubagentError('Allowed prepared control');
+  if (reasonKind === 'stream') reason = new StreamLimitExceededError({ kind: 'tool_call_args', limit: 10, observed: 11, toolName: 'lookup' });
+  const controller = new AbortController(); controller.abort(reason);
+  const runner = createLocalProgrammaticToolCallingTool({ cwd: process.cwd() });
+  const invoke: (params: { lang: string; code: string; tool_manifest: string[] }, manager: undefined, config: RunnableConfig & { toolCall?: ToolCall & Partial<ProgrammaticCache> }) => Promise<unknown> = Reflect.get(runner, '_call');
+  try {
+    const auditUrl = `http://127.0.0.1:${(audit.address() as AddressInfo).port}`;
+    const code = `response=$(curl -sS -X POST -H "Content-Type: application/json" -H "$__LIBRECHAT_TOOL_HEADER: $__LIBRECHAT_TOOL_TOKEN" --data-binary '{"name":"lookup","input":{"count":42}}' "$__LIBRECHAT_TOOL_BRIDGE?mode=${mode}")
+printf '%s' "$response" | curl -sS -X POST --data-binary @- '${auditUrl}'
+echo "Allowed outer control"`;
+    // Exercise the real runner body so LangChain's outer abort race cannot mask bridge responses.
+    const outcome = invoke.call(runner, { lang: 'bash', code, tool_manifest: ['lookup'] }, undefined, { signal: controller.signal, toolCall: { id: 'cancelled-local', name: runner.name, type: 'tool_call', args: {}, toolMap: new Map([['lookup', direct(() => { executions++; return fixtures.canaries[0]; })]]), toolDefs: [{ name: 'lookup', allowed_callers: ['code_execution'], parameters: { type: 'object', properties: { count: { type: 'number' } } } }], toolResultProtection: policy({ inspect: () => { inspections++; return approve('[EMAIL_1]'); } }) } }).catch((value: Error) => value);
+    await received.promise; expect(responses).toHaveLength(1); assertNoCanary(responses.join('')); const error = await outcome;
+    if (reasonKind === 'prepared' || reasonKind === 'stream') expect(error).toBe(reason);
+    else { const code = reasonKind === 'typed' ? 'blocked' : 'cancelled'; expect(error).toMatchObject({ code }); expect(responses[0]).toContain(code); } assertNoCanary(String(error)); expect(executions).toBe(0); expect(inspections).toBe(0);
+  } finally { audit.closeAllConnections(); await new Promise<void>((resolve) => audit.close(() => resolve())); }
 });

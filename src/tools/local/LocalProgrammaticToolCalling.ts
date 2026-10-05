@@ -30,8 +30,10 @@ import {
   getLocalSessionId,
   shellQuote,
 } from './LocalExecutionEngine';
+import { protectToolText, ToolResultProtectionError } from '@/protection/toolResult';
 import { ProviderTextProtectionError } from '@/protection/providerText';
-import { protectToolText } from '@/protection/toolResult';
+import { PreparedSubagentError } from '@/tools/preparedSubagents';
+import { StreamLimitExceededError } from '@/llm/streamLimits';
 import { executeHooks } from '@/hooks';
 import { Constants } from '@/common';
 
@@ -131,8 +133,10 @@ function createLocalBashProgrammaticToolCallingSchema(
   } as const;
 }
 
+type ToolBridgeFailure = ProviderTextProtectionError | PreparedSubagentError | StreamLimitExceededError;
+
 type ToolBridge = {
-  protectionFailure: () => ProviderTextProtectionError | undefined;
+  protectionFailure: () => ToolBridgeFailure | undefined;
   url: string;
   token: string;
   close: () => Promise<void>;
@@ -261,12 +265,18 @@ export async function applyPreToolUseHooksForBridge(
   return { input: nextInput };
 }
 
+function bridgeAbortError(signal: AbortSignal): ToolBridgeFailure {
+  const reason: unknown = signal.reason;
+  if (reason instanceof PreparedSubagentError || reason instanceof StreamLimitExceededError) return reason;
+  return new ToolResultProtectionError(reason instanceof ProviderTextProtectionError ? reason.code : 'cancelled');
+}
+
 async function createToolBridge(
   toolMap: t.ToolMap,
   hookContext?: t.ProgrammaticHookContext,
   protection?: { policy?: ToolResultProtection; signal?: AbortSignal }
 ): Promise<ToolBridge> {
-  let protectionFailure: ProviderTextProtectionError | undefined;
+  let protectionFailure: ToolBridgeFailure | undefined;
   const inFlight = new Set<Promise<void>>();
   const token = randomBytes(32).toString('hex');
   const server = createServer((req, res) => {
@@ -321,6 +331,7 @@ async function createToolBridge(
         }
 
         if (protectionFailure != null) throw protectionFailure;
+        if (protection?.policy != null && protection.signal?.aborted === true) throw bridgeAbortError(protection.signal);
         protection?.signal?.throwIfAborted();
         const callId = body.id ?? `local_call_${randomUUID()}`;
         let effectiveInput: Record<string, unknown> = body.input ?? {};
@@ -380,7 +391,9 @@ async function createToolBridge(
         });
       })
       .catch((error: Error) => {
-        if (error instanceof ProviderTextProtectionError) protectionFailure = error;
+        const signal = protection?.signal;
+        if (protection?.policy != null && signal?.aborted === true) error = bridgeAbortError(signal);
+        if (error instanceof ProviderTextProtectionError || error instanceof PreparedSubagentError || error instanceof StreamLimitExceededError) protectionFailure ??= error;
         if (isTextMode) {
           res.writeHead(500, { 'Content-Type': 'text/plain' });
           res.end(error.message);
