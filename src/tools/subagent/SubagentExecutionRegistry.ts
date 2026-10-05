@@ -63,6 +63,8 @@ export type SubagentInvocationBinding = Readonly<{
   description: string;
   subagentType: string;
   configId?: string;
+  /** Value-free identity of the call's validated host arguments. */
+  hostArgsDigest?: string;
 }>;
 
 export type SubagentSettlementBinding = Readonly<{
@@ -340,7 +342,8 @@ function assertCompatibleResumeExecution(
     current.parentToolCallId === next.parentToolCallId &&
     current.childRunId === next.childRunId &&
     current.subagentType === next.subagentType &&
-    current.configId === next.configId
+    current.configId === next.configId &&
+    current.hostArgsDigest === next.hostArgsDigest
   ) {
     return;
   }
@@ -354,7 +357,8 @@ function assertSameInvocation(
   if (
     current.description === next.description &&
     current.subagentType === next.subagentType &&
-    current.configId === next.configId
+    current.configId === next.configId &&
+    current.hostArgsDigest === next.hostArgsDigest
   ) {
     return;
   }
