@@ -2029,3 +2029,39 @@ it.each(['name', 'format'] as const)('rejects native producer %s identity change
   await expect(node.invoke(state(), { callbacks: [observer(events)] })).rejects.toMatchObject({ code: 'unsupported' });
   expect(executions).toBe(1); assertNoCanary(events.join(''));
 });
+
+it.each([false, true])('keeps required child-host throws raw-free and terminal (eager=%s)', async (eager) => {
+  let executions = 0; const updates: string[] = [];
+  const run = await Run.create({ runId: `child-host-throw-${eager}`, graphConfig: { type: 'standard', agents: [{ agentId: 'parent', provider: Providers.OPENAI, instructions: 'Allowed parent control.', subagentConfigs: [{ type: 'worker', name: 'Worker', description: 'Allowed child.', agentInputs: { agentId: 'child', provider: Providers.OPENAI, instructions: 'Allowed child control.', toolDefinitions: [{ name: 'lookup', parameters: { type: 'object', properties: { count: { type: 'number' } } } }] } }] }] }, toolResultProtection: policy(), eagerEventToolExecution: { enabled: eager }, customHandlers: {
+    [GraphEvents.ON_TOOL_EXECUTE]: { handle: (): never => { executions++; throw new Error(fixtures.canaries[0]); } },
+    [GraphEvents.ON_SUBAGENT_UPDATE]: { handle: (_event, data): void => { updates.push(JSON.stringify(data)); } },
+  }, skipCleanup: true });
+  run.Graph!.overrideModel = new FakeChatModel({ responses: ['', 'Must not continue'], toolCalls: [{ id: 'child-control', name: Constants.SUBAGENT, args: { description: 'Allowed task.', subagent_type: 'worker' }, type: 'tool_call' }] });
+  run.Graph!.setSubagentModelOverride(new FakeChatModel({ responses: ['', 'Must not continue'], toolCalls: [{ id: 'lookup-control', name: 'lookup', args: { count: 42 }, type: 'tool_call' }] }));
+  const error = await run.processStream({ messages: [new HumanMessage('Allowed control')] }, { version: 'v2', configurable: { thread_id: `child-host-throw-${eager}` } }).catch((value: Error) => value);
+  expect(error).toMatchObject({ code: 'unavailable' }); expect(executions).toBe(1); assertNoCanary(String(error)); assertNoCanary(updates.join('')); assertNoCanary(run.Graph!.getRunMessages());
+});
+
+it.each(['live', 'restored-same', 'restored-strict', 'live-strict', 'blocked'] as const)('binds reference reuse to the current policy rather than a serialized protected flag (%s)', async (mode) => {
+  const runId = `restored-reference-${mode}`; const config = { configurable: { run_id: runId } }; const inspected: string[] = []; const piped: string[] = [];
+  const previous = policy({ inspect: ({ content }) => { inspected.push(content); return approve(content); } });
+  const registry = new ToolOutputReferenceRegistry();
+  const source = new ToolNode({ tools: [direct(() => fixtures.canaries[0])], toolOutputRegistry: registry, toolResultProtection: previous });
+  await source.invoke(state(), config);
+  const restored = mode.startsWith('restored') || mode === 'blocked';
+  const consumerRegistry = restored ? new ToolOutputReferenceRegistry() : registry;
+  if (restored) consumerRegistry.restoreState(runId, JSON.parse(JSON.stringify(registry.snapshotState(runId))));
+  const gate = mode === 'live' || mode === 'restored-same' ? previous : policy({ inspect: ({ content }) => { inspected.push(content); return mode === 'blocked' ? { version: 1, ok: false, error: { code: 'blocked' } } : approve('[EMAIL_1]'); } });
+  const pipe = new DynamicStructuredTool({ name: 'pipe', description: 'Allowed pipe control.', schema: z.object({ command: z.string() }), func: async ({ command }) => { piped.push(command); return command; } });
+  const node = new ToolNode({ tools: [pipe], toolOutputRegistry: consumerRegistry, toolResultProtection: gate });
+  const pending = node.invoke({ messages: [new AIMessage({ content: '', tool_calls: [{ id: 'pipe-control', name: 'pipe', args: { command: '{{' + 'tool0turn0' + '}}' } }] })] }, config);
+  if (mode === 'blocked') { await expect(pending).rejects.toMatchObject({ code: 'blocked' }); expect(piped).toEqual([]); return; }
+  const result = await pending;
+  expect(inspected).toEqual(mode === 'live' ? [fixtures.canaries[0]] : [fixtures.canaries[0], fixtures.canaries[0]]);
+  expect(piped).toEqual([mode === 'live' || mode === 'restored-same' ? fixtures.canaries[0] : '[EMAIL_1]']);
+  if (mode !== 'live' && mode !== 'restored-same') { assertNoCanary(result); expect(consumerRegistry.get(runId, 'tool0turn0')).toBe('[EMAIL_1]'); }
+  const before = inspected.length;
+  await node.invoke({ messages: [new AIMessage({ content: '', tool_calls: [{ id: 'pipe-again', name: 'pipe', args: { command: '{{' + 'tool0turn0' + '}}' } }] })] }, config);
+  expect(inspected).toHaveLength(before);
+  expect(piped[1]).toBe(piped[0]);
+});

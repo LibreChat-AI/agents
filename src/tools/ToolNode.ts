@@ -53,7 +53,7 @@ import type { SettledToolBatchResult } from '@/tools/toolBatchReplay';
 import type { PreparedSubagents } from '@/tools/preparedSubagents';
 import type { RunBreakerScope } from '@/llm/streamLimits';
 import type * as t from '@/types';
-import { validateToolReferenceSources, protectToolReferenceState, bindToolExecuteProtection, validateToolExecuteResults, hasReleasedToolReference, isReleasedToolError, markReleasedToolMessage, protectToolText, protectToolMessage, protectToolExecuteResult, withToolResultBoundary, requiresToolResultProtection, validateToolResultProtection, ToolResultProtectionError } from '@/protection/toolResult';
+import { needsToolReferenceInspection, protectToolReferenceState, bindToolExecuteProtection, validateToolExecuteResults, hasReleasedToolReference, isReleasedToolError, markReleasedToolMessage, protectToolText, protectToolMessage, protectToolExecuteResult, withToolResultBoundary, requiresToolResultProtection, validateToolResultProtection, ToolResultProtectionError } from '@/protection/toolResult';
 import {
   TOOL_BATCH_REPLAY_KEY,
   getToolBatchReplayOwner,
@@ -2384,7 +2384,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           refMeta._refScope,
           refMeta._refKey,
           settledOutput.referenceContent,
-          this.createReferenceProtection(call.name, call.id ?? '')
+          this.createReferenceProtection(call.name, call.id ?? ''),
+          this.toolResultProtection
         );
       }
       return settledOutput.output;
@@ -3070,7 +3071,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             refScope,
             refKey,
             replaced.registryContent,
-            this.createReferenceProtection(call.name, call.id ?? '')
+            this.createReferenceProtection(call.name, call.id ?? ''),
+            this.toolResultProtection
           );
         }
         return persistOutput(
@@ -3189,7 +3191,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     call?: Pick<ToolCall, 'name' | 'id'>
   ): t.ToolMessageRefMetadata | undefined {
     if (this.toolOutputRegistry != null && refKey != null) {
-      this.toolOutputRegistry.set(runId, refKey, registryContent, call == null ? undefined : this.createReferenceProtection(call.name, call.id ?? ''));
+      this.toolOutputRegistry.set(runId, refKey, registryContent, call == null ? undefined : this.createReferenceProtection(call.name, call.id ?? ''), this.toolResultProtection);
     }
     if (refKey == null && unresolved.length === 0) return undefined;
     const meta: t.ToolMessageRefMetadata = {};
@@ -5279,7 +5281,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           baseContext.batchScopeId,
           refMeta._refKey,
           result.referenceContent,
-          this.createReferenceProtection(call.name, call.id ?? '')
+          this.createReferenceProtection(call.name, call.id ?? ''),
+          this.toolResultProtection
         );
         if (isBaseMessage(result.output)) {
           result = {
@@ -5618,26 +5621,17 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
      */
     const incomingRunId = config.configurable?.run_id as string | undefined;
     const batchScopeId = incomingRunId ?? `\0anon-${this.anonBatchCounter++}`;
-    const resumedReferenceState = this.toolResultProtection != null && referenceReplay.state != null
-      ? await protectToolReferenceState(this.toolResultProtection, referenceReplay.state, config.signal)
-      : referenceReplay.state;
-    const currentReferenceState = resumedReferenceState ?? this.toolOutputRegistry?.snapshotState(batchScopeId);
-    if (this.toolResultProtection != null && resumedReferenceState == null && currentReferenceState != null) {
-      validateToolReferenceSources(this.toolResultProtection, currentReferenceState);
-    }
-    const replayInputSnapshot =
-      resumedReferenceState == null
-        ? undefined
-        : this.toolOutputRegistry?.resumeBatch(
-          batchScopeId,
-          resumedReferenceState,
-          this.toolResultProtection != null
-        );
-    referenceReplay.state = currentReferenceState;
-    const turn =
-      resumedReferenceState?.turnCounter ??
-      this.toolOutputRegistry?.nextTurn(batchScopeId) ??
-      0;
+    let inputReferences = referenceReplay.state ?? this.toolOutputRegistry?.snapshotState(batchScopeId);
+    const replaying = referenceReplay.state != null;
+    const turn = referenceReplay.state?.turnCounter ?? this.toolOutputRegistry?.nextTurn(batchScopeId) ?? 0;
+    const policy = this.toolResultProtection;
+    const liveRegistry = replaying ? undefined : this.toolOutputRegistry;
+    const inspectReferences = policy != null && inputReferences != null && needsToolReferenceInspection(policy, inputReferences, liveRegistry, batchScopeId);
+    if (inspectReferences) inputReferences = await protectToolReferenceState(policy, inputReferences, config.signal, liveRegistry, batchScopeId);
+    const replayInputSnapshot = (replaying || inspectReferences) && inputReferences != null
+      ? this.toolOutputRegistry?.resumeBatch(batchScopeId, inputReferences, policy != null, policy)
+      : undefined;
+    referenceReplay.state = inputReferences;
     let outputs: (BaseMessage | Command)[];
     let replayBatchKey: string | undefined;
     /** Hoisted from the messages-state branch so the Command tail can carry

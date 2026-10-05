@@ -14,13 +14,13 @@ import type {
   ProviderTextProtectionResult,
   ProviderTextProtectionErrorCode,
 } from './providerText';
+import type { ToolOutputReferenceRegistry, ToolOutputReferenceState } from '@/tools/toolOutputReferences';
 import type {
   GenericTool,
   ToolExecuteResult,
   ToolExecuteBatchRequest,
   ToolCallRequest,
 } from '@/types';
-import type { ToolOutputReferenceState } from '@/tools/toolOutputReferences';
 import {
   ProviderTextAttempt,
   ProviderTextProtectionError,
@@ -558,17 +558,24 @@ export function validateToolReferenceSources(
   }
 }
 
+export function needsToolReferenceInspection(policy: ToolResultProtection, state: ToolOutputReferenceState, registry?: ToolOutputReferenceRegistry, runId?: string): boolean {
+  validateToolReferenceSources(policy, state);
+  return state.entries.some((entry) => requiresToolResultProtection(policy, entry.protection!.toolName) && registry?.isPolicyBound(runId, entry, policy) !== true);
+}
+
 export async function protectToolReferenceState(
   policy: ToolResultProtection | undefined,
   state: ToolOutputReferenceState | undefined,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  liveRegistry?: ToolOutputReferenceRegistry,
+  runId?: string
 ): Promise<ToolOutputReferenceState | undefined> {
   if (policy == null || state == null) return state;
   validateToolReferenceSources(policy, state);
   const entries = await Promise.all(
     state.entries.map(async (entry) => ({
       ...entry,
-      value: (await protectToolText(
+      value: liveRegistry?.isPolicyBound(runId, entry, policy) === true ? entry.value : (await protectToolText(
         policy,
         entry.protection!.toolName,
         entry.protection!.toolCallId,

@@ -133,6 +133,7 @@ import {
   rebindToolBatchReplayPayload,
   restoreToolReplayConfig,
 } from '@/tools/toolBatchReplay';
+import { hasRequiredToolExecuteProtection, ToolResultProtectionError } from '@/protection/toolResult';
 import {
   executeHooks,
   HookRegistry,
@@ -158,7 +159,6 @@ import {
   isGraphSubagentConfig,
 } from './childGraphConfig';
 import { ProviderTextProtectionError } from '@/protection/providerText';
-import { ToolResultProtectionError } from '@/protection/toolResult';
 import { stripRunStepResumeState } from '@/tools/runStepResume';
 import { seedAgentInitialSessions } from '@/utils/toolSessions';
 import { stableStringify } from '@/tools/eagerEventExecution';
@@ -3759,11 +3759,15 @@ export class SubagentExecutor {
           const toolHandler = parentRegistry.getHandler(
             GraphEvents.ON_TOOL_EXECUTE
           );
-          if (toolHandler) {
-            await toolHandler.handle(
-              GraphEvents.ON_TOOL_EXECUTE,
-              data as ToolExecuteBatchRequest
-            );
+          const request = data as ToolExecuteBatchRequest;
+          const required = hasRequiredToolExecuteProtection(request);
+          try {
+            if (toolHandler) await toolHandler.handle(GraphEvents.ON_TOOL_EXECUTE, request);
+            else if (required) request.reject(new ToolResultProtectionError('unavailable'));
+          } catch (error) {
+            if (!required) throw error;
+            request.reject(error instanceof ProviderTextProtectionError ? error : new ToolResultProtectionError('unavailable'));
+            return;
           }
           /**
            * We also surface a short notice in the subagent-update stream so
