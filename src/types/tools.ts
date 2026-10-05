@@ -316,7 +316,10 @@ export type ToolNodeOptions = {
   /** SDK-owned checkpoint snapshot for open run-step lifecycle state. */
   createRunStepResumeState?: () => RunStepResumeState;
   /** Internal ownership bridge, awaited before ToolNode can execute a batch. */
-  onToolCallsClaimed?: (messageId: string, config: RunnableConfig) => Promise<void>;
+  onToolCallsClaimed?: (
+    messageId: string,
+    config: RunnableConfig
+  ) => Promise<void>;
 };
 
 export type ToolNodeConstructorParams = ToolRefs & ToolNodeOptions;
@@ -552,6 +555,8 @@ export type JsonSchemaType = {
   properties?: Record<string, JsonSchemaType>;
   required?: string[];
   description?: string;
+  pattern?: string;
+  maxLength?: number;
   additionalProperties?: boolean | JsonSchemaType;
 };
 

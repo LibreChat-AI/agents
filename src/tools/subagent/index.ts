@@ -21,9 +21,18 @@ export { InMemorySubagentTaskStore } from './InMemorySubagentTaskStore';
 export type { InMemorySubagentTaskStoreOptions } from './InMemorySubagentTaskStore';
 export {
   SubagentResolutionError,
+  SubagentHostArgumentError,
   getSubagentResolutionFailureMessage,
+  getSubagentHostArgumentFailureMessage,
 } from './diagnostics';
+export {
+  SUBAGENT_HOST_ARG_LIMITS,
+  buildSubagentHostArgProperties,
+  resolveSubagentHostArgs,
+} from './hostArgs';
 export type {
+  SubagentHostArgumentFailure,
+  SubagentHostArgumentRejection,
   SubagentResolutionPhase,
   SubagentResolutionCause,
   SubagentResolutionContext,

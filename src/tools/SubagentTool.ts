@@ -1,5 +1,6 @@
 import type { JsonSchemaType, LCTool } from '@/types/tools';
 import type { SubagentConfig } from '@/types';
+import { buildSubagentHostArgProperties } from '@/tools/subagent/hostArgs';
 import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { Constants } from '@/common';
 
@@ -32,6 +33,9 @@ const RUN_IN_BACKGROUND_PROP_DESCRIPTION =
 
 const SUBAGENT_THREAD_PROP_DESCRIPTION =
   'Continue a host-owned child thread using a fresh execution lease. The saved thread must belong to this scope and subagent type. Only available with run_in_background.';
+
+const HOST_ARGS_DESCRIPTION =
+  '\n\nOPTIONAL ARGUMENTS:\n- Some types accept extra arguments, listed in brackets after the type. Each is optional: omit it to let the host choose. Where values are listed, pass one listed for the selected type; where it says any text, pass a short value of your own.';
 
 export const SubagentToolSchema = {
   type: 'object',
@@ -69,8 +73,13 @@ export function buildSubagentToolParams(
   description: string;
 } {
   const types = configs.map((c) => c.type);
+  const hostArgs = buildSubagentHostArgProperties(configs);
   const typeDescriptions = configs
-    .map((c) => `- "${c.type}" (${c.name}): ${c.description}`)
+    .map((c) => {
+      const summary = hostArgs.summaries.get(c.type);
+      const line = `- "${c.type}" (${c.name}): ${c.description}`;
+      return summary == null ? line : `${line} [optional ${summary}]`;
+    })
     .join('\n');
 
   return {
@@ -96,8 +105,7 @@ export function buildSubagentToolParams(
             },
           }
           : {}),
-        ...(options.background === true &&
-        options.threadContinuation === true
+        ...(options.background === true && options.threadContinuation === true
           ? {
             subagent_thread_id: {
               type: 'string',
@@ -105,10 +113,13 @@ export function buildSubagentToolParams(
             },
           }
           : {}),
+        ...hostArgs.properties,
       },
       required: ['description', 'subagent_type'],
     },
     description: `${SubagentToolDescription}${
+      hostArgs.summaries.size > 0 ? HOST_ARGS_DESCRIPTION : ''
+    }${
       options.background === true
         ? '\n\nBACKGROUND EXECUTION:\n- Set run_in_background to true when you do not need the result immediately. The call returns a background_task_id; use the host background-task tools to poll, steer, queue, interrupt, or cancel it.'
         : ''

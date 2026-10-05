@@ -1,20 +1,20 @@
 import type { ToolCall, ToolMessage } from '@langchain/core/messages/tool';
 import type { RunnableConfig } from '@langchain/core/runnables';
-import type { ToolOutputReferenceState } from '@/tools/toolOutputReferences';
-import type { ToolApprovalReplaySnapshot } from '@/hooks';
 import type {
   FadingTier,
   FadingTiers,
   RunStepResumeState,
   ToolSessionContext,
 } from '@/types';
-import { isFadingTier, isLegacyFadingTier } from '@/messages/fading';
+import type { ToolOutputReferenceState } from '@/tools/toolOutputReferences';
+import type { ToolApprovalReplaySnapshot } from '@/hooks';
 import {
   attachRunStepResumeState,
   getRunStepResumeState,
   isRunStepResumeState,
   stripRunStepResumeState,
 } from '@/tools/runStepResume';
+import { isFadingTier, isLegacyFadingTier } from '@/messages/fading';
 
 export const SUBAGENT_RESUME_MANIFEST_CONFIG_KEY =
   '__librechat_subagent_resume_manifest';
@@ -35,6 +35,7 @@ const SUBAGENT_RESUME_PRIVATE_PAYLOAD_KEYS = [
   SUBAGENT_RESUME_WRAPPER_VERSION_KEY,
 ] as const;
 const MAX_RESUME_MANIFEST_DEPTH = 32;
+const HOST_ARGS_DIGEST_PATTERN = /^[a-f0-9]{64}$/;
 
 export interface SubagentCheckpointReference {
   threadId: string;
@@ -83,6 +84,8 @@ export interface SubagentResumeExecution {
   subagentType?: string;
   /** Lazy child revision bound when this execution first resolved. */
   configId?: string;
+  /** SHA-256 identity of the host arguments bound to this execution; never the values. */
+  hostArgsDigest?: string;
   approvalExecutionScope: string;
   checkpoints: SubagentCheckpointReference[];
   graphState: SubagentGraphResumeState;
@@ -354,6 +357,7 @@ function isSubagentResumeExecution(
   const childRunId = execution.childRunId;
   const subagentType = execution.subagentType;
   const configId = execution.configId;
+  const hostArgsDigest = execution.hostArgsDigest;
   const approvalExecutionScope = execution.approvalExecutionScope;
   const checkpoints = execution.checkpoints;
   const graphState = execution.graphState;
@@ -363,6 +367,9 @@ function isSubagentResumeExecution(
     !isString(childRunId) ||
     (subagentType != null && !isString(subagentType)) ||
     (configId != null && !isString(configId)) ||
+    (hostArgsDigest != null &&
+      (typeof hostArgsDigest !== 'string' ||
+        !HOST_ARGS_DIGEST_PATTERN.test(hostArgsDigest))) ||
     !isString(approvalExecutionScope) ||
     !Array.isArray(checkpoints) ||
     checkpoints.length === 0 ||
