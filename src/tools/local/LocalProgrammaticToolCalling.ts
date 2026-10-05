@@ -30,7 +30,7 @@ import {
   getLocalSessionId,
   shellQuote,
 } from './LocalExecutionEngine';
-import { protectToolText, ToolResultProtectionError } from '@/protection/toolResult';
+import { normalizeToolResultError, protectToolText } from '@/protection/toolResult';
 import { ProviderTextProtectionError } from '@/protection/providerText';
 import { PreparedSubagentError } from '@/tools/preparedSubagents';
 import { StreamLimitExceededError } from '@/llm/streamLimits';
@@ -268,7 +268,7 @@ export async function applyPreToolUseHooksForBridge(
 function bridgeAbortError(signal: AbortSignal): ToolBridgeFailure {
   const reason: unknown = signal.reason;
   if (reason instanceof PreparedSubagentError || reason instanceof StreamLimitExceededError) return reason;
-  return new ToolResultProtectionError(reason instanceof ProviderTextProtectionError ? reason.code : 'cancelled');
+  return normalizeToolResultError(reason, 'cancelled');
 }
 
 async function createToolBridge(
@@ -393,6 +393,7 @@ async function createToolBridge(
       .catch((error: Error) => {
         const signal = protection?.signal;
         if (protection?.policy != null && signal?.aborted === true) error = bridgeAbortError(signal);
+        if (protection?.policy != null && error instanceof ProviderTextProtectionError) error = normalizeToolResultError(error);
         if (error instanceof ProviderTextProtectionError || error instanceof PreparedSubagentError || error instanceof StreamLimitExceededError) protectionFailure ??= error;
         if (isTextMode) {
           res.writeHead(500, { 'Content-Type': 'text/plain' });

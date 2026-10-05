@@ -53,7 +53,7 @@ import type { SettledToolBatchResult } from '@/tools/toolBatchReplay';
 import type { PreparedSubagents } from '@/tools/preparedSubagents';
 import type { RunBreakerScope } from '@/llm/streamLimits';
 import type * as t from '@/types';
-import { needsToolReferenceInspection, protectToolReferenceState, bindToolExecuteProtection, validateToolExecuteResults, hasReleasedToolReference, isReleasedToolError, markReleasedToolMessage, protectToolText, protectToolMessage, protectToolExecuteResult, withToolResultBoundary, requiresToolResultProtection, validateToolResultProtection, ToolResultProtectionError } from '@/protection/toolResult';
+import { replaceReleasedToolMessage, normalizeToolResultError, needsToolReferenceInspection, protectToolReferenceState, bindToolExecuteProtection, validateToolExecuteResults, hasReleasedToolReference, isReleasedToolError, markReleasedToolMessage, protectToolText, protectToolMessage, protectToolExecuteResult, withToolResultBoundary, requiresToolResultProtection, validateToolResultProtection, ToolResultProtectionError } from '@/protection/toolResult';
 import {
   TOOL_BATCH_REPLAY_KEY,
   getToolBatchReplayOwner,
@@ -2148,6 +2148,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       });
     } catch (_e: unknown) {
       let e = _e as Error;
+      if (this.toolResultProtection != null && e instanceof ProviderTextProtectionError) e = normalizeToolResultError(e);
       if (!this.handleToolErrors) {
         if (requiresToolResultProtection(this.toolResultProtection, call.name) && !isReleasedToolError(this.toolResultProtection, call.name, call.id ?? '', e) && !(e instanceof ProviderTextProtectionError) &&
             !(e instanceof StreamLimitExceededError) && !(e instanceof PreparedSubagentError) && !isGraphInterrupt(e)) {
@@ -3066,6 +3067,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             ? this.toolOutputRegistry.perOutputLimit
             : 0
         );
+        const replacement = requiresToolResultProtection(this.toolResultProtection, call.name)
+          ? replaceReleasedToolMessage(this.toolResultProtection, call.name, call.id ?? '', output, replaced.content, refKey == null ? undefined : replaced.registryContent)
+          : cloneToolMessageWithContent(output, replaced.content);
         if (this.toolOutputRegistry != null && refKey != null) {
           this.toolOutputRegistry.set(
             refScope,
@@ -3075,9 +3079,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             this.toolResultProtection
           );
         }
-        return persistOutput(
-          markReleasedToolMessage(this.toolResultProtection, call.name, call.id ?? '', cloneToolMessageWithContent(output, replaced.content), refKey == null ? undefined : this.toolOutputRegistry?.get(refScope, refKey))
-        );
+        return persistOutput(replacement);
       }
     }
 
@@ -4541,6 +4543,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         );
         if (this.toolResultProtection != null && dispatchRequests.some((request) => requiresToolResultProtection(this.toolResultProtection, request.name)) &&
             !(dispatchedOutcome.reason instanceof ProviderTextProtectionError)) throw new ToolResultProtectionError('unavailable');
+        if (this.toolResultProtection != null && dispatchedOutcome.reason instanceof ProviderTextProtectionError) throw normalizeToolResultError(dispatchedOutcome.reason);
         throw dispatchedOutcome.reason;
       }
       const eagerResults = eagerOutcome.value;
@@ -5548,7 +5551,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     const scope = this.getRunScope?.();
     try { return await this.runWithResultProtection(input, config, referenceReplay); }
     catch (error) {
-      if (this.toolResultProtection != null && error instanceof ProviderTextProtectionError) scope?.controller.abort(error);
+      if (this.toolResultProtection != null && error instanceof ProviderTextProtectionError) {
+        const failure = normalizeToolResultError(error);
+        scope?.controller.abort(failure);
+        throw failure;
+      }
       throw error;
     }
   }

@@ -1,4 +1,4 @@
-import { bindToolExecuteProtection, validateToolExecuteResults, requiresToolResultProtection, ToolResultProtectionError, protectToolExecuteResult, validateToolResultProtection } from '@/protection/toolResult';
+import { normalizeToolResultError, bindToolExecuteProtection, validateToolExecuteResults, requiresToolResultProtection, ToolResultProtectionError, protectToolExecuteResult, validateToolResultProtection } from '@/protection/toolResult';
 // src/stream.ts
 import type { ToolCall, ToolCallChunk } from '@langchain/core/messages/tool';
 import type { ChatOpenAIReasoningSummary } from '@langchain/openai';
@@ -838,7 +838,7 @@ function startEagerToolExecutions(args: {
   const hasSelectedResults = entries.some((entry) => requiresToolResultProtection(resultPolicy, entry.toolName));
   const eagerFailure = (error: unknown): t.EagerEventToolExecutionOutcome => {
     if (!hasSelectedResults) return { error: normalizeError(error) };
-    const failure = error instanceof ProviderTextProtectionError ? error : new ToolResultProtectionError('unavailable');
+    const failure = normalizeToolResultError(error);
     resultBreaker.abort(failure);
     return { error: failure };
   };

@@ -28,6 +28,7 @@ import {
   ProviderTextAttempt,
   ProviderTextProtectionError,
   validateProviderTextProtection,
+  isProviderTextRestartCancellation,
 } from './providerText';
 import { PreparedSubagentError } from '@/tools/preparedSubagents';
 import { StreamLimitExceededError } from '@/llm/streamLimits';
@@ -99,6 +100,28 @@ const errors = new Set<ProviderTextProtectionErrorCode>([
   'unsupported',
   'incompatible',
 ]);
+
+/** External exception objects are never proof of a raw-free failure. */
+export function normalizeToolResultError(
+  error: unknown,
+  fallback: ProviderTextProtectionErrorCode = 'unavailable'
+): ProviderTextProtectionError {
+  if (
+    error == null ||
+    typeof error !== 'object' ||
+    types.isProxy(error) ||
+    !(error instanceof ProviderTextProtectionError)
+  )
+    return new ToolResultProtectionError(fallback);
+  if (isProviderTextRestartCancellation(error)) return error;
+  const code: unknown = Object.getOwnPropertyDescriptor(error, 'code')?.value;
+  return new ToolResultProtectionError(
+    typeof code === 'string' &&
+    errors.has(code as ProviderTextProtectionErrorCode)
+      ? (code as ProviderTextProtectionErrorCode)
+      : 'incompatible'
+  );
+}
 
 export function validateToolResultProtection(
   policy: ToolResultProtection
@@ -186,14 +209,19 @@ function snapshotDataArray<T>(
   if (!Array.isArray(value) || types.isProxy(value))
     throw new ToolResultProtectionError('unsupported');
   const prototype = Object.getPrototypeOf(value);
-  const parent = prototype != null && !types.isProxy(prototype) ? Object.getPrototypeOf(prototype) : undefined;
+  const parent =
+    prototype != null && !types.isProxy(prototype)
+      ? Object.getPrototypeOf(prototype)
+      : undefined;
   if (
     prototype !== Array.prototype &&
     (!checkpointData ||
       prototype == null ||
       types.isProxy(prototype) ||
       !Array.isArray(prototype) ||
-      parent == null || types.isProxy(parent) || Object.getPrototypeOf(parent) !== null)
+      parent == null ||
+      types.isProxy(parent) ||
+      Object.getPrototypeOf(parent) !== null)
   )
     throw new ToolResultProtectionError('unsupported');
   const length: number = Object.getOwnPropertyDescriptor(
@@ -290,7 +318,7 @@ async function release(
   } catch (error) {
     attempt.check();
     if (error instanceof ProviderTextProtectionError)
-      throw new ToolResultProtectionError(error.code);
+      throw normalizeToolResultError(error);
     throw new ToolResultProtectionError('unavailable');
   }
 }
@@ -467,6 +495,41 @@ function matchesToolMessageEnvelope(
         unresolved != null &&
         currentUnresolved.length === unresolved.length &&
         currentUnresolved.every((ref, index) => ref === unresolved[index])))
+  );
+}
+
+/** SDK projections may change content, never bless callback-mutated envelopes. */
+export function replaceReleasedToolMessage(
+  policy: ToolResultProtection,
+  name: string,
+  id: string,
+  message: ToolMessage,
+  content: ToolMessage['content'],
+  referenceContent?: string
+): ToolMessage {
+  const entry = approved.get(message);
+  const envelope = snapshotToolMessageEnvelope(message);
+  if (
+    entry?.policy !== policy ||
+    entry.name !== name ||
+    entry.id !== id ||
+    entry.envelope == null ||
+    !matchesToolMessageEnvelope(envelope, entry.envelope)
+  )
+    throw new ToolResultProtectionError('unsupported');
+  return markReleasedToolMessage(
+    policy,
+    name,
+    id,
+    new ToolMessage({
+      name: envelope.name,
+      id: envelope.id,
+      tool_call_id: envelope.tool_call_id,
+      status: envelope.status,
+      content,
+      additional_kwargs: envelope.additional_kwargs,
+    }),
+    referenceContent
   );
 }
 
@@ -848,8 +911,9 @@ export function validateToolExecuteProtection(
   validateBoundToolRequests(hostView, binding);
   if (binding.required && binding.signal?.aborted === true) {
     const reason: unknown = binding.signal.reason;
+    if (reason instanceof ProviderTextProtectionError)
+      throw normalizeToolResultError(reason);
     if (
-      reason instanceof ProviderTextProtectionError ||
       reason instanceof PreparedSubagentError ||
       reason instanceof StreamLimitExceededError
     )
@@ -991,8 +1055,9 @@ export function withToolResultBoundary(
           );
         } catch (error) {
           attempt.check();
+          if (error instanceof ProviderTextProtectionError)
+            throw normalizeToolResultError(error);
           if (
-            error instanceof ProviderTextProtectionError ||
             error instanceof PreparedSubagentError ||
             error instanceof StreamLimitExceededError ||
             error instanceof GraphInterrupt
@@ -1052,8 +1117,9 @@ export function withToolResultBoundary(
         return markReleasedToolMessage(policy, toolName, id, message);
       } catch (error) {
         attempt.check();
+        if (error instanceof ProviderTextProtectionError)
+          throw normalizeToolResultError(error);
         if (
-          error instanceof ProviderTextProtectionError ||
           error instanceof PreparedSubagentError ||
           error instanceof StreamLimitExceededError ||
           error instanceof GraphInterrupt ||

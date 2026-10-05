@@ -128,12 +128,12 @@ import {
   pickSubagentHostArgInput,
   getSubagentHostArgsDigest,
 } from './hostArgs';
+import { normalizeToolResultError, hasRequiredToolExecuteProtection, ToolResultProtectionError } from '@/protection/toolResult';
 import {
   rebindToolBatchReplayScope,
   rebindToolBatchReplayPayload,
   restoreToolReplayConfig,
 } from '@/tools/toolBatchReplay';
-import { hasRequiredToolExecuteProtection, ToolResultProtectionError } from '@/protection/toolResult';
 import {
   executeHooks,
   HookRegistry,
@@ -3766,7 +3766,7 @@ export class SubagentExecutor {
             else if (required) request.reject(new ToolResultProtectionError('unavailable'));
           } catch (error) {
             if (!required) throw error;
-            request.reject(error instanceof ProviderTextProtectionError ? error : new ToolResultProtectionError('unavailable'));
+            request.reject(normalizeToolResultError(error));
             return;
           }
           /**

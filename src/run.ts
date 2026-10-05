@@ -1,4 +1,4 @@
-import { hasRequiredToolExecuteProtection, ToolResultProtectionError } from '@/protection/toolResult';
+import { normalizeToolResultError, hasRequiredToolExecuteProtection, ToolResultProtectionError } from '@/protection/toolResult';
 // src/run.ts
 import { nanoid } from 'nanoid';
 import { PromptTemplate } from '@langchain/core/prompts';
@@ -1133,7 +1133,7 @@ export class Run<_T extends t.BaseGraphState> {
         }
       } catch (error) {
         if (requiredToolRequest == null) throw error;
-        requiredToolRequest.reject(error instanceof ProviderTextProtectionError ? error : new ToolResultProtectionError('unavailable'));
+        requiredToolRequest.reject(normalizeToolResultError(error));
       } finally {
         if (
           eventName === GraphEvents.ON_RUN_STEP_COMPLETED &&

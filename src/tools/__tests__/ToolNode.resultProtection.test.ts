@@ -42,6 +42,7 @@ import {
   getToolBatchReplayState,
 } from '@/tools/toolBatchReplay';
 import { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
+import { ProviderTextProtectionError } from '@/protection/providerText';
 import { ToolResultProtectionError } from '@/protection/toolResult';
 import { PreparedSubagentError } from '@/tools/preparedSubagents';
 import fixtures from '@/protection/__tests__/fixtures/a1.json';
@@ -2234,4 +2235,104 @@ it.each([false, true])('rejects selected host symbol aliases before completion (
   }, skipCleanup: true });
   run.Graph!.overrideModel = new FakeChatModel({ responses: ['', 'Must not continue'], toolCalls: [{ id: 'call-control', name: 'lookup', args: { count: 42 }, type: 'tool_call' }] });
   await expect(run.processStream({ messages: [new HumanMessage('Allowed control')] }, { version: 'v2', configurable: { thread_id: `symbol-host-${eager}` } })).rejects.toMatchObject({ code: 'unsupported' }); expect(inspections).toBe(0); expect(completions).toEqual([]); assertNoCanary(run.Graph!.getRunMessages());
+});
+
+it.each(['content', 'id', 'status', 'metadata'] as const)('revalidates selected nested %s after native callbacks before result extraction', async (field) => {
+  let callbacks = 0;
+  const lookup = direct(() => fixtures.canaries[0]);
+  const callback = BaseCallbackHandler.fromMethods({ handleToolEnd: (output): void => {
+    callbacks++;
+    if (!(output instanceof ToolMessage)) throw new Error('Expected canonical ToolMessage');
+    expect(output.content).toBe('[EMAIL_1]');
+    if (field === 'content') output.content = fixtures.canaries[0];
+    if (field === 'id') output.id = fixtures.canaries[0];
+    if (field === 'status') output.status = 'error';
+    if (field === 'metadata') output.additional_kwargs._refScope = fixtures.canaries[0];
+  } }); callback.awaitHandlers = true; lookup.callbacks = [callback];
+  await expect(executeTools([{ id: 'call-control', name: 'lookup', input: { count: 42 } }], new Map([['lookup', lookup]]), 'run_tools_with_code', { policy: policy() })).rejects.toMatchObject({ code: 'unsupported' });
+  expect(callbacks).toBe(1);
+});
+
+it.each(['ToolResultProtectionError', 'ProviderTextProtectionError'] as const)('reconstructs producer-supplied %s before native error callbacks', async (kind) => {
+  const events: string[] = [];
+  const error = kind === 'ToolResultProtectionError' ? new ToolResultProtectionError('blocked') : new ProviderTextProtectionError('timeout');
+  error.message = fixtures.canaries[0]; Object.defineProperty(error, 'cause', { value: new Error(fixtures.canaries[0]), enumerable: true }); Object.defineProperty(error, 'output', { value: fixtures.canaries[0], enumerable: true });
+  const callback = observer(events);
+  callback.handleToolError = (observed: Error): void => {
+    events.push(observed.message); expect(observed).not.toBe(error); expect(observed.cause).toBeUndefined();
+    for (const key of Reflect.ownKeys(observed)) { const value = Object.getOwnPropertyDescriptor(observed, key)?.value; if (typeof value === 'string') assertNoCanary(value); }
+  };
+  const node = new ToolNode({ trace: true, tools: [direct(() => { throw error; })], toolResultProtection: policy() });
+  const failure = await node.invoke(state(), { callbacks: [callback] }).catch((value: Error) => value);
+  expect(failure).toMatchObject({ code: kind === 'ToolResultProtectionError' ? 'blocked' : 'timeout' }); expect(failure).not.toBe(error); assertNoCanary(String(failure)); assertNoCanary(events.join(''));
+});
+
+it.each(['hook', 'inspection'] as const)('validates post-hook source provenance before stamping replacement (%s)', async (phase) => {
+  let retained: ToolMessage | undefined; let executions = 0; const events: string[] = [];
+  const hooks = new HookRegistry(); hooks.register('PostToolUse', { hooks: [async () => {
+    if (retained == null) throw new Error('Expected canonical message');
+    if (phase === 'hook') retained.id = fixtures.canaries[0];
+    return { updatedOutput: 'Allowed replacement control' };
+  }] });
+  const callback = observer(events); const observe = callback.handleToolEnd!.bind(callback);
+  callback.handleToolEnd = async (output, ...args): Promise<void> => { await observe(output, ...args); if (!(output instanceof ToolMessage)) throw new Error('Expected canonical message'); retained = output; };
+  const gate = policy({ inspect: ({ content }) => {
+    if (content === 'Allowed replacement control' && phase === 'inspection') { if (retained == null) throw new Error('Expected canonical message'); retained.id = fixtures.canaries[0]; }
+    return approve(content);
+  } });
+  const node = new ToolNode({ trace: true, tools: [direct(() => { executions++; return 'Allowed source control'; })], hookRegistry: hooks, toolResultProtection: gate, toolOutputReferences: { enabled: true }, toolCallStepIds: new Map([['call-control', 'step-control']]) });
+  await expect(node.invoke(state(), { configurable: { run_id: `post-envelope-${phase}` }, callbacks: [callback] })).rejects.toMatchObject({ code: 'unsupported' });
+  expect(executions).toBe(1); assertNoCanary(events.join('')); expect(events.join('')).not.toContain('Allowed replacement control');
+});
+
+it.each(([false, true] as const).flatMap((eager) => (['root-throw', 'root-reject', 'child-throw'] as const).map((path) => [eager, path] as const)))('keeps externally supplied policy exceptions raw-free across required host dispatch (%s/%s)', async (eager, path) => {
+  const forged = new ToolResultProtectionError('blocked'); forged.message = fixtures.canaries[0]; Object.defineProperty(forged, 'cause', { value: new Error(fixtures.canaries[0]) }); Object.defineProperty(forged, 'output', { value: fixtures.canaries[0], enumerable: true });
+  const updates: string[] = [];
+  const toolDefinitions = [{ name: 'lookup', parameters: { type: 'object' as const, properties: { count: { type: 'number' as const } } } }];
+  const graphConfig = path === 'child-throw'
+    ? { type: 'standard' as const, agents: [{ agentId: 'parent', provider: Providers.OPENAI, instructions: 'Allowed parent.', subagentConfigs: [{ type: 'worker', name: 'Worker', description: 'Allowed child.', agentInputs: { agentId: 'child', provider: Providers.OPENAI, instructions: 'Allowed child.', toolDefinitions } }] }] }
+    : { type: 'standard' as const, llmConfig: { provider: Providers.OPENAI }, instructions: 'Allowed root.', toolDefinitions };
+  const run = await Run.create({ runId: `forged-host-${eager}-${path}`, graphConfig, toolResultProtection: policy(), eagerEventToolExecution: { enabled: eager }, customHandlers: {
+    [GraphEvents.CHAT_MODEL_STREAM]: new ChatModelStreamHandler(),
+    [GraphEvents.ON_TOOL_EXECUTE]: { handle: (_event, data): void => { if (path === 'root-reject') { (data as ToolExecuteBatchRequest).reject(forged); return; } throw forged; } },
+    [GraphEvents.ON_SUBAGENT_UPDATE]: { handle: (_event, data): void => { updates.push(JSON.stringify(data)); } },
+    [GraphEvents.ON_RUN_STEP_COMPLETED]: { handle: (_event, data): void => { updates.push(JSON.stringify(data)); } },
+  }, skipCleanup: true });
+  const lookupCalls = [{ id: 'call-control', name: 'lookup', args: { count: 42 }, type: 'tool_call' as const }];
+  run.Graph!.overrideModel = new FakeChatModel({ responses: ['', 'Must not continue'], toolCalls: path === 'child-throw' ? [{ id: 'child-control', name: Constants.SUBAGENT, args: { description: 'Allowed task.', subagent_type: 'worker' }, type: 'tool_call' }] : lookupCalls });
+  if (path === 'child-throw') run.Graph!.setSubagentModelOverride(new FakeChatModel({ responses: ['', 'Must not continue'], toolCalls: lookupCalls }));
+  const error = await run.processStream({ messages: [new HumanMessage('Allowed control')] }, { version: 'v2', configurable: { thread_id: `forged-host-${eager}-${path}` } }).catch((value: Error) => value);
+  expect(error).toMatchObject({ code: 'blocked' }); expect(error).not.toBe(forged); expect((error as Error).cause).toBeUndefined(); assertNoCanary(String(error)); assertNoCanary(updates.join('')); assertNoCanary(run.Graph!.getRunMessages());
+});
+
+it.each(['local', 'python', 'bash'] as const)('blocks callback-mutated nested results before the %s runner can reuse them', async (runtime) => {
+  const requests: string[] = [];
+  const server = createServer((request, response) => {
+    let body = ''; request.on('data', (chunk: Buffer): void => { body += chunk.toString(); });
+    request.on('end', (): void => { requests.push(body); response.setHeader('Content-Type', 'application/json'); response.end(JSON.stringify({ status: 'tool_call_required', continuation_token: 'Allowed continuation', tool_calls: [{ id: 'call-control', name: 'lookup', input: { count: 42 } }] })); });
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const callback = BaseCallbackHandler.fromMethods({ handleToolEnd: (output): void => { if (!(output instanceof ToolMessage)) throw new Error('Expected canonical message'); expect(output.content).toBe('[EMAIL_1]'); output.content = fixtures.canaries[0]; } }); callback.awaitHandlers = true;
+    const lookup = direct(() => fixtures.canaries[0]); lookup.callbacks = [callback];
+    let runner = createLocalProgrammaticToolCallingTool({ cwd: process.cwd() });
+    if (runtime === 'python') runner = createProgrammaticToolCallingTool({ baseUrl });
+    if (runtime === 'bash') runner = createBashProgrammaticToolCallingTool({ baseUrl });
+    await expect(runner.invoke({ lang: 'bash', code: runtime === 'python' ? 'print(await lookup(count=42))' : 'lookup \'{"count":42}\' || true', tool_manifest: ['lookup'] }, { toolCall: { id: 'nested-control', name: runner.name, type: 'tool_call', args: {}, toolMap: new Map([['lookup', lookup]]), toolDefs: [{ name: 'lookup', allowed_callers: ['code_execution'], parameters: { type: 'object', properties: { count: { type: 'number' } } } }], toolResultProtection: policy() } })).rejects.toMatchObject({ code: 'unsupported' });
+    expect(requests).toHaveLength(runtime === 'local' ? 0 : 1); assertNoCanary(requests);
+  } finally { server.closeAllConnections(); await new Promise<void>((resolve) => server.close(() => resolve())); }
+});
+
+it('normalizes a producer protection error without invoking its code accessor', async () => {
+  const forged = new ToolResultProtectionError('blocked'); let reads = 0; Object.defineProperty(forged, 'code', { get: () => { reads++; throw new Error(fixtures.canaries[0]); } }); forged.message = fixtures.canaries[0];
+  const events: string[] = [];
+  const node = new ToolNode({ trace: true, tools: [direct(() => { throw forged; })], toolResultProtection: policy() });
+  const error = await node.invoke(state(), { callbacks: [observer(events)] }).catch((value: Error) => value);
+  expect(error).toMatchObject({ code: 'incompatible' }); expect(reads).toBe(0); assertNoCanary(events.join('')); assertNoCanary(String(error));
+});
+
+it('preserves absent-policy nested exception behavior', async () => {
+  const original = new ProviderTextProtectionError('blocked');
+  await expect(executeTools([{ id: 'plain-control', name: 'lookup', input: { count: 42 } }], new Map([['lookup', direct(() => { throw original; })]]))).rejects.toBe(original);
 });

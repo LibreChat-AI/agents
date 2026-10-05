@@ -1,6 +1,6 @@
 import { ToolMessage } from '@langchain/core/messages';
 import type { ToolResultProtection } from '@/protection/toolResult';
-import { isReleasedToolError, protectToolText, withToolResultBoundary, requiresToolResultProtection } from '@/protection/toolResult';
+import { ToolResultProtectionError, normalizeToolResultError, protectToolMessage, isReleasedToolError, protectToolText, withToolResultBoundary, requiresToolResultProtection } from '@/protection/toolResult';
 import { ProviderTextProtectionError } from '@/protection/providerText';
 // src/tools/ProgrammaticToolCalling.ts
 import { config } from 'dotenv';
@@ -896,10 +896,12 @@ export async function executeTools(
 
     try {
       protection?.signal?.throwIfAborted();
-      const result = await withToolResultBoundary(tool, protection?.policy, call.id, { signal: protection?.signal }, call.name).invoke(normalizeToolInput(call.input, tool), {
+      let result = await withToolResultBoundary(tool, protection?.policy, call.id, { signal: protection?.signal }, call.name).invoke(normalizeToolInput(call.input, tool), {
         metadata: { [programmaticToolName]: true }, signal: protection?.signal,
       });
-      if (requiresToolResultProtection(protection?.policy, call.name) && result instanceof ToolMessage) {
+      if (requiresToolResultProtection(protection?.policy, call.name)) {
+        if (!(result instanceof ToolMessage)) throw new ToolResultProtectionError('unsupported');
+        result = await protectToolMessage(protection.policy, call.name, call.id, result, protection.signal);
         return result.status === 'error'
           ? { call_id: call.id, result: null, is_error: true, error_message: result.content as string }
           : { call_id: call.id, result: result.content, is_error: false };
@@ -914,7 +916,7 @@ export async function executeTools(
         is_error: false,
       };
     } catch (error) {
-      if (error instanceof ProviderTextProtectionError) throw error;
+      if (error instanceof ProviderTextProtectionError) throw protection?.policy == null ? error : normalizeToolResultError(error);
       return {
         call_id: call.id,
         result: null,
@@ -1314,7 +1316,7 @@ export function createProgrammaticToolCallingTool(
 
         throw new CodeApiRequestError();
       } catch (error) {
-        if (error instanceof ProviderTextProtectionError) throw error;
+        if (error instanceof ProviderTextProtectionError) throw toolCall.toolResultProtection == null ? error : normalizeToolResultError(error);
         const messageWithReminder = appendFailedExecutionFileReminder(
           (error as Error).message,
           code

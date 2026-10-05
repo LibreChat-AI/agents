@@ -5,8 +5,7 @@ import type { RunnableConfig } from '@langchain/core/runnables';
 import type { ToolCallsDispatchedEvent } from '@/types/stream';
 import type { ToolExecuteBatchRequest } from '@/types/tools';
 import type { AgentLogEvent } from '@/types/graph';
-import { inheritToolExecuteProtection, validateToolExecuteProtection, hasRequiredToolExecuteProtection, protectToolExecuteBatch, ToolResultProtectionError } from '@/protection/toolResult';
-import { ProviderTextProtectionError } from '@/protection/providerText';
+import { normalizeToolResultError, inheritToolExecuteProtection, validateToolExecuteProtection, hasRequiredToolExecuteProtection, protectToolExecuteBatch } from '@/protection/toolResult';
 import { traceHostToolResults } from '@/langfuse';
 import { GraphEvents } from '@/common';
 
@@ -27,6 +26,7 @@ export async function safeDispatchCustomEvent(
       toolRequest = request;
       const exposed: ToolExecuteBatchRequest = {
         ...request,
+        reject: (error): void => request.reject(hasRequiredToolExecuteProtection(request) ? normalizeToolResultError(error) : error),
         resolve: (
           results: Parameters<ToolExecuteBatchRequest['resolve']>[0]
         ): void => {
@@ -47,7 +47,7 @@ export async function safeDispatchCustomEvent(
             catch { console.warn('Failed to record host tool execution metadata'); }
             validateToolExecuteProtection(request, exposed);
             request.resolve(canonical);
-          }).catch((error: unknown) => request.reject(error instanceof ProviderTextProtectionError ? error : new ToolResultProtectionError('unavailable')));
+          }).catch((error: unknown) => request.reject(normalizeToolResultError(error)));
         },
       };
       inheritToolExecuteProtection(request, exposed);
@@ -57,12 +57,12 @@ export async function safeDispatchCustomEvent(
     await dispatchCustomEvent(event, payload, config);
     if (toolRequest != null && hostView != null) {
       try { validateToolExecuteProtection(toolRequest, hostView); }
-      catch (error) { toolRequest.reject(error instanceof ProviderTextProtectionError ? error : new ToolResultProtectionError('unavailable')); return false; }
+      catch (error) { toolRequest.reject(normalizeToolResultError(error)); return false; }
     }
     return true;
   } catch (e) {
     if (toolRequest != null && hasRequiredToolExecuteProtection(toolRequest)) {
-      toolRequest.reject(e instanceof ProviderTextProtectionError ? e : new ToolResultProtectionError('unavailable'));
+      toolRequest.reject(normalizeToolResultError(e));
       return false;
     }
     // Check if this is the known EventStreamCallbackHandler error
