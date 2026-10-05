@@ -2101,6 +2101,13 @@ export class SubagentExecutor {
         checkpoints,
         graphState,
         approvalReplays,
+        ...(activeRun == null
+          ? {}
+          : {
+            pendingInterruptIds: [...new Set(activeRun.pendingInterrupts.flatMap(
+              (pending) => pending.id == null ? [] : [pending.id]
+            ))],
+          }),
         ...(descendant == null ? {} : { descendant }),
       });
     }
@@ -3252,16 +3259,13 @@ export class SubagentExecutor {
         }
         let childInput: BaseGraphState | Command | null;
         if (childResumeMap != null) {
-          const pending = activeChildRun.pendingInterrupts.filter(
-            (entry) => entry.id != null &&
-              Object.prototype.hasOwnProperty.call(childResumeMap, entry.id)
-          );
           restoreToolReplayConfigs(
             childConfigurable,
-            pending,
+            activeChildRun.pendingInterrupts,
             resumeExecution?.approvalExecutionScope ?? approvalExecutionScope,
             approvalExecutionScope,
-            childThreadId
+            childThreadId,
+            new Set(Object.keys(childResumeMap))
           );
           childInput = new Command({ resume: childResumeMap });
         } else if (recoveredInProgress) {

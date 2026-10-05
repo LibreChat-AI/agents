@@ -148,7 +148,8 @@ export function restoreToolReplayConfigs(
   interrupts: readonly Interrupt[],
   sourceScope: string,
   destinationScope: string,
-  destinationThreadId: string
+  destinationThreadId: string,
+  resumedInterruptIds: ReadonlySet<string>
 ): void {
   delete configurable[TOOL_REPLAY_CONFIGS_KEY];
   const configs = new Map<string, ToolReplayConfig>();
@@ -168,11 +169,14 @@ export function restoreToolReplayConfigs(
     );
     const replay = restored[TOOL_BATCH_REPLAY_KEY];
     const review = restored[TOOL_APPROVAL_REVIEW_CONFIG_KEY];
+    const resumed = pending.id != null && resumedInterruptIds.has(pending.id);
     const evidence: ToolReplayConfig = {
-      [TOOL_BATCH_REPLAY_KEY]: replay,
-      [TOOL_APPROVAL_REVIEW_CONFIG_KEY]: review,
+      [TOOL_BATCH_REPLAY_KEY]: resumed || replay == null
+        ? replay
+        : { ...replay, approvalOwner: undefined },
+      [TOOL_APPROVAL_REVIEW_CONFIG_KEY]: resumed ? review : undefined,
     };
-    first ??= evidence;
+    if (resumed) first ??= evidence;
     const owner = review?.owner ?? replay?.approvalOwner;
     const owners = owner == null
       ? new Set(replay?.records.map(record => record.owner))

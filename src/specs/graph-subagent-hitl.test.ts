@@ -34,7 +34,8 @@ class ApprovalModel extends FakeListChatModel {
   constructor(
     private readonly calls: string[],
     private readonly programmatic = false,
-    private readonly sessionTools = false
+    private readonly sessionTools = false,
+    private readonly completedEffects = false
   ) {
     const owners = new Map<string, string>();
     super({
@@ -83,6 +84,17 @@ class ApprovalModel extends FakeListChatModel {
         message: new AIMessageChunk({
           content: '',
           tool_call_chunks: [
+            ...(this.completedEffects
+              ? [
+                {
+                  name: `${owner}_effect`,
+                  args: '{}',
+                  id: 'shared-completed-call',
+                  index: 0,
+                  type: 'tool_call_chunk' as const,
+                },
+              ]
+              : []),
             {
               name: toolName,
               args: JSON.stringify(
@@ -91,7 +103,7 @@ class ApprovalModel extends FakeListChatModel {
                   : { value: 'original' }
               ),
               id: 'shared-member-call',
-              index: 0,
+              index: this.completedEffects ? 1 : 0,
               type: 'tool_call_chunk',
             },
           ],
@@ -108,7 +120,8 @@ function harness(
   eventDriven = false,
   question = false,
   programmatic = false,
-  sessionTools = false
+  sessionTools = false,
+  completedEffects = false
 ) {
   const checkpointer = new MemorySaver();
   const calls: string[] = [];
@@ -123,6 +136,9 @@ function harness(
       `right ${value}`
   );
   const tools = { left: leftExecute, right: rightExecute };
+  const leftEffect = jest.fn(async () => 'left effect');
+  const rightEffect = jest.fn(async () => 'right effect');
+  const effects = { left: leftEffect, right: rightEffect };
   const eventCalls: t.ToolCallRequest[] = [];
   const programmaticExecute = jest.fn(
     async (_args: { code: string }, runnable?: ToolRunnableConfig) => {
@@ -144,6 +160,17 @@ function harness(
       member('entry'),
       ...(['left', 'right'] as const).map((id) => ({
         ...member(id),
+        ...(completedEffects
+          ? {
+            graphTools: [
+              tool(effects[id], {
+                name: `${id}_effect`,
+                description: 'Complete one effect',
+                schema: z.object({}),
+              }),
+            ],
+          }
+          : {}),
         ...(eventDriven
           ? {
             toolDefinitions: [
@@ -266,7 +293,7 @@ function harness(
       skipCleanup: true,
     });
     run.Graph?.setSubagentModelOverride(
-      new ApprovalModel(calls, programmatic, sessionTools)
+      new ApprovalModel(calls, programmatic, sessionTools, completedEffects)
     );
     run.Graph!.overrideModel = createFakeStreamingLLM({
       responses: ['', 'parent completed'],
@@ -289,6 +316,8 @@ function harness(
     leftExecute,
     rightExecute,
     programmaticExecute,
+    leftEffect,
+    rightEffect,
     eventCalls,
   };
 }
@@ -371,6 +400,73 @@ describe('graph subagent foreground HITL', () => {
       );
     expect(returned?.[0].content).toBe('result completed');
   });
+
+  test.each(
+    [false, true].flatMap((eventDriven) =>
+      [false, true].flatMap((rebuilt) =>
+        ['left', 'right', 'both'].map((addressed) => ({
+          eventDriven,
+          rebuilt,
+          addressed,
+        }))
+      )
+    )
+  )(
+    'preserves settled effects for unresumed members: eventDriven=$eventDriven rebuilt=$rebuilt addressed=$addressed',
+    async ({ eventDriven, rebuilt, addressed }) => {
+      const h = harness(eventDriven, false, false, false, true);
+      const run = await h.build();
+      await start(run);
+      expect(h.leftEffect).toHaveBeenCalledTimes(1);
+      expect(h.rightEffect).toHaveBeenCalledTimes(1);
+      expect(h.leftExecute).not.toHaveBeenCalled();
+      expect(h.rightExecute).not.toHaveBeenCalled();
+      const pending = await pendingMemberInterrupts(h.checkpointer);
+      const decisions: Record<string, t.ToolApprovalDecision[]> = {};
+      for (const entry of pending) {
+        if (entry.id == null) throw new Error('Missing interrupt ID');
+        const payload = getPublicToolInterruptPayload(entry.value);
+        if (!isToolApprovalInterrupt(payload))
+          throw new Error('Missing approval');
+        const memberId = payload.subagent?.agent_id;
+        if (addressed === 'both' || memberId === addressed)
+          decisions[entry.id] = [{ type: 'approve' }];
+      }
+      const resumed = rebuilt ? await h.build() : run;
+      await resumed.resume(decisions, config);
+      expect(h.leftEffect).toHaveBeenCalledTimes(1);
+      expect(h.rightEffect).toHaveBeenCalledTimes(1);
+      expect(h.leftExecute).toHaveBeenCalledTimes(
+        addressed === 'right' ? 0 : 1
+      );
+      expect(h.rightExecute).toHaveBeenCalledTimes(
+        addressed === 'left' ? 0 : 1
+      );
+      let final = resumed;
+      if (addressed !== 'both') {
+        expect(resumed.getInterrupt()?.payload.type).toBe('tool_approval');
+        expect(h.calls.filter((id) => id === 'result')).toHaveLength(0);
+        final = await h.build();
+        await final.resume([{ type: 'approve' }], config);
+      }
+      expect(final.getInterrupt()).toBeUndefined();
+      expect(h.leftEffect).toHaveBeenCalledTimes(1);
+      expect(h.rightEffect).toHaveBeenCalledTimes(1);
+      expect(h.leftExecute).toHaveBeenCalledTimes(1);
+      expect(h.rightExecute).toHaveBeenCalledTimes(1);
+      expect(h.calls.filter((id) => id === 'entry')).toHaveLength(1);
+      expect(h.calls.filter((id) => id === 'result')).toHaveLength(1);
+      expect(
+        final
+          .getRunMessages()
+          ?.find(
+            (message) =>
+              message._getType() === 'tool' &&
+              (message as ToolMessage).name === Constants.SUBAGENT
+          )?.content
+      ).toBe('result completed');
+    }
+  );
 
   test.each(
     [false, true].flatMap((eventDriven) =>
