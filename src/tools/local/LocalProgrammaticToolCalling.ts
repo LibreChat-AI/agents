@@ -4,6 +4,7 @@ import { randomBytes, randomUUID, timingSafeEqual } from 'crypto';
 import type { DynamicStructuredTool } from '@langchain/core/tools';
 import type { IncomingMessage, ServerResponse } from 'http';
 import type { AddressInfo } from 'net';
+import type { ToolResultProtection } from '@/protection/toolResult';
 import type * as t from '@/types';
 import {
   executeTools,
@@ -29,6 +30,7 @@ import {
   getLocalSessionId,
   shellQuote,
 } from './LocalExecutionEngine';
+import { ProviderTextProtectionError } from '@/protection/providerText';
 import { executeHooks } from '@/hooks';
 import { Constants } from '@/common';
 
@@ -129,6 +131,7 @@ function createLocalBashProgrammaticToolCallingSchema(
 }
 
 type ToolBridge = {
+  protectionFailure: () => ProviderTextProtectionError | undefined;
   url: string;
   token: string;
   close: () => Promise<void>;
@@ -259,8 +262,10 @@ export async function applyPreToolUseHooksForBridge(
 
 async function createToolBridge(
   toolMap: t.ToolMap,
-  hookContext?: t.ProgrammaticHookContext
+  hookContext?: t.ProgrammaticHookContext,
+  protection?: { policy?: ToolResultProtection; signal?: AbortSignal }
 ): Promise<ToolBridge> {
+  let protectionFailure: ProviderTextProtectionError | undefined;
   const token = randomBytes(32).toString('hex');
   const server = createServer((req, res) => {
     // `?mode=text` returns the already-serialized result as the body
@@ -313,6 +318,8 @@ async function createToolBridge(
           return;
         }
 
+        if (protectionFailure != null) throw protectionFailure;
+        protection?.signal?.throwIfAborted();
         const callId = body.id ?? `local_call_${randomUUID()}`;
         let effectiveInput: Record<string, unknown> = body.input ?? {};
         if (hookContext != null) {
@@ -348,7 +355,7 @@ async function createToolBridge(
               input: effectiveInput,
             },
           ],
-          toolMap
+          toolMap, Constants.PROGRAMMATIC_TOOL_CALLING, protection
         );
 
         if (isTextMode) {
@@ -371,6 +378,7 @@ async function createToolBridge(
         });
       })
       .catch((error: Error) => {
+        if (error instanceof ProviderTextProtectionError) protectionFailure = error;
         if (isTextMode) {
           res.writeHead(500, { 'Content-Type': 'text/plain' });
           res.end(error.message);
@@ -394,6 +402,7 @@ async function createToolBridge(
   return {
     url: `http://127.0.0.1:${address.port}/tool`,
     token,
+    protectionFailure: () => protectionFailure,
     close: () =>
       new Promise((resolve, reject) => {
         server.close((error) => (error ? reject(error) : resolve()));
@@ -581,7 +590,7 @@ function createEffectiveToolMap(
 
 async function runLocalProgrammaticTool(args: {
   params: LocalProgrammaticParams;
-  config?: { toolCall?: unknown };
+  config?: { toolCall?: unknown; signal?: AbortSignal };
   localConfig: t.LocalExecutionConfig;
   runtime: LocalProgrammaticRuntime;
 }): Promise<[string, t.ProgrammaticExecutionArtifact]> {
@@ -626,7 +635,7 @@ async function runLocalProgrammaticTool(args: {
     toolMap ?? new Map(),
     selectedTools
   );
-  const bridge = await createToolBridge(effectiveMap, hookContext);
+  const bridge = await createToolBridge(effectiveMap, hookContext, { policy: context.toolResultProtection, signal: args.config?.signal });
 
   try {
     const timeoutMs =
@@ -655,6 +664,8 @@ async function runLocalProgrammaticTool(args: {
           { ...args.localConfig, timeoutMs }
         );
 
+    const protectionFailure = bridge.protectionFailure();
+    if (protectionFailure != null) throw protectionFailure;
     if (result.exitCode !== 0 || result.timedOut) {
       throw new Error(
         result.stderr !== ''

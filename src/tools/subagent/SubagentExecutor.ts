@@ -148,6 +148,7 @@ import {
   isGraphSubagentConfig,
 } from './childGraphConfig';
 import { ProviderTextProtectionError } from '@/protection/providerText';
+import { ToolResultProtectionError } from '@/protection/toolResult';
 import { stripRunStepResumeState } from '@/tools/runStepResume';
 import { seedAgentInitialSessions } from '@/utils/toolSessions';
 import { stableStringify } from '@/tools/eagerEventExecution';
@@ -958,6 +959,7 @@ export type SubagentExecutorOptions = {
    * graph's own resolved limits; without this the child would silently
    * revert to the defaults.
    */
+  toolResultProtection?: StandardGraphInput['toolResultProtection'];
   providerTextProtection?: StandardGraphInput['providerTextProtection'];
   streamLimits?: StandardGraphInput['streamLimits'];
   humanInTheLoop?: HumanInTheLoopConfig;
@@ -1036,6 +1038,7 @@ export class SubagentExecutor {
   private readonly executionContext: SubagentExecutionContext;
   private readonly langfuse?: StandardGraphInput['langfuse'];
   private readonly tokenCounter?: TokenCounter;
+  private readonly toolResultProtection?: StandardGraphInput['toolResultProtection'];
   private readonly providerTextProtection?: StandardGraphInput['providerTextProtection'];
   private readonly streamLimits?: StandardGraphInput['streamLimits'];
   private readonly humanInTheLoop?: HumanInTheLoopConfig;
@@ -1078,6 +1081,7 @@ export class SubagentExecutor {
     this.tokenCounter = options.tokenCounter;
     this.streamLimits = options.streamLimits;
     this.providerTextProtection = options.providerTextProtection;
+    this.toolResultProtection = options.toolResultProtection;
     this.humanInTheLoop = options.humanInTheLoop;
     this.checkpointer = isCheckpointSaver(options.checkpointer)
       ? options.checkpointer
@@ -1349,6 +1353,7 @@ export class SubagentExecutor {
       onResolutionFailure: this.onResolutionFailure,
       streamLimits: this.streamLimits,
       providerTextProtection: this.providerTextProtection,
+      toolResultProtection: this.toolResultProtection,
       humanInTheLoop:
         this.humanInTheLoop?.enabled === true ||
         this.humanInTheLoop?.backgroundPausePolicy === 'deny'
@@ -2635,6 +2640,7 @@ export class SubagentExecutor {
     executableConfig: ExecutableSubagentConfigEntry
   ): Promise<SubagentExecuteResult> {
     const { description, subagentType, threadId, parentToolCallId } = params;
+    if (params.taskRuntime != null && this.toolResultProtection != null) throw new ToolResultProtectionError('unsupported');
     /** Captured ONCE per execution, preferring the controller the parent
      * tool batch captured at ITS entry (before PreToolUse hooks): a failed
      * run's graph reset replaces the live controller, and resolving it here
@@ -2837,6 +2843,7 @@ export class SubagentExecutor {
       tokenCounter: this.tokenCounter,
       streamLimits: this.streamLimits,
       providerTextProtection: this.providerTextProtection,
+      toolResultProtection: this.toolResultProtection,
       subagentScope: true,
       subagentExecutionContext: childExecutionContext,
       subagentContext: this.subagentContext,

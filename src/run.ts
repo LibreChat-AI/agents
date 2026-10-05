@@ -478,6 +478,7 @@ export class Run<_T extends t.BaseGraphState> {
   private subagentUsageSink?: t.SubagentUsageSink;
   private preemption?: t.StreamPreemption;
   private maxStopContinuations: number;
+  private toolResultProtection?: t.StandardGraphInput['toolResultProtection'];
   private providerTextProtection?: t.StandardGraphInput['providerTextProtection'];
   private streamLimits?: t.StreamLimits;
   private subagentTasks?: t.SubagentTaskConfig;
@@ -581,9 +582,13 @@ export class Run<_T extends t.BaseGraphState> {
     );
     this.streamLimits = config.streamLimits;
     this.providerTextProtection = config.providerTextProtection;
+    this.toolResultProtection = config.toolResultProtection;
 
     if (!config.graphConfig) {
       throw new Error('Graph config not provided');
+    }
+    if ('toolResultProtection' in config.graphConfig && config.graphConfig.toolResultProtection != null) {
+      throw new ProviderTextProtectionError('incompatible');
     }
     if ('providerTextProtection' in config.graphConfig &&
         config.graphConfig.providerTextProtection != null) {
@@ -686,6 +691,7 @@ export class Run<_T extends t.BaseGraphState> {
         preemption: this.preemption,
         streamLimits: this.streamLimits,
         providerTextProtection: this.providerTextProtection,
+        toolResultProtection: this.toolResultProtection,
         toolExecution: this.toolExecution,
         clientDelegatedToolNames: this.clientDelegatedToolNames,
       },
@@ -734,6 +740,7 @@ export class Run<_T extends t.BaseGraphState> {
         preemption: this.preemption,
         streamLimits: this.streamLimits,
         providerTextProtection: this.providerTextProtection,
+        toolResultProtection: this.toolResultProtection,
         toolExecution: this.toolExecution,
       },
     });

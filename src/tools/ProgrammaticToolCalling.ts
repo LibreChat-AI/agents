@@ -1,3 +1,7 @@
+import { ToolMessage } from '@langchain/core/messages';
+import type { ToolResultProtection } from '@/protection/toolResult';
+import { withToolResultBoundary, requiresToolResultProtection } from '@/protection/toolResult';
+import { ProviderTextProtectionError } from '@/protection/providerText';
 // src/tools/ProgrammaticToolCalling.ts
 import { config } from 'dotenv';
 import { randomUUID } from 'node:crypto';
@@ -875,7 +879,8 @@ function normalizeToolInput(
 export async function executeTools(
   toolCalls: t.PTCToolCall[],
   toolMap: t.ToolMap,
-  programmaticToolName = Constants.PROGRAMMATIC_TOOL_CALLING
+  programmaticToolName: string = Constants.PROGRAMMATIC_TOOL_CALLING,
+  protection?: { policy?: ToolResultProtection; signal?: AbortSignal }
 ): Promise<t.PTCToolResult[]> {
   const executions = toolCalls.map(async (call): Promise<t.PTCToolResult> => {
     const tool = toolMap.get(call.name);
@@ -890,9 +895,15 @@ export async function executeTools(
     }
 
     try {
-      const result = await tool.invoke(normalizeToolInput(call.input, tool), {
-        metadata: { [programmaticToolName]: true },
+      protection?.signal?.throwIfAborted();
+      const result = await withToolResultBoundary(tool, protection?.policy, call.id, { signal: protection?.signal }).invoke(normalizeToolInput(call.input, tool), {
+        metadata: { [programmaticToolName]: true }, signal: protection?.signal,
       });
+      if (requiresToolResultProtection(protection?.policy, call.name) && result instanceof ToolMessage) {
+        return result.status === 'error'
+          ? { call_id: call.id, result: null, is_error: true, error_message: result.content as string }
+          : { call_id: call.id, result: result.content, is_error: false };
+      }
 
       const isMCPTool = tool.mcp === true;
       const unwrappedResult = unwrapToolResponse(result, isMCPTool);
@@ -903,6 +914,7 @@ export async function executeTools(
         is_error: false,
       };
     } catch (error) {
+      if (error instanceof ProviderTextProtectionError) throw error;
       return {
         call_id: call.id,
         result: null,
@@ -1271,8 +1283,8 @@ export function createProgrammaticToolCallingTool(
           }
 
           const toolResults = await executeTools(
-            response.tool_calls ?? [],
-            effectiveToolMap
+            response.tool_calls ?? [], effectiveToolMap, programmaticToolName,
+            { policy: toolCall.toolResultProtection, signal: config.signal }
           );
 
           response = await makeRequest(

@@ -1,3 +1,4 @@
+import { protectToolExecuteResult, validateToolResultProtection } from '@/protection/toolResult';
 // src/stream.ts
 import type { ToolCall, ToolCallChunk } from '@langchain/core/messages/tool';
 import type { ChatOpenAIReasoningSummary } from '@langchain/openai';
@@ -830,6 +831,11 @@ function startEagerToolExecutions(args: {
     entry.request.codeSessionBaselineId =
       entry.request.codeSessionContext?.session_id;
   }
+  const entryScope = graph.runScope as RunBreakerScope | undefined;
+  const resultBreaker = entryScope?.controller ?? graph.breakerAbort;
+  const resultPolicy = graph.toolResultProtection;
+  if (resultPolicy != null) validateToolResultProtection(resultPolicy);
+  const batchSignal = composeAbortSignals(composeAbortSignals(graph.config?.signal, graph.signal), graph.breakerAbort.signal);
   const records: t.EagerEventToolExecution[] = [];
   const promise: Promise<t.EagerEventToolExecutionOutcome> = new Promise<
     t.ToolExecuteResult[]
@@ -891,18 +897,25 @@ function startEagerToolExecutions(args: {
       .catch(reject);
   }).then(
     async (results): Promise<t.EagerEventToolExecutionOutcome> => {
-      await dispatchEagerToolCompletions({
-        graph,
-        agentContext,
-        records,
-        results,
-      });
-      return { results };
+      const policy = resultPolicy;
+      if (policy != null) validateToolResultProtection(policy);
+      const recordMap = new Map(records.map((entry) => [entry.toolCallId, entry]));
+      let safeResults: t.ToolExecuteResult[];
+      try {
+        safeResults = policy == null ? results : await Promise.all(results.map(async (result) => {
+          const record = recordMap.get(result.toolCallId);
+          if (record == null) throw new Error('Unknown eager result identity');
+          return protectToolExecuteResult(policy, record.request, result, batchSignal);
+        }));
+      } catch (error) {
+        if (policy != null && error instanceof ProviderTextProtectionError) resultBreaker.abort(error);
+        throw error;
+      }
+      await dispatchEagerToolCompletions({ graph, agentContext, records, results: safeResults });
+      return { results: safeResults };
     },
-    (error): t.EagerEventToolExecutionOutcome => ({
-      error: normalizeError(error),
-    })
-  );
+    (error): t.EagerEventToolExecutionOutcome => ({ error: normalizeError(error) })
+  ).catch((error: unknown): t.EagerEventToolExecutionOutcome => ({ error: normalizeError(error) }));
 
   for (const entry of entries) {
     const record: t.EagerEventToolExecution = {
@@ -925,6 +938,9 @@ async function dispatchEagerToolCompletions(args: {
   results: t.ToolExecuteResult[];
 }): Promise<void> {
   const { graph, agentContext, records, results } = args;
+  if (graph.toolResultProtection != null) {
+    graph.config?.signal?.throwIfAborted(); graph.signal?.throwIfAborted(); graph.breakerAbort.signal.throwIfAborted();
+  }
   const recordById = new Map(
     records.map((record) => [record.toolCallId, record])
   );

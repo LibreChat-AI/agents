@@ -128,3 +128,6 @@ export type {
   ProviderTextProtectionResult,
   ProviderTextProtectionErrorCode,
 } from './protection/providerText';
+
+export { TOOL_RESULT_PROTECTION_VERSION, ToolResultProtectionError } from './protection/toolResult';
+export type { ToolResultProtection, ToolResultProtectionResult } from './protection/toolResult';

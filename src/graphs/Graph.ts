@@ -180,6 +180,7 @@ import { SUBAGENT_REPLAY_CONTROLLER } from '@/tools/subagent/SubagentReplay';
 import { applyGraphRuntimeConfig } from '@/graphs/applyGraphRuntimeConfig';
 import { isFadingTier, isInformativeFadingTier } from '@/messages/fading';
 import { createContextPressureMeter } from '@/llm/contextPressureMeter';
+import { validateToolResultProtection } from '@/protection/toolResult';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { createCloudflareCodingToolBundle } from '@/tools/cloudflare';
 import { calculateMaxToolCallInputChars } from '@/utils/truncation';
@@ -1382,6 +1383,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    * these on every streamed chunk event.
    */
   streamLimits: ResolvedStreamLimits;
+  /** Default-off mandatory tool-result release. */
+  toolResultProtection?: t.StandardGraphInput['toolResultProtection'];
   /** Default-off mandatory provider prose release. */
   providerTextProtection?: t.StandardGraphInput['providerTextProtection'];
   /**
@@ -1560,6 +1563,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       preemption,
       streamLimits,
       providerTextProtection,
+      toolResultProtection,
       toolExecution,
       clientDelegatedToolNames,
     }: t.StandardGraphInput,
@@ -1592,6 +1596,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     if (providerTextProtection != null)
       validateProviderTextProtection(providerTextProtection);
     this.providerTextProtection = providerTextProtection;
+    if (toolResultProtection != null) validateToolResultProtection(toolResultProtection);
+    this.toolResultProtection = toolResultProtection;
     this.toolExecution = toolExecution;
     if (clientDelegatedToolNames != null && clientDelegatedToolNames.length > 0) {
       if (agents.length !== 1) {
@@ -2964,6 +2970,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         maxContextTokens: agentContext?.maxContextTokens,
         maxToolResultChars: agentContext?.maxToolResultChars,
         toolOutputRegistry: this.getOrCreateToolOutputRegistry(),
+        toolResultProtection: this.toolResultProtection,
         fileCheckpointer: this.getOrCreateFileCheckpointer(),
         getBreakerSignal: (): AbortSignal => this.breakerAbort.signal,
         getRunScope: (): RunBreakerScope => this.runScope,
@@ -3047,6 +3054,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       maxContextTokens: agentContext?.maxContextTokens,
       maxToolResultChars: agentContext?.maxToolResultChars,
       toolOutputRegistry: this.getOrCreateToolOutputRegistry(),
+      toolResultProtection: this.toolResultProtection,
       fileCheckpointer: this.getOrCreateFileCheckpointer(),
       getBreakerSignal: (): AbortSignal => this.breakerAbort.signal,
       getRunScope: (): RunBreakerScope => this.runScope,
@@ -5368,6 +5376,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           onResolutionFailure: this.onSubagentResolutionFailure,
           streamLimits: this.streamLimits,
           providerTextProtection: this.providerTextProtection,
+          toolResultProtection: this.toolResultProtection,
           humanInTheLoop: this.humanInTheLoop,
           checkpointer: this.compileOptions?.checkpointer,
           maxDepth: effectiveSubagentDepth,
