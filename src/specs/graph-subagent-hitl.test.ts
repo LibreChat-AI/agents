@@ -8,6 +8,8 @@ import {
 } from '@langchain/core/messages';
 import { ChatGenerationChunk } from '@langchain/core/outputs';
 import { FakeListChatModel } from '@langchain/core/utils/testing';
+import type { ToolCall } from '@langchain/core/messages/tool';
+import type { ToolRunnableConfig } from '@langchain/core/tools';
 import type * as t from '@/types';
 import { createFakeStreamingLLM } from '@/llm/fake';
 import { askUserQuestion } from '@/hitl';
@@ -24,7 +26,10 @@ const member = (agentId: string): t.AgentInputs => ({
 
 class ApprovalModel extends FakeListChatModel {
   private readonly owners: Map<string, string>;
-  constructor(private readonly calls: string[]) {
+  constructor(
+    private readonly calls: string[],
+    private readonly programmatic = false
+  ) {
     const owners = new Map<string, string>();
     super({
       responses: ['unused'],
@@ -56,10 +61,14 @@ class ApprovalModel extends FakeListChatModel {
     );
     if (owner == null) throw new Error('Missing graph member identity');
     this.calls.push(owner);
+    const toolName =
+      this.programmatic && owner === 'left'
+        ? Constants.PROGRAMMATIC_TOOL_CALLING
+        : `${owner}_tool`;
     const prior = messages.some(
       (message) =>
         message._getType() === 'tool' &&
-        (message as ToolMessage).name === `${owner}_tool`
+        (message as ToolMessage).name === toolName
     );
     if ((owner === 'left' || owner === 'right') && !prior) {
       yield new ChatGenerationChunk({
@@ -68,8 +77,12 @@ class ApprovalModel extends FakeListChatModel {
           content: '',
           tool_call_chunks: [
             {
-              name: `${owner}_tool`,
-              args: '{"value":"original"}',
+              name: toolName,
+              args: JSON.stringify(
+                this.programmatic && owner === 'left'
+                  ? { code: 'left_tool({value: "programmatic"})' }
+                  : { value: 'original' }
+              ),
               id: 'shared-member-call',
               index: 0,
               type: 'tool_call_chunk',
@@ -84,7 +97,7 @@ class ApprovalModel extends FakeListChatModel {
   }
 }
 
-function harness(eventDriven = false, question = false) {
+function harness(eventDriven = false, question = false, programmatic = false) {
   const checkpointer = new MemorySaver();
   const calls: string[] = [];
   const leftExecute = jest.fn(async ({ value }: { value: string }) =>
@@ -96,6 +109,17 @@ function harness(eventDriven = false, question = false) {
     async ({ value }: { value: string }) => `right ${value}`
   );
   const tools = { left: leftExecute, right: rightExecute };
+  const programmaticExecute = jest.fn(
+    async (_args: { code: string }, runnable?: ToolRunnableConfig) => {
+      const cache = runnable?.toolCall as
+        | (ToolCall & Partial<t.ProgrammaticCache>)
+        | undefined;
+      const target = cache?.toolMap?.get('left_tool');
+      return target == null
+        ? 'left unavailable'
+        : target.invoke({ value: 'programmatic' });
+    }
+  );
   const graph: t.GraphSubagentConfig = {
     kind: 'graph',
     type: 'team',
@@ -137,11 +161,36 @@ function harness(eventDriven = false, question = false) {
     entryAgentId: 'entry',
     resultAgentId: 'result',
   };
+  if (programmatic) {
+    const target = graph.agents[1].tools?.[0];
+    if (target == null) throw new Error('Missing target tool');
+    graph.agents[1].tools = [
+      target,
+      tool(programmaticExecute, {
+        name: Constants.PROGRAMMATIC_TOOL_CALLING,
+        description: 'Run tools with code',
+        schema: z.object({ code: z.string() }),
+      }),
+    ];
+    graph.agents[1].toolRegistry = new Map([
+      ['left_tool', { name: 'left_tool', allowed_callers: ['direct'] }],
+      [
+        Constants.PROGRAMMATIC_TOOL_CALLING,
+        {
+          name: Constants.PROGRAMMATIC_TOOL_CALLING,
+          allowed_callers: ['direct'],
+        },
+      ],
+    ]);
+  }
   const build = async (definition = graph, signal?: AbortSignal) => {
     const hookRegistry = new HookRegistry();
     for (const id of ['left', 'right'])
       hookRegistry.register('PreToolUse', {
-        pattern: `${id}_tool`,
+        pattern:
+          programmatic && id === 'left'
+            ? Constants.PROGRAMMATIC_TOOL_CALLING
+            : `${id}_tool`,
         hooks: [async () => ({ decision: 'ask' as const })],
       });
     const run = await Run.create<t.IState>({
@@ -192,7 +241,7 @@ function harness(eventDriven = false, question = false) {
       returnContent: true,
       skipCleanup: true,
     });
-    run.Graph?.setSubagentModelOverride(new ApprovalModel(calls));
+    run.Graph?.setSubagentModelOverride(new ApprovalModel(calls, programmatic));
     run.Graph!.overrideModel = createFakeStreamingLLM({
       responses: ['', 'parent completed'],
       toolCalls: [
@@ -206,7 +255,15 @@ function harness(eventDriven = false, question = false) {
     });
     return run;
   };
-  return { checkpointer, graph, calls, build, leftExecute, rightExecute };
+  return {
+    checkpointer,
+    graph,
+    calls,
+    build,
+    leftExecute,
+    rightExecute,
+    programmaticExecute,
+  };
 }
 const config = {
   configurable: { thread_id: 'graph-approval-thread' },
@@ -314,10 +371,40 @@ describe('graph subagent foreground HITL', () => {
     'revision',
     'tool-schema',
     'direct-tool-schema',
+    'registry-callers',
+    'registry-schema',
+    'registry-deferred',
+    'registry-response-format',
+    'registry-server',
+    'registry-classification',
+    'registry-removal',
+    'registry-key',
+    'tool-map-schema',
+    'direct-tool-mode',
   ] as const)(
     'a rebuilt run rejects a changed graph %s before approved execution',
     async (change) => {
       const h = harness();
+      const originalTool = h.graph.agents[1].tools?.[0];
+      if (originalTool == null) throw new Error('Missing member tool');
+      h.graph.agents[1].toolRegistry = new Map([
+        [
+          'left_tool',
+          {
+            name: 'left_tool',
+            description: 'Requires review',
+            parameters: {
+              type: 'object',
+              properties: { value: { type: 'string' } },
+            },
+            allowed_callers: ['direct'],
+            defer_loading: false,
+            responseFormat: 'content',
+            serverName: 'original-server',
+            toolType: 'mcp',
+          },
+        ],
+      ]);
       const run = await h.build();
       await start(run);
       expect(run.getInterrupt()?.payload.type).toBe('tool_approval');
@@ -358,6 +445,42 @@ describe('graph subagent foreground HITL', () => {
             schema: z.object({ value: z.string(), path: z.string() }),
           }),
         ];
+      const originalDeclaration =
+        h.graph.agents[1].toolRegistry.get('left_tool');
+      if (originalDeclaration == null)
+        throw new Error('Missing registry declaration');
+      const declaration = { ...originalDeclaration };
+      if (change === 'registry-callers')
+        declaration.allowed_callers = ['direct', 'code_execution'];
+      if (change === 'registry-schema')
+        declaration.parameters = {
+          type: 'object',
+          properties: { path: { type: 'string' } },
+        };
+      if (change === 'registry-deferred') declaration.defer_loading = true;
+      if (change === 'registry-response-format')
+        declaration.responseFormat = 'content_and_artifact';
+      if (change === 'registry-server') declaration.serverName = 'new-server';
+      if (change === 'registry-classification') declaration.toolType = 'action';
+      graph.agents[1].toolRegistry = new Map([
+        [change === 'registry-key' ? 'renamed-key' : 'left_tool', declaration],
+      ]);
+      if (change === 'registry-removal') graph.agents[1].toolRegistry.clear();
+      if (change === 'tool-map-schema')
+        graph.agents[1].toolMap = new Map([
+          [
+            'left_tool',
+            tool(h.leftExecute, {
+              name: 'left_tool',
+              description: 'New map implementation',
+              schema: z.object({ value: z.string(), path: z.string() }),
+            }),
+          ],
+        ]);
+      if (change === 'direct-tool-mode') {
+        graph.agents[1].graphTools = graph.agents[1].tools as t.GenericTool[];
+        graph.agents[1].tools = [];
+      }
       const rebuilt = await h.build(graph);
       await rebuilt.resume([{ type: 'approve' }], config);
       expect(h.leftExecute).not.toHaveBeenCalled();
@@ -453,4 +576,94 @@ describe('graph subagent foreground HITL', () => {
     expect(run.getInterrupt()?.interruptId).not.toBe(firstId);
     expect(h.calls.filter((id) => id === 'result')).toHaveLength(0);
   });
+
+  test('registry entry and allowed-caller order do not invalidate unchanged capabilities', async () => {
+    const h = harness();
+    const definitions: Array<[string, t.LCTool]> = [
+      [
+        'left_tool',
+        { name: 'left_tool', allowed_callers: ['direct', 'code_execution'] },
+      ],
+      ['other_tool', { name: 'other_tool', allowed_callers: ['direct'] }],
+    ];
+    h.graph.agents[1].toolRegistry = new Map(definitions);
+    const run = await h.build();
+    await start(run);
+    const reordered = {
+      ...h.graph,
+      agents: h.graph.agents.map((agent) => ({ ...agent })),
+    };
+    reordered.agents[1].toolRegistry = new Map(
+      definitions
+        .slice()
+        .reverse()
+        .map(([key, declaration]) => [
+          key,
+          {
+            ...declaration,
+            allowed_callers: declaration.allowed_callers?.slice().reverse(),
+          },
+        ])
+    );
+    const rebuilt = await h.build(reordered);
+    for (let attempt = 0; attempt < 2; attempt++)
+      await rebuilt.resume([{ type: 'approve' }], config);
+    expect(rebuilt.getInterrupt()).toBeUndefined();
+    expect(h.leftExecute).toHaveBeenCalledTimes(1);
+    expect(h.rightExecute).toHaveBeenCalledTimes(1);
+    expect(h.calls.filter((id) => id === 'entry')).toHaveLength(1);
+    expect(h.calls.filter((id) => id === 'result')).toHaveLength(1);
+    expect(definitions[0][1].allowed_callers).toEqual([
+      'direct',
+      'code_execution',
+    ]);
+  });
+
+  test.each([false, true])(
+    'programmatic approval cannot gain an expanded registry, changed=%s',
+    async (changed) => {
+      const h = harness(false, false, true);
+      const run = await h.build();
+      await start(run);
+      expect(run.getInterrupt()?.payload.type).toBe('tool_approval');
+      expect(h.programmaticExecute).not.toHaveBeenCalled();
+      const resumed = {
+        ...h.graph,
+        agents: h.graph.agents.map((agent) => ({ ...agent })),
+      };
+      if (changed) {
+        resumed.agents[1].toolRegistry = new Map(
+          h.graph.agents[1].toolRegistry
+        );
+        resumed.agents[1].toolRegistry.set('left_tool', {
+          name: 'left_tool',
+          allowed_callers: ['direct', 'code_execution'],
+        });
+      }
+      const rebuilt = await h.build(resumed);
+      await rebuilt.resume([{ type: 'approve' }], config);
+      if (changed) {
+        expect(h.programmaticExecute).not.toHaveBeenCalled();
+        expect(h.rightExecute).not.toHaveBeenCalled();
+        expect(
+          rebuilt
+            .getRunMessages()
+            ?.some(
+              (message) =>
+                message._getType() === 'tool' &&
+                String(message.content).includes('changed')
+            )
+        ).toBe(true);
+      } else {
+        await rebuilt.resume([{ type: 'approve' }], config);
+        expect(rebuilt.getInterrupt()).toBeUndefined();
+        expect(h.programmaticExecute).toHaveBeenCalledTimes(1);
+        expect(h.rightExecute).toHaveBeenCalledTimes(1);
+      }
+      expect(h.leftExecute).not.toHaveBeenCalled();
+      expect(
+        h.graph.agents[1].toolRegistry?.get('left_tool')?.allowed_callers
+      ).toEqual(['direct']);
+    }
+  );
 });

@@ -451,9 +451,27 @@ function getSubagentDefinitionId(
       additionalInstructions: agent.additional_instructions,
       maxContextTokens: agent.maxContextTokens,
       toolDefinitions: agent.toolDefinitions,
-      tools: [...(agent.tools ?? []), ...(agent.graphTools ?? [])].map(
+      toolRegistry: Object.fromEntries(
+        Array.from(agent.toolRegistry ?? [], ([key, definition]) => [
+          key,
+          {
+            ...definition,
+            allowed_callers: [
+              ...new Set(definition.allowed_callers ?? ['direct']),
+            ].sort(),
+          },
+        ])
+      ),
+      toolMap: Object.fromEntries(
+        Array.from(agent.toolMap ?? [], ([key, tool]) => [
+          key,
+          convertToOpenAITool(tool),
+        ])
+      ),
+      tools: agent.tools?.map(
         (tool) => (isLangChainTool(tool) ? convertToOpenAITool(tool) : tool)
       ),
+      graphTools: agent.graphTools?.map((tool) => convertToOpenAITool(tool)),
     })),
   };
   return `graph:${createHash('sha256').update(stableStringify(declaration)).digest('hex')}`;
