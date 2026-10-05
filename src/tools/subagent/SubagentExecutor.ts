@@ -1,5 +1,6 @@
 import { nanoid } from 'nanoid';
 import { createHash } from 'crypto';
+import { convertToOpenAITool, isLangChainTool } from '@langchain/core/utils/function_calling';
 import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
 import { AsyncLocalStorageProviderSingleton } from '@langchain/core/singletons';
 import {
@@ -430,6 +431,34 @@ type SubagentCheckpointMarker = {
   settledOutput?: PersistedToolOutput;
 };
 
+/** Declarative graph identity plus the host's revision for executable implementations. */
+function getSubagentDefinitionId(
+  config: ExecutableSubagentConfigEntry | undefined
+): string | undefined {
+  if (!config || !isGraphSubagentConfig(config)) return config?.configId;
+  const declaration = {
+    revision: config.configId,
+    type: config.type,
+    maxTurns: config.maxTurns,
+    entry: config.entryAgentId,
+    result: config.resultAgentId,
+    edges: config.edges,
+    members: config.agents.map((agent) => ({
+      id: agent.agentId,
+      provider: agent.provider,
+      model: resolveClientOptionsModel(agent.clientOptions),
+      instructions: agent.instructions,
+      additionalInstructions: agent.additional_instructions,
+      maxContextTokens: agent.maxContextTokens,
+      toolDefinitions: agent.toolDefinitions,
+      tools: [...(agent.tools ?? []), ...(agent.graphTools ?? [])].map(
+        (tool) => (isLangChainTool(tool) ? convertToOpenAITool(tool) : tool)
+      ),
+    })),
+  };
+  return `graph:${createHash('sha256').update(stableStringify(declaration)).digest('hex')}`;
+}
+
 function isResumeExecutionCompatible(
   resumeExecution: SubagentResumeExecution | undefined,
   subagentType: string | undefined,
@@ -442,7 +471,7 @@ function isResumeExecutionCompatible(
   if (
     subagentType == null ||
     executableConfig == null ||
-    resumeExecution.configId !== executableConfig.configId
+    resumeExecution.configId !== getSubagentDefinitionId(executableConfig)
   ) {
     return false;
   }
@@ -2321,7 +2350,7 @@ export class SubagentExecutor {
         return undefined;
       }
     }
-    const configId = executableConfig?.configId;
+    const configId = getSubagentDefinitionId(executableConfig);
     const bound = this.bindExecutionDefinition(
       execution,
       {
@@ -2429,9 +2458,9 @@ export class SubagentExecutor {
     const configId =
       resolvedSubagentType == null
         ? (execution.binding?.configId ??
-          executableConfig?.configId ??
+          getSubagentDefinitionId(executableConfig) ??
           resumeExecution?.configId)
-        : executableConfig?.configId;
+        : getSubagentDefinitionId(executableConfig);
     if (subagentType == null) {
       return;
     }
@@ -2586,16 +2615,6 @@ export class SubagentExecutor {
       );
     }
     if (
-      isGraphSubagentConfig(executableConfig) &&
-      this.humanInTheLoop?.enabled === true
-    ) {
-      return Promise.resolve(
-        createSubagentFailure(
-          'Error: Human-in-the-loop execution is not yet supported for graph subagents.'
-        )
-      );
-    }
-    if (
       this.humanInTheLoop?.enabled === true &&
       (params.parentToolCallId == null || params.parentToolCallId === '')
     ) {
@@ -2615,9 +2634,9 @@ export class SubagentExecutor {
         {
           description: params.description,
           subagentType: params.subagentType,
-          ...(executableConfig.configId == null
+          ...(getSubagentDefinitionId(executableConfig) == null
             ? {}
-            : { configId: executableConfig.configId }),
+            : { configId: getSubagentDefinitionId(executableConfig) }),
           ...(hostArgsDigest == null ? {} : { hostArgsDigest }),
         },
         () =>
@@ -2792,9 +2811,9 @@ export class SubagentExecutor {
       execution,
       {
         subagentType,
-        ...(executableConfig.configId == null
+        ...(getSubagentDefinitionId(executableConfig) == null
           ? {}
-          : { configId: executableConfig.configId }),
+          : { configId: getSubagentDefinitionId(executableConfig) }),
       },
       'effective'
     );
@@ -3184,7 +3203,11 @@ export class SubagentExecutor {
               checkpointMessages,
               executionSuffix
             );
-            result = { messages: persistedMessages };
+            const values = persistedState.values as MultiAgentGraphState;
+            result = {
+              messages: persistedMessages,
+              ...(childPlan.kind === 'graph' ? { subagentResult: values.subagentResult } : {}),
+            };
             recoveredComplete = true;
             childAlreadyStarted = true;
             childAlreadyCompleted = marker?.lifecycleComplete === true;

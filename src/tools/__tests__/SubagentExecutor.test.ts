@@ -1822,7 +1822,7 @@ describe('SubagentExecutor', () => {
     expect(result.messages).toEqual([]);
   });
 
-  it('fails graph HITL before factories, hooks, events, or usage can run', async () => {
+  it('requires a parent call ID for graph HITL before factories, hooks, events, or usage can run', async () => {
     const graphConfig: GraphSubagentConfig = {
       kind: 'graph',
       type: 'graph-team',
@@ -1862,13 +1862,32 @@ describe('SubagentExecutor', () => {
     });
 
     expect(result.content).toBe(
-      'Error: Human-in-the-loop execution is not yet supported for graph subagents.'
+      'Error: Resumable subagent execution requires a parent tool call ID.'
     );
     expect(createChildGraph).not.toHaveBeenCalled();
     expect(createChildGraphByKind).not.toHaveBeenCalled();
     expect(hook).not.toHaveBeenCalled();
     expect(update).not.toHaveBeenCalled();
     expect(usageSink).not.toHaveBeenCalled();
+  });
+
+  it('retains the designated graph result when recovering an already completed child checkpoint', async () => {
+    const graphConfig: GraphSubagentConfig = { kind: 'graph', type: 'recovered-team', name: 'Recovered', description: 'Already completed', agents: [makeChildInputs('entry'), makeChildInputs('result')], edges: [{ from: 'entry', to: 'result', edgeType: 'direct' }], entryAgentId: 'entry', resultAgentId: 'result' };
+    const finalMessage = new AIMessage('Designated graph result');
+    const invoke = jest.fn();
+    const updateState = jest.fn().mockResolvedValue({});
+    const executor = createExecutor({
+      configs: new Map([[graphConfig.type, graphConfig]]),
+      humanInTheLoop: { enabled: true },
+      createChildGraphByKind: () => ({
+        createWorkflow: () => ({ getState: jest.fn().mockResolvedValue({ values: { messages: [new AIMessage('Worker output'), finalMessage], subagentResult: { agentId: 'result', message: finalMessage } }, next: [], tasks: [] }), invoke, updateState }),
+        clearHeavyState: jest.fn(),
+      }) as unknown as StandardGraph,
+    });
+    const result = await executor.execute({ description: 'Recover the team', subagentType: graphConfig.type, threadId: 'recovered-team-thread', parentToolCallId: 'recovered-spawn' });
+    expect(result.content).toBe('Designated graph result');
+    expect(invoke).not.toHaveBeenCalled();
+    expect(updateState).toHaveBeenCalled();
   });
 
   it('fails closed when resumable execution has no parent tool call ID', async () => {

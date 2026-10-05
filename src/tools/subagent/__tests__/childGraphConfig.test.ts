@@ -477,7 +477,6 @@ describe('lazy and graph subagent normalization', () => {
   });
 
   it.each([
-    ['configId', 'graph@v1'],
     ['resolveAgentInputs', async () => makeAgent('unexpected')],
   ] as const)('rejects %s on graph descriptors', (field, value) => {
     const graphConfig = makeGraphConfig();
@@ -485,7 +484,7 @@ describe('lazy and graph subagent normalization', () => {
 
     expect(() =>
       normalizeSubagentConfigEntries([graphConfig], makeParentContext())
-    ).toThrow(/lazy fields configId\/resolveAgentInputs/);
+    ).toThrow(/lazy fields resolveAgentInputs/);
   });
 
   it('rejects unresolved self configs that also declare a resolver', () => {
@@ -518,4 +517,20 @@ describe('lazy and graph subagent normalization', () => {
       normalizeSubagentConfigs([invalidConfig], makeParentContext())
     ).toThrow(/cannot combine self with resolveAgentInputs/);
   });
+});
+
+test('graph revisions bind implementation changes without enabling lazy resolution', () => {
+  const graph = { ...makeGraphConfig(), configId: 'team@v2' };
+  expect(
+    normalizeSubagentConfigEntries(
+      [graph],
+      AgentContext.fromConfig(makeAgent('parent'))
+    )
+  ).toEqual([graph]);
+  expect(() =>
+    normalizeSubagentConfigEntries(
+      [{ ...graph, configId: '' }],
+      AgentContext.fromConfig(makeAgent('parent'))
+    )
+  ).toThrow('non-empty revision');
 });

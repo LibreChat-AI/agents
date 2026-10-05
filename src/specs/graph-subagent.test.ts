@@ -298,22 +298,23 @@ describe('Graph subagent integration', () => {
     expect(output).toMatch(/Subagent error: Recursion limit of 3 reached/);
   });
 
-  it('fails closed when human-in-the-loop is enabled', async () => {
+  it('executes a graph with HITL enabled when its members need no approval', async () => {
     const run = await createRun(makeGraphConfig(), {
       humanInTheLoop: { enabled: true },
     });
-
+    (run.Graph as StandardGraph).setSubagentModelOverride(
+      createFakeStreamingLLM({ responses: ['plan', 'left', 'right', 'answer'] })
+    );
     const result = await getGraphSubagentTool(run).invoke(
       {
-        description: 'Do not start this graph.',
-        subagent_type: 'research-team',
+        type: 'tool_call',
+        name: 'subagent',
+        id: 'graph-spawn',
+        args: { description: 'Research', subagent_type: 'research-team' },
       },
       invokeConfig
     );
-
-    expect(result).toBe(
-      'Error: Human-in-the-loop execution is not yet supported for graph subagents.'
-    );
+    expect(result).toMatchObject({ content: 'answer' });
   });
 
   it('attributes usage to each graph member', async () => {

@@ -155,14 +155,21 @@ function assertGraphSubagentConfigShape(
     );
   }
   if (
+    candidate.configId !== undefined &&
+    !isNonEmptyString(candidate.configId)
+  ) {
+    throw new Error(
+      `Graph subagent "${configType}" configId must be a non-empty revision.`
+    );
+  }
+  if (
     candidate.agentInputs !== undefined ||
     candidate.resolveAgentInputs !== undefined ||
-    candidate.configId !== undefined ||
     candidate.hostArgs !== undefined ||
     candidate.self !== undefined
   ) {
     throw new Error(
-      `Graph subagent "${configType}" cannot define agentInputs or self, or lazy fields configId/resolveAgentInputs/hostArgs.`
+      `Graph subagent "${configType}" cannot define agentInputs or self, or lazy fields resolveAgentInputs/hostArgs.`
     );
   }
 }

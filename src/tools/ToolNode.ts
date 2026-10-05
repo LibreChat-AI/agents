@@ -516,9 +516,24 @@ type AskEntry = {
  */
 function buildToolApprovalInterruptPayload(
   askEntries: ReadonlyArray<AskEntry>,
-  hookSessionId?: string
+  hookSessionId?: string,
+  executionContext?: t.SubagentExecutionContext,
+  executingAgentId?: string
 ): t.ToolApprovalInterruptPayload {
+  const leaf = executionContext?.ancestry[executionContext.ancestry.length - 1];
   return {
+    ...(leaf?.subagentKind === 'graph' &&
+    executingAgentId != null &&
+    executingAgentId !== ''
+      ? {
+        subagent: {
+          run_id: leaf.subagentRunId,
+          agent_id: executingAgentId,
+          subagent_type: leaf.subagentType,
+          parent_tool_call_id: leaf.parentToolCallId,
+        },
+      }
+      : {}),
     type: 'tool_approval',
     ...(hookSessionId == null || hookSessionId === ''
       ? {}
@@ -2733,7 +2748,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             reason: askReason,
             allowedDecisions,
           };
-          const payload = buildToolApprovalInterruptPayload([askEntry], runId);
+          const payload = buildToolApprovalInterruptPayload(
+            [askEntry], runId, this.executionContext, this.executingAgentId
+          );
           const resumeValue = AsyncLocalStorageProviderSingleton.runWithConfig(
             config,
             () =>
@@ -3967,7 +3984,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
        * consumed one-shot hooks replay their pending approval aggregate.
        */
       if (askEntries.length > 0) {
-        const payload = buildToolApprovalInterruptPayload(askEntries, runId);
+        const payload = buildToolApprovalInterruptPayload(
+          askEntries, runId, this.executionContext, this.executingAgentId
+        );
 
         /**
          * `interrupt()` reads the current `RunnableConfig` from

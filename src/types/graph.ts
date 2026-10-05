@@ -677,7 +677,8 @@ export interface SingleAgentSubagentConfig extends SubagentConfig {
 
 export interface GraphSubagentConfig extends SubagentConfigBase {
   kind: 'graph';
-  configId?: never;
+  /** Host revision for member implementations not represented by declarative inputs. */
+  configId?: string;
   resolveAgentInputs?: never;
   hostArgs?: never;
   allowNested?: false;

@@ -3101,7 +3101,7 @@ describe('SubagentExecutor lazy selected-subagent resolution', () => {
     };
 
     await expect(initializeAndExecute()).rejects.toThrow(
-      /lazy fields configId\/resolveAgentInputs/
+      /lazy fields resolveAgentInputs/
     );
     expect(resolveAgentInputs).not.toHaveBeenCalled();
     expect(createChildGraph).not.toHaveBeenCalled();
