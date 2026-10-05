@@ -14,7 +14,12 @@ import type {
   ProviderTextProtectionResult,
   ProviderTextProtectionErrorCode,
 } from './providerText';
-import type { GenericTool, ToolExecuteResult, ToolCallRequest } from '@/types';
+import type {
+  GenericTool,
+  ToolExecuteResult,
+  ToolExecuteBatchRequest,
+  ToolCallRequest,
+} from '@/types';
 import {
   ProviderTextAttempt,
   ProviderTextProtectionError,
@@ -130,7 +135,16 @@ export function requiresToolResultProtection(
 }
 
 function plainObject(value: object, allowed: readonly string[]): void {
-  if (types.isProxy(value)) throw new ToolResultProtectionError('unsupported');
+  const candidate: unknown = value;
+  if (
+    candidate == null ||
+    typeof candidate !== 'object' ||
+    types.isProxy(value)
+  )
+    throw new ToolResultProtectionError('unsupported');
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null)
+    throw new ToolResultProtectionError('unsupported');
   const descriptors = Object.getOwnPropertyDescriptors(value);
   for (const [key, descriptor] of Object.entries(descriptors)) {
     if (!allowed.includes(key) || !('value' in descriptor))
@@ -393,6 +407,41 @@ export async function protectToolMessage(
   return safe;
 }
 
+/** Validate host-owned envelopes before even reading their routing IDs. */
+export function validateToolExecuteResults(
+  results: ToolExecuteResult[],
+  maxResults: number
+): void {
+  if (
+    !Array.isArray(results) ||
+    types.isProxy(results) ||
+    Object.getPrototypeOf(results) !== Array.prototype ||
+    results.length > maxResults
+  )
+    throw new ToolResultProtectionError('unsupported');
+  for (let index = 0; index < results.length; index++) {
+    const descriptor = Object.getOwnPropertyDescriptor(results, String(index));
+    if (descriptor == null || !('value' in descriptor))
+      throw new ToolResultProtectionError('unsupported');
+    plainObject(descriptor.value as ToolExecuteResult, [
+      'toolCallId',
+      'received_at',
+      'content',
+      'status',
+      'errorMessage',
+      'artifact',
+      'injectedMessages',
+    ]);
+  }
+  for (const key of Reflect.ownKeys(results)) {
+    if (
+      key !== 'length' &&
+      (typeof key !== 'string' || !/^(0|[1-9]\d*)$/.test(key))
+    )
+      throw new ToolResultProtectionError('unsupported');
+  }
+}
+
 export async function protectToolExecuteResult(
   policy: ToolResultProtection | undefined,
   request: Pick<ToolCallRequest, 'id' | 'name'>,
@@ -410,6 +459,7 @@ export async function protectToolExecuteResult(
     'injectedMessages',
   ]);
   const status: string = result.status;
+  const receivedAt = result.received_at;
   if (
     result.toolCallId !== request.id ||
     (status !== 'success' && status !== 'error') ||
@@ -418,11 +468,11 @@ export async function protectToolExecuteResult(
       (typeof result.received_at !== 'number' ||
         !Number.isFinite(result.received_at))) ||
     (result.injectedMessages?.length ?? 0) > 0 ||
-    (result.status === 'success' && result.errorMessage != null)
+    (status === 'success' && result.errorMessage != null)
   )
     throw new ToolResultProtectionError('unsupported');
   const text =
-    result.status === 'error'
+    status === 'error'
       ? (result.errorMessage ?? result.content)
       : result.content;
   const cached = approved.get(result);
@@ -431,7 +481,7 @@ export async function protectToolExecuteResult(
     cached.name === request.name &&
     cached.id === request.id &&
     cached.text === text &&
-    cached.status === result.status
+    cached.status === status
   )
     return result;
   const canonical = (await protectToolText(
@@ -439,15 +489,15 @@ export async function protectToolExecuteResult(
     request.name,
     request.id,
     text,
-    result.status,
+    status,
     signal
   )) as string;
   const safe: ToolExecuteResult = {
     toolCallId: request.id,
-    status: result.status,
-    content: result.status === 'error' ? '' : canonical,
-    ...(result.status === 'error' ? { errorMessage: canonical } : {}),
-    ...(result.received_at == null ? {} : { received_at: result.received_at }),
+    status,
+    content: status === 'error' ? '' : canonical,
+    ...(status === 'error' ? { errorMessage: canonical } : {}),
+    ...(receivedAt == null ? {} : { received_at: receivedAt }),
   };
   approved.set(safe, {
     policy,
@@ -457,6 +507,70 @@ export async function protectToolExecuteResult(
     status: safe.status,
   });
   return safe;
+}
+
+const hostPolicies = new WeakMap<
+  ToolExecuteBatchRequest,
+  { policy: ToolResultProtection; signal?: AbortSignal }
+>();
+
+/** Internal request identity binds mandatory policy without exposing it to hosts. */
+export function bindToolExecuteProtection(
+  request: ToolExecuteBatchRequest,
+  policy: ToolResultProtection | undefined,
+  signal?: AbortSignal
+): void {
+  if (
+    policy != null &&
+    request.toolCalls.some((call) =>
+      requiresToolResultProtection(policy, call.name)
+    )
+  )
+    hostPolicies.set(request, { policy, signal });
+}
+
+export function protectToolExecuteBatch(
+  request: ToolExecuteBatchRequest,
+  results: ToolExecuteResult[]
+): Promise<ToolExecuteResult[]> | undefined {
+  const selected = hostPolicies.get(request);
+  if (selected == null) return undefined;
+  return protectBoundToolExecuteBatch(
+    request,
+    results,
+    selected.policy,
+    selected.signal
+  );
+}
+
+async function protectBoundToolExecuteBatch(
+  request: ToolExecuteBatchRequest,
+  results: ToolExecuteResult[],
+  policy: ToolResultProtection,
+  signal?: AbortSignal
+): Promise<ToolExecuteResult[]> {
+  validateToolExecuteResults(results, request.toolCalls.length);
+  const requests = new Map(request.toolCalls.map((call) => [call.id, call]));
+  const seen = new Set<string>();
+  for (const result of results) {
+    if (!requests.has(result.toolCallId) || seen.has(result.toolCallId))
+      throw new ToolResultProtectionError('unsupported');
+    seen.add(result.toolCallId);
+  }
+  for (const call of request.toolCalls) {
+    if (requiresToolResultProtection(policy, call.name) && !seen.has(call.id))
+      throw new ToolResultProtectionError('unavailable');
+  }
+  return Promise.all(
+    results.map((result) =>
+      protectToolExecuteResult(
+        policy,
+        requests.get(result.toolCallId)!,
+        result,
+        signal
+      )
+    )
+  );
 }
 
 /** Keep child/control APIs usable, but no raw body observations escape before release. */

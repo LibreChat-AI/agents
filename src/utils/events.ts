@@ -5,6 +5,8 @@ import type { RunnableConfig } from '@langchain/core/runnables';
 import type { ToolCallsDispatchedEvent } from '@/types/stream';
 import type { ToolExecuteBatchRequest } from '@/types/tools';
 import type { AgentLogEvent } from '@/types/graph';
+import { protectToolExecuteBatch, ToolResultProtectionError } from '@/protection/toolResult';
+import { ProviderTextProtectionError } from '@/protection/providerText';
 import { traceHostToolResults } from '@/langfuse';
 import { GraphEvents } from '@/common';
 
@@ -26,13 +28,25 @@ export async function safeDispatchCustomEvent(
           results: Parameters<ToolExecuteBatchRequest['resolve']>[0]
         ): void => {
           const receivedAt = Date.now();
-          const stamped = results.map((result) => ({ ...result, received_at: receivedAt }));
-          void traceHostToolResults(request, results, config).then(
-            () => request.resolve(stamped),
-            () => {
-              console.warn('Failed to record host tool execution metadata');
-              request.resolve(stamped);
-            }
+          const protectedResults = protectToolExecuteBatch(request, results);
+          const release = (canonical: typeof results, guarded: boolean): void => {
+            const stamped = canonical.map((result) => {
+              if (!guarded) return { ...result, received_at: receivedAt };
+              result.received_at = receivedAt;
+              return result;
+            });
+            void traceHostToolResults(request, canonical, config).then(
+              () => request.resolve(stamped),
+              () => {
+                console.warn('Failed to record host tool execution metadata');
+                request.resolve(stamped);
+              }
+            );
+          };
+          if (protectedResults == null) { release(results, false); return; }
+          void protectedResults.then(
+            (canonical) => release(canonical, true),
+            (error: unknown) => request.reject(error instanceof ProviderTextProtectionError ? error : new ToolResultProtectionError('unavailable'))
           );
         },
       } satisfies ToolExecuteBatchRequest;

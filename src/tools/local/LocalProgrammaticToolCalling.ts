@@ -400,14 +400,15 @@ async function createToolBridge(
   });
 
   const address = server.address() as AddressInfo;
+  let closing: Promise<void> | undefined;
+  const close = (): Promise<void> => closing ??= new Promise((resolve, reject) => {
+    server.close((error) => (error ? reject(error) : resolve()));
+  });
   return {
     url: `http://127.0.0.1:${address.port}/tool`,
     token,
     protectionFailure: () => protectionFailure,
-    close: () =>
-      new Promise((resolve, reject) => {
-        server.close((error) => (error ? reject(error) : resolve()));
-      }),
+    close,
   };
 }
 
@@ -665,6 +666,8 @@ async function runLocalProgrammaticTool(args: {
           { ...args.localConfig, timeoutMs }
         );
 
+    // Late accepted requests must settle before the enclosing result is accepted.
+    await bridge.close();
     const protectionFailure = bridge.protectionFailure();
     if (protectionFailure != null) throw protectionFailure;
     if (result.exitCode !== 0 || result.timedOut) {

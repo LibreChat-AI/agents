@@ -53,7 +53,7 @@ import type { SettledToolBatchResult } from '@/tools/toolBatchReplay';
 import type { PreparedSubagents } from '@/tools/preparedSubagents';
 import type { RunBreakerScope } from '@/llm/streamLimits';
 import type * as t from '@/types';
-import { hasReleasedToolReference, isReleasedToolError, markReleasedToolMessage, protectToolText, protectToolMessage, protectToolExecuteResult, withToolResultBoundary, requiresToolResultProtection, validateToolResultProtection, ToolResultProtectionError } from '@/protection/toolResult';
+import { bindToolExecuteProtection, validateToolExecuteResults, hasReleasedToolReference, isReleasedToolError, markReleasedToolMessage, protectToolText, protectToolMessage, protectToolExecuteResult, withToolResultBoundary, requiresToolResultProtection, validateToolResultProtection, ToolResultProtectionError } from '@/protection/toolResult';
 import {
   TOOL_BATCH_REPLAY_KEY,
   getToolBatchReplayOwner,
@@ -2173,6 +2173,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         const safeError = await protectToolText(this.toolResultProtection, call.name, call.id ?? '', e.message, 'error', config.signal);
         e = new Error(safeError as string);
       }
+      const admittedErrorText = e.message;
       if (this.errorHandler) {
         try {
           const dispatched = await this.errorHandler(
@@ -2236,6 +2237,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
                 },
           });
         }
+      }
+      if (requiresToolResultProtection(this.toolResultProtection, call.name) && e.message !== admittedErrorText) {
+        e = new Error(await protectToolText(this.toolResultProtection, call.name, call.id ?? '', e.message, 'error', config.signal) as string);
       }
       const errorContent = formatToolErrorContent(
         e.message,
@@ -2854,16 +2858,14 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
                 effectiveCall.args as Record<string, unknown>
               );
             }
+            const canonical = await protectToolText(this.toolResultProtection, call.name, call.id ?? '', responseText, 'success', config.signal) as string;
             return persistOutput(
-              new ToolMessage({
+              markReleasedToolMessage(this.toolResultProtection, call.name, call.id ?? '', new ToolMessage({
                 status: 'success',
-                content: truncateToolResultContent(
-                  responseText,
-                  this.maxToolResultChars
-                ),
+                content: truncateToolResultContent(canonical, this.maxToolResultChars),
                 name: call.name,
                 tool_call_id: call.id ?? '',
-              }),
+              })),
               effectiveCall.args as Record<string, unknown>
             );
           }
@@ -4452,6 +4454,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
                   | undefined,
               signal: config.signal,
               resolve: (results): void => {
+                if (this.toolResultProtection != null) {
+                  try { validateToolExecuteResults(results, dispatchRequests.length); } catch (error) { reject(error); return; }
+                }
                 const receivedAt = Date.now();
                 for (const result of results) {
                   if (dispatchRequestById.has(result.toolCallId)) {
@@ -4466,6 +4471,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               ...(canEmitEarlyCompletions && { onResult }),
             };
 
+            bindToolExecuteProtection(batchRequest, this.toolResultProtection, config.signal);
             void safeDispatchCustomEvent(
               GraphEvents.ON_TOOL_CALLS_DISPATCHED,
               createToolCallsDispatchedEvent(config, dispatchRequests),
@@ -4540,6 +4546,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       );
       const unprotectedResults = [ ...plan.rejectedResults, ...flattenedEagerResults, ...dispatchedResults ];
       if (this.toolResultProtection != null) {
+        validateToolExecuteResults(unprotectedResults, plan.allRequests.length);
         const ids = new Set<string>();
         for (const result of unprotectedResults) {
           if (ids.has(result.toolCallId)) throw new ToolResultProtectionError('unsupported');

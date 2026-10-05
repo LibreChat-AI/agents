@@ -1,4 +1,4 @@
-import { requiresToolResultProtection, ToolResultProtectionError, protectToolExecuteResult, validateToolResultProtection } from '@/protection/toolResult';
+import { bindToolExecuteProtection, validateToolExecuteResults, requiresToolResultProtection, ToolResultProtectionError, protectToolExecuteResult, validateToolResultProtection } from '@/protection/toolResult';
 // src/stream.ts
 import type { ToolCall, ToolCallChunk } from '@langchain/core/messages/tool';
 import type { ChatOpenAIReasoningSummary } from '@langchain/openai';
@@ -885,6 +885,7 @@ function startEagerToolExecutions(args: {
       reject,
     };
 
+    bindToolExecuteProtection(batchRequest, resultPolicy, batchSignal);
     if (graph.config != null) {
       void safeDispatchCustomEvent(
         GraphEvents.ON_TOOL_CALLS_DISPATCHED,
@@ -910,6 +911,7 @@ function startEagerToolExecutions(args: {
       let safeResults: t.ToolExecuteResult[];
       try {
         if (hasSelectedResults) {
+          validateToolExecuteResults(results, records.length);
           const ids = new Set<string>();
           for (const result of results) {
             if (ids.has(result.toolCallId) || !recordMap.has(result.toolCallId)) throw new ToolResultProtectionError('unsupported');

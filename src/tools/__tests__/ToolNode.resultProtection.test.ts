@@ -19,14 +19,25 @@ import type {
   ToolResultProtection,
   ToolResultProtectionResult,
 } from '@/protection/toolResult';
-import type { ToolExecuteBatchRequest, EventHandler } from '@/types';
+import type {
+  ToolExecuteBatchRequest,
+  ToolExecuteResult,
+  EventHandler,
+} from '@/types';
+import {
+  createCloudflareProgrammaticToolCallingTool,
+  createCloudflareBashProgrammaticToolCallingTool,
+} from '@/tools/cloudflare/CloudflareProgrammaticToolCalling';
 import { createLocalProgrammaticToolCallingTool } from '@/tools/local/LocalProgrammaticToolCalling';
 import {
   createProgrammaticToolCallingTool,
   executeTools,
 } from '@/tools/ProgrammaticToolCalling';
 import { createBashProgrammaticToolCallingTool } from '@/tools/BashProgrammaticToolCalling';
-import { TOOL_BATCH_REPLAY_KEY, getToolBatchReplayState } from '@/tools/toolBatchReplay';
+import {
+  TOOL_BATCH_REPLAY_KEY,
+  getToolBatchReplayState,
+} from '@/tools/toolBatchReplay';
 import { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import { ToolResultProtectionError } from '@/protection/toolResult';
 import { PreparedSubagentError } from '@/tools/preparedSubagents';
@@ -1449,8 +1460,7 @@ it('retains full approved reference content while projecting only the model prev
               id: 'pipe-control',
               name: 'pipe',
               args: {
-                command:
-                  '{{' + 'tool0turn0' + '}}',
+                command: '{{' + 'tool0turn0' + '}}',
               },
             },
           ],
@@ -1550,7 +1560,9 @@ it('re-inspects checkpoint-owned references after mixed approval replay without 
   const resumedRuntime = create();
   const resumed = await resumedRuntime.graph.invoke(
     new Command({ resume: [{ type: 'approve' }] }),
-    { configurable: { ...config.configurable, [TOOL_BATCH_REPLAY_KEY]: replay } }
+    {
+      configurable: { ...config.configurable, [TOOL_BATCH_REPLAY_KEY]: replay },
+    }
   );
   expect(lookups).toBe(1);
   expect(approvals).toBe(1);
@@ -1589,4 +1601,289 @@ it('protects text-only content_and_artifact exceptions through the native error 
   assertNoCanary(result);
   assertNoCanary(events.join(''));
   expect(events.join('')).toContain('[EMAIL_1]');
+});
+
+it.each([false, true])(
+  'rejects hostile host envelopes before reading accessors (eager=%s)',
+  async (eager) => {
+    for (const key of [
+      'toolCallId',
+      'status',
+      'content',
+      'array-index',
+      'own-content',
+    ] as const) {
+      let reads = 0;
+      const completions: string[] = [];
+      const getter = (): never => {
+        reads++;
+        throw new Error(fixtures.canaries[0]);
+      };
+      const result =
+        (key === 'array-index' || key === 'own-content')
+          ? {
+            toolCallId: 'call-control',
+            status: 'success',
+            content: 'Allowed control',
+          }
+          : Object.create(
+            Object.defineProperty({}, key, { get: getter }),
+            Object.fromEntries(
+              Object.entries({
+                toolCallId: 'call-control',
+                status: 'success',
+                content: 'Allowed control',
+              })
+                .filter(([name]) => name !== key)
+                .map(([name, value]) => [name, { value, enumerable: true }])
+            )
+          );
+      if (key === 'own-content') Object.defineProperty(result, 'content', { get: getter, enumerable: true });
+      const results = [result] as ToolExecuteResult[];
+      if (key === 'array-index')
+        Object.defineProperty(results, '0', { get: getter });
+      const run = await Run.create({
+        runId: `host-accessor-${eager}-${key}`,
+        graphConfig: {
+          type: 'standard',
+          llmConfig: { provider: Providers.OPENAI },
+          instructions: 'Allowed control.',
+          toolDefinitions: [
+            {
+              name: 'lookup',
+              parameters: {
+                type: 'object',
+                properties: { count: { type: 'number' } },
+              },
+            },
+          ],
+        },
+        customHandlers: {
+          [GraphEvents.CHAT_MODEL_STREAM]: new ChatModelStreamHandler(),
+          [GraphEvents.ON_TOOL_EXECUTE]: {
+            handle: (_event, data): void => {
+              (data as ToolExecuteBatchRequest).resolve(results);
+            },
+          },
+          [GraphEvents.ON_RUN_STEP_COMPLETED]: {
+            handle: (_event, data): void => {
+              completions.push(JSON.stringify(data));
+            },
+          },
+        },
+        eagerEventToolExecution: { enabled: eager },
+        toolResultProtection: policy(),
+        skipCleanup: true,
+      });
+      run.Graph!.overrideModel = new FakeChatModel({
+        responses: ['', 'Must not continue'],
+        toolCalls: [
+          {
+            id: 'call-control',
+            name: 'lookup',
+            args: { count: 42 },
+            type: 'tool_call',
+          },
+        ],
+      });
+      const error = await run
+        .processStream(
+          { messages: [new HumanMessage('Allowed control')] },
+          {
+            version: 'v2',
+            configurable: { thread_id: `host-accessor-${eager}-${key}` },
+          }
+        )
+        .catch((value: Error) => value);
+      expect(error).toMatchObject({ code: 'unsupported' });
+      expect(reads).toBe(0);
+      expect(completions).toEqual([]);
+      assertNoCanary(String(error));
+      assertNoCanary(run.Graph!.getRunMessages());
+    }
+  }
+);
+
+it.each(['python', 'bash'] as const)(
+  'gates selected Cloudflare native outputs before any %s sandbox work',
+  async (runtime) => {
+    let executions = 0;
+    const sandbox = {
+      exec: async () => {
+        executions++;
+        return { exitCode: 0, stdout: 'Allowed control', stderr: '' };
+      },
+      readFile: async () => {
+        executions++;
+        return fixtures.canaries[0];
+      },
+      writeFile: async () => {
+        executions++;
+        return undefined;
+      },
+      mkdir: async () => undefined,
+      listFiles: async () => [],
+      deleteFile: async () => undefined,
+    };
+    const runner =
+      runtime === 'python'
+        ? createCloudflareProgrammaticToolCallingTool({ sandbox })
+        : createCloudflareBashProgrammaticToolCallingTool({ sandbox });
+    for (const manifest of [['read_file'], []]) {
+      await expect(
+        runner.invoke(
+          {
+            code:
+              runtime === 'python'
+                ? 'print(await read_file("canary.txt"))'
+                : 'read_file \'{"path":"canary.txt"}\'',
+            tool_manifest: manifest,
+          },
+          {
+            toolCall: {
+              id: 'cloudflare-control',
+              name: runner.name,
+              type: 'tool_call',
+              args: {},
+              toolDefs: [
+                { name: 'read_file', allowed_callers: ['code_execution'] },
+              ],
+              toolResultProtection: policy({ toolNames: ['read_file'] }),
+            },
+          }
+        )
+      ).rejects.toMatchObject({ code: 'unsupported' });
+    }
+    expect(executions).toBe(0);
+    const allowed = await runner.invoke(
+      {
+        code:
+          runtime === 'python'
+            ? 'print("Allowed control")'
+            : 'echo "Allowed control"',
+        tool_manifest: [],
+      },
+      {
+        toolCall: {
+          id: 'cloudflare-allowed',
+          name: runner.name,
+          type: 'tool_call',
+          args: {},
+          toolDefs: [],
+          toolResultProtection: policy(),
+        },
+      }
+    );
+    expect(executions).toBeGreaterThan(0);
+    expect(JSON.stringify(allowed)).toContain('Allowed control');
+    assertNoCanary(allowed);
+  }
+);
+
+it('keeps a late blocked local bridge result terminal while draining detached requests', async () => {
+  const started = deferred<void>();
+  const decision = deferred<ToolResultProtectionResult>();
+  const runner = createLocalProgrammaticToolCallingTool({ cwd: process.cwd() });
+  const pending = runner.invoke(
+    {
+      lang: 'bash',
+      code: 'lookup \'{"count":42}\' >/dev/null 2>&1 &\nsleep 0.05\necho "Allowed outer control"',
+      tool_manifest: ['lookup'],
+    },
+    {
+      toolCall: {
+        id: 'late-local-control',
+        name: runner.name,
+        type: 'tool_call',
+        args: {},
+        toolMap: new Map([['lookup', direct(() => fixtures.canaries[0])]]),
+        toolDefs: [
+          {
+            name: 'lookup',
+            allowed_callers: ['code_execution'],
+            parameters: {
+              type: 'object',
+              properties: { count: { type: 'number' } },
+            },
+          },
+        ],
+        toolResultProtection: policy({
+          inspect: () => {
+            started.resolve();
+            return decision.promise;
+          },
+        }),
+      },
+    }
+  );
+  const outcome = pending.catch((error: Error) => error);
+  await started.promise;
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  decision.resolve({ version: 1, ok: false, error: { code: 'blocked' } });
+  expect(await outcome).toMatchObject({ code: 'blocked' });
+});
+
+it.each([false, true])(
+  'inspects full direct approval response before model truncation (block=%s)',
+  async (block) => {
+    const raw = 'Allowed response '.repeat(80) + fixtures.canaries[0];
+    const inspected: string[] = [];
+    let executions = 0;
+    const hooks = new HookRegistry();
+    hooks.register('PreToolUse', {
+      hooks: [
+        async () => ({ decision: 'ask', reason: 'Allowed approval control' }),
+      ],
+    });
+    const node = new ToolNode({
+      tools: [
+        direct(() => {
+          executions++;
+          return 'Must not run';
+        }),
+      ],
+      hookRegistry: hooks,
+      humanInTheLoop: { enabled: true },
+      maxToolResultChars: 128,
+      toolResultProtection: policy({
+        inspect: ({ content }) => {
+          inspected.push(content);
+          return block
+            ? { version: 1, ok: false, error: { code: 'blocked' } }
+            : approve('[EMAIL_1]');
+        },
+      }),
+    });
+    const graph = new StateGraph(MessagesAnnotation)
+      .addNode('tools', node)
+      .addEdge(START, 'tools')
+      .addEdge('tools', END)
+      .compile({ checkpointer: new MemorySaver() });
+    const config = {
+      configurable: {
+        thread_id: `response-c1-${block}`,
+        run_id: `response-c1-${block}`,
+      },
+    };
+    expect(isInterrupted(await graph.invoke(state(), config))).toBe(true);
+    const resumed = graph.invoke(
+      new Command({ resume: [{ type: 'respond', responseText: raw }] }),
+      config
+    );
+    if (block) await expect(resumed).rejects.toMatchObject({ code: 'blocked' });
+    else {
+      const value = await resumed;
+      assertNoCanary(value);
+      expect(JSON.stringify(value)).toContain('[EMAIL_1]');
+    }
+    expect(executions).toBe(0);
+    expect(inspected).toEqual([raw]);
+  }
+);
+
+it('re-inspects an observational error-handler replacement before completion and model reuse', async () => {
+  const inspected: string[] = []; const events: string[] = [];
+  const node = new ToolNode({ trace: true, tools: [direct(() => { throw new Error('Allowed initial error'); })], toolCallStepIds: new Map([['call-control', 'step-control']]), toolResultProtection: policy({ inspect: ({ content }) => { inspected.push(content); return approve(content.replace(fixtures.canaries[0], '[EMAIL_1]')); } }), errorHandler: async ({ error }) => { error!.message = fixtures.canaries[0]; return false; } });
+  const result = await node.invoke(state(), { callbacks: [observer(events)] });
+  expect(inspected).toEqual(['Allowed initial error', fixtures.canaries[0]]); assertNoCanary(result); assertNoCanary(events.join('')); expect(events.join('')).toContain('[EMAIL_1]');
 });
