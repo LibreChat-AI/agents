@@ -14,7 +14,10 @@ import type {
   ProviderTextProtectionResult,
   ProviderTextProtectionErrorCode,
 } from './providerText';
-import type { ToolOutputReferenceRegistry, ToolOutputReferenceState } from '@/tools/toolOutputReferences';
+import type {
+  ToolOutputReferenceRegistry,
+  ToolOutputReferenceState,
+} from '@/tools/toolOutputReferences';
 import type {
   GenericTool,
   ToolExecuteResult,
@@ -62,6 +65,18 @@ export class ToolResultProtectionError extends ProviderTextProtectionError {
   }
 }
 
+const messageFields = [
+  'content',
+  'artifact',
+  'name',
+  'id',
+  'tool_call_id',
+  'status',
+  'additional_kwargs',
+  'response_metadata',
+] as const;
+type ToolMessageEnvelope = Pick<ToolMessage, (typeof messageFields)[number]>;
+
 const adapters = new WeakMap<ToolResultProtection, ProviderTextProtection>();
 const approved = new WeakMap<
   object,
@@ -72,6 +87,7 @@ const approved = new WeakMap<
     text: string;
     status: string;
     referenceContent?: string;
+    envelope?: ToolMessageEnvelope;
   }
 >();
 const errors = new Set<ProviderTextProtectionErrorCode>([
@@ -283,6 +299,7 @@ export function markReleasedToolMessage(
       id,
       text: message.content,
       status: message.status ?? 'success',
+      envelope: snapshotToolMessageEnvelope(message),
       referenceContent:
         referenceContent ?? approved.get(message)?.referenceContent,
     });
@@ -305,7 +322,9 @@ export function hasReleasedToolReference(
     entry.id === id &&
     entry.text === message.content &&
     entry.status === message.status &&
-    entry.referenceContent === referenceContent
+    entry.referenceContent === referenceContent &&
+    entry.envelope != null &&
+    matchesToolMessageEnvelope(snapshotToolMessageEnvelope(message), entry.envelope)
   );
 }
 
@@ -328,6 +347,82 @@ function validateReplayReferenceMetadata(message: ToolMessage): void {
     throw new ToolResultProtectionError('unsupported');
 }
 
+function snapshotToolMessageEnvelope(
+  message: ToolMessage
+): ToolMessageEnvelope {
+  if (types.isProxy(message))
+    throw new ToolResultProtectionError('unsupported');
+  for (const key of messageFields) {
+    const descriptor = Object.getOwnPropertyDescriptor(message, key);
+    if (descriptor != null && !('value' in descriptor))
+      throw new ToolResultProtectionError('unsupported');
+  }
+  plainObject(message.additional_kwargs, [
+    '_refKey',
+    '_refScope',
+    '_unresolvedRefs',
+  ]);
+  plainObject(message.response_metadata, []);
+  const unresolved = message.additional_kwargs._unresolvedRefs;
+  if (Array.isArray(unresolved)) {
+    if (types.isProxy(unresolved))
+      throw new ToolResultProtectionError('unsupported');
+    for (let index = 0; index < unresolved.length; index++) {
+      if (
+        !Object.hasOwn(
+          Object.getOwnPropertyDescriptor(unresolved, String(index)) ?? {},
+          'value'
+        )
+      )
+        throw new ToolResultProtectionError('unsupported');
+    }
+  }
+  validateReplayReferenceMetadata(message);
+  return {
+    content: message.content,
+    artifact: message.artifact,
+    name: message.name,
+    id: message.id,
+    tool_call_id: message.tool_call_id,
+    status: message.status,
+    additional_kwargs: {
+      ...message.additional_kwargs,
+      ...(Array.isArray(unresolved)
+        ? { _unresolvedRefs: [...unresolved] }
+        : {}),
+    },
+    response_metadata: {},
+  };
+}
+
+function matchesToolMessageEnvelope(
+  current: ToolMessageEnvelope,
+  envelope: ToolMessageEnvelope
+): boolean {
+  const metadata = envelope.additional_kwargs;
+  const currentMetadata = current.additional_kwargs;
+  const unresolved = metadata._unresolvedRefs as string[] | undefined;
+  const currentUnresolved = currentMetadata._unresolvedRefs as
+    | string[]
+    | undefined;
+  return (
+    current.content === envelope.content &&
+    current.artifact === envelope.artifact &&
+    current.id === envelope.id &&
+    current.name === envelope.name &&
+    current.tool_call_id === envelope.tool_call_id &&
+    current.status === envelope.status &&
+    Object.keys(currentMetadata).length === Object.keys(metadata).length &&
+    currentMetadata._refKey === metadata._refKey &&
+    currentMetadata._refScope === metadata._refScope &&
+    (currentUnresolved === unresolved ||
+      (currentUnresolved != null &&
+        unresolved != null &&
+        currentUnresolved.length === unresolved.length &&
+        currentUnresolved.every((ref, index) => ref === unresolved[index])))
+  );
+}
+
 export async function protectToolMessage(
   policy: ToolResultProtection | undefined,
   name: string,
@@ -337,47 +432,28 @@ export async function protectToolMessage(
   ownedReplayMetadata = false
 ): Promise<ToolMessage> {
   if (!requiresToolResultProtection(policy, name)) return message;
-  if (types.isProxy(message))
-    throw new ToolResultProtectionError('unsupported');
-  for (const key of [
-    'content',
-    'artifact',
-    'name',
-    'id',
-    'tool_call_id',
-    'status',
-    'additional_kwargs',
-    'response_metadata',
-  ]) {
-    const descriptor = Object.getOwnPropertyDescriptor(message, key);
-    if (descriptor != null && !('value' in descriptor))
-      throw new ToolResultProtectionError('unsupported');
-  }
-  const status: string | undefined = message.status;
+  const envelope = snapshotToolMessageEnvelope(message);
+  const status: string | undefined = envelope.status;
   if (
-    types.isProxy(message) ||
-    message.artifact != null ||
-    message.tool_call_id !== id ||
-    (message.name != null && message.name !== name) ||
+    envelope.artifact != null ||
+    envelope.tool_call_id !== id ||
+    (envelope.name != null && envelope.name !== name) ||
     (status != null && status !== 'success' && status !== 'error')
   )
     throw new ToolResultProtectionError('unsupported');
-  plainObject(message.additional_kwargs, [
-    '_refKey',
-    '_refScope',
-    '_unresolvedRefs',
-  ]);
-  if (ownedReplayMetadata) validateReplayReferenceMetadata(message);
   if (
     approved.get(message) == null &&
     !ownedReplayMetadata &&
-    (Object.keys(message.additional_kwargs).length > 0 ||
-      (message.id != null && message.id !== id))
+    (Object.keys(envelope.additional_kwargs).length > 0 ||
+      (envelope.id != null && envelope.id !== id))
   )
     throw new ToolResultProtectionError('unsupported');
-  if (Object.keys(message.response_metadata).length > 0)
-    throw new ToolResultProtectionError('unsupported');
   const existing = approved.get(message);
+  if (
+    existing?.envelope != null &&
+    !matchesToolMessageEnvelope(envelope, existing.envelope)
+  )
+    throw new ToolResultProtectionError('unsupported');
   if (
     existing?.policy === policy &&
     existing.name === name &&
@@ -390,26 +466,21 @@ export async function protectToolMessage(
     policy,
     name,
     id,
-    message.content,
-    message.status === 'error' ? 'error' : 'success',
+    envelope.content,
+    envelope.status === 'error' ? 'error' : 'success',
     signal
   );
+  if (!matchesToolMessageEnvelope(snapshotToolMessageEnvelope(message), envelope))
+    throw new ToolResultProtectionError('unsupported');
   const safe = new ToolMessage({
-    name: message.name ?? name,
-    id: message.id,
+    name: envelope.name ?? name,
+    id: envelope.id,
     tool_call_id: id,
-    status: message.status ?? 'success',
+    status: envelope.status ?? 'success',
     content: content as string,
-    additional_kwargs: message.additional_kwargs,
+    additional_kwargs: envelope.additional_kwargs,
   });
-  approved.set(safe, {
-    policy,
-    name,
-    id,
-    text: safe.content as string,
-    status: safe.status ?? 'success',
-  });
-  return safe;
+  return markReleasedToolMessage(policy, name, id, safe);
 }
 
 /** Validate host-owned envelopes before even reading their routing IDs. */
@@ -558,9 +629,18 @@ export function validateToolReferenceSources(
   }
 }
 
-export function needsToolReferenceInspection(policy: ToolResultProtection, state: ToolOutputReferenceState, registry?: ToolOutputReferenceRegistry, runId?: string): boolean {
+export function needsToolReferenceInspection(
+  policy: ToolResultProtection,
+  state: ToolOutputReferenceState,
+  registry?: ToolOutputReferenceRegistry,
+  runId?: string
+): boolean {
   validateToolReferenceSources(policy, state);
-  return state.entries.some((entry) => requiresToolResultProtection(policy, entry.protection!.toolName) && registry?.isPolicyBound(runId, entry, policy) !== true);
+  return state.entries.some(
+    (entry) =>
+      requiresToolResultProtection(policy, entry.protection!.toolName) &&
+      registry?.isPolicyBound(runId, entry, policy) !== true
+  );
 }
 
 export async function protectToolReferenceState(
@@ -575,14 +655,17 @@ export async function protectToolReferenceState(
   const entries = await Promise.all(
     state.entries.map(async (entry) => ({
       ...entry,
-      value: liveRegistry?.isPolicyBound(runId, entry, policy) === true ? entry.value : (await protectToolText(
-        policy,
-        entry.protection!.toolName,
-        entry.protection!.toolCallId,
-        entry.value,
-        'success',
-        signal
-      )) as string,
+      value:
+        liveRegistry?.isPolicyBound(runId, entry, policy) === true
+          ? entry.value
+          : ((await protectToolText(
+            policy,
+              entry.protection!.toolName,
+              entry.protection!.toolCallId,
+              entry.value,
+              'success',
+              signal
+          )) as string),
     }))
   );
   return { ...state, entries };
@@ -853,7 +936,10 @@ export function withToolResultBoundary(
           status = 'error';
         }
         attempt.check();
-        if (admittedTool.name !== toolName || admittedTool.responseFormat !== responseFormat)
+        if (
+          admittedTool.name !== toolName ||
+          admittedTool.responseFormat !== responseFormat
+        )
           throw new ToolResultProtectionError('unsupported');
         if (raw instanceof ToolMessage)
           return await protectToolMessage(
@@ -893,14 +979,7 @@ export function withToolResultBoundary(
           content,
           status,
         });
-        approved.set(message, {
-          policy,
-          name: toolName,
-          id,
-          text: content,
-          status,
-        });
-        return message;
+        return markReleasedToolMessage(policy, toolName, id, message);
       } catch (error) {
         attempt.check();
         if (

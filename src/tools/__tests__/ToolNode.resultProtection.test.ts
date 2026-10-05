@@ -2065,3 +2065,61 @@ it.each(['live', 'restored-same', 'restored-strict', 'live-strict', 'blocked'] a
   expect(inspected).toHaveLength(before);
   expect(piped[1]).toBe(piped[0]);
 });
+
+it.each(['id', 'name', 'tool_call_id', 'status', 'content', 'metadata', 'metadata-object', 'artifact', 'response-metadata', 'accessor'] as const)('rejects a retained producer message %s mutation during inspection before native release', async (field) => {
+  const started = deferred<void>(); const decision = deferred<ToolResultProtectionResult>(); const events: string[] = [];
+  const message = new ToolMessage({ id: 'call-control', name: 'lookup', tool_call_id: 'call-control', status: 'success', content: fixtures.canaries[0] });
+  const node = new ToolNode({ trace: true, tools: [direct(() => message)], toolResultProtection: policy({ inspect: () => { started.resolve(); return decision.promise; } }), toolOutputReferences: { enabled: true } });
+  const outcome = node.invoke(state(), { configurable: { run_id: `message-mutation-${field}` }, callbacks: [observer(events)] }).catch((error: Error) => error);
+  await started.promise;
+  if (field === 'id') message.id = fixtures.canaries[0];
+  if (field === 'name') message.name = fixtures.canaries[0];
+  if (field === 'tool_call_id') message.tool_call_id = fixtures.canaries[0];
+  if (field === 'status') message.status = 'error';
+  if (field === 'content') message.content = 'Different retained producer control';
+  if (field === 'metadata') message.additional_kwargs._refScope = fixtures.canaries[0];
+  if (field === 'metadata-object') message.additional_kwargs = { _refScope: fixtures.canaries[0] };
+  if (field === 'artifact') message.artifact = { value: fixtures.canaries[0] };
+  if (field === 'response-metadata') message.response_metadata = { output: fixtures.canaries[0] };
+  if (field === 'accessor') Object.defineProperty(message, 'id', { get: () => { throw new Error(fixtures.canaries[0]); } });
+  decision.resolve(approve('[EMAIL_1]'));
+  const error = await outcome;
+  expect(error).toMatchObject({ code: 'unsupported' }); assertNoCanary(String(error)); assertNoCanary(events.join('')); expect(events.join('')).not.toContain('[EMAIL_1]');
+  expect(node._unsafeGetToolOutputRegistry()!.size).toBe(0);
+});
+
+it.each(['success', 'error'] as const)('releases an immutable producer message with its original identity/status (%s)', async (status) => {
+  const events: string[] = []; const message = new ToolMessage({ id: 'call-control', name: 'lookup', tool_call_id: 'call-control', status, content: fixtures.canaries[0] });
+  const node = new ToolNode({ trace: true, tools: [direct(() => message)], toolResultProtection: policy() });
+  const result = await node.invoke(state(), { callbacks: [observer(events)] }) as { messages: ToolMessage[] };
+  expect(result.messages[0]).toMatchObject({ id: 'call-control', tool_call_id: 'call-control', name: 'lookup', status });
+  expect(result.messages[0].content).toBe('[EMAIL_1]'); assertNoCanary(result); assertNoCanary(events.join('')); expect(events.join('')).toContain('[EMAIL_1]');
+});
+
+it.each(['id', 'status', 'metadata'] as const)('rechecks canonical message %s provenance before storage and reuse', async (field) => {
+  const events: string[] = [];
+  const callback = observer(events);
+  const observe = callback.handleToolEnd!.bind(callback);
+  callback.handleToolEnd = async (output, ...args): Promise<void> => {
+    await observe(output, ...args);
+    if (!(output instanceof ToolMessage)) throw new Error('Expected native ToolMessage');
+    if (field === 'id') output.id = fixtures.canaries[0];
+    if (field === 'status') output.status = 'error';
+    if (field === 'metadata') output.additional_kwargs._refScope = fixtures.canaries[0];
+  };
+  const node = new ToolNode({ trace: true, tools: [direct(() => fixtures.canaries[0])], toolResultProtection: policy(), toolOutputReferences: { enabled: true } });
+  await expect(node.invoke(state(), { configurable: { run_id: `canonical-mutation-${field}` }, callbacks: [callback] })).rejects.toMatchObject({ code: 'unsupported' });
+  assertNoCanary(events.join('')); expect(node._unsafeGetToolOutputRegistry()!.size).toBe(0);
+});
+
+it('copies retained producer metadata before canonical native publication', async () => {
+  const original = new ToolMessage({ id: 'call-control', tool_call_id: 'call-control', content: fixtures.canaries[0] });
+  const callback = BaseCallbackHandler.fromMethods({ handleToolEnd: (output): void => {
+    if (!(output instanceof ToolMessage)) throw new Error('Expected native ToolMessage');
+    expect(output.additional_kwargs).not.toBe(original.additional_kwargs);
+    original.id = fixtures.canaries[0]; original.status = 'error'; original.additional_kwargs._refScope = fixtures.canaries[0];
+  } }); callback.awaitHandlers = true;
+  const node = new ToolNode({ trace: true, tools: [direct(() => original)], toolResultProtection: policy() });
+  const result = await node.invoke(state(), { callbacks: [callback] }) as { messages: ToolMessage[] };
+  expect(result.messages[0]).toMatchObject({ id: 'call-control', status: 'success', content: '[EMAIL_1]' }); assertNoCanary(result);
+});
