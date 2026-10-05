@@ -5,7 +5,7 @@ import type { RunnableConfig } from '@langchain/core/runnables';
 import type { ToolCallsDispatchedEvent } from '@/types/stream';
 import type { ToolExecuteBatchRequest } from '@/types/tools';
 import type { AgentLogEvent } from '@/types/graph';
-import { protectToolExecuteBatch, ToolResultProtectionError } from '@/protection/toolResult';
+import { inheritToolExecuteProtection, validateToolExecuteProtection, hasRequiredToolExecuteProtection, protectToolExecuteBatch, ToolResultProtectionError } from '@/protection/toolResult';
 import { ProviderTextProtectionError } from '@/protection/providerText';
 import { traceHostToolResults } from '@/langfuse';
 import { GraphEvents } from '@/common';
@@ -19,41 +19,52 @@ export async function safeDispatchCustomEvent(
   payload: unknown,
   config?: RunnableConfig
 ): Promise<boolean | void> {
+  let toolRequest: ToolExecuteBatchRequest | undefined;
+  let hostView: ToolExecuteBatchRequest | undefined;
   try {
     if (event === GraphEvents.ON_TOOL_EXECUTE) {
       const request = payload as ToolExecuteBatchRequest;
-      payload = {
+      toolRequest = request;
+      const exposed: ToolExecuteBatchRequest = {
         ...request,
         resolve: (
           results: Parameters<ToolExecuteBatchRequest['resolve']>[0]
         ): void => {
           const receivedAt = Date.now();
-          const protectedResults = protectToolExecuteBatch(request, results);
-          const release = (canonical: typeof results, guarded: boolean): void => {
-            const stamped = canonical.map((result) => {
-              if (!guarded) return { ...result, received_at: receivedAt };
-              result.received_at = receivedAt;
-              return result;
-            });
-            void traceHostToolResults(request, canonical, config).then(
+          const protectedResults = protectToolExecuteBatch(request, results, exposed);
+          if (protectedResults == null) {
+            const stamped = results.map((result) => ({ ...result, received_at: receivedAt }));
+            void traceHostToolResults(request, results, config).then(
               () => request.resolve(stamped),
-              () => {
-                console.warn('Failed to record host tool execution metadata');
-                request.resolve(stamped);
-              }
+              () => { console.warn('Failed to record host tool execution metadata'); request.resolve(stamped); }
             );
-          };
-          if (protectedResults == null) { release(results, false); return; }
-          void protectedResults.then(
-            (canonical) => release(canonical, true),
-            (error: unknown) => request.reject(error instanceof ProviderTextProtectionError ? error : new ToolResultProtectionError('unavailable'))
-          );
+            return;
+          }
+          void protectedResults.then(async (canonical) => {
+            validateToolExecuteProtection(request, exposed);
+            for (const result of canonical) result.received_at = receivedAt;
+            try { await traceHostToolResults(request, canonical, config); }
+            catch { console.warn('Failed to record host tool execution metadata'); }
+            validateToolExecuteProtection(request, exposed);
+            request.resolve(canonical);
+          }).catch((error: unknown) => request.reject(error instanceof ProviderTextProtectionError ? error : new ToolResultProtectionError('unavailable')));
         },
-      } satisfies ToolExecuteBatchRequest;
+      };
+      inheritToolExecuteProtection(request, exposed);
+      hostView = exposed;
+      payload = exposed;
     }
     await dispatchCustomEvent(event, payload, config);
+    if (toolRequest != null && hostView != null) {
+      try { validateToolExecuteProtection(toolRequest, hostView); }
+      catch (error) { toolRequest.reject(error instanceof ProviderTextProtectionError ? error : new ToolResultProtectionError('unavailable')); return false; }
+    }
     return true;
   } catch (e) {
+    if (toolRequest != null && hasRequiredToolExecuteProtection(toolRequest)) {
+      toolRequest.reject(e instanceof ProviderTextProtectionError ? e : new ToolResultProtectionError('unavailable'));
+      return false;
+    }
     // Check if this is the known EventStreamCallbackHandler error
     if (
       e instanceof Error &&

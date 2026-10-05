@@ -455,6 +455,7 @@ export async function protectToolExecuteResult(
   result: ToolExecuteResult,
   signal?: AbortSignal
 ): Promise<ToolExecuteResult> {
+  request = checkedRequestIdentity(request);
   if (!requiresToolResultProtection(policy, request.name)) return result;
   plainObject(result, [
     'toolCallId',
@@ -580,59 +581,155 @@ export async function protectToolReferenceState(
   return { ...state, entries };
 }
 
+type ToolRequestIdentity = Readonly<Pick<ToolCallRequest, 'id' | 'name'>>;
+type BoundToolExecuteRequest = {
+  readonly policy: ToolResultProtection;
+  readonly signal?: AbortSignal;
+  readonly calls: readonly ToolRequestIdentity[];
+  readonly required: boolean;
+};
 const hostPolicies = new WeakMap<
   ToolExecuteBatchRequest,
-  { policy: ToolResultProtection; signal?: AbortSignal }
+  BoundToolExecuteRequest
 >();
+const requestIdentities = new WeakMap<object, ToolRequestIdentity>();
 
-/** Internal request identity binds mandatory policy without exposing it to hosts. */
+function checkedRequestIdentity(
+  request: ToolRequestIdentity
+): ToolRequestIdentity {
+  const identity = requestIdentities.get(request);
+  if (identity == null) return request;
+  if (
+    types.isProxy(request) ||
+    Object.getOwnPropertyDescriptor(request, 'id')?.value !== identity.id ||
+    Object.getOwnPropertyDescriptor(request, 'name')?.value !== identity.name
+  )
+    throw new ToolResultProtectionError('unsupported');
+  return identity;
+}
+
+function validateBoundToolRequests(
+  request: ToolExecuteBatchRequest,
+  binding: BoundToolExecuteRequest
+): void {
+  if (types.isProxy(request))
+    throw new ToolResultProtectionError('unsupported');
+  const calls: ToolCallRequest[] | undefined = Object.getOwnPropertyDescriptor(
+    request,
+    'toolCalls'
+  )?.value;
+  if (
+    calls == null ||
+    !Array.isArray(calls) ||
+    types.isProxy(calls) ||
+    calls.length !== binding.calls.length
+  )
+    throw new ToolResultProtectionError('unsupported');
+  for (let index = 0; index < calls.length; index++) {
+    const call: ToolCallRequest | undefined = Object.getOwnPropertyDescriptor(
+      calls,
+      String(index)
+    )?.value;
+    if (
+      call == null ||
+      types.isProxy(call) ||
+      Object.getOwnPropertyDescriptor(call, 'id')?.value !==
+        binding.calls[index].id ||
+      Object.getOwnPropertyDescriptor(call, 'name')?.value !==
+        binding.calls[index].name
+    )
+      throw new ToolResultProtectionError('unsupported');
+  }
+}
+
+/** Internal snapshots bind selection to dispatched identities, never mutable host requests. */
 export function bindToolExecuteProtection(
   request: ToolExecuteBatchRequest,
   policy: ToolResultProtection | undefined,
   signal?: AbortSignal
 ): void {
-  if (
-    policy != null &&
-    request.toolCalls.some((call) =>
+  if (policy == null) return;
+  const calls = request.toolCalls.map((call) => {
+    const identity = Object.freeze({ id: call.id, name: call.name });
+    requestIdentities.set(call, identity);
+    return identity;
+  });
+  hostPolicies.set(request, {
+    policy,
+    signal,
+    calls,
+    required: calls.some((call) =>
       requiresToolResultProtection(policy, call.name)
+    ),
+  });
+}
+
+export function inheritToolExecuteProtection(
+  request: ToolExecuteBatchRequest,
+  hostView: ToolExecuteBatchRequest
+): void {
+  const binding = hostPolicies.get(request);
+  if (binding != null) hostPolicies.set(hostView, binding);
+}
+
+export function hasRequiredToolExecuteProtection(
+  request: ToolExecuteBatchRequest
+): boolean {
+  return hostPolicies.get(request)?.required === true;
+}
+
+export function validateToolExecuteProtection(
+  request: ToolExecuteBatchRequest,
+  hostView = request
+): void {
+  const binding = hostPolicies.get(request);
+  if (binding == null) return;
+  validateBoundToolRequests(request, binding);
+  validateBoundToolRequests(hostView, binding);
+  if (binding.required && binding.signal?.aborted === true) {
+    const reason: unknown = binding.signal.reason;
+    if (
+      reason instanceof ProviderTextProtectionError ||
+      reason instanceof PreparedSubagentError ||
+      reason instanceof StreamLimitExceededError
     )
-  )
-    hostPolicies.set(request, { policy, signal });
+      throw reason;
+    throw new ToolResultProtectionError('cancelled');
+  }
 }
 
 export function protectToolExecuteBatch(
   request: ToolExecuteBatchRequest,
-  results: ToolExecuteResult[]
+  results: ToolExecuteResult[],
+  hostView = request
 ): Promise<ToolExecuteResult[]> | undefined {
-  const selected = hostPolicies.get(request);
-  if (selected == null) return undefined;
-  return protectBoundToolExecuteBatch(
-    request,
-    results,
-    selected.policy,
-    selected.signal
-  );
+  const binding = hostPolicies.get(request);
+  if (binding == null) return undefined;
+  return protectBoundToolExecuteBatch(request, hostView, results, binding);
 }
 
 async function protectBoundToolExecuteBatch(
   request: ToolExecuteBatchRequest,
+  hostView: ToolExecuteBatchRequest,
   results: ToolExecuteResult[],
-  policy: ToolResultProtection,
-  signal?: AbortSignal
+  binding: BoundToolExecuteRequest
 ): Promise<ToolExecuteResult[]> {
-  validateToolExecuteResults(results, request.toolCalls.length);
-  const requests = new Map(request.toolCalls.map((call) => [call.id, call]));
+  validateBoundToolRequests(request, binding);
+  validateBoundToolRequests(hostView, binding);
+  validateToolExecuteResults(results, binding.calls.length);
+  const { policy, signal } = binding;
+  const requests = new Map(binding.calls.map((call) => [call.id, call]));
   const seen = new Set<string>();
   for (const result of results) {
     if (!requests.has(result.toolCallId) || seen.has(result.toolCallId))
       throw new ToolResultProtectionError('unsupported');
     seen.add(result.toolCallId);
   }
-  for (const call of request.toolCalls) {
+  for (const call of binding.calls) {
     if (requiresToolResultProtection(policy, call.name) && !seen.has(call.id))
       throw new ToolResultProtectionError('unavailable');
   }
-  return Promise.all(
+  const canonical = await Promise.all(
     results.map((result) =>
       protectToolExecuteResult(
         policy,
@@ -642,6 +739,9 @@ async function protectBoundToolExecuteBatch(
       )
     )
   );
+  validateBoundToolRequests(request, binding);
+  validateBoundToolRequests(hostView, binding);
+  return canonical;
 }
 
 /** Keep child/control APIs usable, but no raw body observations escape before release. */
@@ -672,6 +772,7 @@ export function withToolResultBoundary(
     return tool;
   if (requestName !== tool.name)
     throw new ToolResultProtectionError('unsupported');
+  const toolName = tool.name;
   if (
     [
       'subagent',
@@ -684,6 +785,7 @@ export function withToolResultBoundary(
     throw new ToolResultProtectionError('unsupported');
   if (!(tool instanceof StructuredTool))
     throw new ToolResultProtectionError('unsupported');
+  const responseFormat = tool.responseFormat;
   if (
     tool.invoke !== StructuredTool.prototype.invoke ||
     ![
@@ -699,6 +801,7 @@ export function withToolResultBoundary(
     Object.getOwnPropertyDescriptors(tool)
   ) as StructuredTool;
   protectedTool.responseFormat = 'content';
+  const admittedTool = tool;
   const invoke: (
     input: unknown,
     manager: CallbackManagerForToolRun | undefined,
@@ -743,25 +846,24 @@ export function withToolResultBoundary(
           status = 'error';
         }
         attempt.check();
+        if (admittedTool.name !== toolName || admittedTool.responseFormat !== responseFormat)
+          throw new ToolResultProtectionError('unsupported');
         if (raw instanceof ToolMessage)
           return await protectToolMessage(
             policy,
-            tool.name,
+            toolName,
             id,
             raw,
             attempt.signal
           );
-        if (
-          status === 'success' &&
-          tool.responseFormat === 'content_and_artifact'
-        ) {
+        if (status === 'success' && responseFormat === 'content_and_artifact') {
           if (!Array.isArray(raw) || raw.length !== 2 || raw[1] != null)
             throw new ToolResultProtectionError('unsupported');
           raw = raw[0];
         }
         const content = await release(
           policy,
-          tool.name,
+          toolName,
           id,
           raw,
           status,
@@ -771,7 +873,7 @@ export function withToolResultBoundary(
           const error = new Error(content);
           approved.set(error, {
             policy,
-            name: tool.name,
+            name: toolName,
             id,
             text: content,
             status,
@@ -779,14 +881,14 @@ export function withToolResultBoundary(
           throw error;
         }
         const message = new ToolMessage({
-          name: tool.name,
+          name: toolName,
           tool_call_id: id,
           content,
           status,
         });
         approved.set(message, {
           policy,
-          name: tool.name,
+          name: toolName,
           id,
           text: content,
           status,
@@ -800,7 +902,7 @@ export function withToolResultBoundary(
           error instanceof StreamLimitExceededError ||
           error instanceof GraphInterrupt ||
           (error instanceof Error &&
-            isReleasedToolError(policy, tool.name, id, error))
+            isReleasedToolError(policy, toolName, id, error))
         )
           throw error;
         throw new ToolResultProtectionError('unavailable');

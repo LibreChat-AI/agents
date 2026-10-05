@@ -1971,3 +1971,61 @@ it('rejects selected host outcome aliases rather than admitting unchecked public
   await expect(node.invoke(state(), { callbacks: [observer(events, (request) => request.resolve([{ toolCallId: 'call-control', content: 'Allowed control', status: 'success', outcome: fixtures.canaries[0] }]))] })).rejects.toMatchObject({ code: 'unsupported' });
   assertNoCanary(events.join(''));
 });
+
+it.each([false, true])('rejects host identity mutation before any protected publication (eager=%s)', async (eager) => {
+  for (const field of ['name', 'id', 'array'] as const) {
+    for (const timing of ['before', 'inspecting', 'cleanup'] as const) {
+      const inspected = deferred<void>(); const decision = deferred<ToolResultProtectionResult>(); const completions: string[] = []; let executions = 0;
+      const mutate = (request: ToolExecuteBatchRequest): void => {
+        if (field === 'name') request.toolCalls[0].name = 'host_alias';
+        if (field === 'id') request.toolCalls[0].id = 'host-id-alias';
+        if (field === 'array') request.toolCalls = [{ ...request.toolCalls[0], name: 'host_alias' }];
+      };
+      const run = await Run.create({ runId: `host-identity-${eager}-${field}-${timing}`, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, instructions: 'Allowed control.', toolDefinitions: [{ name: 'lookup', parameters: { type: 'object', properties: { count: { type: 'number' } } } }] }, toolResultProtection: policy({ inspect: () => { inspected.resolve(); return timing === 'before' ? approve('[EMAIL_1]') : decision.promise; } }), eagerEventToolExecution: { enabled: eager }, customHandlers: {
+        [GraphEvents.CHAT_MODEL_STREAM]: new ChatModelStreamHandler(),
+        [GraphEvents.ON_TOOL_EXECUTE]: { handle: async (_event, data): Promise<void> => {
+          const request = data as ToolExecuteBatchRequest; executions++;
+          if (timing === 'before') mutate(request);
+          request.resolve([{ toolCallId: 'call-control', status: 'success', content: fixtures.canaries[0] }]);
+          if (timing !== 'before') { await inspected.promise; if (timing === 'cleanup') { decision.resolve(approve('[EMAIL_1]')); await new Promise((resolve) => setImmediate(resolve)); } mutate(request); decision.resolve(approve('[EMAIL_1]')); }
+        } },
+        [GraphEvents.ON_RUN_STEP_COMPLETED]: { handle: (_event, data): void => { completions.push(JSON.stringify(data)); } },
+      }, skipCleanup: true });
+      run.Graph!.overrideModel = new FakeChatModel({ responses: ['', 'Must not continue'], toolCalls: [{ id: 'call-control', name: 'lookup', args: { count: 42 }, type: 'tool_call' }] });
+      await expect(run.processStream({ messages: [new HumanMessage('Allowed control')] }, { version: 'v2', configurable: { thread_id: `host-identity-${eager}-${field}-${timing}` } })).rejects.toMatchObject({ code: 'unsupported' });
+      expect(executions).toBe(1); expect(completions).toEqual([]); assertNoCanary(run.Graph!.getRunMessages());
+    }
+  }
+});
+
+it.each(['blocked', 'timeout'] as const)('prioritizes a required %s failure over an interrupting sibling approval', async (code) => {
+  let executions = 0; let regularExecutions = 0; const inspected: string[] = [];
+  const ask = new DynamicStructuredTool({ name: 'approval_control', description: 'Allowed pause control.', schema: z.object({ count: z.number() }), func: async () => { throw new GraphInterrupt([{ id: 'approval-control', value: 'Allowed approval control' }]); } });
+  const lookup = direct(() => { executions++; return fixtures.canaries[0]; });
+  const regular = new DynamicStructuredTool({ name: 'regular_control', description: 'Must not run after a safety failure.', schema: z.object({ count: z.number() }), func: async () => { regularExecutions++; return 'Must not run'; } });
+  const gate = policy({ timeoutMs: code === 'timeout' ? 30 : 10000, inspect: ({ content }) => { inspected.push(content); return code === 'blocked' ? { version: 1, ok: false, error: { code: 'blocked' } } : new Promise<ToolResultProtectionResult>(() => {}); } });
+  const node = new ToolNode({ tools: [ask, lookup, regular], interruptingToolNames: new Set(['approval_control', 'lookup']), toolResultProtection: gate });
+  const graph = new StateGraph(MessagesAnnotation).addNode('tools', node).addEdge(START, 'tools').addEdge('tools', END).compile({ checkpointer: new MemorySaver() });
+  await expect(graph.invoke({ messages: [new AIMessage({ id: 'interrupting-batch', content: '', tool_calls: [{ id: 'approval-control', name: 'approval_control', args: { count: 42 } }, { id: 'call-control', name: 'lookup', args: { count: 42 } }, { id: 'regular-control', name: 'regular_control', args: { count: 42 } }] })] }, { configurable: { thread_id: `interrupting-protection-${code}`, run_id: `interrupting-protection-${code}` } })).rejects.toMatchObject({ code });
+  expect(executions).toBe(1); expect(regularExecutions).toBe(0); expect(inspected).toEqual([fixtures.canaries[0]]);
+});
+
+it.each(([false, true] as const).flatMap((eager) => (['throw', 'absent'] as const).map((mode) => [eager, mode] as const)))('fails raw-free for a required host handler %s/%s', async (eager, mode) => {
+  const completions: string[] = [];
+  const run = await Run.create({ runId: `throwing-host-${eager}`, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, instructions: 'Allowed control.', toolDefinitions: [{ name: 'lookup', parameters: { type: 'object', properties: { count: { type: 'number' } } } }] }, toolResultProtection: policy(), eagerEventToolExecution: { enabled: eager }, customHandlers: {
+    [GraphEvents.CHAT_MODEL_STREAM]: new ChatModelStreamHandler(),
+    ...(mode === 'throw' ? { [GraphEvents.ON_TOOL_EXECUTE]: { handle: (): never => { throw new Error(fixtures.canaries[0]); } } } : {}),
+    [GraphEvents.ON_RUN_STEP_COMPLETED]: { handle: (_event, data): void => { completions.push(JSON.stringify(data)); } },
+  }, skipCleanup: true });
+  run.Graph!.overrideModel = new FakeChatModel({ responses: ['', 'Must not continue'], toolCalls: [{ id: 'call-control', name: 'lookup', args: { count: 42 }, type: 'tool_call' }] });
+  const error = await run.processStream({ messages: [new HumanMessage('Allowed control')] }, { version: 'v2', configurable: { thread_id: `throwing-host-${eager}` } }).catch((value: Error) => value);
+  expect(error).toMatchObject({ code: 'unavailable' }); assertNoCanary(String(error)); expect(completions).toEqual([]); assertNoCanary(run.Graph!.getRunMessages());
+});
+
+it.each(['name', 'format'] as const)('rejects native producer %s identity changes before callback publication', async (field) => {
+  const events: string[] = []; let executions = 0;
+  const lookup = direct(() => { executions++; if (field === 'name') Object.defineProperty(lookup, 'name', { value: 'producer_alias' }); else lookup.responseFormat = 'content_and_artifact'; return fixtures.canaries[0]; });
+  const node = new ToolNode({ trace: true, tools: [lookup], toolResultProtection: policy() });
+  await expect(node.invoke(state(), { callbacks: [observer(events)] })).rejects.toMatchObject({ code: 'unsupported' });
+  expect(executions).toBe(1); assertNoCanary(events.join(''));
+});

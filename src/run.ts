@@ -1,3 +1,4 @@
+import { hasRequiredToolExecuteProtection, ToolResultProtectionError } from '@/protection/toolResult';
 // src/run.ts
 import { nanoid } from 'nanoid';
 import { PromptTemplate } from '@langchain/core/prompts';
@@ -1106,7 +1107,13 @@ export class Run<_T extends t.BaseGraphState> {
        * close; duplicate callback echoes are absorbed by the terminal-status
        * guard in `closeRunStep`.
        */
+      const requiredToolRequest = eventName === GraphEvents.ON_TOOL_EXECUTE && hasRequiredToolExecuteProtection(data as t.ToolExecuteBatchRequest)
+        ? data as t.ToolExecuteBatchRequest : undefined;
       try {
+        if (requiredToolRequest != null && (!handler || !this.Graph)) {
+          requiredToolRequest.reject(new ToolResultProtectionError('unavailable'));
+          return;
+        }
         if (handler && this.Graph) {
           return await handler.handle(
             eventName,
@@ -1124,6 +1131,9 @@ export class Run<_T extends t.BaseGraphState> {
             this.Graph
           );
         }
+      } catch (error) {
+        if (requiredToolRequest == null) throw error;
+        requiredToolRequest.reject(error instanceof ProviderTextProtectionError ? error : new ToolResultProtectionError('unavailable'));
       } finally {
         if (
           eventName === GraphEvents.ON_RUN_STEP_COMPLETED &&

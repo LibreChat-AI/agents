@@ -5390,6 +5390,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       );
       this.throwIfBreakerTripped(config);
       const failed =
+        results.find((result) => result.status === 'rejected' && result.reason instanceof ProviderTextProtectionError) ??
         results.find(
           (result) =>
             result.status === 'rejected' && !isGraphInterrupt(result.reason)
@@ -5431,7 +5432,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     for (let i = 0; i < interruptingResults.length; i++) {
       const result = interruptingResults[i];
       if (result.status === 'rejected') {
-        if (!hasInterruptingError) {
+        if (!hasInterruptingError || result.reason instanceof ProviderTextProtectionError ||
+            (isGraphInterrupt(interruptingError) && !isGraphInterrupt(result.reason))) {
           hasInterruptingError = true;
           interruptingError = result.reason;
         }
