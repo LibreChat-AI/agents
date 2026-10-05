@@ -171,6 +171,16 @@ describe('Graph subagent integration', () => {
     expect(result).toBe('synthesized answer');
   });
 
+  it('keeps unversioned functional prompts supported when HITL is disabled', async () => {
+    const config = makeGraphConfig();
+    const prompt = jest.fn(() => 'Synthesize the result.');
+    config.edges[1].prompt = prompt;
+    const run = await createRun(config);
+    run.Graph?.setSubagentModelOverride(createFakeStreamingLLM({ responses: ['plan', 'left work', 'right work', 'team answer'] }));
+    expect(await getGraphSubagentTool(run).invoke({ description: 'Complete the team.', subagent_type: config.type }, invokeConfig)).toBe('team answer');
+    expect(prompt).toHaveBeenCalledTimes(1);
+  });
+
   it('runs a depth-one parallel team without giving any member a grandchild tool', async () => {
     const config = makeGraphConfig();
     config.agents = config.agents.map((agent) => ({

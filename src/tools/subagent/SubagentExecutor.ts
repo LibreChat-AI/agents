@@ -442,7 +442,12 @@ function getSubagentDefinitionId(
     maxTurns: config.maxTurns,
     entry: config.entryAgentId,
     result: config.resultAgentId,
-    edges: config.edges,
+    edges: config.edges.map((edge) => ({
+      ...edge,
+      prompt: typeof edge.prompt === 'function'
+        ? { revision: config.configId }
+        : edge.prompt,
+    })),
     members: config.agents.map((agent) => ({
       id: agent.agentId,
       provider: agent.provider,
@@ -2652,6 +2657,18 @@ export class SubagentExecutor {
         )
       );
     }
+    if (
+      this.humanInTheLoop?.enabled === true &&
+      isGraphSubagentConfig(executableConfig) &&
+      executableConfig.configId == null &&
+      executableConfig.edges.some((edge) => typeof edge.prompt === 'function')
+    ) {
+      return Promise.resolve(
+        createSubagentFailure(
+          'Error: Resumable graph subagents with functional prompts require a configId revision.'
+        )
+      );
+    }
     const execution = this.executions.open({
       threadId: params.threadId,
       parentToolCallId: params.parentToolCallId ?? nanoid(8),
@@ -3064,7 +3081,6 @@ export class SubagentExecutor {
     if (params.taskRuntime != null) {
       childGraph.hookRegistry = this.hookRegistry;
     }
-    seedChildGraphSessions(childGraph, childPlan.agents);
     let forwarding: ForwarderCallback | undefined;
     if (forwardingEnabled) {
       forwarding = this.createForwarderCallback({
@@ -3164,6 +3180,7 @@ export class SubagentExecutor {
           currentHookSessionId
         );
       }
+      seedChildGraphSessions(childGraph, childPlan.agents);
       const childConfigurable: Record<string, unknown> = {
         ...inheritedConfigurable,
         ...sanitizePreparedConfigurable(preparedContext?.configurable),

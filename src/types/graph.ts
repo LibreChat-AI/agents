@@ -677,7 +677,7 @@ export interface SingleAgentSubagentConfig extends SubagentConfig {
 
 export interface GraphSubagentConfig extends SubagentConfigBase {
   kind: 'graph';
-  /** Host revision for member implementations not represented by declarative inputs. */
+  /** Host revision for executable implementations. Required for HITL functional edge prompts. */
   configId?: string;
   resolveAgentInputs?: never;
   hostArgs?: never;

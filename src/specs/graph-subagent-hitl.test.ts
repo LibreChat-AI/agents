@@ -640,6 +640,7 @@ describe('graph subagent foreground HITL', () => {
   );
 
   test.each([
+    'prompt-kind',
     'topology',
     'instructions',
     'model',
@@ -683,6 +684,10 @@ describe('graph subagent foreground HITL', () => {
           },
         ],
       ]);
+      if (change === 'prompt-kind') {
+        h.graph.configId = 'stable-revision';
+        h.graph.edges[1].prompt = () => 'Original prompt';
+      }
       const run = await h.build();
       await start(run);
       expect(run.getInterrupt()?.payload.type).toBe('tool_approval');
@@ -690,6 +695,7 @@ describe('graph subagent foreground HITL', () => {
         ...h.graph,
         agents: h.graph.agents.map((agent) => ({ ...agent })),
       };
+      if (change === 'prompt-kind') graph.edges = h.graph.edges.map((edge, index) => index === 1 ? { ...edge, prompt: 'Different static prompt' } : edge);
       if (change === 'topology')
         graph.edges = [
           { from: 'entry', to: 'right', edgeType: 'direct' },
@@ -1110,4 +1116,147 @@ describe('graph subagent foreground HITL', () => {
     expect(h.rightExecute).toHaveBeenCalledTimes(1);
     expect(h.calls.filter((id) => id === 'entry')).toHaveLength(1);
   });
+
+  test.each([false, true])(
+    'functional prompt revisions protect rebuilt approval, changed=%s',
+    async (changed) => {
+      const h = harness();
+      h.graph.configId = 'prompt-v1';
+      h.graph.edges[1].prompt = () => 'Original transition';
+      const run = await h.build();
+      await start(run);
+      const definition = {
+        ...h.graph,
+        configId: changed ? 'prompt-v2' : 'prompt-v1',
+        edges: h.graph.edges.map((edge) => ({ ...edge })),
+      };
+      definition.edges[1].prompt = () =>
+        changed ? 'Changed transition' : 'Original transition';
+      const rebuilt = await h.build(definition);
+      await rebuilt.resume([{ type: 'approve' }], config);
+      if (changed) {
+        expect(h.leftExecute).not.toHaveBeenCalled();
+        expect(h.rightExecute).not.toHaveBeenCalled();
+        return;
+      }
+      await rebuilt.resume([{ type: 'approve' }], config);
+      expect(rebuilt.getInterrupt()).toBeUndefined();
+      expect(h.leftExecute).toHaveBeenCalledTimes(1);
+      expect(h.rightExecute).toHaveBeenCalledTimes(1);
+    }
+  );
+
+  test('functional prompts require a host revision before resumable graph work starts', async () => {
+    const h = harness();
+    h.graph.edges[1].prompt = () => 'Unversioned transition';
+    const run = await h.build();
+    await start(run);
+    expect(h.calls).toHaveLength(0);
+    expect(h.leftExecute).not.toHaveBeenCalled();
+    expect(h.rightExecute).not.toHaveBeenCalled();
+    expect(
+      run
+        .getRunMessages()
+        ?.some((message) => String(message.content).includes('configId'))
+    ).toBe(true);
+  });
+
+  test.each(
+    [false, true].flatMap((eventDriven) =>
+      [false, true].map((rebuilt) => ({ eventDriven, rebuilt }))
+    )
+  )(
+    'refreshed authorized seeds merge after checkpoint restore: eventDriven=$eventDriven rebuilt=$rebuilt',
+    async ({ eventDriven, rebuilt }) => {
+      const h = harness(eventDriven, false, false, true);
+      let refresh = false;
+      const original: t.ToolSessionMap = new Map([
+        [
+          Constants.EXECUTE_CODE,
+          {
+            session_id: 'original-session',
+            lastUpdated: 1,
+            files: [
+              {
+                id: 'original-file',
+                name: 'original.txt',
+                storage_session_id: 'original-storage',
+              },
+            ],
+          },
+        ],
+      ]);
+      const refreshed: t.ToolSessionMap = new Map([
+        [
+          Constants.EXECUTE_CODE,
+          {
+            session_id: 'fresh-session',
+            lastUpdated: 2,
+            files: [
+              {
+                id: 'fresh-file',
+                name: 'fresh.txt',
+                storage_session_id: 'fresh-storage',
+              },
+            ],
+          },
+        ],
+      ]);
+      const adapter: t.SubagentContextAdapter = {
+        prepare: async () => ({
+          agentSessions: {
+            left: {
+              codeSessionKey: 'left-partition',
+              initialSessions: refresh ? refreshed : original,
+            },
+            right: {
+              codeSessionKey: 'right-partition',
+              initialSessions: original,
+            },
+          },
+        }),
+      };
+      const run = await h.build(h.graph, undefined, adapter);
+      await start(run);
+      refresh = true;
+      const resumed = rebuilt
+        ? await h.build(h.graph, undefined, adapter)
+        : run;
+      await resumed.resume([{ type: 'approve' }], config);
+      await resumed.resume([{ type: 'approve' }], config);
+      expect(resumed.getInterrupt()).toBeUndefined();
+      expect(h.leftExecute).toHaveBeenCalledTimes(1);
+      expect(h.rightExecute).toHaveBeenCalledTimes(1);
+      const files = eventDriven
+        ? h.eventCalls.find(
+          (call) =>
+            call.name === Constants.EXECUTE_CODE &&
+              call.codeSessionContext?.files?.some(
+                (file) => file.id === 'fresh-file'
+              ) === true
+        )?.codeSessionContext
+        : h.leftExecute.mock.calls[0][1]?.toolCall;
+      expect(files).toEqual(
+        expect.objectContaining(
+          eventDriven
+            ? {
+              session_id: 'original-session',
+              files: [
+                expect.objectContaining({ id: 'original-file' }),
+                expect.objectContaining({ id: 'fresh-file' }),
+              ],
+            }
+            : {
+              session_id: 'original-session',
+              _injected_files: [
+                expect.objectContaining({ id: 'original-file' }),
+                expect.objectContaining({ id: 'fresh-file' }),
+              ],
+            }
+        )
+      );
+      expect(original.get(Constants.EXECUTE_CODE)?.files).toHaveLength(1);
+      expect(refreshed.get(Constants.EXECUTE_CODE)?.files).toHaveLength(1);
+    }
+  );
 });
