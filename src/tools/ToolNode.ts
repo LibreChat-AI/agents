@@ -1596,6 +1596,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         this.executingAgentId ?? '',
         this.agentId ?? '',
         this.name,
+        ...(this.codeSessionKey === Constants.EXECUTE_CODE
+          ? []
+          : [this.codeSessionKey]),
       ]),
       toolUsageCounts: [...this.toolUsageCount].map(([toolName, count]) => ({
         toolName,

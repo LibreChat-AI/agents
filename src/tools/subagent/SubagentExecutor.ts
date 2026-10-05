@@ -446,6 +446,9 @@ function getSubagentDefinitionId(
     members: config.agents.map((agent) => ({
       id: agent.agentId,
       provider: agent.provider,
+      codeSessionKey: agent.codeSessionKey ?? Constants.EXECUTE_CODE,
+      toolEnd: agent.toolEnd ?? false,
+      summarizeOnly: agent.summarizeOnly ?? false,
       model: resolveClientOptionsModel(agent.clientOptions),
       instructions: agent.instructions,
       additionalInstructions: agent.additional_instructions,
@@ -2931,18 +2934,21 @@ export class SubagentExecutor {
       )) {
         const member = childPlan.memberInputs.get(agentId);
         if (member == null) throw new Error('Unknown subagent context member.');
+        member.codeSessionKey = sessions.codeSessionKey;
+        member.initialSessions = sessions.initialSessions;
+      }
+      for (const member of childPlan.agents) {
         const activeMember =
-          execution.activeRun?.graph.agentContexts.get(agentId);
+          execution.activeRun?.graph.agentContexts.get(member.agentId);
         if (
           activeMember != null &&
-          activeMember.codeSessionKey !== sessions.codeSessionKey
+          (activeMember.codeSessionKey ?? Constants.EXECUTE_CODE) !==
+            (member.codeSessionKey ?? Constants.EXECUTE_CODE)
         ) {
           throw new Error(
             'Subagent session partition changed during execution.'
           );
         }
-        member.codeSessionKey = sessions.codeSessionKey;
-        member.initialSessions = sessions.initialSessions;
       }
     } catch (error) {
       if (childSignal.aborted) {

@@ -28,7 +28,8 @@ class ApprovalModel extends FakeListChatModel {
   private readonly owners: Map<string, string>;
   constructor(
     private readonly calls: string[],
-    private readonly programmatic = false
+    private readonly programmatic = false,
+    private readonly sessionTools = false
   ) {
     const owners = new Map<string, string>();
     super({
@@ -61,10 +62,11 @@ class ApprovalModel extends FakeListChatModel {
     );
     if (owner == null) throw new Error('Missing graph member identity');
     this.calls.push(owner);
-    const toolName =
+    const memberTool =
       this.programmatic && owner === 'left'
         ? Constants.PROGRAMMATIC_TOOL_CALLING
         : `${owner}_tool`;
+    const toolName = this.sessionTools ? Constants.EXECUTE_CODE : memberTool;
     const prior = messages.some(
       (message) =>
         message._getType() === 'tool' &&
@@ -97,18 +99,26 @@ class ApprovalModel extends FakeListChatModel {
   }
 }
 
-function harness(eventDriven = false, question = false, programmatic = false) {
+function harness(
+  eventDriven = false,
+  question = false,
+  programmatic = false,
+  sessionTools = false
+) {
   const checkpointer = new MemorySaver();
   const calls: string[] = [];
-  const leftExecute = jest.fn(async ({ value }: { value: string }) =>
-    question
-      ? `left ${askUserQuestion({ question: 'Clarify the review' }, { toolCallId: 'shared-member-call' }).answer}`
-      : `left ${value}`
+  const leftExecute = jest.fn(
+    async ({ value }: { value: string }, _config?: ToolRunnableConfig) =>
+      question
+        ? `left ${askUserQuestion({ question: 'Clarify the review' }, { toolCallId: 'shared-member-call' }).answer}`
+        : `left ${value}`
   );
   const rightExecute = jest.fn(
-    async ({ value }: { value: string }) => `right ${value}`
+    async ({ value }: { value: string }, _config?: ToolRunnableConfig) =>
+      `right ${value}`
   );
   const tools = { left: leftExecute, right: rightExecute };
+  const eventCalls: t.ToolCallRequest[] = [];
   const programmaticExecute = jest.fn(
     async (_args: { code: string }, runnable?: ToolRunnableConfig) => {
       const cache = runnable?.toolCall as
@@ -133,7 +143,7 @@ function harness(eventDriven = false, question = false, programmatic = false) {
           ? {
             toolDefinitions: [
               {
-                name: `${id}_tool`,
+                name: sessionTools ? Constants.EXECUTE_CODE : `${id}_tool`,
                 description: 'Requires review',
                 parameters: {
                   type: 'object' as const,
@@ -146,7 +156,7 @@ function harness(eventDriven = false, question = false, programmatic = false) {
           : {}),
         tools: [
           tool(tools[id], {
-            name: `${id}_tool`,
+            name: sessionTools ? Constants.EXECUTE_CODE : `${id}_tool`,
             description: 'Requires review',
             schema: z.object({ value: z.string() }),
           }),
@@ -183,16 +193,22 @@ function harness(eventDriven = false, question = false, programmatic = false) {
       ],
     ]);
   }
-  const build = async (definition = graph, signal?: AbortSignal) => {
+  const build = async (
+    definition = graph,
+    signal?: AbortSignal,
+    subagentContext?: t.SubagentContextAdapter
+  ) => {
     const hookRegistry = new HookRegistry();
-    for (const id of ['left', 'right'])
+    for (const id of ['left', 'right']) {
+      const memberTool =
+        programmatic && id === 'left'
+          ? Constants.PROGRAMMATIC_TOOL_CALLING
+          : `${id}_tool`;
       hookRegistry.register('PreToolUse', {
-        pattern:
-          programmatic && id === 'left'
-            ? Constants.PROGRAMMATIC_TOOL_CALLING
-            : `${id}_tool`,
+        pattern: sessionTools ? Constants.EXECUTE_CODE : memberTool,
         hooks: [async () => ({ decision: 'ask' as const })],
       });
+    }
     const run = await Run.create<t.IState>({
       runId: `graph-approval-${Math.random()}`,
       graphConfig: {
@@ -208,17 +224,20 @@ function harness(eventDriven = false, question = false, programmatic = false) {
         ],
       },
       humanInTheLoop: { enabled: true },
+      subagentContext,
       ...(eventDriven
         ? {
           customHandlers: {
             [GraphEvents.ON_TOOL_EXECUTE]: {
               async handle(_event, rawData) {
                 const batch = rawData as t.ToolExecuteBatchRequest;
+                eventCalls.push(...batch.toolCalls);
                 batch.resolve(
                   await Promise.all(
                     batch.toolCalls.map(async (call) => {
                       const executor =
-                          call.name === 'left_tool'
+                          call.name === 'left_tool' ||
+                          (sessionTools && batch.agentId === 'left')
                             ? leftExecute
                             : rightExecute;
                       const result = await executor({
@@ -241,7 +260,9 @@ function harness(eventDriven = false, question = false, programmatic = false) {
       returnContent: true,
       skipCleanup: true,
     });
-    run.Graph?.setSubagentModelOverride(new ApprovalModel(calls, programmatic));
+    run.Graph?.setSubagentModelOverride(
+      new ApprovalModel(calls, programmatic, sessionTools)
+    );
     run.Graph!.overrideModel = createFakeStreamingLLM({
       responses: ['', 'parent completed'],
       toolCalls: [
@@ -263,6 +284,7 @@ function harness(eventDriven = false, question = false, programmatic = false) {
     leftExecute,
     rightExecute,
     programmaticExecute,
+    eventCalls,
   };
 }
 const config = {
@@ -381,6 +403,9 @@ describe('graph subagent foreground HITL', () => {
     'registry-key',
     'tool-map-schema',
     'direct-tool-mode',
+    'session-partition',
+    'tool-end',
+    'summarize-only',
   ] as const)(
     'a rebuilt run rejects a changed graph %s before approved execution',
     async (change) => {
@@ -418,6 +443,10 @@ describe('graph subagent foreground HITL', () => {
           { from: 'right', to: 'left', edgeType: 'direct' },
           { from: 'left', to: 'result', edgeType: 'direct' },
         ];
+      if (change === 'session-partition')
+        graph.agents[1].codeSessionKey = 'different-partition';
+      if (change === 'tool-end') graph.agents[1].toolEnd = true;
+      if (change === 'summarize-only') graph.agents[1].summarizeOnly = true;
       if (change === 'instructions')
         graph.agents[1].instructions = 'Changed member permissions';
       if (change === 'model')
@@ -666,4 +695,166 @@ describe('graph subagent foreground HITL', () => {
       ).toEqual(['direct']);
     }
   );
+
+  test.each([
+    ...[false, true].flatMap((eventDriven) => [
+      { eventDriven, source: 'declaration', rebuilt: true, changed: false },
+      { eventDriven, source: 'declaration', rebuilt: true, changed: true },
+      ...[false, true].flatMap((rebuilt) => [
+        { eventDriven, source: 'adapter', rebuilt, changed: false },
+        { eventDriven, source: 'adapter', rebuilt, changed: true },
+        { eventDriven, source: 'removed-adapter', rebuilt, changed: true },
+      ]),
+    ]),
+  ])(
+    'session authority survives resume: eventDriven=$eventDriven source=$source rebuilt=$rebuilt changed=$changed',
+    async ({ eventDriven, source, rebuilt, changed }) => {
+      const h = harness(eventDriven, false, false, true);
+      const seed = (suffix: string): t.ToolSessionMap =>
+        new Map([
+          [
+            Constants.EXECUTE_CODE,
+            {
+              session_id: `session-${suffix}`,
+              lastUpdated: 1,
+              files: [
+                {
+                  id: `file-${suffix}`,
+                  name: `${suffix}.txt`,
+                  storage_session_id: `storage-${suffix}`,
+                },
+              ],
+            },
+          ],
+        ]);
+      const leftSeed = seed('A');
+      const rightSeed = seed('B');
+      h.graph.agents[1].codeSessionKey =
+        source === 'declaration' ? 'partition-A' : 'declared-A';
+      h.graph.agents[1].initialSessions = leftSeed;
+      h.graph.agents[2].codeSessionKey = 'partition-B';
+      h.graph.agents[2].initialSessions = rightSeed;
+      let partition = 'partition-A';
+      let removed = false;
+      const adapter: t.SubagentContextAdapter = {
+        prepare: async () =>
+          removed
+            ? {}
+            : {
+              agentSessions: {
+                left: {
+                  codeSessionKey: partition,
+                  initialSessions: leftSeed,
+                },
+                right: {
+                  codeSessionKey: 'partition-B',
+                  initialSessions: rightSeed,
+                },
+              },
+            },
+      };
+      const context = source === 'declaration' ? undefined : adapter;
+      const run = await h.build(h.graph, undefined, context);
+      await start(run);
+      expect(run.getInterrupt()?.payload.type).toBe('tool_approval');
+      expect(h.leftExecute).not.toHaveBeenCalled();
+      expect(h.rightExecute).not.toHaveBeenCalled();
+      const definition = {
+        ...h.graph,
+        agents: h.graph.agents.map((agent) => ({ ...agent })),
+      };
+      if (changed && source === 'declaration')
+        definition.agents[1].codeSessionKey = 'partition-B';
+      if (changed && source === 'adapter') partition = 'partition-B';
+      if (source === 'removed-adapter') removed = true;
+      const resumed = rebuilt
+        ? await h.build(definition, undefined, context)
+        : run;
+      await resumed.resume([{ type: 'approve' }], config);
+      if (changed) {
+        expect(h.leftExecute).not.toHaveBeenCalled();
+        expect(h.rightExecute).not.toHaveBeenCalled();
+        expect(h.eventCalls).toHaveLength(0);
+        expect(h.calls.filter((id) => id === 'result')).toHaveLength(0);
+        return;
+      }
+      await resumed.resume([{ type: 'approve' }], config);
+      expect(resumed.getInterrupt()).toBeUndefined();
+      expect(h.leftExecute).toHaveBeenCalledTimes(1);
+      expect(h.rightExecute).toHaveBeenCalledTimes(1);
+      if (eventDriven) {
+        expect(h.eventCalls.map((call) => call.codeSessionContext)).toEqual(
+          expect.arrayContaining([
+            {
+              session_id: 'session-A',
+              files: [
+                expect.objectContaining({
+                  id: 'file-A',
+                  storage_session_id: 'storage-A',
+                }),
+              ],
+            },
+            {
+              session_id: 'session-B',
+              files: [
+                expect.objectContaining({
+                  id: 'file-B',
+                  storage_session_id: 'storage-B',
+                }),
+              ],
+            },
+          ])
+        );
+      } else {
+        expect(h.leftExecute.mock.calls[0][1]).toEqual(
+          expect.objectContaining({
+            toolCall: expect.objectContaining({
+              session_id: 'session-A',
+              _injected_files: [
+                expect.objectContaining({
+                  id: 'file-A',
+                  storage_session_id: 'storage-A',
+                }),
+              ],
+            }),
+          })
+        );
+        expect(h.rightExecute.mock.calls[0][1]).toEqual(
+          expect.objectContaining({
+            toolCall: expect.objectContaining({
+              session_id: 'session-B',
+              _injected_files: [
+                expect.objectContaining({
+                  id: 'file-B',
+                  storage_session_id: 'storage-B',
+                }),
+              ],
+            }),
+          })
+        );
+      }
+      expect(h.calls.filter((id) => id === 'entry')).toHaveLength(1);
+      expect(h.calls.filter((id) => id === 'result')).toHaveLength(1);
+    }
+  );
+
+  test('an explicit default member partition resumes the same saved declaration', async () => {
+    const h = harness();
+    const run = await h.build();
+    await start(run);
+    const definition = {
+      ...h.graph,
+      agents: h.graph.agents.map((agent) => ({
+        ...agent,
+        codeSessionKey: Constants.EXECUTE_CODE,
+      })),
+    };
+    const rebuilt = await h.build(definition);
+    for (let attempt = 0; attempt < 2; attempt++)
+      await rebuilt.resume([{ type: 'approve' }], config);
+    expect(rebuilt.getInterrupt()).toBeUndefined();
+    expect(h.leftExecute).toHaveBeenCalledTimes(1);
+    expect(h.rightExecute).toHaveBeenCalledTimes(1);
+    expect(h.calls.filter((id) => id === 'entry')).toHaveLength(1);
+  });
 });

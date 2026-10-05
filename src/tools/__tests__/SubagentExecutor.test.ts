@@ -59,6 +59,9 @@ const makeConfig = (
   ...overrides,
 });
 
+const makeAgentContexts = ({ agents }: StandardGraphInput): Map<string, AgentContext> =>
+  new Map(agents.map(agent => [agent.agentId, AgentContext.fromConfig(agent)]));
+
 describe('filterSubagentResult', () => {
   it('treats a result member with no new AI message as textless completion', () => {
     expect(
@@ -984,8 +987,9 @@ describe('SubagentExecutor', () => {
           return { content: `${result.content} delivered` };
         },
       },
-      createChildGraph: (): StandardGraph =>
+      createChildGraph: (input): StandardGraph =>
         ({
+          agentContexts: makeAgentContexts(input),
           createWorkflow: () => ({ invoke }),
           clearHeavyState: jest.fn(),
         }) as unknown as StandardGraph,
@@ -1028,8 +1032,9 @@ describe('SubagentExecutor', () => {
     const executor = createExecutor({
       taskConfig: { store, scopeId: 'owner:conversation' },
       subagentContext: { prepare: async () => ({}), complete },
-      createChildGraph: (): StandardGraph =>
+      createChildGraph: (input): StandardGraph =>
         ({
+          agentContexts: makeAgentContexts(input),
           createWorkflow: () => ({ invoke }),
           clearHeavyState: jest.fn(),
         }) as unknown as StandardGraph,
@@ -3189,8 +3194,9 @@ describe('SubagentExecutor', () => {
       configs: new Map([[hitlConfig.type, hitlConfig]]),
       humanInTheLoop: { enabled: true },
       checkpointer: new MemorySaver(),
-      createChildGraph: (): StandardGraph =>
+      createChildGraph: (input): StandardGraph =>
         ({
+          agentContexts: makeAgentContexts(input),
           sessions: childSessions,
           createWorkflow: () => ({
             getState: jest.fn().mockResolvedValue({
