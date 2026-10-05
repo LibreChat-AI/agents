@@ -5,6 +5,7 @@ import type { RunnableConfig } from '@langchain/core/runnables';
 import type { ToolCallsDispatchedEvent } from '@/types/stream';
 import type { ToolExecuteBatchRequest } from '@/types/tools';
 import type { AgentLogEvent } from '@/types/graph';
+import { normalizeToolResultError, inheritToolExecuteProtection, validateToolExecuteProtection, hasRequiredToolExecuteProtection, protectToolExecuteBatch } from '@/protection/toolResult';
 import { traceHostToolResults } from '@/langfuse';
 import { GraphEvents } from '@/common';
 
@@ -17,29 +18,53 @@ export async function safeDispatchCustomEvent(
   payload: unknown,
   config?: RunnableConfig
 ): Promise<boolean | void> {
+  let toolRequest: ToolExecuteBatchRequest | undefined;
+  let hostView: ToolExecuteBatchRequest | undefined;
   try {
     if (event === GraphEvents.ON_TOOL_EXECUTE) {
       const request = payload as ToolExecuteBatchRequest;
-      payload = {
+      toolRequest = request;
+      const exposed: ToolExecuteBatchRequest = {
         ...request,
+        reject: (error): void => request.reject(hasRequiredToolExecuteProtection(request) ? normalizeToolResultError(error) : error),
         resolve: (
           results: Parameters<ToolExecuteBatchRequest['resolve']>[0]
         ): void => {
           const receivedAt = Date.now();
-          const stamped = results.map((result) => ({ ...result, received_at: receivedAt }));
-          void traceHostToolResults(request, results, config).then(
-            () => request.resolve(stamped),
-            () => {
-              console.warn('Failed to record host tool execution metadata');
-              request.resolve(stamped);
-            }
-          );
+          const protectedResults = protectToolExecuteBatch(request, results, exposed);
+          if (protectedResults == null) {
+            const stamped = results.map((result) => ({ ...result, received_at: receivedAt }));
+            void traceHostToolResults(request, results, config).then(
+              () => request.resolve(stamped),
+              () => { console.warn('Failed to record host tool execution metadata'); request.resolve(stamped); }
+            );
+            return;
+          }
+          void protectedResults.then(async (canonical) => {
+            validateToolExecuteProtection(request, exposed);
+            for (const result of canonical) result.received_at = receivedAt;
+            try { await traceHostToolResults(request, canonical, config); }
+            catch { console.warn('Failed to record host tool execution metadata'); }
+            validateToolExecuteProtection(request, exposed);
+            request.resolve(canonical);
+          }).catch((error: unknown) => request.reject(normalizeToolResultError(error)));
         },
-      } satisfies ToolExecuteBatchRequest;
+      };
+      inheritToolExecuteProtection(request, exposed);
+      hostView = exposed;
+      payload = exposed;
     }
     await dispatchCustomEvent(event, payload, config);
+    if (toolRequest != null && hostView != null) {
+      try { validateToolExecuteProtection(toolRequest, hostView); }
+      catch (error) { toolRequest.reject(normalizeToolResultError(error)); return false; }
+    }
     return true;
   } catch (e) {
+    if (toolRequest != null && hasRequiredToolExecuteProtection(toolRequest)) {
+      toolRequest.reject(normalizeToolResultError(e));
+      return false;
+    }
     // Check if this is the known EventStreamCallbackHandler error
     if (
       e instanceof Error &&
