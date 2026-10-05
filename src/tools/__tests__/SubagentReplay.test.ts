@@ -84,6 +84,18 @@ describe('SubagentReplay manifest', () => {
     ],
   };
 
+  it('round-trips optional pending child interrupt IDs and accepts older snapshots', () => {
+    const snapshot = attachSubagentResumeManifest({}, { version: 1, executions: [{ ...execution, pendingInterruptIds: ['left-interrupt', 'right-interrupt'] }] });
+    expect(getSubagentResumeManifest(JSON.parse(JSON.stringify(snapshot)))?.executions[0].pendingInterruptIds).toEqual(['left-interrupt', 'right-interrupt']);
+    expect(getSubagentResumeManifest(attachSubagentResumeManifest({}, { version: 1, executions: [execution] }))?.executions[0].pendingInterruptIds).toBeUndefined();
+  });
+
+  it.each(['not-an-array', [''], [4], ['repeated', 'repeated']])('rejects malformed pending interrupt identities: %j', pendingInterruptIds => {
+    const snapshot = { __librechat_subagent_resume_manifest: { version: 1, executions: [{ ...execution, pendingInterruptIds }] } };
+    expect(getSubagentResumeManifest(snapshot)).toBeUndefined();
+    expect(() => requireValidSubagentResumeManifest(snapshot)).toThrow('Invalid subagent resume manifest');
+  });
+
   it.each([null, 'confirm', ['a', 'b']])(
     'preserves nested custom payload %j with parent replay state',
     async (payload) => {

@@ -90,6 +90,7 @@ export interface SubagentResumeExecution {
   checkpoints: SubagentCheckpointReference[];
   graphState: SubagentGraphResumeState;
   approvalReplays: ToolApprovalReplaySnapshot[];
+  pendingInterruptIds?: string[];
   descendant?: SubagentResumeManifest;
 }
 
@@ -375,7 +376,12 @@ function isSubagentResumeExecution(
     checkpoints.length === 0 ||
     !checkpoints.every(isCheckpointReference) ||
     !isGraphResumeState(graphState) ||
-    !Array.isArray(approvalReplays)
+    !Array.isArray(approvalReplays) ||
+    (execution.pendingInterruptIds != null &&
+      (!Array.isArray(execution.pendingInterruptIds) ||
+        !execution.pendingInterruptIds.every(isString) ||
+        new Set(execution.pendingInterruptIds).size !==
+          execution.pendingInterruptIds.length))
   ) {
     return false;
   }

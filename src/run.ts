@@ -22,6 +22,7 @@ import type {
 } from '@langchain/core/messages';
 import type { StringPromptValue } from '@langchain/core/prompt_values';
 import type { RunnableConfig } from '@langchain/core/runnables';
+import type { SubagentResumeManifest } from '@/tools/subagent/SubagentReplay';
 import type { AggregatedHookResult, HookRegistry } from '@/hooks';
 import type { MultiAgentGraph } from '@/graphs/MultiAgentGraph';
 import type { StandardGraph } from '@/graphs/Graph';
@@ -66,6 +67,7 @@ import {
 } from '@/prompts/reasoningLabel';
 import {
   TOOL_BATCH_REPLAY_KEY,
+  TOOL_REPLAY_CONFIGS_KEY,
   restoreToolReplayConfig,
   stripToolBatchReplayState,
   getPublicToolInterruptPayload,
@@ -268,12 +270,24 @@ function getToolCompletion(
 
 function isLangGraphResumeMapForInterrupt(
   value: unknown,
-  interruptId: string
+  interruptId: string,
+  manifest?: SubagentResumeManifest
 ): value is Record<string, unknown> {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
     return false;
   }
-  return Object.prototype.hasOwnProperty.call(value, interruptId);
+  if (Object.prototype.hasOwnProperty.call(value, interruptId)) return true;
+  const pending = [...(manifest?.executions ?? [])];
+  while (pending.length > 0) {
+    const execution = pending.pop()!;
+    if (
+      execution.pendingInterruptIds?.some(
+        (id) => Object.prototype.hasOwnProperty.call(value, id)
+      ) === true
+    ) return true;
+    pending.push(...(execution.descendant?.executions ?? []));
+  }
+  return false;
 }
 
 function getInterruptHookSessionId(payload: unknown): string | undefined {
@@ -1314,6 +1328,7 @@ export class Run<_T extends t.BaseGraphState> {
     };
     delete config.configurable?.[TOOL_APPROVAL_REVIEW_CONFIG_KEY];
     delete config.configurable?.[TOOL_BATCH_REPLAY_KEY];
+    delete config.configurable?.[TOOL_REPLAY_CONFIGS_KEY];
     if (!isResume) {
       delete config.configurable?.[SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY];
       delete config.configurable?.[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY];
@@ -2084,7 +2099,11 @@ export class Run<_T extends t.BaseGraphState> {
     const scopedResume =
       typeof interruptId === 'string' &&
       interruptId.length > 0 &&
-      !isLangGraphResumeMapForInterrupt(resumeValue, interruptId)
+      !isLangGraphResumeMapForInterrupt(
+        resumeValue,
+        interruptId,
+        requireValidSubagentResumeManifest(resumeConfig.configurable)
+      )
         ? { [interruptId]: resumeValue }
         : resumeValue;
     // langgraph 1.4.5 applies resume + state update + reroute in one superstep
@@ -2119,6 +2138,7 @@ export class Run<_T extends t.BaseGraphState> {
     const resumeConfigurable = { ...callerConfig.configurable };
     delete resumeConfigurable[TOOL_APPROVAL_REVIEW_CONFIG_KEY];
     delete resumeConfigurable[TOOL_BATCH_REPLAY_KEY];
+    delete resumeConfigurable[TOOL_REPLAY_CONFIGS_KEY];
     delete resumeConfigurable[SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY];
     delete resumeConfigurable[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY];
     resumeConfigurable[SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY] = nanoid();
