@@ -1499,15 +1499,19 @@ async function attemptInvokeBody(
       );
     }
 
-    if (finalChunk != null) detachValidatedModelToolCalls(finalChunk);
-    if ((finalChunk?.tool_calls?.length ?? 0) > 0) {
-      finalChunk!.tool_calls = finalChunk!.tool_calls?.filter(
+    if (finalChunk == null) {
+      throw new Error('The model provider returned an empty response.');
+    }
+
+    detachValidatedModelToolCalls(finalChunk);
+    if ((finalChunk.tool_calls?.length ?? 0) > 0) {
+      finalChunk.tool_calls = finalChunk.tool_calls?.filter(
         (tool_call: ToolCall) => !!tool_call.name
       );
     }
 
     assertNotTruncatedToolCall(finalChunk, provider);
-    return { messages: [finalChunk as AIMessageChunk] };
+    return { messages: [finalChunk] };
   }
 
   const finalMessage = snapshotValidatedModelChunk(
