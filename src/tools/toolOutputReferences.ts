@@ -95,8 +95,15 @@ export type ToolOutputReferenceRegistryOptions = {
   maxActiveRuns?: number;
 };
 
+export type ToolOutputReferenceProtection = {
+  version: 1;
+  toolName: string;
+  toolCallId: string;
+  protected: boolean;
+};
+
 export interface ToolOutputReferenceState {
-  entries: Array<{ key: string; value: string }>;
+  entries: Array<{ key: string; value: string; protection?: ToolOutputReferenceProtection }>;
   turnCounter: number;
   warnedNonStringTools: string[];
 }
@@ -160,6 +167,7 @@ const EMPTY_ENTRIES: ReadonlyMap<string, string> = new Map<string, string>();
  */
 class RunStateBucket {
   entries: Map<string, string> = new Map();
+  protections: Map<string, ToolOutputReferenceProtection> = new Map();
   totalSize: number = 0;
   turnCounter: number = 0;
   warnedNonStringTools: Set<string> = new Set();
@@ -265,7 +273,7 @@ export class ToolOutputReferenceRegistry {
   }
 
   /** Registers (or replaces) the output stored under `key` for `runId`. */
-  set(runId: string | undefined, key: string, value: string): void {
+  set(runId: string | undefined, key: string, value: string, protection?: ToolOutputReferenceProtection): void {
     const bucket = this.getOrCreate(runId);
     const clipped =
       value.length > this.maxOutputSize
@@ -277,6 +285,8 @@ export class ToolOutputReferenceRegistry {
       bucket.entries.delete(key);
     }
     bucket.entries.set(key, clipped);
+    if (protection == null) bucket.protections.delete(key);
+    else bucket.protections.set(key, { ...protection });
     bucket.totalSize += clipped.length;
     this.evictWithinBucket(bucket);
   }
@@ -414,6 +424,7 @@ export class ToolOutputReferenceRegistry {
       entries: [...(bucket?.entries ?? EMPTY_ENTRIES)].map(([key, value]) => ({
         key,
         value,
+        ...(bucket?.protections.has(key) === true ? { protection: { ...bucket.protections.get(key)! } } : {}),
       })),
       turnCounter: bucket?.turnCounter ?? 0,
       warnedNonStringTools: [...(bucket?.warnedNonStringTools ?? [])],
@@ -421,11 +432,14 @@ export class ToolOutputReferenceRegistry {
   }
 
   /** Restore batch inputs without rolling back graph-owned concurrent outputs. */
-  resumeBatch(runId: string, state: ToolOutputReferenceState): ToolOutputResolveView {
+  resumeBatch(runId: string, state: ToolOutputReferenceState, canonicalInputs = false): ToolOutputResolveView {
     if (!this.runStates.has(runId)) {
       this.restoreState(runId, state);
     }
     const bucket = this.getOrCreate(runId);
+    if (canonicalInputs) {
+      for (const { key, value, protection } of state.entries) this.set(runId, key, value, protection);
+    }
     bucket.turnCounter = Math.max(bucket.turnCounter, state.turnCounter + 1);
     const inputs = new ToolOutputReferenceRegistry({
       maxOutputSize: this.maxOutputSize,
@@ -443,8 +457,8 @@ export class ToolOutputReferenceRegistry {
   ): void {
     this.releaseRun(runId);
     const bucket = this.getOrCreate(runId);
-    for (const { key, value } of state.entries) {
-      this.set(runId, key, value);
+    for (const { key, value, protection } of state.entries) {
+      this.set(runId, key, value, protection);
     }
     bucket.turnCounter = state.turnCounter;
     for (const toolName of state.warnedNonStringTools) {
@@ -555,6 +569,7 @@ export class ToolOutputReferenceRegistry {
       }
       bucket.totalSize -= entry.length;
       bucket.entries.delete(key);
+      bucket.protections.delete(key);
     }
   }
 }

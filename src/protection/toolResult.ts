@@ -20,6 +20,7 @@ import type {
   ToolExecuteBatchRequest,
   ToolCallRequest,
 } from '@/types';
+import type { ToolOutputReferenceState } from '@/tools/toolOutputReferences';
 import {
   ProviderTextAttempt,
   ProviderTextProtectionError,
@@ -134,7 +135,11 @@ export function requiresToolResultProtection(
   return policy != null && policy.toolNames.includes(name);
 }
 
-function plainObject(value: object, allowed: readonly string[]): void {
+function plainObject(
+  value: object,
+  allowed: readonly string[],
+  checkpointData = false
+): void {
   const candidate: unknown = value;
   if (
     candidate == null ||
@@ -143,7 +148,7 @@ function plainObject(value: object, allowed: readonly string[]): void {
   )
     throw new ToolResultProtectionError('unsupported');
   const prototype = Object.getPrototypeOf(value);
-  if (prototype !== Object.prototype && prototype !== null)
+  if (!checkpointData && prototype !== Object.prototype && prototype !== null)
     throw new ToolResultProtectionError('unsupported');
   const descriptors = Object.getOwnPropertyDescriptors(value);
   for (const [key, descriptor] of Object.entries(descriptors)) {
@@ -431,6 +436,8 @@ export function validateToolExecuteResults(
       'errorMessage',
       'artifact',
       'injectedMessages',
+      'outcome',
+      'outcome_patch',
     ]);
   }
   for (const key of Reflect.ownKeys(results)) {
@@ -507,6 +514,70 @@ export async function protectToolExecuteResult(
     status: safe.status,
   });
   return safe;
+}
+
+/** Old checkpoints cannot establish which required source produced a reference. */
+export function validateToolReferenceSources(
+  policy: ToolResultProtection,
+  state: ToolOutputReferenceState
+): void {
+  for (const entry of state.entries) {
+    plainObject(entry, ['key', 'value', 'protection'], true);
+    if (
+      typeof Object.getOwnPropertyDescriptor(entry, 'key')?.value !==
+        'string' ||
+      typeof Object.getOwnPropertyDescriptor(entry, 'value')?.value !== 'string'
+    )
+      throw new ToolResultProtectionError('incompatible');
+    const source: typeof entry.protection = Object.getOwnPropertyDescriptor(
+      entry,
+      'protection'
+    )?.value;
+    if (source == null) throw new ToolResultProtectionError('incompatible');
+    plainObject(
+      source,
+      ['version', 'toolName', 'toolCallId', 'protected'],
+      true
+    );
+    for (const field of ['version', 'toolName', 'toolCallId', 'protected']) {
+      if (!Object.hasOwn(source, field))
+        throw new ToolResultProtectionError('incompatible');
+    }
+    const version: number = source.version;
+    if (
+      version !== 1 ||
+      typeof source.toolName !== 'string' ||
+      source.toolName.length === 0 ||
+      typeof source.toolCallId !== 'string' ||
+      typeof source.protected !== 'boolean' ||
+      (requiresToolResultProtection(policy, source.toolName) &&
+        !source.protected)
+    )
+      throw new ToolResultProtectionError('incompatible');
+  }
+}
+
+export async function protectToolReferenceState(
+  policy: ToolResultProtection | undefined,
+  state: ToolOutputReferenceState | undefined,
+  signal?: AbortSignal
+): Promise<ToolOutputReferenceState | undefined> {
+  if (policy == null || state == null) return state;
+  validateToolReferenceSources(policy, state);
+  const entries = await Promise.all(
+    state.entries.map(async (entry) => ({
+      ...entry,
+      value: (await protectToolText(
+        policy,
+        entry.protection!.toolName,
+        entry.protection!.toolCallId,
+        entry.value,
+        'success',
+        signal
+      )) as string,
+    }))
+  );
+  return { ...state, entries };
 }
 
 const hostPolicies = new WeakMap<

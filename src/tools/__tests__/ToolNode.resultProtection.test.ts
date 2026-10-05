@@ -1915,3 +1915,59 @@ it('keeps disconnected selected bridge work terminal after the enclosing local p
   decision.resolve({ version: 1, ok: false, error: { code: 'blocked' } });
   expect(await outcome).toMatchObject({ code: 'blocked' });
 });
+
+it.each((['legacy', 'protected', 'unselected', 'new-selection', 'reblocked'] as const).flatMap((mode) => (['direct', 'host'] as const).map((path) => [mode, path] as const)))('gates earlier-turn checkpoint references before resumed reuse (%s/%s)', async (mode, path) => {
+  const runId = `earlier-ref-${mode}-${path}`; const config = { configurable: { run_id: runId, thread_id: runId } };
+  const registry = new ToolOutputReferenceRegistry(); const inspected: string[] = []; const piped: string[] = [];
+  const sourceName = mode === 'unselected' ? 'other' : 'lookup';
+  const source = new DynamicStructuredTool({ name: sourceName, description: 'Allowed source control.', schema: z.object({ count: z.number() }), func: async () => mode === 'unselected' ? 'Allowed unselected control' : fixtures.canaries[0] });
+  const gate = policy({ inspect: ({ content }) => { inspected.push(content); return approve(content.replace(fixtures.canaries[0], '[EMAIL_1]')); } });
+  let previous: ToolResultProtection | undefined = gate;
+  if (mode === 'legacy') previous = undefined;
+  if (mode === 'new-selection') previous = policy({ toolNames: ['other'] });
+  const producer = new ToolNode({ trace: true, tools: [source], eventDrivenMode: path === 'host', toolOutputRegistry: registry, toolResultProtection: previous });
+  await producer.invoke({ messages: [new AIMessage({ id: 'previous-turn', content: '', tool_calls: [{ id: 'source-control', name: sourceName, args: { count: 42 } }] })] }, { ...config, callbacks: [observer([], (request) => request.resolve([{ toolCallId: 'source-control', status: 'success', content: mode === 'unselected' ? 'Allowed unselected control' : fixtures.canaries[0] }]))] });
+  const pipe = new DynamicStructuredTool({ name: 'pipe', description: 'Allowed pipe.', schema: z.object({ command: z.string() }), func: async ({ command }) => { piped.push(command); return command; } });
+  const hooks = new HookRegistry(); hooks.register('PreToolUse', { hooks: [async () => ({ decision: 'ask', reason: 'Allowed approval control' })] });
+  const saver = new MemorySaver();
+  const create = (resultPolicy: ToolResultProtection | undefined, refs: ToolOutputReferenceRegistry): Pick<Runnable<unknown, unknown>, 'invoke'> => new StateGraph(MessagesAnnotation).addNode('tools', new ToolNode({ tools: [pipe], toolOutputRegistry: refs, toolResultProtection: resultPolicy, hookRegistry: hooks, humanInTheLoop: { enabled: true } })).addEdge(START, 'tools').addEdge('tools', END).compile({ checkpointer: saver });
+  const initial = create(previous, registry);
+  const paused = await initial.invoke({ messages: [new AIMessage({ id: 'next-turn', content: '', tool_calls: [{ id: 'pipe-control', name: 'pipe', args: { command: '{{' + 'tool0turn0' + '}}' } }] })] }, config);
+  if (!isInterrupted(paused)) throw new Error('Expected approval checkpoint');
+  const replay = getToolBatchReplayState(paused.__interrupt__[0].value); expect(replay?.records[0].referenceState?.entries).toHaveLength(1);
+  const resumePolicy = mode === 'reblocked' ? policy({ inspect: () => ({ version: 1, ok: false, error: { code: 'blocked' } }) }) : gate;
+  const resumed = create(resumePolicy, new ToolOutputReferenceRegistry()).invoke(new Command({ resume: [{ type: 'approve' }] }), { configurable: { ...config.configurable, [TOOL_BATCH_REPLAY_KEY]: replay } });
+  if (mode === 'legacy' || mode === 'new-selection' || mode === 'reblocked') {
+    await expect(resumed).rejects.toMatchObject({ code: mode === 'reblocked' ? 'blocked' : 'incompatible' }); expect(piped).toEqual([]); return;
+  }
+  const value = await resumed; assertNoCanary(value); expect(piped).toEqual([mode === 'unselected' ? 'Allowed unselected control' : '[EMAIL_1]']);
+  expect(inspected).toEqual(mode === 'unselected' ? [] : [fixtures.canaries[0], '[EMAIL_1]']);
+});
+
+it.each([false, true])('preserves unselected host outcome fields in protected routing (mixed=%s)', async (mixed) => {
+  const events: string[] = [];
+  const other = new DynamicStructuredTool({ name: 'other', description: 'Allowed control.', schema: z.object({ count: z.number() }), func: async () => 'Unused schema control' });
+  const node = new ToolNode({ trace: true, tools: [direct(() => 'Unused schema control'), other], eventDrivenMode: true, toolResultProtection: policy(), toolCallStepIds: new Map([['other-control', 'other-step'], ['call-control', 'lookup-step']]) });
+  const calls = [{ id: 'other-control', name: 'other', args: { count: 42, intent: 'Searching' } }, ...(mixed ? [{ id: 'call-control', name: 'lookup', args: { count: 42 } }] : [])];
+  const result = await node.invoke({ messages: [new AIMessage({ content: '', tool_calls: calls })] }, { callbacks: [observer(events, (request) => request.resolve(request.toolCalls.map((call) => call.name === 'other' ? { toolCallId: call.id, status: 'success', content: 'Allowed unselected output', outcome: 'Searched', outcome_patch: { from: 'Searching', to: 'Searched' } } : { toolCallId: call.id, status: 'success', content: fixtures.canaries[0] })))] });
+  expect(events.join('')).toContain('Searched'); expect(JSON.stringify(result)).toContain('Allowed unselected output'); assertNoCanary(result); assertNoCanary(events.join(''));
+});
+
+it.each([false, true])('preserves unselected host outcomes through real run/eager dispatch (eager=%s)', async (eager) => {
+  const completions: string[] = [];
+  const run = await Run.create({ runId: `outcomes-${eager}`, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, instructions: 'Allowed control.', toolDefinitions: ['lookup', 'other'].map((name) => ({ name, parameters: { type: 'object', properties: { count: { type: 'number' }, intent: { type: 'string' } } } })) }, toolResultProtection: policy(), eagerEventToolExecution: { enabled: eager }, customHandlers: {
+    [GraphEvents.CHAT_MODEL_STREAM]: new ChatModelStreamHandler(),
+    [GraphEvents.ON_TOOL_EXECUTE]: { handle: (_event, data): void => { const request = data as ToolExecuteBatchRequest; request.resolve(request.toolCalls.map((call) => call.name === 'other' ? { toolCallId: call.id, content: 'Allowed unselected control', status: 'success', outcome_patch: { from: 'Searching', to: 'Searched' } } : { toolCallId: call.id, content: fixtures.canaries[0], status: 'success' })); } },
+    [GraphEvents.ON_RUN_STEP_COMPLETED]: { handle: (_event, data): void => { completions.push(JSON.stringify(data)); } },
+  }, skipCleanup: true });
+  run.Graph!.overrideModel = new FakeChatModel({ responses: ['', 'Allowed final control'], toolCalls: [{ id: 'other-control', name: 'other', args: { count: 42, intent: 'Searching' }, type: 'tool_call' }, { id: 'lookup-control', name: 'lookup', args: { count: 42 }, type: 'tool_call' }] });
+  await run.processStream({ messages: [new HumanMessage('Allowed control')] }, { version: 'v2', configurable: { thread_id: `outcomes-${eager}` } });
+  expect(completions.join('')).toContain('Searched'); assertNoCanary(completions.join('')); assertNoCanary(run.Graph!.getRunMessages());
+});
+
+it('rejects selected host outcome aliases rather than admitting unchecked public text', async () => {
+  const events: string[] = [];
+  const node = new ToolNode({ trace: true, tools: [direct(() => 'Unused schema control')], eventDrivenMode: true, toolResultProtection: policy() });
+  await expect(node.invoke(state(), { callbacks: [observer(events, (request) => request.resolve([{ toolCallId: 'call-control', content: 'Allowed control', status: 'success', outcome: fixtures.canaries[0] }]))] })).rejects.toMatchObject({ code: 'unsupported' });
+  assertNoCanary(events.join(''));
+});

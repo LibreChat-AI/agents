@@ -36,7 +36,7 @@ import type {
   PreResolvedArgsMap,
   ResolvedArgsByCallId,
   ResolveResult,
-  ResolveOptions,
+  ResolveOptions, ToolOutputReferenceProtection
 } from '@/tools/toolOutputReferences';
 import type {
   ReplayableSubagentTool,
@@ -53,7 +53,7 @@ import type { SettledToolBatchResult } from '@/tools/toolBatchReplay';
 import type { PreparedSubagents } from '@/tools/preparedSubagents';
 import type { RunBreakerScope } from '@/llm/streamLimits';
 import type * as t from '@/types';
-import { bindToolExecuteProtection, validateToolExecuteResults, hasReleasedToolReference, isReleasedToolError, markReleasedToolMessage, protectToolText, protectToolMessage, protectToolExecuteResult, withToolResultBoundary, requiresToolResultProtection, validateToolResultProtection, ToolResultProtectionError } from '@/protection/toolResult';
+import { validateToolReferenceSources, protectToolReferenceState, bindToolExecuteProtection, validateToolExecuteResults, hasReleasedToolReference, isReleasedToolError, markReleasedToolMessage, protectToolText, protectToolMessage, protectToolExecuteResult, withToolResultBoundary, requiresToolResultProtection, validateToolResultProtection, ToolResultProtectionError } from '@/protection/toolResult';
 import {
   TOOL_BATCH_REPLAY_KEY,
   getToolBatchReplayOwner,
@@ -2082,7 +2082,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               runId,
               registryContent,
               refKey,
-              unresolvedRefs
+              unresolvedRefs,
+              call
             );
             if (refKey != null) releasedReference = this.toolOutputRegistry?.get(runId, refKey);
             if (refMeta != null) {
@@ -2133,7 +2134,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         runId,
         stripCodeSessionFileSummary(serialized.registryContent),
         refKey,
-        unresolvedRefs
+        unresolvedRefs,
+        call
       );
       return new ToolMessage({
         status: 'success',
@@ -2381,7 +2383,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         this.toolOutputRegistry.set(
           refMeta._refScope,
           refMeta._refKey,
-          settledOutput.referenceContent
+          settledOutput.referenceContent,
+          this.createReferenceProtection(call.name, call.id ?? '')
         );
       }
       return settledOutput.output;
@@ -3066,7 +3069,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           this.toolOutputRegistry.set(
             refScope,
             refKey,
-            replaced.registryContent
+            replaced.registryContent,
+            this.createReferenceProtection(call.name, call.id ?? '')
           );
         }
         return persistOutput(
@@ -3153,6 +3157,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     });
   }
 
+  private createReferenceProtection(toolName: string, toolCallId: string): ToolOutputReferenceProtection | undefined {
+    if (this.toolResultProtection == null) return undefined;
+    return { version: 1, toolName, toolCallId, protected: requiresToolResultProtection(this.toolResultProtection, toolName) };
+  }
+
   /**
    * Registers the full, raw output under `refKey` (when provided) and
    * builds the per-message ref metadata stamped onto the resulting
@@ -3176,10 +3185,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     runId: string | undefined,
     registryContent: string,
     refKey: string | undefined,
-    unresolved: string[]
+    unresolved: string[],
+    call?: Pick<ToolCall, 'name' | 'id'>
   ): t.ToolMessageRefMetadata | undefined {
     if (this.toolOutputRegistry != null && refKey != null) {
-      this.toolOutputRegistry.set(runId, refKey, registryContent);
+      this.toolOutputRegistry.set(runId, refKey, registryContent, call == null ? undefined : this.createReferenceProtection(call.name, call.id ?? ''));
     }
     if (refKey == null && unresolved.length === 0) return undefined;
     const meta: t.ToolMessageRefMetadata = {};
@@ -4756,7 +4766,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             registryRunId,
             stripCodeSessionFileSummary(registryRaw),
             refKey,
-            unresolved
+            unresolved,
+            { name: toolName, id: result.toolCallId }
           );
 
           toolMessage = new ToolMessage({
@@ -5267,7 +5278,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         this.toolOutputRegistry?.set(
           baseContext.batchScopeId,
           refMeta._refKey,
-          result.referenceContent
+          result.referenceContent,
+          this.createReferenceProtection(call.name, call.id ?? '')
         );
         if (isBaseMessage(result.output)) {
           result = {
@@ -5604,17 +5616,22 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
      */
     const incomingRunId = config.configurable?.run_id as string | undefined;
     const batchScopeId = incomingRunId ?? `\0anon-${this.anonBatchCounter++}`;
-    const resumedReferenceState = referenceReplay.state;
+    const resumedReferenceState = this.toolResultProtection != null && referenceReplay.state != null
+      ? await protectToolReferenceState(this.toolResultProtection, referenceReplay.state, config.signal)
+      : referenceReplay.state;
+    const currentReferenceState = resumedReferenceState ?? this.toolOutputRegistry?.snapshotState(batchScopeId);
+    if (this.toolResultProtection != null && resumedReferenceState == null && currentReferenceState != null) {
+      validateToolReferenceSources(this.toolResultProtection, currentReferenceState);
+    }
     const replayInputSnapshot =
       resumedReferenceState == null
         ? undefined
         : this.toolOutputRegistry?.resumeBatch(
           batchScopeId,
-          resumedReferenceState
+          resumedReferenceState,
+          this.toolResultProtection != null
         );
-    referenceReplay.state =
-      resumedReferenceState ??
-      this.toolOutputRegistry?.snapshotState(batchScopeId);
+    referenceReplay.state = currentReferenceState;
     const turn =
       resumedReferenceState?.turnCounter ??
       this.toolOutputRegistry?.nextTurn(batchScopeId) ??

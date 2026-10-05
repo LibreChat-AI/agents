@@ -531,3 +531,29 @@ describe('ToolOutputReferenceRegistry', () => {
     });
   });
 });
+
+it('round-trips reference source provenance and clears it on unprotected overwrite', () => {
+  const registry = new ToolOutputReferenceRegistry();
+  const protection = { version: 1 as const, toolName: 'lookup', toolCallId: 'source-control', protected: true };
+  registry.set('source', 'tool0turn0', 'Allowed canonical control', protection);
+  const snapshot = registry.snapshotState('source');
+  expect(snapshot.entries[0].protection).toEqual(protection);
+  snapshot.entries[0].protection!.toolName = 'changed-copy';
+  expect(registry.snapshotState('source').entries[0].protection!.toolName).toBe('lookup');
+  registry.restoreState('resume', registry.snapshotState('source'));
+  expect(registry.snapshotState('resume').entries[0].protection).toEqual(protection);
+  registry.set('resume', 'tool0turn0', 'New uncertified control');
+  expect(registry.snapshotState('resume').entries[0].protection).toBeUndefined();
+});
+
+it('projects canonical replay inputs into the live registry without dropping unrelated concurrent outputs', () => {
+  const registry = new ToolOutputReferenceRegistry();
+  registry.set('resume', 'tool0turn0', 'Previous allowed control');
+  registry.set('resume', 'tool0turn4', 'Concurrent allowed control');
+  const protection = { version: 1 as const, toolName: 'lookup', toolCallId: 'source-control', protected: true };
+  const view = registry.resumeBatch('resume', { entries: [{ key: 'tool0turn0', value: 'Canonical allowed control', protection }], turnCounter: 1, warnedNonStringTools: [] }, true);
+  expect(view.resolve('{{' + 'tool0turn0' + '}}').resolved).toBe('Canonical allowed control');
+  expect(registry.get('resume', 'tool0turn0')).toBe('Canonical allowed control');
+  expect(registry.get('resume', 'tool0turn4')).toBe('Concurrent allowed control');
+  expect(registry.snapshotState('resume').entries[1].protection).toEqual(protection);
+});
