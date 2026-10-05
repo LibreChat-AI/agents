@@ -130,9 +130,9 @@ import {
   getSubagentHostArgsDigest,
 } from './hostArgs';
 import {
-  rebindToolBatchReplayScope,
+  TOOL_REPLAY_CONFIGS_KEY,
   rebindToolBatchReplayPayload,
-  restoreToolReplayConfig,
+  restoreToolReplayConfigs,
 } from '@/tools/toolBatchReplay';
 import {
   executeHooks,
@@ -3252,15 +3252,13 @@ export class SubagentExecutor {
         }
         let childInput: BaseGraphState | Command | null;
         if (childResumeMap != null) {
-          const pending =
-            activeChildRun.pendingInterrupts.find(
-              (entry) =>
-                entry.id != null &&
-                Object.prototype.hasOwnProperty.call(childResumeMap, entry.id)
-            ) ?? activeChildRun.pendingInterrupts[0];
-          restoreToolReplayConfig(childConfigurable, pending.id, pending.value);
-          rebindToolBatchReplayScope(
+          const pending = activeChildRun.pendingInterrupts.filter(
+            (entry) => entry.id != null &&
+              Object.prototype.hasOwnProperty.call(childResumeMap, entry.id)
+          );
+          restoreToolReplayConfigs(
             childConfigurable,
+            pending,
             resumeExecution?.approvalExecutionScope ?? approvalExecutionScope,
             approvalExecutionScope,
             childThreadId
@@ -4155,6 +4153,7 @@ function isLangGraphRuntimeConfigKey(key: string): boolean {
     key === SUBAGENT_RESUME_MANIFEST_CONFIG_KEY ||
     key === SUBAGENT_PARENT_BATCH_CONFIG_KEY ||
     key === TOOL_APPROVAL_EXECUTION_SCOPE_CONFIG_KEY ||
+    key === TOOL_REPLAY_CONFIGS_KEY ||
     /** The parent batch's breaker scope must not leak into the child
      * workflow's configurable — children own separate controllers. */
     key === RUN_BREAKER_SCOPE_CONFIG_KEY

@@ -8,9 +8,14 @@ import {
 } from '@langchain/core/messages';
 import { ChatGenerationChunk } from '@langchain/core/outputs';
 import { FakeListChatModel } from '@langchain/core/utils/testing';
-import type { ToolCall } from '@langchain/core/messages/tool';
 import type { ToolRunnableConfig } from '@langchain/core/tools';
+import type { ToolCall } from '@langchain/core/messages/tool';
+import type { Interrupt } from '@langchain/langgraph';
+import type { SubagentCheckpointReference } from '@/tools/subagent/SubagentReplay';
 import type * as t from '@/types';
+import { getSubagentResumeManifest } from '@/tools/subagent/SubagentReplay';
+import { getPublicToolInterruptPayload } from '@/tools/toolBatchReplay';
+import { isToolApprovalInterrupt } from '@/types/hitl';
 import { createFakeStreamingLLM } from '@/llm/fake';
 import { askUserQuestion } from '@/hitl';
 import { HookRegistry } from '@/hooks';
@@ -299,6 +304,36 @@ async function start(run: Run<t.IState>) {
   );
 }
 
+async function pendingMemberInterrupts(
+  checkpointer: MemorySaver
+): Promise<Interrupt[]> {
+  let reference: SubagentCheckpointReference | undefined;
+  for await (const parent of checkpointer.list(config)) {
+    const interrupted = parent.pendingWrites?.find(
+      ([, channel]) => channel === '__interrupt__'
+    )?.[2] as Interrupt | undefined;
+    const manifest = getSubagentResumeManifest(interrupted?.value);
+    reference = manifest?.executions[0].checkpoints.find(
+      (checkpoint) => checkpoint.checkpointNs === ''
+    );
+    if (reference != null) break;
+  }
+  if (reference == null) throw new Error('Missing child checkpoint');
+  const child = await checkpointer.getTuple({
+    configurable: {
+      thread_id: reference.threadId,
+      checkpoint_ns: reference.checkpointNs,
+      checkpoint_id: reference.checkpointId,
+    },
+  });
+  const pending =
+    child?.pendingWrites?.flatMap(([, channel, value]) =>
+      channel === '__interrupt__' ? [value as Interrupt] : []
+    ) ?? [];
+  expect(pending.map((interrupt) => interrupt.id)).toHaveLength(2);
+  return pending;
+}
+
 describe('graph subagent foreground HITL', () => {
   test('keeps parallel approvals pending and resumes a rebuilt run without repeating completed members', async () => {
     const h = harness();
@@ -335,6 +370,128 @@ describe('graph subagent foreground HITL', () => {
           (message as ToolMessage).name === Constants.SUBAGENT
       );
     expect(returned?.[0].content).toBe('result completed');
+  });
+
+  test.each(
+    [false, true].flatMap((eventDriven) =>
+      [false, true].map((rebuilt) => ({ eventDriven, rebuilt }))
+    )
+  )(
+    'resumes both member approvals together: eventDriven=$eventDriven rebuilt=$rebuilt',
+    async ({ eventDriven, rebuilt }) => {
+      const h = harness(eventDriven);
+      const run = await h.build();
+      await start(run);
+      const pending = await pendingMemberInterrupts(h.checkpointer);
+      const decisions: Record<string, t.ToolApprovalDecision[]> = {};
+      for (const interrupt of pending) {
+        if (interrupt.id == null) throw new Error('Missing interrupt ID');
+        const payload = getPublicToolInterruptPayload(interrupt.value);
+        if (!isToolApprovalInterrupt(payload))
+          throw new Error('Missing member approval');
+        expect(payload.action_requests[0].tool_call_id).toBe(
+          'shared-member-call'
+        );
+        decisions[interrupt.id] = [{ type: 'approve' }];
+      }
+      const resumed = rebuilt ? await h.build() : run;
+      await resumed.resume(decisions, config);
+      expect(resumed.getInterrupt()).toBeUndefined();
+      expect(h.leftExecute).toHaveBeenCalledTimes(1);
+      expect(h.rightExecute).toHaveBeenCalledTimes(1);
+      expect(h.calls.filter((id) => id === 'entry')).toHaveLength(1);
+      expect(h.calls.filter((id) => id === 'result')).toHaveLength(1);
+      expect(
+        resumed
+          .getRunMessages()
+          ?.find(
+            (message) =>
+              message._getType() === 'tool' &&
+              (message as ToolMessage).name === Constants.SUBAGENT
+          )?.content
+      ).toBe('result completed');
+    }
+  );
+
+  test.each(
+    [false, true].flatMap((eventDriven) =>
+      ['edit-reject', 'respond-approve', 'partial'].map((mode) => ({
+        eventDriven,
+        mode,
+      }))
+    )
+  )(
+    'keeps batched decisions member-scoped: eventDriven=$eventDriven mode=$mode',
+    async ({ eventDriven, mode }) => {
+      const h = harness(eventDriven);
+      const run = await h.build();
+      await start(run);
+      const pending = await pendingMemberInterrupts(h.checkpointer);
+      const decisions: Record<string, t.ToolApprovalDecision[]> = {};
+      for (const entry of pending) {
+        if (entry.id == null) throw new Error('Missing interrupt ID');
+        const payload = getPublicToolInterruptPayload(entry.value);
+        if (!isToolApprovalInterrupt(payload))
+          throw new Error('Missing approval');
+        const isLeft = payload.subagent?.agent_id === 'left';
+        if (mode === 'partial' && !isLeft) continue;
+        let decision: t.ToolApprovalDecision = { type: 'approve' };
+        if (mode === 'edit-reject')
+          decision = isLeft
+            ? { type: 'edit', updatedInput: { value: 'edited-left' } }
+            : { type: 'reject', reason: 'No right effect' };
+        if (mode === 'respond-approve' && isLeft)
+          decision = { type: 'respond', responseText: 'Manual left result' };
+        decisions[entry.id] = [decision];
+      }
+      const rebuilt = await h.build();
+      await rebuilt.resume(decisions, config);
+      if (mode === 'partial') {
+        expect(h.leftExecute).toHaveBeenCalledTimes(1);
+        expect(h.rightExecute).not.toHaveBeenCalled();
+        expect(rebuilt.getInterrupt()?.payload.type).toBe('tool_approval');
+        const again = await h.build();
+        await again.resume([{ type: 'approve' }], config);
+        expect(again.getInterrupt()).toBeUndefined();
+        expect(h.leftExecute).toHaveBeenCalledTimes(1);
+        expect(h.rightExecute).toHaveBeenCalledTimes(1);
+      } else {
+        expect(rebuilt.getInterrupt()).toBeUndefined();
+        expect(h.leftExecute).toHaveBeenCalledTimes(
+          mode === 'edit-reject' ? 1 : 0
+        );
+        expect(h.rightExecute).toHaveBeenCalledTimes(
+          mode === 'edit-reject' ? 0 : 1
+        );
+        if (mode === 'edit-reject')
+          expect(h.leftExecute.mock.calls[0][0]).toEqual({
+            value: 'edited-left',
+          });
+      }
+      expect(h.calls.filter((id) => id === 'entry')).toHaveLength(1);
+      expect(h.calls.filter((id) => id === 'result')).toHaveLength(1);
+    }
+  );
+
+  test('a question after batched approval resumes without repeating its completed sibling', async () => {
+    const h = harness(false, true);
+    const run = await h.build();
+    await start(run);
+    const pending = await pendingMemberInterrupts(h.checkpointer);
+    const decisions = Object.fromEntries(
+      pending.map((entry) => [entry.id!, [{ type: 'approve' }]])
+    );
+    await run.resume(decisions, config);
+    expect(run.getInterrupt()?.payload.type).toBe('ask_user_question');
+    expect(h.rightExecute).toHaveBeenCalledTimes(1);
+    const rebuilt = await h.build();
+    await rebuilt.resume({ answer: 'batch clarified' }, config);
+    expect(rebuilt.getInterrupt()).toBeUndefined();
+    expect(h.rightExecute).toHaveBeenCalledTimes(1);
+    expect(h.calls.filter((id) => id === 'result')).toHaveLength(1);
+    expect(await h.leftExecute.mock.results.at(-1)?.value).toBe(
+      'left batch clarified'
+    );
   });
 
   test.each([false, true])(

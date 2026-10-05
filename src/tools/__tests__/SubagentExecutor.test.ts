@@ -29,6 +29,7 @@ import {
   summarizeEvent,
 } from '../subagent';
 import { sanitizeForwardedSubagentUpdateData } from '../subagent/SubagentExecutor';
+import { TOOL_REPLAY_CONFIGS_KEY } from '../toolBatchReplay';
 import { SUBAGENT_PARENT_BATCH_CONFIG_KEY } from '../subagent/SubagentReplay';
 import { Constants, Providers, GraphEvents, StepTypes } from '@/common';
 import { StreamLimitExceededError } from '@/llm/streamLimits';
@@ -3388,6 +3389,7 @@ describe('SubagentExecutor', () => {
           checkpoint_map: { parent: 'checkpoint' },
           checkpoint_ns: 'parent-checkpoint-ns',
           [SUBAGENT_PARENT_BATCH_CONFIG_KEY]: 'assistant-batch',
+          [TOOL_REPLAY_CONFIGS_KEY]: new Map([['foreign-owner', {}]]),
           requestBody: { messageId: 'msg-1' },
           thread_id: 'parent-thread',
           user: { id: 'user_abc' },
@@ -3405,6 +3407,7 @@ describe('SubagentExecutor', () => {
       expect(configurable.checkpoint_map).toBeUndefined();
       expect(configurable.checkpoint_ns).toBeUndefined();
       expect(configurable[SUBAGENT_PARENT_BATCH_CONFIG_KEY]).toBeUndefined();
+      expect(configurable[TOOL_REPLAY_CONFIGS_KEY]).toBeUndefined();
       expect(configurable.requestBody).toEqual({ messageId: 'msg-1' });
       expect(configurable.thread_id).toBe('parent-thread');
       expect(configurable.user).toEqual({ id: 'user_abc' });

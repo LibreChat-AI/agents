@@ -1,8 +1,10 @@
 import { Command, MemorySaver, isCommand } from '@langchain/langgraph';
 import { isBaseMessage } from '@langchain/core/messages';
-import type { BaseMessage } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
+import type { BaseMessage } from '@langchain/core/messages';
+import type { Interrupt } from '@langchain/langgraph';
 import type { SubagentToolNodeResumeState } from '@/tools/subagent/SubagentReplay';
+import type { ToolApprovalReviewEvidence } from '@/hitl/approvalReview';
 import type { ToolOutputReferenceState } from '@/tools/toolOutputReferences';
 import {
   isToolNodeResumeState,
@@ -24,6 +26,7 @@ import {
 } from '@/tools/runStepResume';
 
 export const TOOL_BATCH_REPLAY_KEY = '__librechat_tool_batch_replay';
+export const TOOL_REPLAY_CONFIGS_KEY = '__librechat_tool_replay_configs';
 const TOOL_BATCH_PAYLOAD_KEY = '__librechat_tool_batch_payload';
 const TOOL_BATCH_WRAPPER_KEY = '__librechat_tool_batch_wrapper';
 
@@ -58,6 +61,11 @@ interface ToolBatchReplayState {
   records: ToolBatchReplayRecord[];
   wrappedPayload?: boolean;
 }
+
+type ToolReplayConfig = {
+  [TOOL_BATCH_REPLAY_KEY]?: ToolBatchReplayState;
+  [TOOL_APPROVAL_REVIEW_CONFIG_KEY]?: ToolApprovalReviewEvidence;
+};
 
 /** Use the same message/Command codec as LangGraph checkpoints. */
 const serializer = new MemorySaver().serde;
@@ -132,6 +140,71 @@ export function restoreToolReplayConfig(
   if (review != null) {
     configurable[TOOL_APPROVAL_REVIEW_CONFIG_KEY] = review;
   }
+}
+
+/** Restore each checkpointed interrupt without sharing member authorization. */
+export function restoreToolReplayConfigs(
+  configurable: NonNullable<RunnableConfig['configurable']>,
+  interrupts: readonly Interrupt[],
+  sourceScope: string,
+  destinationScope: string,
+  destinationThreadId: string
+): void {
+  delete configurable[TOOL_REPLAY_CONFIGS_KEY];
+  const configs = new Map<string, ToolReplayConfig>();
+  let first: ToolReplayConfig | undefined;
+  for (const pending of interrupts) {
+    const restored: ToolReplayConfig &
+      NonNullable<RunnableConfig['configurable']> = {
+        user_id: configurable.user_id,
+        thread_id: configurable.thread_id,
+      };
+    restoreToolReplayConfig(restored, pending.id, pending.value);
+    rebindToolBatchReplayScope(
+      restored,
+      sourceScope,
+      destinationScope,
+      destinationThreadId
+    );
+    const replay = restored[TOOL_BATCH_REPLAY_KEY];
+    const review = restored[TOOL_APPROVAL_REVIEW_CONFIG_KEY];
+    const evidence: ToolReplayConfig = {
+      [TOOL_BATCH_REPLAY_KEY]: replay,
+      [TOOL_APPROVAL_REVIEW_CONFIG_KEY]: review,
+    };
+    first ??= evidence;
+    const owner = review?.owner ?? replay?.approvalOwner;
+    const owners = owner == null
+      ? new Set(replay?.records.map(record => record.owner))
+      : new Set([owner]);
+    for (const owner of owners) {
+      if (configs.has(owner)) {
+        throw new Error('Ambiguous tool replay checkpoint owner');
+      }
+      configs.set(owner, evidence);
+    }
+  }
+  delete configurable[TOOL_BATCH_REPLAY_KEY];
+  delete configurable[TOOL_APPROVAL_REVIEW_CONFIG_KEY];
+  Object.assign(configurable, first);
+  if (configs.size > 1) configurable[TOOL_REPLAY_CONFIGS_KEY] = configs;
+}
+
+/** Select a member's evidence before the unchanged owner/proposal safeguards. */
+export function getToolReplayConfig(
+  config: RunnableConfig,
+  owner: string
+): RunnableConfig {
+  const candidate = config.configurable?.[TOOL_REPLAY_CONFIGS_KEY];
+  if (!(candidate instanceof Map)) return config;
+  const evidence = (candidate as ReadonlyMap<string, ToolReplayConfig>).get(owner);
+  if (evidence == null) return config;
+  const configurable: NonNullable<RunnableConfig['configurable']> = {
+    ...config.configurable,
+    ...evidence,
+  };
+  delete configurable[TOOL_REPLAY_CONFIGS_KEY];
+  return { ...config, configurable };
 }
 
 /**

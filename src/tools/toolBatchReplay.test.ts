@@ -1,7 +1,11 @@
 import { ToolMessage } from '@langchain/core/messages';
 import { Command } from '@langchain/langgraph';
+import type { RunnableConfig } from '@langchain/core/runnables';
 import {
   TOOL_BATCH_REPLAY_KEY,
+  TOOL_REPLAY_CONFIGS_KEY,
+  getToolReplayConfig,
+  restoreToolReplayConfigs,
   attachToolBatchReplayState,
   clearStaleToolApprovalConfig,
   getToolBatchReplayOwner,
@@ -14,6 +18,7 @@ import {
   getPublicToolInterruptPayload,
   rebindToolBatchReplayPayload,
 } from './toolBatchReplay';
+import { getToolApprovalReviewEvidence } from '@/hitl/approvalReview';
 
 const approval = {
   type: 'tool_approval',
@@ -28,6 +33,53 @@ const approval = {
 };
 
 describe('checkpoint-owned tool batch replay', () => {
+  it.each([false, true])('routes each checkpoint owner independently across a fork, question=%s', async question => {
+    const interrupts = await Promise.all(['left', 'right'].map(async member => ({
+      id: `${member}-interrupt`,
+      value: await attachToolBatchReplayState(
+        question ? { type: 'ask_user_question', question: { question: 'Continue?' } } : approval,
+        JSON.stringify(['source', '', member, 'user', 'source-thread']),
+        new Map([[JSON.stringify(['source', member]), new Map()]]),
+      ),
+    })));
+    const config: RunnableConfig = { configurable: {
+      user_id: 'user', thread_id: 'child-thread',
+      __librechat_tool_approval_execution_scope: 'fork',
+    } };
+    restoreToolReplayConfigs(config.configurable!, interrupts, 'source', 'fork', 'child-thread');
+    const original = config.configurable?.[TOOL_BATCH_REPLAY_KEY];
+    for (const member of ['left', 'right']) {
+      const owner = getToolBatchReplayOwner(config, member);
+      const selected = getToolReplayConfig(config, owner);
+      expect(selected).not.toBe(config);
+      expect(selected.configurable?.[TOOL_REPLAY_CONFIGS_KEY]).toBeUndefined();
+      expect(getToolBatchReplayState(selected.configurable)?.interruptId).toBe(`${member}-interrupt`);
+      expect((await restoreToolBatchReplayState(selected, owner))[0].batch).toBe(JSON.stringify(['fork', member]));
+      if (!question) expect(getToolApprovalReviewEvidence(selected)?.owner).toBe(owner);
+      const foreign = {
+        ...config,
+        configurable: { ...config.configurable, user_id: 'different-user' },
+      };
+      expect(getToolReplayConfig(foreign, getToolBatchReplayOwner(foreign, member))).toBe(foreign);
+    }
+    expect(config.configurable?.[TOOL_BATCH_REPLAY_KEY]).toBe(original);
+    expect(getToolBatchReplayState(interrupts[0].value)?.records[0].owner).toBe(JSON.stringify(['source', '', 'left', 'user', 'source-thread']));
+  });
+
+  it('rejects ambiguous member evidence rather than accepting the last checkpoint', async () => {
+    const payload = await attachToolBatchReplayState(approval, JSON.stringify(['source', '', 'member']), new Map());
+    expect(() => restoreToolReplayConfigs({}, [{ id: 'first', value: payload }, { id: 'second', value: payload }], 'source', 'fork', 'child-thread')).toThrow('Ambiguous tool replay checkpoint owner');
+  });
+
+  it('does not let one restored owner select authorization for a different member', async () => {
+    const payload = await attachToolBatchReplayState(approval, JSON.stringify(['source', '', 'left']), new Map());
+    const config: RunnableConfig = { configurable: { thread_id: 'child-thread', __librechat_tool_approval_execution_scope: 'fork' } };
+    restoreToolReplayConfigs(config.configurable!, [{ id: 'only-left', value: payload }], 'source', 'fork', 'child-thread');
+    const selected = getToolReplayConfig(config, getToolBatchReplayOwner(config, 'right'));
+    expect(selected).toBe(config);
+    expect(getToolApprovalReviewEvidence(selected)?.owner).not.toBe(getToolBatchReplayOwner(config, 'right'));
+  });
+
   it.each([
     { interruptId: 'current', resume: [[]], isChildReplay: false, expected: 'active' },
     { interruptId: 'prior', resume: [[]], isChildReplay: false, expected: 'unverifiable' },

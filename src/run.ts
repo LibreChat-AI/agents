@@ -66,6 +66,7 @@ import {
 } from '@/prompts/reasoningLabel';
 import {
   TOOL_BATCH_REPLAY_KEY,
+  TOOL_REPLAY_CONFIGS_KEY,
   restoreToolReplayConfig,
   stripToolBatchReplayState,
   getPublicToolInterruptPayload,
@@ -1314,6 +1315,7 @@ export class Run<_T extends t.BaseGraphState> {
     };
     delete config.configurable?.[TOOL_APPROVAL_REVIEW_CONFIG_KEY];
     delete config.configurable?.[TOOL_BATCH_REPLAY_KEY];
+    delete config.configurable?.[TOOL_REPLAY_CONFIGS_KEY];
     if (!isResume) {
       delete config.configurable?.[SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY];
       delete config.configurable?.[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY];
@@ -2119,6 +2121,7 @@ export class Run<_T extends t.BaseGraphState> {
     const resumeConfigurable = { ...callerConfig.configurable };
     delete resumeConfigurable[TOOL_APPROVAL_REVIEW_CONFIG_KEY];
     delete resumeConfigurable[TOOL_BATCH_REPLAY_KEY];
+    delete resumeConfigurable[TOOL_REPLAY_CONFIGS_KEY];
     delete resumeConfigurable[SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY];
     delete resumeConfigurable[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY];
     resumeConfigurable[SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY] = nanoid();
