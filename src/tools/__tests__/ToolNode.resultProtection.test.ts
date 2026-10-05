@@ -1887,3 +1887,31 @@ it('re-inspects an observational error-handler replacement before completion and
   const result = await node.invoke(state(), { callbacks: [observer(events)] });
   expect(inspected).toEqual(['Allowed initial error', fixtures.canaries[0]]); assertNoCanary(result); assertNoCanary(events.join('')); expect(events.join('')).toContain('[EMAIL_1]');
 });
+
+it.each(['lookup', 'request_alias'])('rejects uncertified nested executable aliases before execution (selected=%s)', async (selected) => {
+  let executions = 0;
+  const lookup = direct(() => { executions++; return fixtures.canaries[0]; });
+  const result = executeTools([{ id: 'alias-control', name: 'request_alias', input: { count: 42 } }], new Map([['request_alias', lookup]]), 'run_tools_with_code', { policy: policy({ toolNames: [selected] }) });
+  await expect(result).rejects.toMatchObject({ code: 'unsupported' });
+  expect(executions).toBe(0);
+});
+
+it('rejects a standalone nested incompatible policy before native tool execution', async () => {
+  let executions = 0;
+  const future = { ...policy(), version: 2 } as unknown as ToolResultProtection;
+  await expect(executeTools([{ id: 'version-control', name: 'lookup', input: { count: 42 } }], new Map([['lookup', direct(() => { executions++; return fixtures.canaries[0]; })]]), 'run_tools_with_code', { policy: future })).rejects.toMatchObject({ code: 'incompatible' });
+  expect(executions).toBe(0);
+});
+
+it('keeps disconnected selected bridge work terminal after the enclosing local process exits', async () => {
+  const started = deferred<void>(); const decision = deferred<ToolResultProtectionResult>();
+  const runner = createLocalProgrammaticToolCallingTool({ cwd: process.cwd() });
+  const pending = runner.invoke({ lang: 'bash', code: 'curl -sS --max-time 0.05 -X POST -H "Content-Type: application/json" -H "$__LIBRECHAT_TOOL_HEADER: $__LIBRECHAT_TOOL_TOKEN" --data-binary \'{"name":"lookup","input":{"count":42}}\' "$__LIBRECHAT_TOOL_BRIDGE?mode=text" >/dev/null 2>&1 || true\necho "Allowed outer control"', tool_manifest: ['lookup'] }, { toolCall: {
+    id: 'disconnect-local-control', name: runner.name, type: 'tool_call', args: {}, toolMap: new Map([['lookup', direct(() => fixtures.canaries[0])]]), toolDefs: [{ name: 'lookup', allowed_callers: ['code_execution'], parameters: { type: 'object', properties: { count: { type: 'number' } } } }],
+    toolResultProtection: policy({ inspect: () => { started.resolve(); return decision.promise; } }),
+  } });
+  const outcome = pending.catch((error: Error) => error);
+  await started.promise; await new Promise((resolve) => setTimeout(resolve, 100));
+  decision.resolve({ version: 1, ok: false, error: { code: 'blocked' } });
+  expect(await outcome).toMatchObject({ code: 'blocked' });
+});

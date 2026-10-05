@@ -1687,7 +1687,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         config
       );
     }
-    return withToolResultBoundary(tool, this.toolResultProtection, call.id ?? '', config).invoke(invokeParams, runtime);
+    return withToolResultBoundary(tool, this.toolResultProtection, call.id ?? '', config, call.name).invoke(invokeParams, runtime);
   }
 
   /** Only Graph's built-in subagent binding is allowed to call this seam. */

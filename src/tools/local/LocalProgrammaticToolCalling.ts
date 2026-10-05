@@ -267,6 +267,7 @@ async function createToolBridge(
   protection?: { policy?: ToolResultProtection; signal?: AbortSignal }
 ): Promise<ToolBridge> {
   let protectionFailure: ProviderTextProtectionError | undefined;
+  const inFlight = new Set<Promise<void>>();
   const token = randomBytes(32).toString('hex');
   const server = createServer((req, res) => {
     // `?mode=text` returns the already-serialized result as the body
@@ -301,7 +302,7 @@ async function createToolBridge(
       return;
     }
 
-    readRequestBody(req)
+    const work = readRequestBody(req)
       .then(async (body) => {
         if (typeof body.name !== 'string' || body.name === '') {
           const message = 'Tool request is missing a tool name.';
@@ -392,6 +393,10 @@ async function createToolBridge(
           });
         }
       });
+    if (protection?.policy != null) {
+      inFlight.add(work);
+      void work.then(() => { inFlight.delete(work); }, () => { inFlight.delete(work); });
+    }
   });
 
   await new Promise<void>((resolve, reject) => {
@@ -401,9 +406,9 @@ async function createToolBridge(
 
   const address = server.address() as AddressInfo;
   let closing: Promise<void> | undefined;
-  const close = (): Promise<void> => closing ??= new Promise((resolve, reject) => {
+  const close = (): Promise<void> => closing ??= new Promise<void>((resolve, reject) => {
     server.close((error) => (error ? reject(error) : resolve()));
-  });
+  }).then(async () => { await Promise.allSettled(inFlight); });
   return {
     url: `http://127.0.0.1:${address.port}/tool`,
     token,

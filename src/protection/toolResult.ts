@@ -590,9 +590,17 @@ export function withToolResultBoundary(
   tool: GenericTool,
   policy: ToolResultProtection | undefined,
   id: string,
-  config: RunnableConfig
+  config: RunnableConfig,
+  requestName = tool.name
 ): GenericTool {
-  if (!requiresToolResultProtection(policy, tool.name)) return tool;
+  if (policy != null) validateToolResultProtection(policy);
+  if (
+    !requiresToolResultProtection(policy, tool.name) &&
+    !requiresToolResultProtection(policy, requestName)
+  )
+    return tool;
+  if (requestName !== tool.name)
+    throw new ToolResultProtectionError('unsupported');
   if (
     [
       'subagent',

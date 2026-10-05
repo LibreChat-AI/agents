@@ -896,7 +896,7 @@ export async function executeTools(
 
     try {
       protection?.signal?.throwIfAborted();
-      const result = await withToolResultBoundary(tool, protection?.policy, call.id, { signal: protection?.signal }).invoke(normalizeToolInput(call.input, tool), {
+      const result = await withToolResultBoundary(tool, protection?.policy, call.id, { signal: protection?.signal }, call.name).invoke(normalizeToolInput(call.input, tool), {
         metadata: { [programmaticToolName]: true }, signal: protection?.signal,
       });
       if (requiresToolResultProtection(protection?.policy, call.name) && result instanceof ToolMessage) {
