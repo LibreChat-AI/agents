@@ -13,6 +13,7 @@ import {
   END,
   isInterrupted,
 } from '@langchain/langgraph';
+import type { Runnable } from '@langchain/core/runnables';
 import type { AddressInfo } from 'node:net';
 import type {
   ToolResultProtection,
@@ -25,6 +26,7 @@ import {
   executeTools,
 } from '@/tools/ProgrammaticToolCalling';
 import { createBashProgrammaticToolCallingTool } from '@/tools/BashProgrammaticToolCalling';
+import { TOOL_BATCH_REPLAY_KEY, getToolBatchReplayState } from '@/tools/toolBatchReplay';
 import { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import { ToolResultProtectionError } from '@/protection/toolResult';
 import { PreparedSubagentError } from '@/tools/preparedSubagents';
@@ -1399,4 +1401,192 @@ it('rejects selected accessor output before native callbacks can observe its exc
     node.invoke(state(), { callbacks: [observer(events)] })
   ).rejects.toMatchObject({ code: 'unavailable' });
   assertNoCanary(events.join(''));
+});
+
+it('retains full approved reference content while projecting only the model preview', async () => {
+  const raw = 'Allowed control '.repeat(150) + fixtures.canaries[0];
+  const canonical = raw.replace(fixtures.canaries[0], '[EMAIL_1]');
+  const inspected: string[] = [];
+  const piped: string[] = [];
+  const pipe = new DynamicStructuredTool({
+    name: 'pipe',
+    description: 'Allowed pipe control.',
+    schema: z.object({ command: z.string() }),
+    func: async ({ command }) => {
+      piped.push(command);
+      return 'Allowed piped control';
+    },
+  });
+  const node = new ToolNode({
+    tools: [direct(() => raw), pipe],
+    maxToolResultChars: 128,
+    toolOutputReferences: { enabled: true, maxOutputSize: 8192 },
+    toolResultProtection: policy({
+      inspect: ({ content }) => {
+        inspected.push(content);
+        return approve(content.replace(fixtures.canaries[0], '[EMAIL_1]'));
+      },
+    }),
+  });
+  const config = { configurable: { run_id: 'full-ref-control' } };
+  const result = (await node.invoke(state(), config)) as {
+    messages: ToolMessage[];
+  };
+  expect((result.messages[0].content as string).length).toBeLessThan(
+    canonical.length
+  );
+  expect(
+    node._unsafeGetToolOutputRegistry()!.get('full-ref-control', 'tool0turn0')
+  ).toBe(canonical);
+  expect(inspected).toEqual([raw]);
+  await node.invoke(
+    {
+      messages: [
+        new AIMessage({
+          content: '',
+          tool_calls: [
+            {
+              id: 'pipe-control',
+              name: 'pipe',
+              args: {
+                command:
+                  '{{' + 'tool0turn0' + '}}',
+              },
+            },
+          ],
+        }),
+      ],
+    },
+    config
+  );
+  expect(piped).toEqual([canonical]);
+  assertNoCanary(result);
+});
+
+it('re-inspects checkpoint-owned references after mixed approval replay without repeating side effects', async () => {
+  let lookups = 0;
+  let approvals = 0;
+  const inspected: string[] = [];
+  const raw = 'Allowed replay control '.repeat(80) + fixtures.canaries[0];
+  const canonical = raw.replace(fixtures.canaries[0], '[EMAIL_1]');
+  const lookup = direct(() => {
+    lookups++;
+    return raw;
+  });
+  const approval = new DynamicStructuredTool({
+    name: 'approval_control',
+    description: 'Allowed approval.',
+    schema: z.object({ count: z.number() }),
+    func: async () => {
+      approvals++;
+      return 'Approved control';
+    },
+  });
+  const hooks = new HookRegistry();
+  hooks.register('PreToolUse', {
+    hooks: [
+      async (input) => ({
+        decision: input.toolName === 'approval_control' ? 'ask' : 'allow',
+        reason: 'Allowed approval control',
+      }),
+    ],
+  });
+  const gate = policy({
+    inspect: ({ content }) => {
+      inspected.push(content);
+      return approve(content.replace(fixtures.canaries[0], '[EMAIL_1]'));
+    },
+  });
+  const saver = new MemorySaver();
+  const create = (): {
+    node: ToolNode;
+    graph: Pick<Runnable<unknown, unknown>, 'invoke'>;
+  } => {
+    const node = new ToolNode({
+      trace: true,
+      tools: [lookup, approval],
+      hookRegistry: hooks,
+      humanInTheLoop: { enabled: true },
+      maxToolResultChars: 128,
+      toolOutputReferences: { enabled: true, maxOutputSize: 8192 },
+      toolResultProtection: gate,
+    });
+    const graph = new StateGraph(MessagesAnnotation)
+      .addNode('tools', node)
+      .addEdge(START, 'tools')
+      .addEdge('tools', END)
+      .compile({ checkpointer: saver });
+    return { node, graph };
+  };
+  const config = {
+    configurable: { thread_id: 'mixed-ref-replay', run_id: 'mixed-ref-replay' },
+  };
+  const initial = create();
+  const paused = await initial.graph.invoke(
+    {
+      messages: [
+        new AIMessage({
+          id: 'mixed-batch',
+          content: '',
+          tool_calls: [
+            { id: 'lookup-control', name: 'lookup', args: { count: 42 } },
+            {
+              id: 'approval-control',
+              name: 'approval_control',
+              args: { count: 42 },
+            },
+          ],
+        }),
+      ],
+    },
+    config
+  );
+  expect(isInterrupted(paused)).toBe(true);
+  expect(lookups).toBe(1);
+  expect(approvals).toBe(0);
+  if (!isInterrupted(paused)) throw new Error('Expected checkpointed approval');
+  const replay = getToolBatchReplayState(paused.__interrupt__[0].value);
+  expect(replay).toBeDefined();
+  const resumedRuntime = create();
+  const resumed = await resumedRuntime.graph.invoke(
+    new Command({ resume: [{ type: 'approve' }] }),
+    { configurable: { ...config.configurable, [TOOL_BATCH_REPLAY_KEY]: replay } }
+  );
+  expect(lookups).toBe(1);
+  expect(approvals).toBe(1);
+  expect(inspected).toEqual([raw, canonical]);
+  expect(
+    resumedRuntime.node
+      ._unsafeGetToolOutputRegistry()!
+      .get('mixed-ref-replay', 'tool0turn0')
+  ).toBe(canonical);
+  assertNoCanary(resumed);
+});
+
+it('protects text-only content_and_artifact exceptions through the native error lifecycle', async () => {
+  const events: string[] = [];
+  const inspected: string[] = [];
+  const lookup = direct(() => {
+    throw new Error(fixtures.canaries[0]);
+  });
+  lookup.responseFormat = 'content_and_artifact';
+  const node = new ToolNode({
+    trace: true,
+    tools: [lookup],
+    toolResultProtection: policy({
+      inspect: ({ content, target }) => {
+        inspected.push(content);
+        expect(target.outcome).toBe('error');
+        return approve('[EMAIL_1]');
+      },
+    }),
+  });
+  const result = (await node.invoke(state(), {
+    callbacks: [observer(events)],
+  })) as { messages: ToolMessage[] };
+  expect(result.messages[0].status).toBe('error');
+  expect(inspected).toEqual([fixtures.canaries[0]]);
+  assertNoCanary(result);
+  assertNoCanary(events.join(''));
+  expect(events.join('')).toContain('[EMAIL_1]');
 });

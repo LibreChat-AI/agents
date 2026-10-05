@@ -53,6 +53,7 @@ import type { SettledToolBatchResult } from '@/tools/toolBatchReplay';
 import type { PreparedSubagents } from '@/tools/preparedSubagents';
 import type { RunBreakerScope } from '@/llm/streamLimits';
 import type * as t from '@/types';
+import { hasReleasedToolReference, isReleasedToolError, markReleasedToolMessage, protectToolText, protectToolMessage, protectToolExecuteResult, withToolResultBoundary, requiresToolResultProtection, validateToolResultProtection, ToolResultProtectionError } from '@/protection/toolResult';
 import {
   TOOL_BATCH_REPLAY_KEY,
   getToolBatchReplayOwner,
@@ -64,7 +65,6 @@ import {
   isChildToolReplayOwner,
   getToolReplayResumeStatus,
 } from '@/tools/toolBatchReplay';
-import { isReleasedToolError, markReleasedToolMessage, protectToolText, protectToolMessage, protectToolExecuteResult, withToolResultBoundary, requiresToolResultProtection, validateToolResultProtection, ToolResultProtectionError } from '@/protection/toolResult';
 import {
   type CallerCapabilityProjection,
   createCallerCapabilityProjectionSnapshot,
@@ -2056,6 +2056,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         if (compacted.changed) {
           toolMsg.content = compacted.content;
         }
+        let releasedReference: string | undefined;
         const isError = toolMsg.status === 'error';
         if (isError) {
           /**
@@ -2071,7 +2072,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               _unresolvedRefs: unresolvedRefs,
             };
           }
-          return toolMsg;
+          return markReleasedToolMessage(this.toolResultProtection, call.name, call.id ?? '', toolMsg);
         }
         if (this.toolOutputRegistry != null || unresolvedRefs.length > 0) {
           if (typeof originalContent === 'string') {
@@ -2083,6 +2084,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               refKey,
               unresolvedRefs
             );
+            if (refKey != null) releasedReference = this.toolOutputRegistry?.get(runId, refKey);
             if (refMeta != null) {
               toolMsg.additional_kwargs = {
                 ...toolMsg.additional_kwargs,
@@ -2118,7 +2120,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             }
           }
         }
-        return toolMsg;
+        return markReleasedToolMessage(this.toolResultProtection, call.name, call.id ?? '', toolMsg, releasedReference);
       }
       const serialized = serializeToolOutputWithinLimits(
         output,
@@ -2340,10 +2342,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       replayConfig
     );
     if (settledOutput != null) {
-      settledOutput.output = await protectToolMessage(this.toolResultProtection, call.name, call.id ?? '', settledOutput.output, config.signal);
       if (requiresToolResultProtection(this.toolResultProtection, call.name)) {
         if (settledOutput.additionalContexts.length > 0) throw new ToolResultProtectionError('unsupported');
-        settledOutput.referenceContent = settledOutput.output.content as string;
+        const released = await this.protectSettledToolResult(call, settledOutput.output, settledOutput.referenceContent, config);
+        settledOutput.output = released.output;
+        settledOutput.referenceContent = released.referenceContent;
       }
       if (
         batchContext.additionalContextsSink != null &&
@@ -3065,7 +3068,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           );
         }
         return persistOutput(
-          markReleasedToolMessage(this.toolResultProtection, call.name, call.id ?? '', cloneToolMessageWithContent(output, replaced.content))
+          markReleasedToolMessage(this.toolResultProtection, call.name, call.id ?? '', cloneToolMessageWithContent(output, replaced.content), refKey == null ? undefined : this.toolOutputRegistry?.get(refScope, refKey))
         );
       }
     }
@@ -5154,6 +5157,23 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     );
   }
 
+  private async protectSettledToolResult(call: ToolCall, output: ToolMessage, referenceContent: string | undefined, config: RunnableConfig): Promise<{ output: ToolMessage; referenceContent?: string }> {
+    const policy = this.toolResultProtection;
+    if (!requiresToolResultProtection(policy, call.name)) return { output, referenceContent };
+    const id = call.id ?? '';
+    if (referenceContent != null && output.status !== 'success') throw new ToolResultProtectionError('unsupported');
+    if (hasReleasedToolReference(policy, call.name, id, output, referenceContent)) {
+      config.signal?.throwIfAborted();
+      return { output, referenceContent };
+    }
+    // Only checkpoint-owner/identity-validated replay enters this path.
+    const candidate = referenceContent == null ? output : new ToolMessage({ ...output, content: referenceContent });
+    const canonical = await protectToolMessage(policy, call.name, id, candidate, config.signal, true);
+    const fullReference = referenceContent == null ? undefined : canonical.content as string;
+    const preview = referenceContent == null ? canonical : cloneToolMessageWithContent(canonical, compactToolContent(canonical.content, this.maxToolResultChars).content);
+    return { output: markReleasedToolMessage(policy, call.name, id, preview, fullReference), referenceContent: fullReference };
+  }
+
   /**
    * Execute a group of direct (in-process) tool calls with interrupt-safe
    * ordering, returning outputs aligned 1:1 with `directCalls`.
@@ -5224,8 +5244,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     ): Promise<SettledDirectToolResult> => {
       if (requiresToolResultProtection(this.toolResultProtection, call.name)) {
         if (!(result.output instanceof ToolMessage) || result.additionalContexts.length > 0) throw new ToolResultProtectionError('unsupported');
-        result.output = await protectToolMessage(this.toolResultProtection, call.name, call.id ?? '', result.output, config.signal);
-        result.referenceContent = result.output.content as string;
+        const released = await this.protectSettledToolResult(call, result.output, result.referenceContent, config);
+        result.output = released.output;
+        result.referenceContent = released.referenceContent;
       }
       baseContext.additionalContextsSink?.push(...result.additionalContexts);
       const turn = result.turn;
@@ -5244,13 +5265,13 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         if (isBaseMessage(result.output)) {
           result = {
             ...result,
-            output: new ToolMessage({
+            output: markReleasedToolMessage(this.toolResultProtection, call.name, call.id ?? '', new ToolMessage({
               ...(result.output as ToolMessage),
               additional_kwargs: {
                 ...result.output.additional_kwargs,
                 _refScope: baseContext.batchScopeId,
               },
-            }),
+            }), result.referenceContent),
           };
         }
       }

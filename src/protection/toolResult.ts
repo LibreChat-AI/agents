@@ -65,6 +65,7 @@ const approved = new WeakMap<
     id: string;
     text: string;
     status: string;
+    referenceContent?: string;
   }
 >();
 const errors = new Set<ProviderTextProtectionErrorCode>([
@@ -250,7 +251,8 @@ export function markReleasedToolMessage(
   policy: ToolResultProtection | undefined,
   name: string,
   id: string,
-  message: ToolMessage
+  message: ToolMessage,
+  referenceContent?: string
 ): ToolMessage {
   if (
     requiresToolResultProtection(policy, name) &&
@@ -262,9 +264,49 @@ export function markReleasedToolMessage(
       id,
       text: message.content,
       status: message.status ?? 'success',
+      referenceContent:
+        referenceContent ?? approved.get(message)?.referenceContent,
     });
   }
   return message;
+}
+
+export function hasReleasedToolReference(
+  policy: ToolResultProtection,
+  name: string,
+  id: string,
+  message: ToolMessage,
+  referenceContent: string | undefined
+): boolean {
+  const entry = approved.get(message);
+  return (
+    entry != null &&
+    entry.policy === policy &&
+    entry.name === name &&
+    entry.id === id &&
+    entry.text === message.content &&
+    entry.status === message.status &&
+    entry.referenceContent === referenceContent
+  );
+}
+
+function validateReplayReferenceMetadata(message: ToolMessage): void {
+  const metadata = message.additional_kwargs;
+  const key = metadata._refKey;
+  const scope = metadata._refScope;
+  const unresolved = metadata._unresolvedRefs;
+  if (
+    (key != null &&
+      (typeof key !== 'string' || !/^tool\d+turn\d+$/.test(key))) ||
+    (scope != null && typeof scope !== 'string') ||
+    (unresolved != null &&
+      (!Array.isArray(unresolved) ||
+        unresolved.length > 128 ||
+        unresolved.some(
+          (ref) => typeof ref !== 'string' || !/^tool\d+turn\d+$/.test(ref)
+        )))
+  )
+    throw new ToolResultProtectionError('unsupported');
 }
 
 export async function protectToolMessage(
@@ -272,7 +314,8 @@ export async function protectToolMessage(
   name: string,
   id: string,
   message: ToolMessage,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  ownedReplayMetadata = false
 ): Promise<ToolMessage> {
   if (!requiresToolResultProtection(policy, name)) return message;
   if (types.isProxy(message))
@@ -305,8 +348,10 @@ export async function protectToolMessage(
     '_refScope',
     '_unresolvedRefs',
   ]);
+  if (ownedReplayMetadata) validateReplayReferenceMetadata(message);
   if (
     approved.get(message) == null &&
+    !ownedReplayMetadata &&
     (Object.keys(message.additional_kwargs).length > 0 ||
       (message.id != null && message.id !== id))
   )
@@ -513,7 +558,10 @@ export function withToolResultBoundary(
             raw,
             attempt.signal
           );
-        if (tool.responseFormat === 'content_and_artifact') {
+        if (
+          status === 'success' &&
+          tool.responseFormat === 'content_and_artifact'
+        ) {
           if (!Array.isArray(raw) || raw.length !== 2 || raw[1] != null)
             throw new ToolResultProtectionError('unsupported');
           raw = raw[0];
