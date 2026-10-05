@@ -64,6 +64,7 @@ import {
   isChildToolReplayOwner,
   getToolReplayResumeStatus,
 } from '@/tools/toolBatchReplay';
+import { isReleasedToolError, markReleasedToolMessage, protectToolText, protectToolMessage, protectToolExecuteResult, withToolResultBoundary, requiresToolResultProtection, validateToolResultProtection, ToolResultProtectionError } from '@/protection/toolResult';
 import {
   type CallerCapabilityProjection,
   createCallerCapabilityProjectionSnapshot,
@@ -72,7 +73,6 @@ import {
   mergeCallerCapabilityDefinitions,
   resolveCallerCapabilityProjection,
 } from '@/tools/CallerCapabilities';
-import { markReleasedToolMessage, protectToolText, protectToolMessage, protectToolExecuteResult, withToolResultBoundary, requiresToolResultProtection, validateToolResultProtection, ToolResultProtectionError } from '@/protection/toolResult';
 import {
   cloneToolMessageWithContent,
   compactToolContent,
@@ -2145,7 +2145,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     } catch (_e: unknown) {
       let e = _e as Error;
       if (!this.handleToolErrors) {
-        if (requiresToolResultProtection(this.toolResultProtection, call.name) && !(e instanceof ProviderTextProtectionError) &&
+        if (requiresToolResultProtection(this.toolResultProtection, call.name) && !isReleasedToolError(this.toolResultProtection, call.name, call.id ?? '', e) && !(e instanceof ProviderTextProtectionError) &&
             !(e instanceof StreamLimitExceededError) && !(e instanceof PreparedSubagentError) && !isGraphInterrupt(e)) {
           // eslint-disable-next-line preserve-caught-error -- Raw causes must not escape protection.
           throw new Error(await protectToolText(this.toolResultProtection, call.name, call.id ?? '', e.message, 'error', config.signal) as string);
@@ -2167,7 +2167,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       ) {
         throw e;
       }
-      if (requiresToolResultProtection(this.toolResultProtection, call.name)) {
+      if (requiresToolResultProtection(this.toolResultProtection, call.name) && !isReleasedToolError(this.toolResultProtection, call.name, call.id ?? '', e)) {
         const safeError = await protectToolText(this.toolResultProtection, call.name, call.id ?? '', e.message, 'error', config.signal);
         e = new Error(safeError as string);
       }
@@ -2250,7 +2250,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             unresolvedRefs
           )
           : undefined;
-      return new ToolMessage({
+      return markReleasedToolMessage(this.toolResultProtection, call.name, call.id ?? '', new ToolMessage({
         status: 'error',
         content: errorContent,
         name: call.name,
@@ -2258,7 +2258,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         ...(refMeta != null && {
           additional_kwargs: refMeta as Record<string, unknown>,
         }),
-      });
+      }));
     }
   }
 

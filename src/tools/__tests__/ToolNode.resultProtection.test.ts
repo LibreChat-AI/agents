@@ -1345,3 +1345,58 @@ it('rejects an opaque producer message-id alias rather than rewriting control id
   ).rejects.toMatchObject({ code: 'unsupported' });
   assertNoCanary(events.join(''));
 });
+
+it('preserves native error callbacks and canonical error-handler ownership', async () => {
+  let ends = 0;
+  const errors: string[] = [];
+  const handled: string[] = [];
+  const callback = BaseCallbackHandler.fromMethods({
+    handleToolEnd: (): void => {
+      ends++;
+    },
+    handleToolError: (error: Error): void => {
+      errors.push(error.message);
+    },
+  });
+  callback.awaitHandlers = true;
+  const node = new ToolNode({
+    trace: true,
+    tools: [
+      direct(() => {
+        throw new Error(fixtures.canaries[0]);
+      }),
+    ],
+    toolResultProtection: policy(),
+    errorHandler: async (data) => {
+      handled.push(data.error!.message);
+      return false;
+    },
+  });
+  const result = await node.invoke(state(), { callbacks: [callback] });
+  expect(ends).toBe(0);
+  expect(errors).toEqual(['[EMAIL_1]']);
+  expect(handled).toEqual(['[EMAIL_1]']);
+  assertNoCanary(result);
+});
+
+it('rejects selected accessor output before native callbacks can observe its exception', async () => {
+  const events: string[] = [];
+  const message = new ToolMessage({
+    tool_call_id: 'call-control',
+    content: 'Allowed control',
+  });
+  Object.defineProperty(message, 'content', {
+    get: () => {
+      throw new Error(fixtures.canaries[0]);
+    },
+  });
+  const node = new ToolNode({
+    trace: true,
+    tools: [direct(() => message)],
+    toolResultProtection: policy(),
+  });
+  await expect(
+    node.invoke(state(), { callbacks: [observer(events)] })
+  ).rejects.toMatchObject({ code: 'unavailable' });
+  assertNoCanary(events.join(''));
+});

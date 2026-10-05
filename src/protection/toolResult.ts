@@ -228,6 +228,23 @@ export async function protectToolText(
   }
 }
 
+export function isReleasedToolError(
+  policy: ToolResultProtection | undefined,
+  name: string,
+  id: string,
+  error: Error
+): boolean {
+  const entry = approved.get(error);
+  return (
+    entry != null &&
+    entry.policy === policy &&
+    entry.name === name &&
+    entry.id === id &&
+    entry.status === 'error' &&
+    entry.text === error.message
+  );
+}
+
 /** Internal provenance only after an awaited release; never exposed from the root SDK entry. */
 export function markReleasedToolMessage(
   policy: ToolResultProtection | undefined,
@@ -258,6 +275,22 @@ export async function protectToolMessage(
   signal?: AbortSignal
 ): Promise<ToolMessage> {
   if (!requiresToolResultProtection(policy, name)) return message;
+  if (types.isProxy(message))
+    throw new ToolResultProtectionError('unsupported');
+  for (const key of [
+    'content',
+    'artifact',
+    'name',
+    'id',
+    'tool_call_id',
+    'status',
+    'additional_kwargs',
+    'response_metadata',
+  ]) {
+    const descriptor = Object.getOwnPropertyDescriptor(message, key);
+    if (descriptor != null && !('value' in descriptor))
+      throw new ToolResultProtectionError('unsupported');
+  }
   const status: string | undefined = message.status;
   if (
     types.isProxy(message) ||
@@ -493,6 +526,17 @@ export function withToolResultBoundary(
           status,
           attempt
         );
+        if (status === 'error') {
+          const error = new Error(content);
+          approved.set(error, {
+            policy,
+            name: tool.name,
+            id,
+            text: content,
+            status,
+          });
+          throw error;
+        }
         const message = new ToolMessage({
           name: tool.name,
           tool_call_id: id,
@@ -507,6 +551,18 @@ export function withToolResultBoundary(
           status,
         });
         return message;
+      } catch (error) {
+        attempt.check();
+        if (
+          error instanceof ProviderTextProtectionError ||
+          error instanceof PreparedSubagentError ||
+          error instanceof StreamLimitExceededError ||
+          error instanceof GraphInterrupt ||
+          (error instanceof Error &&
+            isReleasedToolError(policy, tool.name, id, error))
+        )
+          throw error;
+        throw new ToolResultProtectionError('unavailable');
       } finally {
         attempt.finish();
       }
