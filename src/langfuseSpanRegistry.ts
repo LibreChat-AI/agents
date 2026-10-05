@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
-import { context, trace } from '@opentelemetry/api';
+import { context, trace, createContextKey } from '@opentelemetry/api';
+import type { Span, SpanContext, Context } from '@opentelemetry/api';
 import type { LangfuseSpanProcessorParams } from '@langfuse/otel';
-import type { Span, SpanContext } from '@opentelemetry/api';
 import type * as t from '@/types';
 import {
   hasLangfuseConfigCredentials,
@@ -30,6 +30,22 @@ import { isPresent } from '@/utils/misc';
  * group runs under their own Langfuse observations.
  */
 const managedSpanDestinations = new WeakMap<Span, string>();
+const SPAN_CAPTURE = createContextKey('librechat.langfuse.span-capture');
+
+/** Capture the observation created by one callback without relying on its later ambient context. */
+export function withLangfuseSpanCapture<T>(
+  capture: (span: Span) => void,
+  action: () => T
+): T {
+  return context.with(context.active().setValue(SPAN_CAPTURE, capture), action);
+}
+
+export function captureLangfuseSpan(span: Span, parentContext: Context): void {
+  const capture = parentContext.getValue(SPAN_CAPTURE) as
+    | ((span: Span) => void)
+    | undefined;
+  capture?.(span);
+}
 
 type AnchoredSpan = {
   destinationKey: string;

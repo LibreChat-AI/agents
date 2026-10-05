@@ -3924,6 +3924,7 @@ function createUsageCaptureHandler(args: {
           try {
             await sink({
               usage,
+              modelRunId: runId,
               model,
               provider: callProvider,
               subagentType,
