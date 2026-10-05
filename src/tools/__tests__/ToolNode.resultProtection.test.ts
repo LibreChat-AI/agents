@@ -26,6 +26,7 @@ import type {
   ToolResultProtection,
   ToolResultProtectionResult,
 } from '@/protection/toolResult';
+import type { ToolOutputReferenceState } from '@/tools/toolOutputReferences';
 import {
   createCloudflareProgrammaticToolCallingTool,
   createCloudflareBashProgrammaticToolCallingTool,
@@ -2154,4 +2155,83 @@ echo "Allowed outer control"`;
     if (reasonKind === 'prepared' || reasonKind === 'stream') expect(error).toBe(reason);
     else { const code = reasonKind === 'typed' ? 'blocked' : 'cancelled'; expect(error).toMatchObject({ code }); expect(responses[0]).toContain(code); } assertNoCanary(String(error)); expect(executions).toBe(0); expect(inspections).toBe(0);
   } finally { audit.closeAllConnections(); await new Promise<void>((resolve) => audit.close(() => resolve())); }
+});
+
+it.each(['map', 'some', 'iterator', 'subclass', 'proxy', 'iterable', 'index', 'sparse', 'symbol'] as const)('rejects checkpoint-controlled reference collection %s before execution', async (kind) => {
+  let calls = 0; let inspections = 0; let executions = 0;
+  const entries: ToolOutputReferenceState['entries'] = [{ key: 'tool0turn0', value: fixtures.canaries[0], protection: { version: 1, toolName: 'lookup', toolCallId: 'source-control', protected: true } }];
+  let hostile = entries;
+  if (kind === 'map') Object.defineProperty(hostile, 'map', { value: () => { calls++; return entries; } });
+  if (kind === 'some') Object.defineProperty(hostile, 'some', { value: () => { calls++; return false; } });
+  if (kind === 'iterator') Object.defineProperty(hostile, Symbol.iterator, { value: function* () { calls++; yield entries[0]; } });
+  if (kind === 'subclass') { class ReferenceArray extends Array<ToolOutputReferenceState['entries'][number]> {} hostile = new ReferenceArray(entries[0]); }
+  if (kind === 'proxy') hostile = new Proxy(entries, { get: (target, key, receiver): unknown => { calls++; return Reflect.get(target, key, receiver); } });
+  if (kind === 'iterable') hostile = { [Symbol.iterator]: function* () { calls++; yield entries[0]; }, some: () => { calls++; return false; } } as unknown as typeof entries;
+  if (kind === 'index') Object.defineProperty(hostile, '0', { get: () => { calls++; return entries[0]; } });
+  if (kind === 'sparse') hostile = new Array<ToolOutputReferenceState['entries'][number]>(1);
+  if (kind === 'symbol') Object.defineProperty(hostile, Symbol('raw-alias'), { value: fixtures.canaries[0], enumerable: true });
+  const snapshot: ToolOutputReferenceState = { entries: hostile, turnCounter: 1, warnedNonStringTools: [] };
+  class CheckpointRegistry extends ToolOutputReferenceRegistry {
+    snapshotState(): ToolOutputReferenceState { return snapshot; }
+  }
+  const registry = new CheckpointRegistry();
+  const pipe = new DynamicStructuredTool({ name: 'pipe', description: 'Allowed consumer.', schema: z.object({ command: z.string() }), func: async ({ command }) => { executions++; return command; } });
+  const events: string[] = [];
+  const node = new ToolNode({ trace: true, tools: [pipe], toolOutputRegistry: registry, toolResultProtection: policy({ inspect: ({ content }) => { inspections++; return approve(content.replace(fixtures.canaries[0], '[EMAIL_1]')); } }) });
+  const error = await node.invoke({ messages: [new AIMessage({ content: '', tool_calls: [{ id: 'pipe-control', name: 'pipe', args: { command: '{{' + 'tool0turn0' + '}}' } }] })] }, { configurable: { run_id: `hostile-reference-${kind}` }, callbacks: [observer(events)] }).catch((value: Error) => value);
+  expect(error).toMatchObject({ code: 'unsupported' }); expect(calls).toBe(0); expect(executions).toBe(0); expect(inspections).toBe(0); assertNoCanary(String(error)); assertNoCanary(events.join('')); expect(registry.size).toBe(0);
+});
+
+it.each((['additional', 'response'] as const).flatMap((field) => [true, false].map((enumerable) => [field, enumerable] as const)))('rejects %s symbol metadata before native callbacks (enumerable=%s)', async (field, enumerable) => {
+  const alias = Symbol('producer-alias'); const events: string[] = []; let inspections = 0; let released = 0;
+  const message = new ToolMessage({ tool_call_id: 'call-control', content: 'Allowed content control' });
+  Object.defineProperty(field === 'additional' ? message.additional_kwargs : message.response_metadata, alias, { value: fixtures.canaries[0], enumerable });
+  const callback = observer(events);
+  callback.handleToolEnd = (output): void => {
+    released++;
+    if (!(output instanceof ToolMessage)) return;
+    for (const metadata of [output.additional_kwargs, output.response_metadata]) {
+      for (const key of Reflect.ownKeys(metadata)) events.push(String(Reflect.get(metadata, key)));
+    }
+  };
+  const node = new ToolNode({ trace: true, tools: [direct(() => message)], toolResultProtection: policy({ inspect: () => { inspections++; return approve('Allowed canonical control'); } }), toolOutputReferences: { enabled: true } });
+  await expect(node.invoke(state(), { callbacks: [callback] })).rejects.toMatchObject({ code: 'unsupported' });
+  expect(inspections).toBe(0); expect(released).toBe(0); assertNoCanary(events.join('')); expect(node._unsafeGetToolOutputRegistry()!.size).toBe(0);
+});
+
+it('keeps admitted reference identity and metadata detached while current-policy inspection awaits', async () => {
+  const started = deferred<void>(); const decision = deferred<ToolResultProtectionResult>(); const piped: string[] = []; const inspected: string[] = [];
+  const snapshot: ToolOutputReferenceState = { entries: [{ key: 'tool0turn0', value: fixtures.canaries[0], protection: { version: 1, toolName: 'lookup', toolCallId: 'source-control', protected: true } }], turnCounter: 1, warnedNonStringTools: [] };
+  class CheckpointRegistry extends ToolOutputReferenceRegistry { snapshotState(): ToolOutputReferenceState { return snapshot; } }
+  const registry = new CheckpointRegistry();
+  const pipe = new DynamicStructuredTool({ name: 'pipe', description: 'Allowed consumer.', schema: z.object({ command: z.string() }), func: async ({ command }) => { piped.push(command); return command; } });
+  const node = new ToolNode({ tools: [pipe], toolOutputRegistry: registry, toolResultProtection: policy({ inspect: ({ content, toolName, toolCallId }) => { inspected.push(content); expect(toolName).toBe('lookup'); expect(toolCallId).toBe('source-control'); started.resolve(); return decision.promise; } }) });
+  const outcome = node.invoke({ messages: [new AIMessage({ content: '', tool_calls: [{ id: 'pipe-control', name: 'pipe', args: { command: '{{' + 'tool0turn0' + '}}' } }] })] }, { configurable: { run_id: 'detached-reference' } });
+  await started.promise;
+  snapshot.entries[0].value = 'Unchecked producer replacement'; snapshot.entries[0].key = 'tool0turn99'; snapshot.entries[0].protection!.toolName = 'unselected_alias'; snapshot.warnedNonStringTools.push(fixtures.canaries[0]);
+  decision.resolve(approve('[EMAIL_1]'));
+  const result = await outcome; expect(inspected).toEqual([fixtures.canaries[0]]); expect(piped).toEqual(['[EMAIL_1]']); expect(registry.get('detached-reference', 'tool0turn0')).toBe('[EMAIL_1]'); expect(registry.get('detached-reference', 'tool0turn99')).toBeUndefined(); assertNoCanary(result);
+});
+
+it.each(['state', 'entry', 'source'] as const)('rejects a hidden checkpoint %s symbol before reference reuse', async (field) => {
+  let inspections = 0; let executions = 0;
+  const snapshot: ToolOutputReferenceState = { entries: [{ key: 'tool0turn0', value: 'Allowed control', protection: { version: 1, toolName: 'lookup', toolCallId: 'source-control', protected: true } }], turnCounter: 1, warnedNonStringTools: [] };
+  let metadata: object = snapshot;
+  if (field === 'entry') metadata = snapshot.entries[0];
+  if (field === 'source') metadata = snapshot.entries[0].protection!;
+  Object.defineProperty(metadata, Symbol('raw-alias'), { value: fixtures.canaries[0] });
+  class CheckpointRegistry extends ToolOutputReferenceRegistry { snapshotState(): ToolOutputReferenceState { return snapshot; } }
+  const node = new ToolNode({ tools: [direct(() => { executions++; return 'Must not run'; })], toolOutputRegistry: new CheckpointRegistry(), toolResultProtection: policy({ inspect: () => { inspections++; return approve('Allowed canonical control'); } }) });
+  await expect(node.invoke(state(), { configurable: { run_id: `hidden-checkpoint-${field}` } })).rejects.toMatchObject({ code: 'unsupported' }); expect(inspections).toBe(0); expect(executions).toBe(0);
+});
+
+it.each([false, true])('rejects selected host symbol aliases before completion (eager=%s)', async (eager) => {
+  const completions: string[] = []; let inspections = 0;
+  const run = await Run.create({ runId: `symbol-host-${eager}`, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, instructions: 'Allowed control.', toolDefinitions: [{ name: 'lookup', parameters: { type: 'object', properties: { count: { type: 'number' } } } }] }, toolResultProtection: policy({ inspect: () => { inspections++; return approve('Allowed canonical control'); } }), eagerEventToolExecution: { enabled: eager }, customHandlers: {
+    [GraphEvents.CHAT_MODEL_STREAM]: new ChatModelStreamHandler(),
+    [GraphEvents.ON_TOOL_EXECUTE]: { handle: (_event, data): void => { const request = data as ToolExecuteBatchRequest; const result: ToolExecuteResult = { toolCallId: 'call-control', status: 'success', content: 'Allowed control' }; Object.defineProperty(result, Symbol('raw-alias'), { value: fixtures.canaries[0], enumerable: true }); request.resolve([result]); } },
+    [GraphEvents.ON_RUN_STEP_COMPLETED]: { handle: (_event, data): void => { completions.push(JSON.stringify(data)); } },
+  }, skipCleanup: true });
+  run.Graph!.overrideModel = new FakeChatModel({ responses: ['', 'Must not continue'], toolCalls: [{ id: 'call-control', name: 'lookup', args: { count: 42 }, type: 'tool_call' }] });
+  await expect(run.processStream({ messages: [new HumanMessage('Allowed control')] }, { version: 'v2', configurable: { thread_id: `symbol-host-${eager}` } })).rejects.toMatchObject({ code: 'unsupported' }); expect(inspections).toBe(0); expect(completions).toEqual([]); assertNoCanary(run.Graph!.getRunMessages());
 });

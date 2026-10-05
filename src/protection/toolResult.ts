@@ -167,10 +167,59 @@ function plainObject(
   if (!checkpointData && prototype !== Object.prototype && prototype !== null)
     throw new ToolResultProtectionError('unsupported');
   const descriptors = Object.getOwnPropertyDescriptors(value);
-  for (const [key, descriptor] of Object.entries(descriptors)) {
-    if (!allowed.includes(key) || !('value' in descriptor))
+  for (const key of Reflect.ownKeys(descriptors)) {
+    if (
+      typeof key !== 'string' ||
+      !allowed.includes(key) ||
+      !('value' in descriptors[key])
+    )
       throw new ToolResultProtectionError('unsupported');
   }
+}
+
+/** Copy indexed data only; checkpoint arrays may originate in the serializer's realm. */
+function snapshotDataArray<T>(
+  value: readonly T[],
+  maxEntries: number,
+  checkpointData = false
+): T[] {
+  if (!Array.isArray(value) || types.isProxy(value))
+    throw new ToolResultProtectionError('unsupported');
+  const prototype = Object.getPrototypeOf(value);
+  const parent = prototype != null && !types.isProxy(prototype) ? Object.getPrototypeOf(prototype) : undefined;
+  if (
+    prototype !== Array.prototype &&
+    (!checkpointData ||
+      prototype == null ||
+      types.isProxy(prototype) ||
+      !Array.isArray(prototype) ||
+      parent == null || types.isProxy(parent) || Object.getPrototypeOf(parent) !== null)
+  )
+    throw new ToolResultProtectionError('unsupported');
+  const length: number = Object.getOwnPropertyDescriptor(
+    value,
+    'length'
+  )?.value;
+  if (!Number.isSafeInteger(length) || length < 0 || length > maxEntries)
+    throw new ToolResultProtectionError('unsupported');
+  const keys = Reflect.ownKeys(value);
+  if (keys.length !== length + 1)
+    throw new ToolResultProtectionError('unsupported');
+  const result: T[] = [];
+  for (const key of keys) {
+    if (key === 'length') continue;
+    if (
+      typeof key !== 'string' ||
+      !/^(0|[1-9]\d*)$/.test(key) ||
+      Number(key) >= length
+    )
+      throw new ToolResultProtectionError('unsupported');
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor == null || !('value' in descriptor))
+      throw new ToolResultProtectionError('unsupported');
+    result[Number(key)] = descriptor.value as T;
+  }
+  return result;
 }
 
 function decision(result: ToolResultProtectionResult | undefined): string {
@@ -324,12 +373,16 @@ export function hasReleasedToolReference(
     entry.status === message.status &&
     entry.referenceContent === referenceContent &&
     entry.envelope != null &&
-    matchesToolMessageEnvelope(snapshotToolMessageEnvelope(message), entry.envelope)
+    matchesToolMessageEnvelope(
+      snapshotToolMessageEnvelope(message),
+      entry.envelope
+    )
   );
 }
 
-function validateReplayReferenceMetadata(message: ToolMessage): void {
-  const metadata = message.additional_kwargs;
+function validateReplayReferenceMetadata(
+  metadata: ToolMessage['additional_kwargs']
+): void {
   const key = metadata._refKey;
   const scope = metadata._refScope;
   const unresolved = metadata._unresolvedRefs;
@@ -364,20 +417,19 @@ function snapshotToolMessageEnvelope(
   ]);
   plainObject(message.response_metadata, []);
   const unresolved = message.additional_kwargs._unresolvedRefs;
-  if (Array.isArray(unresolved)) {
-    if (types.isProxy(unresolved))
-      throw new ToolResultProtectionError('unsupported');
-    for (let index = 0; index < unresolved.length; index++) {
-      if (
-        !Object.hasOwn(
-          Object.getOwnPropertyDescriptor(unresolved, String(index)) ?? {},
-          'value'
-        )
-      )
-        throw new ToolResultProtectionError('unsupported');
-    }
-  }
-  validateReplayReferenceMetadata(message);
+  const additional_kwargs = {
+    ...message.additional_kwargs,
+    ...(unresolved != null
+      ? {
+        _unresolvedRefs: snapshotDataArray(
+            unresolved as readonly string[],
+            128,
+            true
+        ),
+      }
+      : {}),
+  };
+  validateReplayReferenceMetadata(additional_kwargs);
   return {
     content: message.content,
     artifact: message.artifact,
@@ -385,12 +437,7 @@ function snapshotToolMessageEnvelope(
     id: message.id,
     tool_call_id: message.tool_call_id,
     status: message.status,
-    additional_kwargs: {
-      ...message.additional_kwargs,
-      ...(Array.isArray(unresolved)
-        ? { _unresolvedRefs: [...unresolved] }
-        : {}),
-    },
+    additional_kwargs,
     response_metadata: {},
   };
 }
@@ -470,7 +517,9 @@ export async function protectToolMessage(
     envelope.status === 'error' ? 'error' : 'success',
     signal
   );
-  if (!matchesToolMessageEnvelope(snapshotToolMessageEnvelope(message), envelope))
+  if (
+    !matchesToolMessageEnvelope(snapshotToolMessageEnvelope(message), envelope)
+  )
     throw new ToolResultProtectionError('unsupported');
   const safe = new ToolMessage({
     name: envelope.name ?? name,
@@ -488,18 +537,9 @@ export function validateToolExecuteResults(
   results: ToolExecuteResult[],
   maxResults: number
 ): void {
-  if (
-    !Array.isArray(results) ||
-    types.isProxy(results) ||
-    Object.getPrototypeOf(results) !== Array.prototype ||
-    results.length > maxResults
-  )
-    throw new ToolResultProtectionError('unsupported');
-  for (let index = 0; index < results.length; index++) {
-    const descriptor = Object.getOwnPropertyDescriptor(results, String(index));
-    if (descriptor == null || !('value' in descriptor))
-      throw new ToolResultProtectionError('unsupported');
-    plainObject(descriptor.value as ToolExecuteResult, [
+  const entries = snapshotDataArray(results, maxResults);
+  for (const entry of entries) {
+    plainObject(entry, [
       'toolCallId',
       'received_at',
       'content',
@@ -510,13 +550,6 @@ export function validateToolExecuteResults(
       'outcome',
       'outcome_patch',
     ]);
-  }
-  for (const key of Reflect.ownKeys(results)) {
-    if (
-      key !== 'length' &&
-      (typeof key !== 'string' || !/^(0|[1-9]\d*)$/.test(key))
-    )
-      throw new ToolResultProtectionError('unsupported');
   }
 }
 
@@ -592,8 +625,34 @@ export async function protectToolExecuteResult(
 export function validateToolReferenceSources(
   policy: ToolResultProtection,
   state: ToolOutputReferenceState
-): void {
-  for (const entry of state.entries) {
+): ToolOutputReferenceState {
+  plainObject(state, ['entries', 'turnCounter', 'warnedNonStringTools'], true);
+  if (
+    !Object.hasOwn(state, 'entries') ||
+    !Object.hasOwn(state, 'turnCounter') ||
+    !Object.hasOwn(state, 'warnedNonStringTools') ||
+    !Number.isSafeInteger(state.turnCounter) ||
+    state.turnCounter < 0
+  )
+    throw new ToolResultProtectionError('incompatible');
+  const entries = snapshotDataArray(
+    state.entries,
+    Number.MAX_SAFE_INTEGER,
+    true
+  );
+  const warnedNonStringTools = snapshotDataArray(
+    state.warnedNonStringTools,
+    Number.MAX_SAFE_INTEGER,
+    true
+  );
+  if (warnedNonStringTools.some((name) => typeof name !== 'string'))
+    throw new ToolResultProtectionError('incompatible');
+  const snapshot: ToolOutputReferenceState = {
+    entries: [],
+    turnCounter: state.turnCounter,
+    warnedNonStringTools,
+  };
+  for (const entry of entries) {
     plainObject(entry, ['key', 'value', 'protection'], true);
     if (
       typeof Object.getOwnPropertyDescriptor(entry, 'key')?.value !==
@@ -626,7 +685,18 @@ export function validateToolReferenceSources(
         !source.protected)
     )
       throw new ToolResultProtectionError('incompatible');
+    snapshot.entries.push({
+      key: entry.key,
+      value: entry.value,
+      protection: {
+        version: 1,
+        toolName: source.toolName,
+        toolCallId: source.toolCallId,
+        protected: source.protected,
+      },
+    });
   }
+  return snapshot;
 }
 
 export function needsToolReferenceInspection(
@@ -635,8 +705,8 @@ export function needsToolReferenceInspection(
   registry?: ToolOutputReferenceRegistry,
   runId?: string
 ): boolean {
-  validateToolReferenceSources(policy, state);
-  return state.entries.some(
+  const snapshot = validateToolReferenceSources(policy, state);
+  return snapshot.entries.some(
     (entry) =>
       requiresToolResultProtection(policy, entry.protection!.toolName) &&
       registry?.isPolicyBound(runId, entry, policy) !== true
@@ -651,9 +721,9 @@ export async function protectToolReferenceState(
   runId?: string
 ): Promise<ToolOutputReferenceState | undefined> {
   if (policy == null || state == null) return state;
-  validateToolReferenceSources(policy, state);
+  const snapshot = validateToolReferenceSources(policy, state);
   const entries = await Promise.all(
-    state.entries.map(async (entry) => ({
+    snapshot.entries.map(async (entry) => ({
       ...entry,
       value:
         liveRegistry?.isPolicyBound(runId, entry, policy) === true
@@ -668,7 +738,7 @@ export async function protectToolReferenceState(
           )) as string),
     }))
   );
-  return { ...state, entries };
+  return { ...snapshot, entries };
 }
 
 type ToolRequestIdentity = Readonly<Pick<ToolCallRequest, 'id' | 'name'>>;
