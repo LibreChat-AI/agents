@@ -1,6 +1,6 @@
 import { ToolMessage } from '@langchain/core/messages';
 import type { ToolResultProtection } from '@/protection/toolResult';
-import { withToolResultBoundary, requiresToolResultProtection } from '@/protection/toolResult';
+import { protectToolText, withToolResultBoundary, requiresToolResultProtection } from '@/protection/toolResult';
 import { ProviderTextProtectionError } from '@/protection/providerText';
 // src/tools/ProgrammaticToolCalling.ts
 import { config } from 'dotenv';
@@ -890,7 +890,7 @@ export async function executeTools(
         call_id: call.id,
         result: null,
         is_error: true,
-        error_message: `Tool '${call.name}' not found. Available tools: ${Array.from(toolMap.keys()).join(', ')}`,
+        error_message: await protectToolText(protection?.policy, call.name, call.id, `Tool '${call.name}' not found. Available tools: ${Array.from(toolMap.keys()).join(', ')}`, 'error', protection?.signal) as string,
       };
     }
 
@@ -919,7 +919,7 @@ export async function executeTools(
         call_id: call.id,
         result: null,
         is_error: true,
-        error_message: (error as Error).message || 'Tool execution failed',
+        error_message: await protectToolText(protection?.policy, call.name, call.id, (error as Error).message || 'Tool execution failed', 'error', protection?.signal) as string,
       };
     }
   });
@@ -1314,6 +1314,7 @@ export function createProgrammaticToolCallingTool(
 
         throw new CodeApiRequestError();
       } catch (error) {
+        if (error instanceof ProviderTextProtectionError) throw error;
         const messageWithReminder = appendFailedExecutionFileReminder(
           (error as Error).message,
           code

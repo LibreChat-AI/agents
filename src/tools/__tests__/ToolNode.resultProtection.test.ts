@@ -1,17 +1,34 @@
 import { z } from 'zod';
+import { createServer } from 'node:http';
 import { DynamicStructuredTool } from '@langchain/core/tools';
 import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
 import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
+import {
+  GraphInterrupt,
+  Command,
+  StateGraph,
+  MessagesAnnotation,
+  MemorySaver,
+  START,
+  END,
+  isInterrupted,
+} from '@langchain/langgraph';
+import type { AddressInfo } from 'node:net';
 import type {
   ToolResultProtection,
   ToolResultProtectionResult,
 } from '@/protection/toolResult';
 import type { ToolExecuteBatchRequest, EventHandler } from '@/types';
 import { createLocalProgrammaticToolCallingTool } from '@/tools/local/LocalProgrammaticToolCalling';
+import {
+  createProgrammaticToolCallingTool,
+  executeTools,
+} from '@/tools/ProgrammaticToolCalling';
+import { createBashProgrammaticToolCallingTool } from '@/tools/BashProgrammaticToolCalling';
 import { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import { ToolResultProtectionError } from '@/protection/toolResult';
+import { PreparedSubagentError } from '@/tools/preparedSubagents';
 import fixtures from '@/protection/__tests__/fixtures/a1.json';
-import { executeTools } from '@/tools/ProgrammaticToolCalling';
 import { Constants, GraphEvents, Providers } from '@/common';
 import { ChatModelStreamHandler } from '@/stream';
 import { ToolNode } from '@/tools/ToolNode';
@@ -938,3 +955,393 @@ it.each(['direct', 'host'] as const)(
     expect(result.messages[0].content).toContain('Allowed denial control');
   }
 );
+
+it.each([true, false])(
+  'preserves SDK-owned safety interruption identity with tool handling=%s',
+  async (handleToolErrors) => {
+    const safety = new PreparedSubagentError(
+      'Allowed prepared-execution safety control'
+    );
+    const node = new ToolNode({
+      tools: [
+        direct(() => {
+          throw safety;
+        }),
+      ],
+      toolResultProtection: policy(),
+      handleToolErrors,
+    });
+    await expect(node.invoke(state())).rejects.toBe(safety);
+  }
+);
+
+it.each([true, false])(
+  'preserves GraphInterrupt approval/resume identity with tool handling=%s',
+  async (handleToolErrors) => {
+    const safety = new GraphInterrupt([]);
+    const node = new ToolNode({
+      tools: [
+        direct(() => {
+          throw safety;
+        }),
+      ],
+      toolResultProtection: policy(),
+      handleToolErrors,
+    });
+    await expect(node.invoke(state())).rejects.toMatchObject({
+      name: 'GraphInterrupt',
+      interrupts: [],
+    });
+  }
+);
+
+it.each(['rejection', 'missing', 'duplicate'])(
+  'fails a real selected eager %s before any completion',
+  async (kind) => {
+    const completions: string[] = [];
+    const handlers: Record<string, EventHandler> = {
+      [GraphEvents.CHAT_MODEL_STREAM]: new ChatModelStreamHandler(),
+      [GraphEvents.ON_TOOL_EXECUTE]: {
+        handle: (_event, data): void => {
+          const request = data as ToolExecuteBatchRequest;
+          if (kind === 'rejection') {
+            request.reject(new Error(fixtures.canaries[0]));
+            return;
+          }
+          const result = {
+            toolCallId: request.toolCalls[0].id,
+            status: 'success' as const,
+            content: fixtures.canaries[0],
+          };
+          request.resolve(kind === 'missing' ? [] : [result, result]);
+        },
+      },
+      [GraphEvents.ON_RUN_STEP_COMPLETED]: {
+        handle: (_event, data): void => {
+          completions.push(JSON.stringify(data));
+        },
+      },
+    };
+    const run = await Run.create({
+      runId: `c1-eager-${kind}`,
+      graphConfig: {
+        type: 'standard',
+        llmConfig: { provider: Providers.OPENAI },
+        instructions: 'Allowed control.',
+        toolDefinitions: [
+          {
+            name: 'lookup',
+            parameters: {
+              type: 'object',
+              properties: { count: { type: 'number' } },
+            },
+          },
+        ],
+      },
+      customHandlers: handlers,
+      eagerEventToolExecution: { enabled: true },
+      toolResultProtection: policy(),
+      skipCleanup: true,
+    });
+    run.Graph!.overrideModel = new FakeChatModel({
+      responses: ['', 'Must not continue'],
+      toolCalls: [
+        {
+          id: 'call-control',
+          name: 'lookup',
+          args: { count: 42 },
+          type: 'tool_call',
+        },
+      ],
+    });
+    const error = await run
+      .processStream(
+        { messages: [new HumanMessage('Allowed control')] },
+        { version: 'v2', configurable: { thread_id: `c1-eager-${kind}` } }
+      )
+      .catch((value: Error) => value);
+    expect(error).toBeInstanceOf(Error);
+    assertNoCanary(String(error));
+    expect(completions).toEqual([]);
+    assertNoCanary(run.Graph!.getRunMessages());
+  }
+);
+
+it('protects nested diagnostics raised before the native _call', async () => {
+  const bad = new DynamicStructuredTool({
+    name: 'lookup',
+    description: 'Allowed schema.',
+    schema: z.object({
+      count: z.number().refine(() => false, { message: fixtures.canaries[0] }),
+    }),
+    func: async () => {
+      throw new Error('Schema must prevent execution');
+    },
+  });
+  const result = await executeTools(
+    [{ id: 'schema-control', name: 'lookup', input: { count: 42 } }],
+    new Map([['lookup', bad]]),
+    'run_tools_with_code',
+    { policy: policy() }
+  );
+  expect(result[0].is_error).toBe(true);
+  expect(result[0].error_message).toContain('[EMAIL_1]');
+  assertNoCanary(result);
+});
+
+it('protects a denied local bridge response without authorizing the tool', async () => {
+  let executions = 0;
+  const hooks = new HookRegistry();
+  hooks.register('PreToolUse', {
+    hooks: [async () => ({ decision: 'deny', reason: fixtures.canaries[0] })],
+  });
+  const runner = createLocalProgrammaticToolCallingTool({ cwd: process.cwd() });
+  const result = await runner.invoke(
+    {
+      lang: 'bash',
+      code: 'lookup \'{"count":42}\' || true',
+      tool_manifest: ['lookup'],
+    },
+    {
+      toolCall: {
+        id: 'local-denial',
+        name: 'run_tools_with_code',
+        type: 'tool_call',
+        args: {},
+        toolMap: new Map([
+          [
+            'lookup',
+            direct(() => {
+              executions++;
+              return 'Must not run';
+            }),
+          ],
+        ]),
+        toolDefs: [
+          {
+            name: 'lookup',
+            allowed_callers: ['code_execution'],
+            parameters: {
+              type: 'object',
+              properties: { count: { type: 'number' } },
+            },
+          },
+        ],
+        toolResultProtection: policy(),
+        hookContext: { registry: hooks, runId: 'local-denial' },
+      },
+    }
+  );
+  expect(executions).toBe(0);
+  assertNoCanary(result);
+  expect(JSON.stringify(result)).toContain('[EMAIL_1]');
+});
+
+it.each(['python', 'bash'] as const)(
+  'keeps required nested failures terminal through the remote %s runner',
+  async (runtime) => {
+    const requests: string[] = [];
+    const server = createServer((request, response) => {
+      let body = '';
+      request.on('data', (chunk: Buffer): void => {
+        body += chunk.toString();
+      });
+      request.on('end', (): void => {
+        requests.push(body);
+        response.setHeader('Content-Type', 'application/json');
+        response.end(
+          JSON.stringify(
+            requests.length === 1
+              ? {
+                status: 'tool_call_required',
+                continuation_token: 'allowed-continuation',
+                tool_calls: [
+                  {
+                    id: 'inner-control',
+                    name: 'lookup',
+                    input: { count: 42 },
+                  },
+                ],
+              }
+              : { status: 'completed', stdout: 'Allowed control', files: [] }
+          )
+        );
+      });
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, '127.0.0.1', resolve)
+    );
+    try {
+      const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+      const runner =
+        runtime === 'python'
+          ? createProgrammaticToolCallingTool({ baseUrl })
+          : createBashProgrammaticToolCallingTool({ baseUrl });
+      await expect(
+        runner.invoke(
+          {
+            code:
+              runtime === 'python'
+                ? 'print(await lookup(count=42))'
+                : 'lookup \'{"count":42}\'',
+            tool_manifest: ['lookup'],
+          },
+          {
+            toolCall: {
+              id: 'remote-control',
+              name: runner.name,
+              type: 'tool_call',
+              args: {},
+              toolMap: new Map([
+                ['lookup', direct(() => fixtures.canaries[0])],
+              ]),
+              toolDefs: [
+                {
+                  name: 'lookup',
+                  allowed_callers: ['code_execution'],
+                  parameters: {
+                    type: 'object',
+                    properties: { count: { type: 'number' } },
+                  },
+                },
+              ],
+              toolResultProtection: policy({
+                inspect: () => ({
+                  version: 1,
+                  ok: false,
+                  error: { code: 'blocked' },
+                }),
+              }),
+            },
+          }
+        )
+      ).rejects.toMatchObject({ code: 'blocked' });
+      expect(requests).toHaveLength(1);
+      assertNoCanary(requests);
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  }
+);
+
+it.each(['direct', 'host'] as const)(
+  'protects approved %s resume results without repeating execution',
+  async (path) => {
+    let executions = 0;
+    const inspected: string[] = [];
+    const events: string[] = [];
+    const hooks = new HookRegistry();
+    hooks.register('PreToolUse', {
+      hooks: [
+        async () => ({ decision: 'ask', reason: 'Allowed approval control' }),
+      ],
+    });
+    const node = new ToolNode({
+      trace: true,
+      tools: [
+        direct(() => {
+          executions++;
+          return fixtures.canaries[0];
+        }),
+      ],
+      eventDrivenMode: path === 'host',
+      hookRegistry: hooks,
+      humanInTheLoop: { enabled: true },
+      toolResultProtection: policy({
+        inspect: ({ content }) => {
+          inspected.push(content);
+          return approve('[EMAIL_1]');
+        },
+      }),
+      toolOutputReferences: { enabled: true },
+      toolCallStepIds: new Map([['call-control', 'step-control']]),
+    });
+    const graph = new StateGraph(MessagesAnnotation)
+      .addNode('tools', node)
+      .addEdge(START, 'tools')
+      .addEdge('tools', END)
+      .compile({ checkpointer: new MemorySaver() });
+    const config = {
+      configurable: {
+        thread_id: `c1-resume-${path}`,
+        run_id: `c1-resume-${path}`,
+      },
+      callbacks: [
+        observer(events, (request) => {
+          executions++;
+          request.resolve([
+            {
+              toolCallId: 'call-control',
+              status: 'success',
+              content: fixtures.canaries[0],
+            },
+          ]);
+        }),
+      ],
+    };
+    const interrupted = await graph.invoke(state(), config);
+    expect(isInterrupted(interrupted)).toBe(true);
+    expect(executions).toBe(0);
+    expect(inspected).toEqual([]);
+    const resumed = await graph.invoke(
+      new Command({ resume: [{ type: 'approve' }] }),
+      config
+    );
+    expect(executions).toBe(1);
+    expect(inspected).toEqual([fixtures.canaries[0]]);
+    assertNoCanary(resumed);
+    assertNoCanary(events.join(''));
+    expect(JSON.stringify(resumed)).toContain('[EMAIL_1]');
+  }
+);
+
+it('keeps native callback child APIs usable without pre-release raw observations', async () => {
+  const events: string[] = [];
+  const lookup = new DynamicStructuredTool({
+    name: 'lookup',
+    description: 'Allowed child callback control.',
+    schema: z.object({ count: z.number() }),
+    func: async (_input, manager) => {
+      expect(manager).toBeDefined();
+      expect(manager!.getChild()).toBeDefined();
+      await manager!.handleText(fixtures.canaries[0]);
+      return fixtures.canaries[0];
+    },
+  });
+  const node = new ToolNode({
+    trace: true,
+    tools: [lookup],
+    toolResultProtection: policy(),
+    toolCallStepIds: new Map([['call-control', 'step-control']]),
+  });
+  const callbacks = observer(events);
+  callbacks.handleText = (text: string): void => {
+    events.push(text);
+  };
+  const result = await node.invoke(state(), { callbacks: [callbacks] });
+  assertNoCanary(events.join(''));
+  assertNoCanary(result);
+  expect(events.join('')).toContain('[EMAIL_1]');
+});
+
+it('rejects an opaque producer message-id alias rather than rewriting control identity', async () => {
+  const events: string[] = [];
+  const lookup = direct(
+    () =>
+      new ToolMessage({
+        id: fixtures.canaries[0],
+        tool_call_id: 'call-control',
+        content: 'Allowed control',
+      })
+  );
+  const node = new ToolNode({
+    trace: true,
+    tools: [lookup],
+    toolResultProtection: policy(),
+  });
+  await expect(
+    node.invoke(state(), { callbacks: [observer(events)] })
+  ).rejects.toMatchObject({ code: 'unsupported' });
+  assertNoCanary(events.join(''));
+});

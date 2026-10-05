@@ -31,6 +31,7 @@ import {
   shellQuote,
 } from './LocalExecutionEngine';
 import { ProviderTextProtectionError } from '@/protection/providerText';
+import { protectToolText } from '@/protection/toolResult';
 import { executeHooks } from '@/hooks';
 import { Constants } from '@/common';
 
@@ -330,7 +331,7 @@ async function createToolBridge(
             effectiveInput
           );
           if (gate.denyReason != null) {
-            const denyMsg = gate.denyReason;
+            const denyMsg = await protectToolText(protection?.policy, body.name, callId, gate.denyReason, 'error', protection?.signal) as string;
             if (isTextMode) {
               res.writeHead(500, { 'Content-Type': 'text/plain' });
               res.end(denyMsg);

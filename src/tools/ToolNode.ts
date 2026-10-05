@@ -2145,7 +2145,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     } catch (_e: unknown) {
       let e = _e as Error;
       if (!this.handleToolErrors) {
-        if (requiresToolResultProtection(this.toolResultProtection, call.name) && !(e instanceof ProviderTextProtectionError)) {
+        if (requiresToolResultProtection(this.toolResultProtection, call.name) && !(e instanceof ProviderTextProtectionError) &&
+            !(e instanceof StreamLimitExceededError) && !(e instanceof PreparedSubagentError) && !isGraphInterrupt(e)) {
           // eslint-disable-next-line preserve-caught-error -- Raw causes must not escape protection.
           throw new Error(await protectToolText(this.toolResultProtection, call.name, call.id ?? '', e.message, 'error', config.signal) as string);
         }

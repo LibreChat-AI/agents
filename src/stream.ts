@@ -1,4 +1,4 @@
-import { protectToolExecuteResult, validateToolResultProtection } from '@/protection/toolResult';
+import { requiresToolResultProtection, ToolResultProtectionError, protectToolExecuteResult, validateToolResultProtection } from '@/protection/toolResult';
 // src/stream.ts
 import type { ToolCall, ToolCallChunk } from '@langchain/core/messages/tool';
 import type { ChatOpenAIReasoningSummary } from '@langchain/openai';
@@ -835,6 +835,13 @@ function startEagerToolExecutions(args: {
   const resultBreaker = entryScope?.controller ?? graph.breakerAbort;
   const resultPolicy = graph.toolResultProtection;
   if (resultPolicy != null) validateToolResultProtection(resultPolicy);
+  const hasSelectedResults = entries.some((entry) => requiresToolResultProtection(resultPolicy, entry.toolName));
+  const eagerFailure = (error: unknown): t.EagerEventToolExecutionOutcome => {
+    if (!hasSelectedResults) return { error: normalizeError(error) };
+    const failure = error instanceof ProviderTextProtectionError ? error : new ToolResultProtectionError('unavailable');
+    resultBreaker.abort(failure);
+    return { error: failure };
+  };
   const batchSignal = composeAbortSignals(composeAbortSignals(graph.config?.signal, graph.signal), graph.breakerAbort.signal);
   const records: t.EagerEventToolExecution[] = [];
   const promise: Promise<t.EagerEventToolExecutionOutcome> = new Promise<
@@ -902,9 +909,19 @@ function startEagerToolExecutions(args: {
       const recordMap = new Map(records.map((entry) => [entry.toolCallId, entry]));
       let safeResults: t.ToolExecuteResult[];
       try {
+        if (hasSelectedResults) {
+          const ids = new Set<string>();
+          for (const result of results) {
+            if (ids.has(result.toolCallId) || !recordMap.has(result.toolCallId)) throw new ToolResultProtectionError('unsupported');
+            ids.add(result.toolCallId);
+          }
+          for (const record of records) {
+            if (requiresToolResultProtection(policy, record.toolName) && !ids.has(record.toolCallId)) throw new ToolResultProtectionError('unavailable');
+          }
+        }
         safeResults = policy == null ? results : await Promise.all(results.map(async (result) => {
           const record = recordMap.get(result.toolCallId);
-          if (record == null) throw new Error('Unknown eager result identity');
+          if (record == null) throw new ToolResultProtectionError('unsupported');
           return protectToolExecuteResult(policy, record.request, result, batchSignal);
         }));
       } catch (error) {
@@ -914,8 +931,8 @@ function startEagerToolExecutions(args: {
       await dispatchEagerToolCompletions({ graph, agentContext, records, results: safeResults });
       return { results: safeResults };
     },
-    (error): t.EagerEventToolExecutionOutcome => ({ error: normalizeError(error) })
-  ).catch((error: unknown): t.EagerEventToolExecutionOutcome => ({ error: normalizeError(error) }));
+    eagerFailure
+  ).catch(eagerFailure);
 
   for (const entry of entries) {
     const record: t.EagerEventToolExecution = {

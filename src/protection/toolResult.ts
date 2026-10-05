@@ -1,11 +1,13 @@
 import { types } from 'node:util';
 import { ToolMessage } from '@langchain/core/messages';
+import { GraphInterrupt, ParentCommand } from '@langchain/langgraph';
 import {
   StructuredTool,
   DynamicStructuredTool,
   DynamicTool,
   Tool,
 } from '@langchain/core/tools';
+import type { CallbackManagerForToolRun } from '@langchain/core/callbacks/manager';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type {
   ProviderTextProtection,
@@ -18,6 +20,8 @@ import {
   ProviderTextProtectionError,
   validateProviderTextProtection,
 } from './providerText';
+import { PreparedSubagentError } from '@/tools/preparedSubagents';
+import { StreamLimitExceededError } from '@/llm/streamLimits';
 
 export const TOOL_RESULT_PROTECTION_VERSION = 1;
 export type ToolResultProtectionResult = ProviderTextProtectionResult;
@@ -270,7 +274,8 @@ export async function protectToolMessage(
   ]);
   if (
     approved.get(message) == null &&
-    Object.keys(message.additional_kwargs).length > 0
+    (Object.keys(message.additional_kwargs).length > 0 ||
+      (message.id != null && message.id !== id))
   )
     throw new ToolResultProtectionError('unsupported');
   if (Object.keys(message.response_metadata).length > 0)
@@ -376,6 +381,18 @@ export async function protectToolExecuteResult(
   return safe;
 }
 
+/** Keep child/control APIs usable, but no raw body observations escape before release. */
+function toolBodyCallbacks(
+  manager: CallbackManagerForToolRun | undefined
+): CallbackManagerForToolRun | undefined {
+  if (manager == null) return manager;
+  return Object.create(Object.getPrototypeOf(manager), {
+    ...Object.getOwnPropertyDescriptors(manager),
+    handlers: { value: [], enumerable: true },
+    inheritableHandlers: { value: [], enumerable: true },
+  }) as CallbackManagerForToolRun;
+}
+
 /** Intercepts StructuredTool before native tool-end callbacks, never mutating a shared tool. */
 export function withToolResultBoundary(
   tool: GenericTool,
@@ -413,13 +430,13 @@ export function withToolResultBoundary(
   protectedTool.responseFormat = 'content';
   const invoke: (
     input: unknown,
-    manager: undefined,
+    manager: CallbackManagerForToolRun | undefined,
     config: RunnableConfig
   ) => Promise<unknown> = Reflect.get(tool, '_call');
   Object.defineProperty(protectedTool, '_call', {
     value: async (
       input: unknown,
-      _manager: undefined,
+      manager: CallbackManagerForToolRun | undefined,
       effective?: RunnableConfig
     ): Promise<ToolMessage> => {
       const attempt = new ProviderTextAttempt(
@@ -432,7 +449,7 @@ export function withToolResultBoundary(
         try {
           raw = await attempt.wait(
             Promise.resolve(
-              invoke.call(tool, input, undefined, {
+              invoke.call(tool, input, toolBodyCallbacks(manager), {
                 ...effective,
                 callbacks: [],
               })
@@ -442,10 +459,13 @@ export function withToolResultBoundary(
           attempt.check();
           if (
             error instanceof ProviderTextProtectionError ||
-            (error instanceof Error &&
-              ['GraphInterrupt', 'ParentCommand'].includes(error.name))
+            error instanceof PreparedSubagentError ||
+            error instanceof StreamLimitExceededError ||
+            error instanceof GraphInterrupt
           )
             throw error;
+          if (error instanceof ParentCommand)
+            throw new ToolResultProtectionError('unsupported');
           if (!(error instanceof Error))
             throw new ToolResultProtectionError('unsupported');
           raw = error.message;
