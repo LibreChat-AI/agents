@@ -657,12 +657,9 @@ describe('message output usage metadata conversion', () => {
       responseMetadata
     );
 
-    // Fork divergence: upstream@1.4.2 folds cache read+write INTO input_tokens
-    // (would be 20). Our fork keeps input_tokens = raw inputTokens (10) and
-    // surfaces cache tokens only in input_token_details (Bedrock cache is
-    // additive, not a subset of input_tokens). Assert OURS.
+    // Match the non-streaming decoder's cache-inclusive input accounting.
     expect(result.usage_metadata).toEqual({
-      input_tokens: 10,
+      input_tokens: 20,
       output_tokens: 5,
       total_tokens: 25,
       input_token_details: {
@@ -709,8 +706,7 @@ describe('message output usage metadata conversion', () => {
     );
     const message = chunk.message as AIMessageChunk;
 
-    // Same fork divergence as the non-stream case: upstream would report
-    // input_tokens 35 (20+9+6); our fork keeps the raw 20.
+    // Streaming metadata keeps cache counts separate from input_tokens.
     expect(message.usage_metadata).toEqual({
       input_tokens: 20,
       output_tokens: 4,

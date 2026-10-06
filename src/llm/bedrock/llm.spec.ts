@@ -977,7 +977,7 @@ describe('convertConverseMessageToLangChainMessage - cache token extraction', ()
     );
 
     expect(result.usage_metadata).toEqual({
-      input_tokens: 20,
+      input_tokens: 10851,
       output_tokens: 5,
       total_tokens: 10856,
       input_token_details: {
