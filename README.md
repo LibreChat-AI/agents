@@ -206,3 +206,7 @@ npx eslint src/
 ## License
 
 MIT
+
+## Search endpoint configuration
+
+Support any Serper.dev-compatible endpoint (like litescrape.com, serpbase.dev, serpensapi.org, and others). Set `SERPER_BASE_URL` to the provider base URL and `SERPER_API_KEY` to its API key. The default remains `https://google.serper.dev`; search, images, videos, and news retain their respective routes.
