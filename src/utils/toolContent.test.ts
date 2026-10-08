@@ -16,6 +16,33 @@ import {
 type ToolContent = BaseMessage['content'];
 
 describe('toolContent', () => {
+  it('counts bounded inline images without exhausting structured character work', () => {
+    const content: ToolContent = [
+      {
+        type: 'image_url',
+        image_url: {
+          url: `data:image/png;base64,${Buffer.alloc(2_477_915).toString('base64')}`,
+        },
+      },
+    ];
+    expect(getToolContentCharLength(content)).toBe(
+      JSON.stringify(content).length
+    );
+    expect(compactToolContent(content, 4_000_000).changed).toBe(false);
+    expect(compactToolContent(content, 400_000).changed).toBe(true);
+  });
+
+  it('retains character traversal protection for escaped and oversized strings', () => {
+    for (const url of [
+      `data:image/png;"base64,${'A'.repeat(1_100_000)}`,
+      `data:image/png;base64,${'A'.repeat(5_000_004)}`,
+      'A'.repeat(1_100_000),
+    ]) {
+      const content: ToolContent = [{ type: 'image_url', image_url: { url } }];
+      expect(compactToolContent(content, 8_000_000).changed).toBe(true);
+    }
+  });
+
   it('normalizes a small opaque array to provider-neutral text', () => {
     const content = [{ type: 'json', rows: [{ id: 1 }] }] as ToolContent;
 
