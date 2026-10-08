@@ -3,6 +3,7 @@ import type * as t from '@/types';
 import { parseBooleanEnv } from '@/utils/misc';
 
 export const LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT = '[tool output redacted]';
+export const LANGFUSE_CONTENT_REDACTION_TEXT = '[CONTENT REDACTED]';
 
 function isPresent(value: unknown): value is string {
   return typeof value === 'string' && value.trim() !== '';
@@ -156,6 +157,40 @@ export function hasToolOutputTracingConfig(
   );
 }
 
+/**
+ * Resolves the effective privacy policy. Privacy is a run-level deployment
+ * policy, not a per-agent knob: shared spans (the root trace, conversation
+ * payloads, activity-phase traces, parent generations embedding subagent
+ * results) carry every agent's content, and a policy that only some of them
+ * enforce would leak the others'. Agent overlays therefore cannot set it,
+ * and one that asks for `metricsOnly` when the run has not fails closed
+ * (export disabled) rather than export content the host asked to suppress.
+ */
+export function resolveLangfusePrivacyConfig(
+  runLangfuse?: t.LangfuseConfig
+): t.LangfusePrivacyConfig | undefined {
+  return runLangfuse?.privacy;
+}
+
+/** Whether an agent overlay demands privacy the run does not provide. */
+export function hasUnsupportedAgentPrivacy(
+  runLangfuse?: t.LangfuseConfig,
+  agentLangfuse?: t.LangfuseConfig
+): boolean {
+  return (
+    agentLangfuse?.privacy?.mode === 'metricsOnly' &&
+    runLangfuse?.privacy?.mode !== 'metricsOnly'
+  );
+}
+
+export function resolveLangfuseContentRedactionText(
+  privacy?: t.LangfusePrivacyConfig
+): string {
+  return isPresent(privacy?.redactionText)
+    ? privacy.redactionText.trim()
+    : LANGFUSE_CONTENT_REDACTION_TEXT;
+}
+
 export function resolveToolOutputTracingConfig(
   runLangfuse?: t.LangfuseConfig,
   agentLangfuse?: t.LangfuseConfig
@@ -218,7 +253,15 @@ export function resolveLangfuseConfig(
   agentLangfuse?: t.LangfuseConfig
 ): t.LangfuseConfig | undefined {
   if (runLangfuse == null) {
-    return agentLangfuse;
+    // No run config exists to carry a run-level policy, so the overlay's
+    // privacy cannot be enforced either: strip it, failing closed when it
+    // asked for metricsOnly.
+    if (agentLangfuse?.privacy?.mode === 'metricsOnly') {
+      return { ...agentLangfuse, privacy: undefined, enabled: false };
+    }
+    return agentLangfuse?.privacy == null
+      ? agentLangfuse
+      : { ...agentLangfuse, privacy: undefined };
   }
   if (agentLangfuse == null) {
     return runLangfuse;
@@ -267,7 +310,6 @@ export function resolveLangfuseConfig(
         ]),
       ]
       : undefined;
-
   return {
     ...runLangfuse,
     ...agentLangfuse,
@@ -277,5 +319,12 @@ export function resolveLangfuseConfig(
     ...(tags != null ? { tags } : {}),
     ...(toolNodeTracing != null ? { toolNodeTracing } : {}),
     ...(toolOutputTracing != null ? { toolOutputTracing } : {}),
+    // Privacy is run-level: the overlay's copy above never takes effect.
+    ...(runLangfuse.privacy != null
+      ? { privacy: runLangfuse.privacy }
+      : { privacy: undefined }),
+    ...(hasUnsupportedAgentPrivacy(runLangfuse, agentLangfuse)
+      ? { enabled: false }
+      : {}),
   };
 }
