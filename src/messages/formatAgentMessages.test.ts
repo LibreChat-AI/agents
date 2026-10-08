@@ -63,6 +63,58 @@ const getAnthropicPayloadBlocks = (
 };
 
 describe('formatAgentMessages', () => {
+  describe('empty user content stand-in', () => {
+    it('substitutes a stand-in for a user message with empty string content', () => {
+      const payload: TPayload = [
+        { role: 'user', content: 'Hello' },
+        { role: 'assistant', content: 'Hi!' },
+        { role: 'user', content: '' },
+      ];
+      const result = formatAgentMessages(payload);
+      const emptyTurn = result.messages[result.messages.length - 1];
+      expect(emptyTurn).toBeInstanceOf(HumanMessage);
+      expect(JSON.stringify(emptyTurn.content)).toContain('(no text)');
+    });
+
+    it('substitutes a stand-in when empty text parts are all a user turn has', () => {
+      const payload: TPayload = [
+        {
+          role: 'user',
+          content: [
+            { type: ContentTypes.TEXT, [ContentTypes.TEXT]: '' },
+            { type: ContentTypes.TEXT, [ContentTypes.TEXT]: '   ' },
+          ],
+        },
+      ];
+      const result = formatAgentMessages(payload);
+      expect(result.messages).toHaveLength(1);
+      expect(JSON.stringify(result.messages[0].content)).toContain('(no text)');
+    });
+
+    it('leaves a vision turn whose only non-empty part is an image alone', () => {
+      const content: MessageContentComplex[] = [
+        { type: ContentTypes.TEXT, text: '' },
+        {
+          type: 'image_url',
+          image_url: { url: 'https://example.com/cat.png' },
+        },
+      ];
+      const result = formatAgentMessages([{ role: 'user', content }]);
+      expect(result.messages).toHaveLength(1);
+      expect(result.messages[0].content).toEqual(content);
+    });
+
+    it('does not touch assistant messages with empty content', () => {
+      const result = formatAgentMessages([
+        { role: 'user', content: 'Hello' },
+        { role: 'assistant', content: '' },
+      ]);
+      expect(
+        JSON.stringify(result.messages.map((message) => message.role))
+      ).not.toContain('(no text)');
+    });
+  });
+
   it('should format simple user and AI messages', () => {
     const payload: TPayload = [
       { role: 'user', content: 'Hello' },
@@ -1098,8 +1150,8 @@ describe('formatAgentMessages', () => {
     expect(
       messages.flatMap(
         (message) =>
-          getProviderMessageProvenance(message)?.parts.filter((part) =>
-            part.sourceContentPartIndices?.includes(1) === true
+          getProviderMessageProvenance(message)?.parts.filter(
+            (part) => part.sourceContentPartIndices?.includes(1) === true
           ) ?? []
       )
     ).toEqual([
