@@ -109,6 +109,16 @@ function jsonStringLength(
   limit: number,
   work: StructuredWorkState
 ): number {
+  /** Bounded inline images contain no JSON escapes; count their characters directly. */
+  if (
+    value.length <= HARD_MAX_TOTAL_TOOL_OUTPUT_SIZE &&
+    value.startsWith('data:image/') &&
+    /^data:image\/[a-z0-9.+-]+;base64,[a-z0-9+/]+={0,2}$/i.test(value)
+  ) {
+    return value.length + 2 > limit
+      ? conservativeStructuredLength(limit)
+      : value.length + 2;
+  }
   let length = 2;
   for (let i = 0; i < value.length; i++) {
     if (!consumeStructuredCharacterWork(work)) {
