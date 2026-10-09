@@ -238,6 +238,17 @@ export class InMemorySubagentTaskStore implements SubagentTaskStore {
     _receipt: SubagentTaskControlReceipt
   ): void {}
 
+  /**
+   * Payload-free lifecycle seam for hosts that own work scheduled by `run`.
+   * This reports only that the queued dispatcher did not enter the provider
+   * factory; it cannot change task-store state or veto a transition.
+   */
+  protected onRunSkipped(
+    _scopeId: string,
+    _taskId: string,
+    _reason: 'task_not_running' | 'signal_aborted'
+  ): void {}
+
   private emitControlReceipt(
     task: StoredTask,
     receipt: SubagentTaskControlReceipt
@@ -251,6 +262,17 @@ export class InMemorySubagentTaskStore implements SubagentTaskStore {
     } catch {
       // A host projection is observability only. Task admission, draining, and
       // settlement must remain correct when that projection is unavailable.
+    }
+  }
+
+  private emitRunSkipped(
+    task: StoredTask,
+    reason: 'task_not_running' | 'signal_aborted'
+  ): void {
+    try {
+      this.onRunSkipped(task.scopeId, task.id, reason);
+    } catch {
+      // A host lifecycle projection cannot change task settlement or results.
     }
   }
 
@@ -342,6 +364,10 @@ export class InMemorySubagentTaskStore implements SubagentTaskStore {
     void Promise.resolve()
       .then(() => {
         if (task.status !== 'running' || task.controller.signal.aborted) {
+          this.emitRunSkipped(
+            task,
+            task.status !== 'running' ? 'task_not_running' : 'signal_aborted'
+          );
           return undefined;
         }
         return request.run(runtime);
