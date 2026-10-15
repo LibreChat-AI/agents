@@ -11,6 +11,7 @@ network, so it runs in the default `npx jest` and in CI.
 - Provider cases: [`src/specs/prompt-cache/providers.ts`](../src/specs/prompt-cache/providers.ts)
 - Scenarios: [`src/specs/prompt-cache/scenarios.ts`](../src/specs/prompt-cache/scenarios.ts)
 - Invariants: [`src/specs/prompt-cache/prompt-cache.test.ts`](../src/specs/prompt-cache/prompt-cache.test.ts)
+- Tool dispatch: [`src/specs/prompt-cache/tool-dispatch.test.ts`](../src/specs/prompt-cache/tool-dispatch.test.ts)
 
 ```bash
 npx jest src/specs/prompt-cache
@@ -37,6 +38,28 @@ Invariants, for every provider case and every scenario:
 | shared prefix across conversations | two conversations of the same agent share tools and stable instructions |
 | breakpoint limits | at most four `cache_control` (Anthropic, OpenRouter) or `cachePoint` (Bedrock) markers per request |
 | strict alternation | no two user messages in a row where the provider requires alternation |
+
+## Tool dispatch
+
+`tool-dispatch.test.ts` makes a tool available mid-conversation through the
+dispatcher (`AgentInputs.toolDispatch`), for every provider case, with in-graph
+tools and with event-driven tools executed by a host handler, in two ways: the
+host announces it and the model calls `call_tool`, or the model finds it with
+`tool_search` and calls it directly (the SDK rewrites that call into a
+dispatcher call). Model replies are streamed tool calls faked in the provider's
+own wire format (`FakeToolCall`; a provider case's `intercept` answers a
+request when its `record` callback returns one). The turn after the call is rebuilt from the
+content parts a host stores, through `formatAgentMessages`. Checked: `tools`
+is byte-identical on every request and never lists the target, each request
+starts with the previous one, the target runs once with its own arguments, the
+result answers the dispatcher call, and history names only declared tools.
+
+Known gaps, independent of the dispatcher, at the turn rebuilt from stored
+parts: the Responses API replays a live tool round as the provider's output
+items (ids, status), while a rebuilt round has neither and gains an empty
+assistant message; consecutive tool rounds without text between them are
+rebuilt as one parallel batch. There the next turn reuses the prefix only up to
+the tool rounds.
 
 ## Adding a scenario
 

@@ -94,7 +94,7 @@ export interface CapturedTurn {
 
 export const CAPTURED = 'prompt-cache harness: request captured before network';
 
-function createTool({ name, description }: ToolSpec): t.GenericTool {
+export function createTool({ name, description }: ToolSpec): t.GenericTool {
   return tool(async () => 'ok', {
     name,
     description,

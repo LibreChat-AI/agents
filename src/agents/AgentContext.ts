@@ -60,6 +60,10 @@ import { snapshotCompactionSemanticIndex } from '@/summarization/semanticIndex';
 import { createExactTokenCountCache } from '@/llm/contextPressureMeter';
 import { markProviderTextInput } from '@/protection/providerTextInput';
 import { buildSummaryCarrierText } from '@/summarization/shared';
+import {
+  resolveToolDispatchConfig,
+  createToolDispatcherDefinition,
+} from '@/tools/toolDispatch';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { apportionTokenCounts } from '@/utils/tokens';
 import { isThinkingEnabled } from '@/llm/request';
@@ -149,6 +153,7 @@ export class AgentContext {
       subagentConfigs,
       maxSubagentDepth,
       graphTools,
+      toolDispatch,
     } = agentConfig;
 
     const agentContext = new AgentContext({
@@ -192,6 +197,11 @@ export class AgentContext {
         };
     agentContext.subagentConfigs = subagentConfigs;
     agentContext.maxSubagentDepth = maxSubagentDepth;
+    if (toolDispatch != null) {
+      agentContext.toolDispatch = resolveToolDispatchConfig(toolDispatch);
+      agentContext.toolDispatcherDefinition =
+        createToolDispatcherDefinition(toolDispatch);
+    }
     /**
      * Host-supplied direct tools (see `AgentInputs.graphTools`). Copied — never
      * aliased — because the SDK later pushes graph-managed tools (handoff /
@@ -367,6 +377,9 @@ export class AgentContext {
   toolDefinitions?: t.LCTool[];
   /** Set of tool names discovered via tool search (to be loaded) */
   discoveredToolNames: Set<string> = new Set();
+  /** Enabled dispatcher tool (`AgentInputs.toolDispatch`). */
+  toolDispatch?: { name: string; description: string };
+  private toolDispatcherDefinition?: t.LCTool;
   /** Original AgentInputs used to create this context — used for self-spawn subagent resolution. */
   _sourceInputs?: t.AgentInputs;
   /** Subagent configurations for hierarchical delegation. */
@@ -1462,8 +1475,18 @@ export class AgentContext {
      */
     return resolveCallerCapabilityProjection(
       effectiveToolDefinitions,
-      (toolDef) => isToolDefinitionActive(toolDef, this.discoveredToolNames)
+      (toolDef) => this.isToolDefinitionBound(toolDef)
     ).directTools;
+  }
+
+  /**
+   * With a dispatcher, deferred tools are reached through it and never bound,
+   * even once discovered: binding them would change `tools` mid-conversation.
+   */
+  private isToolDefinitionBound(toolDef: t.LCTool): boolean {
+    return this.toolDispatch != null
+      ? toolDef.defer_loading !== true
+      : isToolDefinitionActive(toolDef, this.discoveredToolNames);
   }
 
   /**
@@ -1551,7 +1574,11 @@ export class AgentContext {
       }
     }
 
-    for (const def of this.getActiveToolDefinitions()) {
+    const dispatcher =
+      this.toolDispatcherDefinition == null
+        ? []
+        : [this.toolDispatcherDefinition];
+    for (const def of [...this.getActiveToolDefinitions(), ...dispatcher]) {
       if (countedToolNames.has(def.name)) {
         continue;
       }
@@ -2359,6 +2386,19 @@ export class AgentContext {
    * @returns Array of tools to bind to model
    */
   getToolsForBinding(): t.GraphTools | undefined {
+    const tools = this.getToolsForBindingWithoutDispatcher();
+    if (this.toolDispatcherDefinition == null) {
+      return tools;
+    }
+    return [
+      ...(tools ?? []),
+      ...(createSchemaOnlyTools([
+        this.toolDispatcherDefinition,
+      ]) as t.GraphTools),
+    ];
+  }
+
+  private getToolsForBindingWithoutDispatcher(): t.GraphTools | undefined {
     if (this.toolDefinitions && this.toolDefinitions.length > 0) {
       return this.getEventDrivenToolsForBinding();
     }
@@ -2410,7 +2450,7 @@ export class AgentContext {
 
       return (
         allowsToolCaller(toolDef, 'direct') &&
-        isToolDefinitionActive(toolDef, this.discoveredToolNames)
+        this.isToolDefinitionBound(toolDef)
       );
     });
   }
