@@ -36,6 +36,7 @@ import type {
   ToolEndEvent,
   GenericTool,
   LCTool,
+  ToolDispatchConfig,
   ToolExecutionConfig,
   ToolExecuteBatchRequest,
 } from '@/types/tools';
@@ -1022,8 +1023,22 @@ interface AgentInputFields {
   maxContextTokens?: number;
   /** Per-agent Langfuse tracing configuration. */
   langfuse?: LangfuseConfig;
-  /** Dynamic system tail appended after stable instructions without provider cache markers. */
+  /**
+   * Per-turn volatile context appended after the other instructions without
+   * provider cache markers. With Anthropic or OpenRouter prompt caching it
+   * travels as a user message ahead of the newest human message, so a change
+   * every turn leaves the cached history intact.
+   */
   additional_instructions?: string;
+  /**
+   * Per-conversation context that stays the same for a whole conversation
+   * (for example its start time, memory, attached file lists). Kept in the
+   * system message right after `instructions`, never moved, with its own
+   * prompt-cache breakpoint where the provider supports one, so each request
+   * of the conversation extends the previous one while `instructions` stays
+   * shared across conversations. The compaction summary follows it.
+   */
+  conversation_instructions?: string;
   reasoningKey?: 'reasoning_content' | 'reasoning';
   /** Format content blocks as strings (for legacy compatibility i.e. Ollama/Azure Serverless) */
   useLegacyContent?: boolean;
@@ -1039,6 +1054,14 @@ interface AgentInputFields {
    * ON_TOOL_EXECUTE events instead of invoking tools directly.
    */
   toolDefinitions?: LCTool[];
+  /**
+   * Binds a fixed dispatcher tool from the first turn. Deferred
+   * `toolRegistry` entries (`defer_loading: true`) become callable through it
+   * and are never bound, even after discovery, so the `tools` parameter stays
+   * byte-identical while the host announces new tools in the history. The
+   * SDK unwraps dispatcher calls before hooks, approval, and execution.
+   */
+  toolDispatch?: true | ToolDispatchConfig;
   /**
    * Tool names discovered from previous conversation history.
    * These tools will be pre-marked as discovered so they're included
@@ -1069,7 +1092,8 @@ interface AgentInputFields {
    */
   compactionSemanticIndex?: CompactionSemanticIndex;
   /** Cross-run summary from a previous run, forwarded from formatAgentMessages.
-   *  Injected into the dynamic system tail via AgentContext. */
+   *  Rendered in the system message after `conversation_instructions`, where
+   *  the run that created it placed it. */
   initialSummary?: { text: string; tokenCount: number };
   contextPruningConfig?: ContextPruningConfig;
   maxToolResultChars?: number;

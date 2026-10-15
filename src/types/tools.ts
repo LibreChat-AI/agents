@@ -147,6 +147,8 @@ export type ToolNodeOptions = {
   toolRegistry?: LCToolRegistry;
   /** Returns the owning agent's currently discovered deferred tool names. */
   getDiscoveredToolNames?: () => readonly string[];
+  /** Enabled dispatcher tool; its calls are unwrapped to their target before anything else reads them. */
+  toolDispatch?: { name: string; canDispatch?: (toolName: string) => boolean };
   /** Reference to Graph's sessions map for automatic session injection */
   sessions?: ToolSessionMap;
   /** Partition within `sessions` used by this agent's code tools. */
@@ -584,6 +586,30 @@ export type LCTool = {
   serverName?: string;
   /** Tool type classification */
   toolType?: 'builtin' | 'mcp' | 'action';
+  /**
+   * The tool stays bound but every call fails with a tool error before hooks,
+   * approval, or execution, so a host can switch it off without changing the
+   * provider's `tools` parameter (and its prompt cache).
+   */
+  disabled?: { reason?: string };
+};
+
+/**
+ * Opt-in fixed dispatcher tool (see `AgentInputs.toolDispatch`). Deferred
+ * registry tools are reached through it instead of being bound, so making a
+ * tool available mid-conversation never changes the provider's `tools`.
+ */
+export type ToolDispatchConfig = {
+  /** Dispatcher tool name. Defaults to `call_tool`. */
+  name?: string;
+  /** Replaces the default dispatcher description. */
+  description?: string;
+  /**
+   * Narrows the tools the dispatcher may call. A deferred tool is dispatchable
+   * only when this returns true, so a host reaches only the tools it declared
+   * to the model. Without it every deferred registry tool is dispatchable.
+   */
+  canDispatch?: (toolName: string) => boolean;
 };
 
 /** Single tool call within a batch request for event-driven execution */
@@ -614,6 +640,12 @@ export type ToolCallRequest = {
    * continuity): the hint identifies the durable server-side runtime session.
    */
   runtimeSessionHint?: string;
+  /**
+   * Set when the model reached this tool through the dispatcher tool: the
+   * dispatcher's name. `name`/`args` are the target's; `id` is the
+   * dispatcher call's id, which the result answers in the history.
+   */
+  dispatcher?: string;
 };
 
 /**
@@ -1289,6 +1321,12 @@ export type ToolSearchParams = {
   mcpServer?: string | string[];
   /** Format for MCP tool names: 'full' (tool_mcp_server) or 'base' (tool only). Default: 'full' */
   mcpNameFormat?: McpNameFormat;
+  /**
+   * Dispatcher tool name when the agent uses `toolDispatch`: results carry
+   * full names and parameter schemas and tell the model to call found tools
+   * through the dispatcher. ToolNode passes it at runtime for in-graph search.
+   */
+  toolDispatch?: string;
 };
 
 /** Simplified tool metadata for search purposes */

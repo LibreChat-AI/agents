@@ -5342,6 +5342,56 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
     expect(graph.eagerEventToolExecutions.has('call_cf2')).toBe(false);
   });
 
+  it('does not prestart dispatcher calls, dispatchable tools, or disabled tools', async () => {
+    const graph = createGraph({
+      eagerEventToolExecution: { enabled: true },
+      getAgentContext: jest.fn(() => ({
+        provider: Providers.ANTHROPIC,
+        reasoningKey: 'reasoning',
+        toolDefinitions: [
+          { name: 'weather', disabled: { reason: 'off' } },
+          { name: 'search_wiki', defer_loading: true },
+        ],
+        toolDispatch: { name: 'call_tool' },
+        agentId: 'agent_1',
+      })) as unknown as StandardGraph['getAgentContext'],
+    });
+    const toolExecuteCalls: t.ToolExecuteBatchRequest[] = [];
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data): Promise<void> => {
+        if (event !== GraphEvents.ON_TOOL_EXECUTE) {
+          return;
+        }
+        toolExecuteCalls.push(data as t.ToolExecuteBatchRequest);
+        (data as t.ToolExecuteBatchRequest).resolve([]);
+      });
+
+    await new ChatModelStreamHandler().handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_calls: [
+            {
+              id: 'call_dispatch',
+              name: 'call_tool',
+              args: { name: 'search_wiki', arguments: '{"query":"x"}' },
+            },
+            { id: 'call_off', name: 'weather', args: { city: 'Oslo' } },
+            { id: 'call_direct', name: 'search_wiki', args: { query: 'x' } },
+          ],
+          response_metadata: finalToolCallResponseMetadata,
+        } as unknown as t.StreamChunk,
+      },
+      { langgraph_node: 'agent' },
+      graph
+    );
+
+    expect(toolExecuteCalls).toHaveLength(0);
+    expect(graph.eagerEventToolExecutions.size).toBe(0);
+  });
+
   it('keeps the direct-tool batch guard when an excluded tool is also direct', async () => {
     // edit_file is both a direct graph tool AND excluded from eager. A mixed
     // batch with a direct tool must suppress eager for the whole batch, so the
