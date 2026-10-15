@@ -1,8 +1,10 @@
 import { tool } from '@langchain/core/tools';
-import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
+import { AIMessage, ToolMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
 import type { ProviderCase } from './providers';
+import { formatAgentMessages } from '@/messages';
+import { ContentTypes } from '@/common';
 import { Run } from '@/run';
 
 /**
@@ -25,10 +27,13 @@ export interface ToolSpec {
   description: string;
 }
 
+/** One model response that called a tool; consecutive rounds run sequentially. */
 export interface ToolRound {
   name: string;
   args: Record<string, string>;
   result: string;
+  /** Assistant text the model emitted before the call. */
+  text?: string;
 }
 
 export interface TurnSpec {
@@ -106,36 +111,64 @@ function createTool({ name, description }: ToolSpec): t.GenericTool {
   }) as unknown as t.GenericTool;
 }
 
-function toolRoundMessages(turn: TurnSpec, index: number): BaseMessage[] {
-  return (turn.toolRounds ?? []).flatMap((round, roundIndex) => {
-    const id = `call_${index}_${roundIndex}`;
-    return [
-      new AIMessage({
-        content: '',
-        tool_calls: [{ id, name: round.name, args: round.args }],
-      }),
-      new ToolMessage({ content: round.result, tool_call_id: id }),
-    ];
-  });
+const callId = (turn: number, round: number): string =>
+  `call_${turn}_${round}`;
+
+/** Graph state after `count` rounds of the turn, as the live run holds it. */
+function liveRoundMessages(
+  turn: TurnSpec,
+  index: number,
+  count: number
+): BaseMessage[] {
+  return (turn.toolRounds ?? []).slice(0, count).flatMap((round, r) => [
+    new AIMessage({
+      content: round.text ?? '',
+      tool_calls: [{ id: callId(index, r), name: round.name, args: round.args }],
+    }),
+    new ToolMessage({
+      name: round.name,
+      content: round.result,
+      tool_call_id: callId(index, r),
+    }),
+  ]);
 }
 
-function turnMessages(turn: TurnSpec, index: number): BaseMessage[] {
-  return [...toolRoundMessages(turn, index), new AIMessage(turn.answer)];
+/** Content parts a host stores for a finished turn (as the aggregator builds them). */
+function storedAnswerParts(turn: TurnSpec, index: number): t.MessageContentComplex[] {
+  const parts = (turn.toolRounds ?? []).flatMap((round, r) => [
+    ...(round.text != null
+      ? [{ type: ContentTypes.TEXT, text: round.text } as t.MessageContentComplex]
+      : []),
+    {
+      type: ContentTypes.TOOL_CALL,
+      tool_call: {
+        id: callId(index, r),
+        name: round.name,
+        args: JSON.stringify(round.args),
+        output: round.result,
+        progress: 1,
+        roundId: `step_${index}_${r}`,
+      },
+    } as t.MessageContentComplex,
+  ]);
+  return [...parts, { type: ContentTypes.TEXT, text: turn.answer }];
 }
 
+/** History restored from stored parts the way a host formats it each turn. */
 function buildHistory(
   turns: TurnSpec[],
   current: number,
   retainFromTurn: number
 ): BaseMessage[] {
-  const messages: BaseMessage[] = [];
+  const payload: t.TPayload = [];
   for (let i = retainFromTurn; i <= current; i++) {
-    messages.push(new HumanMessage(turns[i].user));
+    payload.push({ role: 'user', content: turns[i].user });
     if (i < current) {
-      messages.push(...turnMessages(turns[i], i));
+      payload.push({ role: 'assistant', content: storedAnswerParts(turns[i], i) });
     }
   }
-  return messages;
+  const tools = new Set(turns.flatMap((turn) => (turn.toolRounds ?? []).map((round) => round.name)));
+  return formatAgentMessages(payload, undefined, tools).messages;
 }
 
 async function captureRequest(
@@ -223,7 +256,7 @@ export async function runConversation(
       const request = await captureRequest(
         providerCase,
         { ...agent, tools: tools.map(createTool) } as t.AgentInputs,
-        [...history, ...toolRoundMessages(turn, i).slice(0, 2 * call)],
+        [...history, ...liveRoundMessages(turn, i, call)],
         compacted ? compaction!.summary : undefined
       );
       captured.push({

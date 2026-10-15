@@ -60,6 +60,73 @@ tool list, and one or more conversations; each conversation has its own
 
 Every invariant applies to the new scenario automatically.
 
+Turns before the current one are not built as messages directly: the harness
+stores them as the content parts the SDK aggregator produces and restores them
+with `formatAgentMessages`, as a host does. Each `toolRounds` entry is a
+separate model response (optionally with `text` before its call); the
+follow-up call after every round is captured.
+
+## Restored history
+
+What a host persists decides whether a restored turn serializes to the bytes
+the live run sent. The aggregator writes it onto the content parts; hosts that
+store the parts unchanged need nothing else.
+
+| stored on | field | needed for |
+| --- | --- | --- |
+| `tool_call` part | `tool_call.roundId` | keeps each model response's calls in its own assistant message; without it sequential rounds merge into one parallel batch, and only text between calls separates them |
+| `tool_call` part | `tool_call.providerItems` | OpenAI Responses: the response's output items up to and including this call (`{ origin, created_at, items }`). Restored verbatim as the assistant message's provider output, so ids, status, reasoning items and assistant message items match the live request |
+
+| `tool_call` part | `tool_call.outputFormat` | `blocks` when an in-process tool returned content blocks: `output` holds their JSON and is restored as the same blocks, not as one string |
+
+`providerItems` arrive after the model response completes, through the
+registry-only `GraphEvents.ON_PROVIDER_OUTPUT_ITEMS` event: a host routes it
+to `aggregateContent` like the other step events (it carries encrypted
+reasoning, so there is no need to forward it to a client). The items are
+replayed only to the model and endpoint that produced them (`origin` is a
+digest of both), never with `zdrEnabled`, and a reasoning item without
+`encrypted_content` is left out once it is older than the 30-day retention
+of stored responses, since it is only a reference to that stored copy. A
+round restored without items falls back to rebuilding the items from the
+message fields, without an empty assistant message.
+
+### Restored equals live
+
+[`liveRestore.test.ts`](../src/specs/prompt-cache/liveRestore.test.ts) is the
+strongest invariant and is generic over providers: every provider case runs
+real turns against a scripted stream of its own wire protocol
+([`scriptedReplies.ts`](../src/specs/prompt-cache/scriptedReplies.ts): Chat
+Completions, Responses, Anthropic Messages, Gemini, Bedrock Converse), stores
+the aggregator's parts, restores them, and requires the first request of turn
+N+1 to start, segment by segment and byte for byte, with the last request of
+turn N. Only cache markers are set aside. The scenario mixes parallel and
+sequential rounds, text before calls, an empty text before a call, tool
+results that are plain text, several text blocks and an image, for both
+in-process and event-driven tools. Any new shape drift between a live and a
+restored round fails it for the provider concerned.
+
+Shape rules this relies on: an Anthropic `tool_result` whose content is one
+plain text block is sent as its string (the tail cache marker otherwise
+turned the string into that block for one request only), and with OpenRouter
+prompt caching every non-empty tool message is sent as one text block (the
+breakpoint needs a block).
+
+Reasoning: signed `thinking` (including empty text) and `redacted_thinking`
+reach the follow-up request of their own turn unchanged, and Bedrock signed
+`reasoning_content` likewise; the suite checks this as a regression. Restored
+history does not replay reasoning of earlier turns, which is unchanged SDK
+behavior, so the turn boundary is compared with those blocks set aside.
+Unsigned `thinking` (as some proxies emit) is dropped on both paths, as
+before, because the Anthropic API rejects it. None of this was verified
+against the real Anthropic or Bedrock APIs; the suite drives scripted streams.
+
+[`restoredToolRounds.test.ts`](../src/specs/prompt-cache/restoredToolRounds.test.ts)
+and [`responsesToolRounds.test.ts`](../src/specs/prompt-cache/responsesToolRounds.test.ts)
+check this end to end: real runs against scripted Chat Completions and
+Responses streams (in-process and event-driven tools, reasoning encrypted,
+by reference and off), the aggregator's parts, and every next request
+starting with the whole previous one.
+
 ## Adding a provider
 
 Append a `ProviderCase` to `PROVIDER_CASES`:

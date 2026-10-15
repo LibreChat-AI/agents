@@ -124,6 +124,46 @@ export const SCENARIOS: Scenario[] = [
     ],
   },
   {
+    name: 'consecutive tool rounds with and without text',
+    instructions: STABLE_INSTRUCTIONS,
+    tools: TOOLS,
+    conversations: [
+      {
+        conversationInstructions: CONVERSATION_A_CONTEXT,
+        turns: [
+          {
+            user: 'Check orders 1 and 2.',
+            answer: 'Both ship today.',
+            toolRounds: [
+              { name: 'lookup_order', args: { query: '1' }, result: 'Order 1: ships today' },
+              { name: 'lookup_order', args: { query: '2' }, result: 'Order 2: ships today' },
+            ],
+          },
+          {
+            user: 'Does the warranty cover them?',
+            answer: 'Yes, two years for both.',
+            toolRounds: [
+              {
+                text: 'Searching the documentation first.',
+                name: 'search_docs',
+                args: { query: 'warranty' },
+                result: 'Warranty: two years',
+              },
+              { name: 'lookup_order', args: { query: '1' }, result: 'Order 1: covered' },
+              {
+                text: 'One more order to check.',
+                name: 'lookup_order',
+                args: { query: '2' },
+                result: 'Order 2: covered',
+              },
+            ],
+          },
+          { user: 'Thanks.', answer: 'You are welcome.' },
+        ],
+      },
+    ],
+  },
+  {
     name: 'conversation context changes mid-conversation',
     instructions: STABLE_INSTRUCTIONS,
     tools: TOOLS,
