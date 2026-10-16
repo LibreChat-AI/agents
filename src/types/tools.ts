@@ -985,12 +985,6 @@ export type LocalExecutionConfig = {
    */
   codingToolNames?: readonly string[];
   /**
-   * Set false to drop the optional `intent` status label from the local
-   * coding tool schemas, for hosts that render no live label: the model
-   * then skips writing one sentence per call. Defaults to true.
-   */
-  toolIntentLabels?: boolean;
-  /**
    * Opt-in cap, in characters, on the results the model reads most:
    * `read_file` keeps whole lines up to the cap (and its `limit`, when
    * given) with an `offset` hint to continue, `grep_search` cuts long match lines and stops

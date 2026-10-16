@@ -10,7 +10,6 @@ import {
   createCloudflareExecutionTool,
 } from '@/tools/cloudflare';
 import {
-  applyIntentLabelOption,
   createLocalCodingToolBundle,
   createLocalCodingToolDefinitions,
   createLocalCodingTools,
@@ -177,16 +176,6 @@ function pruneCloudflareCodingToolAllowlist(
 }
 
 function createLocalExecutionTool(
-  name: string,
-  config: t.LocalExecutionConfig
-): t.GenericTool | undefined {
-  const created = createLocalExecutionToolByName(name, config) as
-    | (t.GenericTool & { schema: unknown })
-    | undefined;
-  return created == null ? undefined : applyIntentLabelOption(created, config);
-}
-
-function createLocalExecutionToolByName(
   name: string,
   config: t.LocalExecutionConfig
 ): t.GenericTool | undefined {

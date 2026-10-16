@@ -30,7 +30,7 @@ import { createLocalFileCheckpointer } from './FileCheckpointer';
 import { isWorkspaceClientTimeoutError } from './workspaceFS';
 import { applyEdit, locateEdit } from './editStrategies';
 import { decodeFile, encodeFile } from './textEncoding';
-import { withIntent, withoutIntent } from '@/tools/intentArg';
+import { withIntent } from '@/tools/intentArg';
 import { runPostEditSyntaxCheck } from './syntaxCheck';
 import { capHeadTail, capLines } from './toolResultCaps';
 import { Constants, LOCAL_CODING_BUNDLE_NAMES } from '@/common';
@@ -1488,18 +1488,7 @@ export function createLocalCodingTools(
     config.codingToolNames == null ? undefined : new Set(config.codingToolNames);
   return LOCAL_CODING_BUNDLE_NAMES.filter(
     (name) => names == null || names.has(name)
-  ).map((name) => applyIntentLabelOption(create(name), config));
-}
-
-/** Drops the `intent` field from a local tool's schema when `toolIntentLabels` is false. */
-export function applyIntentLabelOption<T extends { schema: unknown }>(
-  tool: T,
-  config: t.LocalExecutionConfig
-): T {
-  if (config.toolIntentLabels === false) {
-    tool.schema = withoutIntent(tool.schema as t.JsonSchemaType) as T['schema'];
-  }
-  return tool;
+  ).map(create);
 }
 
 /**
