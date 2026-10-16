@@ -409,6 +409,247 @@ describe('AgentContext', () => {
       ]);
     });
 
+    describe('conversation_instructions', () => {
+      const breakpoint = { type: 'ephemeral', ttl: '1h' };
+      const createConversationContext = (
+        agentConfig: Partial<t.AgentInputs>
+      ): AgentContext =>
+        createBasicContext({
+          agentConfig: {
+            instructions: 'Stable instructions',
+            conversation_instructions: 'Conversation context',
+            ...agentConfig,
+          },
+        });
+      const markerCount = (messages: unknown[]): number =>
+        JSON.stringify(messages).match(/"cache_control"/g)?.length ?? 0;
+      const anthropicOptions = { model: 'claude-sonnet-4-5', promptCache: true };
+
+      it.each([Providers.ANTHROPIC, Providers.OPENROUTER])(
+        'keeps the %s conversation block after the stable block with its own breakpoint',
+        async (provider) => {
+          const ctx = createConversationContext({
+            provider,
+            clientOptions: anthropicOptions,
+          });
+
+          const result = await ctx.systemRunnable!.invoke([
+            new HumanMessage('Hello'),
+          ]);
+
+          expect(result[0].content).toEqual([
+            { type: 'text', text: 'Stable instructions', cache_control: breakpoint },
+            { type: 'text', text: 'Conversation context', cache_control: breakpoint },
+          ]);
+          expect(result[1].content).toBe('Hello');
+        }
+      );
+
+      it.each([Providers.ANTHROPIC, Providers.OPENROUTER])(
+        'moves only %s additional_instructions and keeps the summary out of the system message',
+        async (provider) => {
+          const ctx = createConversationContext({
+            provider,
+            clientOptions: anthropicOptions,
+            additional_instructions: 'Per-turn context',
+          });
+          ctx.setInitialSummary('Prior summary', 13);
+
+          const result = await ctx.systemRunnable!.invoke([
+            new HumanMessage('First'),
+            new AIMessage('First answer'),
+            new HumanMessage('Second'),
+          ]);
+
+          expect(result[0].content).toEqual([
+            { type: 'text', text: 'Stable instructions', cache_control: breakpoint },
+            { type: 'text', text: 'Conversation context' },
+          ]);
+          expect(result.slice(1).map((message) => message.text)).toEqual([
+            buildSummaryCarrierText('Prior summary'),
+            'First',
+            'First answer',
+            'Per-turn context',
+            'Second',
+          ]);
+          expect(markerCount(result)).toBe(4 - 1);
+        }
+      );
+
+      it.each([Providers.ANTHROPIC, Providers.OPENROUTER])(
+        'gives the %s summary its own breakpoint while one is left',
+        async (provider) => {
+          const ctx = createConversationContext({
+            provider,
+            clientOptions: anthropicOptions,
+          });
+          ctx.setSummary('Checkpoint', 13);
+
+          const result = await ctx.systemRunnable!.invoke([]);
+
+          expect(result[0].content).toEqual([
+            { type: 'text', text: 'Stable instructions', cache_control: breakpoint },
+            { type: 'text', text: 'Conversation context', cache_control: breakpoint },
+          ]);
+          expect(result[1].content).toEqual([
+            {
+              type: 'text',
+              text: buildSummaryCarrierText('Checkpoint'),
+              cache_control: breakpoint,
+            },
+          ]);
+          expect(markerCount(result)).toBe(3);
+        }
+      );
+
+      it('places a Bedrock cache point after the stable and the conversation block', async () => {
+        const ctx = createConversationContext({
+          provider: Providers.BEDROCK,
+          clientOptions: {
+            model: 'anthropic.claude-sonnet-4-5-20250929-v1:0',
+            promptCache: true,
+          },
+          additional_instructions: 'Per-turn context',
+        });
+
+        const result = await ctx.systemRunnable!.invoke([]);
+        const content = result[0].content as TestSystemContentBlock[];
+
+        expect(content.map((block) => ('text' in block ? block.text : 'cachePoint'))).toEqual([
+          'Stable instructions',
+          'cachePoint',
+          'Conversation context',
+          'cachePoint',
+          'Per-turn context',
+        ]);
+      });
+
+      it('joins the blocks in order and sends the summary as the first message', async () => {
+        const ctx = createConversationContext({
+          additional_instructions: 'Per-turn context',
+        });
+        ctx.setInitialSummary('Prior summary', 13);
+
+        const result = await ctx.systemRunnable!.invoke([
+          new HumanMessage('Latest'),
+        ]);
+
+        expect(result[0].content).toBe(
+          'Stable instructions\n\nConversation context\n\nPer-turn context'
+        );
+        expect(result.slice(1).map((message) => message.content)).toEqual([
+          buildSummaryCarrierText('Prior summary'),
+          'Latest',
+        ]);
+      });
+
+      it('counts the conversation block as system tokens, not as a moved tail', () => {
+        const ctx = createBasicContext({
+          agentConfig: {
+            provider: Providers.ANTHROPIC,
+            clientOptions: anthropicOptions,
+            instructions: 'Stable instructions',
+            conversation_instructions: 'Conversation context',
+          },
+          tokenCounter: (message) => JSON.stringify(message.content).length,
+        });
+        ctx.initializeSystemRunnable();
+
+        expect(ctx.dynamicInstructionTokens).toBe(0);
+        expect(ctx.instructionTokens).toBe(ctx.systemMessageTokens);
+      });
+
+      it('counts the summary message as instruction overhead for both summary kinds', () => {
+        const tokenCounter = (message: { content: unknown }): number =>
+          JSON.stringify(message.content).length;
+        const build = (): AgentContext =>
+          createBasicContext({
+            agentConfig: {
+              instructions: 'Stable instructions',
+              conversation_instructions: 'Conversation context',
+            },
+            tokenCounter,
+          });
+        const live = build();
+        const restored = build();
+        void live.systemRunnable;
+        void restored.systemRunnable;
+        const base = live.instructionTokens;
+
+        live.setSummary('Checkpoint', 50);
+        restored.setInitialSummary('Checkpoint', 50);
+
+        expect(live.instructionTokens).toBe(base + 50);
+        expect(restored.instructionTokens).toBe(base + 50);
+      });
+
+      /** A summary is created in one run and restored from `initialSummary` in
+       *  the next; both must render the same request or the next run loses the
+       *  prompt cache of the requests made after the compaction. */
+      it.each([
+        ['openAI', Providers.OPENAI, {}],
+        ['anthropic promptCache', Providers.ANTHROPIC, { promptCache: true }],
+        ['openrouter promptCache', Providers.OPENROUTER, { promptCache: true }],
+        ['bedrock promptCache', Providers.BEDROCK, { promptCache: true }],
+      ])(
+        'renders a summary from this run like the same summary restored next run (%s)',
+        async (_name, provider, cacheOptions) => {
+          const build = (): AgentContext =>
+            createConversationContext({
+              provider,
+              clientOptions: { model: 'claude-sonnet-4-5', ...cacheOptions },
+              additional_instructions: 'Per-turn context',
+            });
+          const live = build();
+          live.setSummary('Checkpoint', 10);
+          const restored = build();
+          restored.setInitialSummary('Checkpoint', 10);
+
+          for (const messages of [
+            [],
+            [new HumanMessage('Task')],
+            [
+              new AIMessage({
+                content: '',
+                tool_calls: [{ id: 'call_1', name: 'calculator', args: {} }],
+              }),
+              new ToolMessage({ content: '4', tool_call_id: 'call_1' }),
+            ],
+          ]) {
+            const [fromRun, fromRestore] = await Promise.all([
+              live.systemRunnable!.invoke(messages),
+              restored.systemRunnable!.invoke(messages),
+            ]);
+            expect(fromRun).toEqual(fromRestore);
+            expect(JSON.stringify(fromRun[1].content)).toContain('Checkpoint');
+          }
+        }
+      );
+
+      it('keeps the earlier placement for a host that passes no conversation_instructions', async () => {
+        const ctx = createBasicContext({
+          agentConfig: { instructions: 'Stable instructions' },
+        });
+        ctx.setInitialSummary('Prior summary', 13);
+
+        const [restored] = await ctx.systemRunnable!.invoke([]);
+        expect(restored.content).toBe(
+          'Stable instructions\n\n## Conversation Summary\n\nPrior summary'
+        );
+        expect(ctx.instructionTokens).toBe(ctx.systemMessageTokens);
+
+        ctx.setSummary('Checkpoint', 7);
+        const result = await ctx.systemRunnable!.invoke([
+          new HumanMessage('Latest'),
+        ]);
+        expect(result[0].content).toBe('Stable instructions');
+        expect(result.slice(1).map((message) => message.content)).toEqual([
+          buildSummaryCarrierText('Checkpoint'),
+          'Latest',
+        ]);
+      });
+    });
+
     it('keeps dynamic-only OpenRouter instructions as system text', async () => {
       const tokenCounter = (msg: { content: unknown }): number => {
         const content =
@@ -2205,6 +2446,10 @@ describe('AgentContext', () => {
       ctx.systemMessageTokens = 100;
       ctx.indexTokenCountMap = { '0': 50 };
       ctx.currentUsage = { input_tokens: 100 };
+      ctx.reasoningReplaySource = {
+        provider: Providers.ANTHROPIC,
+        model: 'claude-test',
+      };
 
       ctx.reset();
 
@@ -2212,6 +2457,7 @@ describe('AgentContext', () => {
       expect(ctx.instructionTokens).toBe(0);
       expect(ctx.indexTokenCountMap).toEqual({});
       expect(ctx.currentUsage).toBeUndefined();
+      expect(ctx.reasoningReplaySource).toBeUndefined();
     });
 
     it('preserves summarization settings across resets', () => {

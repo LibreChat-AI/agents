@@ -332,6 +332,72 @@ describe('StandardGraph final response reasoning fallback', () => {
     ).toEqual(['commentary', 'final_answer']);
   });
 
+  it('records replay compatibility from the actual override model', async () => {
+    const run = await Run.create<t.IState>({
+      runId: 'reasoning-replay-override-model',
+      graphConfig: {
+        type: 'standard',
+        llmConfig,
+        providerReasoningReplay: true,
+      },
+      returnContent: true,
+      skipCleanup: true,
+    });
+
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+
+    const overrideModel = new InvokeOnlyMessageModel(
+      new AIMessageChunk({ content: 'Done.' })
+    ) as InvokeOnlyMessageModel & { model: string };
+    overrideModel.model = 'gpt-override';
+    run.Graph.overrideModel = overrideModel;
+
+    await run.processStream(
+      { messages: [new HumanMessage('Use the override')] },
+      config
+    );
+
+    expect(
+      run.Graph.agentContexts.get('default')?.reasoningReplaySource
+    ).toEqual({
+      provider: Providers.OPENAI,
+      model: 'gpt-override',
+    });
+  });
+
+  it('records no replay source without the replay opt-in', async () => {
+    const run = await Run.create<t.IState>({
+      runId: 'reasoning-replay-opt-out',
+      graphConfig: {
+        type: 'standard',
+        llmConfig,
+      },
+      returnContent: true,
+      skipCleanup: true,
+    });
+
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+
+    const overrideModel = new InvokeOnlyMessageModel(
+      new AIMessageChunk({ content: 'Done.' })
+    ) as InvokeOnlyMessageModel & { model: string };
+    overrideModel.model = 'gpt-override';
+    run.Graph.overrideModel = overrideModel;
+
+    await run.processStream(
+      { messages: [new HumanMessage('Use the override')] },
+      config
+    );
+
+    expect(
+      run.Graph.agentContexts.get('default')?.reasoningReplaySource
+    ).toBeUndefined();
+  });
+
   it('emits reasoning_content from invoke-only final responses', async () => {
     const reasoningText = 'Need to inspect the Home Assistant tool state.';
     const reasoningDeltas: t.ReasoningDeltaEvent[] = [];

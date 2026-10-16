@@ -51,6 +51,7 @@ import {
 } from '@/messages/cache';
 import { smoothStream, resolveStreamDelay, isSignalAborted } from '@/llm/stream/smoother';
 import { linkStreamLimitCanonical } from '@/llm/streamLimits';
+import { isReasoningRejection, stripBedrockReasoning } from './reasoningRetry';
 import { applyCachePointsToConversePayload } from './cachePoints';
 import { insertBedrockToolCachePoint } from './toolCache';
 import { isBedrockOpenAIModel } from './utils/message_inputs';
@@ -124,6 +125,13 @@ export interface CustomChatBedrockConverseInput
   _lc_stream_delay?: number;
 
   /**
+   * Retry a request once without signed reasoning blocks when Bedrock rejects
+   * them as not matching the conversation. Set by the SDK for agents that
+   * replay provider reasoning; Bedrock has no way to drop such blocks itself.
+   */
+  retryWithoutReasoningOnRejection?: boolean;
+
+  /**
    * Guardrail configuration for Converse and ConverseStream invocations.
    * `streamProcessingMode` is only used by ConverseStream.
    */
@@ -186,6 +194,9 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
    */
   serviceTier?: ServiceTierType;
 
+  /** See {@link CustomChatBedrockConverseInput.retryWithoutReasoningOnRejection}. */
+  retryWithoutReasoningOnRejection?: boolean;
+
   /**
    * The configured model id, captured at construction so it survives the
    * temporary `this.model` swap to an application-inference-profile ARN during
@@ -201,6 +212,8 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
     this._lc_stream_delay = resolveStreamDelay(fields?._lc_stream_delay);
     this.applicationInferenceProfile = fields?.applicationInferenceProfile;
     this.serviceTier = fields?.serviceTier;
+    this.retryWithoutReasoningOnRejection =
+      fields?.retryWithoutReasoningOnRejection;
     // `super(fields)` initializes `this.model` to LangChain's default Claude
     // model when `fields.model` is omitted, so fall back to it rather than ''
     // (which would treat the default Claude model as tool-cache-unsupported).
@@ -274,7 +287,15 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
     }
 
     try {
-      return await super._generateNonStreaming(messages, options, runManager);
+      try {
+        return await super._generateNonStreaming(messages, options, runManager);
+      } catch (error) {
+        const retry = this.reasoningRetryMessages(error, messages);
+        if (retry == null) {
+          throw error;
+        }
+        return await super._generateNonStreaming(retry, options, runManager);
+      }
     } finally {
       this.model = originalModel;
     }
@@ -336,7 +357,69 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
    * This replaces the parent's implementation which strips contentBlockIndex
    * from text and reasoning deltas, making it impossible to merge correctly.
    */
-  override async *_streamResponseChunks(
+  override _streamResponseChunks(
+    messages: BaseMessage[],
+    options: this['ParsedCallOptions'] & CustomChatBedrockConverseCallOptions,
+    runManager?: CallbackManagerForLLMRun
+  ): AsyncGenerator<ChatGenerationChunk> {
+    return this.retryWithoutReasoningOnRejection === true
+      ? this.streamWithReasoningRetry(messages, options, runManager)
+      : this.streamConverse(messages, options, runManager);
+  }
+
+  private async *streamWithReasoningRetry(
+    messages: BaseMessage[],
+    options: this['ParsedCallOptions'] & CustomChatBedrockConverseCallOptions,
+    runManager?: CallbackManagerForLLMRun
+  ): AsyncGenerator<ChatGenerationChunk> {
+    let emitted = false;
+    try {
+      for await (const chunk of this.streamConverse(
+        messages,
+        options,
+        runManager
+      )) {
+        emitted = true;
+        yield chunk;
+      }
+    } catch (error) {
+      const retry = emitted
+        ? undefined
+        : this.reasoningRetryMessages(error, messages);
+      if (retry == null) {
+        throw error;
+      }
+      yield* this.streamConverse(retry, options, runManager);
+    }
+  }
+
+  /**
+   * The messages to send again once, without signed reasoning, after Bedrock
+   * rejected the replayed blocks; undefined when this is not that case.
+   */
+  private reasoningRetryMessages(
+    error: unknown,
+    messages: BaseMessage[]
+  ): BaseMessage[] | undefined {
+    if (
+      this.retryWithoutReasoningOnRejection !== true ||
+      !isReasoningRejection(error)
+    ) {
+      return undefined;
+    }
+    const stripped = stripBedrockReasoning(messages);
+    if (stripped === messages) {
+      return undefined;
+    }
+    // eslint-disable-next-line no-console
+    console.warn(
+      '[bedrock] Replayed reasoning was rejected; retrying once without it:',
+      error instanceof Error ? error.message : error
+    );
+    return stripped;
+  }
+
+  private async *streamConverse(
     messages: BaseMessage[],
     options: this['ParsedCallOptions'] & CustomChatBedrockConverseCallOptions,
     runManager?: CallbackManagerForLLMRun

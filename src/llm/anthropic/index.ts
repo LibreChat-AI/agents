@@ -51,6 +51,13 @@ interface AnthropicEventStream
   controller?: { abort: () => void };
 }
 
+type BoundThinkingConfig = Anthropic.ThinkingConfigParam & {
+  block_binding: { prefix_mismatch_behavior: 'drop_block' };
+};
+
+/** The `block_binding` field is a 400 without this beta header, so they are sent together. */
+const THINKING_BINDING_BETA = 'thinking-binding-controls-2026-08-01' as AnthropicBeta;
+
 const ANTHROPIC_TOOL_BETAS: Partial<Record<string, AnthropicBeta>> = {
   tool_search_tool_regex_20251119: 'advanced-tool-use-2025-11-20',
   tool_search_tool_bm25_20251119: 'advanced-tool-use-2025-11-20',
@@ -424,6 +431,7 @@ export type CustomAnthropicInput = AnthropicInput & {
   outputConfig?: AnthropicOutputConfig;
   inferenceGeo?: string;
   contextManagement?: AnthropicContextManagementConfigParam;
+  dropMismatchedThinkingBlocks?: boolean;
 } & BaseChatModelParams;
 
 export type CustomAnthropicCallOptions = {
@@ -456,8 +464,10 @@ export class CustomAnthropic extends ChatAnthropicMessages {
   outputConfig?: AnthropicOutputConfig;
   inferenceGeo?: string;
   contextManagement?: AnthropicContextManagementConfigParam;
+  dropMismatchedThinkingBlocks?: boolean;
   constructor(fields?: CustomAnthropicInput) {
     super(fields);
+    this.dropMismatchedThinkingBlocks = fields?.dropMismatchedThinkingBlocks;
     this.resetTokenEvents();
     this.setDirectFields(fields);
     this._lc_stream_delay = resolveStreamDelay(fields?._lc_stream_delay);
@@ -514,12 +524,24 @@ export class CustomAnthropic extends ChatAnthropicMessages {
       }
     );
 
+    const requestedThinking = this.thinkingExplicitlySet
+      ? this.thinking
+      : undefined;
+    const bindsThinking =
+      this.dropMismatchedThinkingBlocks === true &&
+      requestedThinking != null &&
+      isThinkingEnabled(requestedThinking);
     const sharedParams = {
       tools: formattedTools,
       tool_choice,
       // Match upstream: omit `thinking` unless the user set it, so we don't send
       // `{ type: 'disabled' }` (an unsupported param on some models) by default.
-      thinking: this.thinkingExplicitlySet ? this.thinking : undefined,
+      thinking: bindsThinking
+        ? ({
+          ...requestedThinking,
+          block_binding: { prefix_mismatch_behavior: 'drop_block' },
+        } as BoundThinkingConfig)
+        : requestedThinking,
       context_management: contextManagement,
       ...this.invocationKwargs,
       container: callOptions?.container,
@@ -528,7 +550,8 @@ export class CustomAnthropic extends ChatAnthropicMessages {
         callOptions?.betas,
         toolBetas,
         compactionBetas,
-        taskBudgetBetas
+        taskBudgetBetas,
+        bindsThinking ? [THINKING_BINDING_BETA] : undefined
       ),
       output_config: mergedOutputConfig,
       inference_geo: inferenceGeo,
