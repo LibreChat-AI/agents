@@ -60,6 +60,13 @@ export {
 } from './matchers';
 export { createToolPolicyHook } from './createToolPolicyHook';
 export type { ToolPolicyMode, ToolPolicyConfig } from './createToolPolicyHook';
+export {
+  createVerifyBeforeStopHook,
+  verifiedSinceLastChange,
+} from './createVerifyBeforeStopHook';
+export type { VerifyBeforeStopConfig } from './createVerifyBeforeStopHook';
+export { createStopOnPassingCheckHook } from './createStopOnPassingCheckHook';
+export type { StopOnPassingCheckConfig } from './createStopOnPassingCheckHook';
 export { createWorkspacePolicyHook } from './createWorkspacePolicyHook';
 export type {
   OutsideAccessPolicy,

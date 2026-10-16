@@ -30,8 +30,9 @@ import { createLocalFileCheckpointer } from './FileCheckpointer';
 import { isWorkspaceClientTimeoutError } from './workspaceFS';
 import { applyEdit, locateEdit } from './editStrategies';
 import { decodeFile, encodeFile } from './textEncoding';
+import { withIntent, withoutIntent } from '@/tools/intentArg';
 import { runPostEditSyntaxCheck } from './syntaxCheck';
-import { withIntent } from '@/tools/intentArg';
+import { capLines } from './toolResultCaps';
 import { Constants } from '@/common';
 
 const MAX_READ_CHARS = 256000;
@@ -233,6 +234,28 @@ function lineWindow(
     text: truncateLocalOutput(numbered, MAX_READ_CHARS),
     truncated: !exhausted || numbered.length > MAX_READ_CHARS,
   };
+}
+
+/** Reads whole lines from `offset` until `maxChars`, then says how to continue. */
+function cappedLineWindow(
+  content: string,
+  offset: number | undefined,
+  maxChars: number
+): string {
+  const lines = content.split('\n');
+  const start = Math.max(offset ?? 1, 1);
+  const kept: string[] = [];
+  let used = 0;
+  for (let i = start - 1; i < lines.length; i++) {
+    const numbered = `${String(i + 1).padStart(6, ' ')}\t${lines[i]}`;
+    if (used + numbered.length + 1 > maxChars && kept.length > 0) break;
+    kept.push(numbered);
+    used += numbered.length + 1;
+  }
+  const end = start + kept.length - 1;
+  return end < lines.length
+    ? `${kept.join('\n')}\n[showing lines ${start}-${end} of ${lines.length}; continue with offset=${end + 1}]`
+    : kept.join('\n');
 }
 
 const MAX_DIFF_CHARS = 4000;
@@ -500,6 +523,16 @@ export function createLocalReadFileTool(
       }
 
       const content = await fs.readFile(path, 'utf8');
+      if (
+        config.toolResultMaxChars != null &&
+        config.toolResultMaxChars > 0 &&
+        input.limit == null
+      ) {
+        return [
+          cappedLineWindow(content, input.offset, config.toolResultMaxChars),
+          { path, bytes: fileStat.size },
+        ];
+      }
       const result = lineWindow(content, input.offset, input.limit);
       return [
         result.truncated ? `${result.text}\n[truncated]` : result.text,
@@ -1181,10 +1214,16 @@ export function createLocalGrepSearchTool(
           .split('\n')
           .filter(Boolean)
           .slice(0, maxResults);
-        const output =
+        const joined =
           lines.length > 0
             ? lines.join('\n')
             : result.stderr.trim() || 'No matches found.';
+        const output =
+          config.toolResultMaxChars != null &&
+          config.toolResultMaxChars > 0 &&
+          lines.length > 0
+            ? capLines(joined, config.toolResultMaxChars)
+            : joined;
         return [output, { matches: lines.length, engine: 'ripgrep' }];
       }
 
@@ -1198,7 +1237,11 @@ export function createLocalGrepSearchTool(
         );
         // Artifact count: ONLY real matches (Codex P2 [43] —
         // skip sentinels used to inflate the count and the budget).
-        const display = formatFallbackGrepDisplay({ matches, skipped });
+        const fullDisplay = formatFallbackGrepDisplay({ matches, skipped });
+        const display =
+          config.toolResultMaxChars != null && config.toolResultMaxChars > 0
+            ? capLines(fullDisplay, config.toolResultMaxChars)
+            : fullDisplay;
         return [
           display,
           {
@@ -1360,7 +1403,7 @@ export function createLocalCodingTools(
     (config.fileCheckpointing === true
       ? createLocalFileCheckpointer({ fs: config.exec?.fs })
       : undefined);
-  return [
+  return selectLocalCodingTools(config, [
     createLocalReadFileTool(config),
     createLocalWriteFileTool(config, checkpointer),
     createLocalEditFileTool(config, checkpointer),
@@ -1372,7 +1415,29 @@ export function createLocalCodingTools(
     createLocalCodeExecutionTool(config),
     createLocalProgrammaticToolCallingTool(config),
     createLocalBashProgrammaticToolCallingTool(config),
-  ];
+  ]);
+}
+
+/** Applies `codingToolNames` and `toolIntentLabels` to a freshly built suite. */
+function selectLocalCodingTools(
+  config: t.LocalExecutionConfig,
+  tools: DynamicStructuredTool[]
+): DynamicStructuredTool[] {
+  const names =
+    config.codingToolNames == null
+      ? undefined
+      : new Set(config.codingToolNames);
+  const selected =
+    names == null ? tools : tools.filter((tool) => names.has(tool.name));
+  if (config.toolIntentLabels !== false) {
+    return selected;
+  }
+  for (const tool of selected) {
+    tool.schema = withoutIntent(
+      tool.schema as t.JsonSchemaType
+    ) as DynamicStructuredTool['schema'];
+  }
+  return selected;
 }
 
 /**

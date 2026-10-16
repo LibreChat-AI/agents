@@ -329,11 +329,16 @@ export function resolveLocalToolRegistry(args: {
   }
 
   const registry = new Map(args.toolRegistry ?? []);
+  const localNames = args.toolExecution?.local?.codingToolNames;
   const selectedNames = shouldUseCloudflareSandboxExecution(args.toolExecution)
     ? getSelectedCloudflareCodingToolNames(
       getCloudflareConfig(args.toolExecution)
     )
     : undefined;
+  const localSelected =
+    selectedNames == null && localNames != null
+      ? new Set(localNames)
+      : undefined;
 
   if (selectedNames != null) {
     const callableInsideCloudflare = new Set(selectedNames);
@@ -356,7 +361,8 @@ export function resolveLocalToolRegistry(args: {
   }
 
   for (const definition of createLocalCodingToolDefinitions()) {
-    if (selectedNames != null && !selectedNames.has(definition.name)) {
+    const keep = selectedNames ?? localSelected;
+    if (keep != null && !keep.has(definition.name)) {
       registry.delete(definition.name);
       continue;
     }

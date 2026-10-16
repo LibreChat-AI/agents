@@ -13,6 +13,7 @@ import {
   BashExecutionToolSchema,
   BashToolOutputReferencesGuide,
 } from '@/tools/BashExecutor';
+import { capHeadTail } from './toolResultCaps';
 import {
   CodeExecutionToolName,
   CodeExecutionToolSchema,
@@ -146,8 +147,11 @@ export function createLocalBashExecutionTool(options?: {
         input.args != null && input.args.length > 0
           ? await executeLocalBashWithArgs(input.command, input.args, config)
           : await executeLocalBash(input.command, config);
+      const formatted = formatLocalOutput(result, cwd);
       return [
-        formatLocalOutput(result, cwd),
+        config.toolResultMaxChars != null && config.toolResultMaxChars > 0
+          ? capHeadTail(formatted, config.toolResultMaxChars)
+          : formatted,
         {
           session_id: getLocalSessionId(config),
           files: [],
