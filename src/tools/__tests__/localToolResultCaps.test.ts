@@ -103,6 +103,19 @@ describe('toolResultMaxChars', () => {
     ).toContain('value_499');
   });
 
+  it('cuts a single line longer than the cap instead of returning it whole', async () => {
+    const cwd = await createTempDir();
+    await writeFile(join(cwd, 'min.json'), `[${'1,'.repeat(50000)}1]\n{}`);
+    const capped = String(
+      await createLocalReadFileTool({ cwd, toolResultMaxChars: 1000 }).invoke({
+        path: 'min.json',
+      })
+    );
+    expect(capped.length).toBeLessThan(1150);
+    expect(capped).toContain('[line truncated]');
+    expect(capped).toMatch(/continue with offset=2\]$/);
+  });
+
   it('caps grep_search and bash_tool results only when set', async () => {
     const cwd = await createTempDir();
     await writeFile(

@@ -80,10 +80,13 @@ export function verifiedSinceLastChange(
 ): boolean | undefined {
   const shellNames = new Set(config.shellToolNames ?? [Constants.BASH_TOOL]);
   const testPattern = config.testCommandPattern ?? DEFAULT_TEST_PATTERN;
-  const outputs = new Map<string, string>();
+  /** Tool output text by call id; `undefined` for an errored tool result. */
+  const outputs = new Map<string, string | undefined>();
   for (const message of messages) {
     const id = (message as { tool_call_id?: unknown }).tool_call_id;
-    if (typeof id === 'string') outputs.set(id, textOf(message));
+    if (typeof id !== 'string') continue;
+    const errored = (message as { status?: unknown }).status === 'error';
+    outputs.set(id, errored ? undefined : textOf(message));
   }
   let changed = false;
   let verified = false;

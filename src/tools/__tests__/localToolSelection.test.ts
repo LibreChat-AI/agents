@@ -1,6 +1,11 @@
 import { describe, it, expect } from '@jest/globals';
 import type * as t from '@/types';
-import { resolveLocalToolRegistry } from '../local/resolveLocalExecutionTools';
+import {
+  resolveLocalExecutionTools,
+  resolveLocalImplementationNames,
+  resolveLocalToolRegistry,
+  resolveLocalToolsForBinding,
+} from '../local/resolveLocalExecutionTools';
 import { createLocalCodingTools } from '../local/LocalCodingTools';
 import { INTENT_ARG } from '../intentArg';
 import { Constants } from '@/common';
@@ -43,5 +48,28 @@ describe('local coding tool selection', () => {
     const registry = resolveLocalToolRegistry({ toolExecution });
     expect(registry?.has(Constants.READ_FILE)).toBe(true);
     expect(registry?.has(Constants.LIST_DIRECTORY)).toBe(false);
+  });
+
+  it('drops host-bound coding tools outside the local allowlist on every path', () => {
+    const toolExecution: t.ToolExecutionConfig = {
+      engine: 'local',
+      local: { codingToolNames: [Constants.READ_FILE] },
+    };
+    const hostBash = { name: Constants.BASH_TOOL } as t.GenericTool;
+    const bound = resolveLocalToolsForBinding({
+      tools: [hostBash],
+      toolExecution,
+    }) as t.GenericTool[];
+    expect(bound.map((tool) => tool.name)).toEqual([Constants.READ_FILE]);
+
+    const { toolMap, localImplementationNames } = resolveLocalExecutionTools({
+      toolMap: new Map([[Constants.BASH_TOOL, hostBash]]) as t.ToolMap,
+      toolExecution,
+    });
+    expect([...toolMap.keys()]).toEqual([Constants.READ_FILE]);
+    expect([...localImplementationNames]).toEqual([Constants.READ_FILE]);
+    expect([
+      ...resolveLocalImplementationNames([Constants.BASH_TOOL], toolExecution),
+    ]).toEqual([Constants.READ_FILE]);
   });
 });

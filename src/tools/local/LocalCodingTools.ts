@@ -247,7 +247,11 @@ function cappedLineWindow(
   const kept: string[] = [];
   let used = 0;
   for (let i = start - 1; i < lines.length; i++) {
-    const numbered = `${String(i + 1).padStart(6, ' ')}\t${lines[i]}`;
+    const full = `${String(i + 1).padStart(6, ' ')}\t${lines[i]}`;
+    const numbered =
+      full.length > maxChars
+        ? `${full.slice(0, maxChars)} [line truncated]`
+        : full;
     if (used + numbered.length + 1 > maxChars && kept.length > 0) break;
     kept.push(numbered);
     used += numbered.length + 1;

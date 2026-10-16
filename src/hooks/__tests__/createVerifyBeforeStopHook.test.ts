@@ -42,6 +42,30 @@ function stopInput(
 }
 
 describe('verifiedSinceLastChange', () => {
+  it('does not count an errored test tool result as verification', () => {
+    const id = `call_${seq++}`;
+    const errored: BaseMessage[] = [
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          {
+            id,
+            name: 'bash_tool',
+            args: { command: 'python3 -m pytest tests' },
+            type: 'tool_call',
+          },
+        ],
+      }),
+      new ToolMessage({
+        content: 'Error: failed to spawn process',
+        tool_call_id: id,
+        name: 'bash_tool',
+        status: 'error',
+      }),
+    ];
+    expect(verifiedSinceLastChange([...edit(), ...errored])).toBe(false);
+  });
+
   it('is undefined when nothing changed', () => {
     expect(
       verifiedSinceLastChange([new HumanMessage('hi'), ...test()])

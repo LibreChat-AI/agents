@@ -129,6 +129,19 @@ function getSelectedCloudflareCodingToolNames(
   );
 }
 
+/** The local coding tools selected by `local.codingToolNames`, or `undefined` for the whole suite. */
+function getSelectedLocalCodingToolNames(
+  config: t.LocalExecutionConfig
+): Set<string> | undefined {
+  if (config.codingToolNames == null) {
+    return undefined;
+  }
+  const requestedNames = new Set(config.codingToolNames);
+  return new Set(
+    LOCAL_CODING_BUNDLE_NAMES.filter((name) => requestedNames.has(name))
+  );
+}
+
 function filterCloudflareCodingToolAllowlist(
   tools: t.GraphTools | undefined,
   selectedNames: Set<string>
@@ -291,8 +304,14 @@ export function resolveLocalToolsForBinding(args: {
 
   const localConfig = args.toolExecution?.local ?? {};
   if (shouldIncludeCodingTools(args.toolExecution)) {
+    const selectedNames = getSelectedLocalCodingToolNames(localConfig);
     return filterToolsForDirectCaller(
-      mergeToolsByName(args.tools, createLocalCodingTools(localConfig)),
+      mergeToolsByName(
+        selectedNames == null
+          ? args.tools
+          : filterCloudflareCodingToolAllowlist(args.tools, selectedNames),
+        createLocalCodingTools(localConfig)
+      ),
       args.toolRegistry,
       args.discoveredToolNames
     );
@@ -329,15 +348,14 @@ export function resolveLocalToolRegistry(args: {
   }
 
   const registry = new Map(args.toolRegistry ?? []);
-  const localNames = args.toolExecution?.local?.codingToolNames;
   const selectedNames = shouldUseCloudflareSandboxExecution(args.toolExecution)
     ? getSelectedCloudflareCodingToolNames(
       getCloudflareConfig(args.toolExecution)
     )
     : undefined;
   const localSelected =
-    selectedNames == null && localNames != null
-      ? new Set(localNames)
+    selectedNames == null
+      ? getSelectedLocalCodingToolNames(args.toolExecution?.local ?? {})
       : undefined;
 
   if (selectedNames != null) {
@@ -391,7 +409,8 @@ export function resolveLocalImplementationNames(
   if (shouldIncludeCodingTools(toolExecution)) {
     return shouldUseCloudflareSandboxExecution(toolExecution)
       ? getSelectedCloudflareCodingToolNames(getCloudflareConfig(toolExecution))
-      : new Set(LOCAL_CODING_BUNDLE_NAMES);
+      : (getSelectedLocalCodingToolNames(toolExecution?.local ?? {}) ??
+          new Set(LOCAL_CODING_BUNDLE_NAMES));
   }
   const existingNames = new Set(toolNames);
   return new Set(
@@ -499,6 +518,10 @@ export function resolveLocalExecutionTools(args: {
   const localConfig = args.toolExecution?.local ?? {};
 
   if (shouldIncludeCodingTools(args.toolExecution)) {
+    const selectedNames = getSelectedLocalCodingToolNames(localConfig);
+    if (selectedNames != null) {
+      pruneCloudflareCodingToolAllowlist(toolMap, selectedNames);
+    }
     // Use the bundle factory when fileCheckpointing is on so we can
     // surface the checkpointer back to the caller — without this, the
     // execution-path tools each captured into a checkpointer that was
