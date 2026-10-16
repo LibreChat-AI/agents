@@ -243,27 +243,39 @@ function cappedLineWindow(
   limit: number | undefined,
   maxChars: number
 ): string {
-  const lines = content.split('\n');
   const start = Math.max(offset ?? 1, 1);
+  // Walk newline indices instead of splitting the file, so a page costs
+  // O(offset + page) rather than O(file).
+  let cursor = 0;
+  for (let line = 1; line < start; line++) {
+    const next = content.indexOf('\n', cursor);
+    if (next === -1) return '';
+    cursor = next + 1;
+  }
+  const maxLines = limit != null && limit > 0 ? limit : Infinity;
   const kept: string[] = [];
   let used = 0;
-  const stop =
-    limit != null && limit > 0
-      ? Math.min(lines.length, start - 1 + limit)
-      : lines.length;
-  for (let i = start - 1; i < stop; i++) {
-    const full = `${String(i + 1).padStart(6, ' ')}\t${lines[i]}`;
+  while (cursor <= content.length && kept.length < maxLines) {
+    const newline = content.indexOf('\n', cursor);
+    const lineEnd = newline === -1 ? content.length : newline;
+    const text = content.slice(cursor, Math.min(lineEnd, cursor + maxChars));
+    const full = `${String(start + kept.length).padStart(6, ' ')}\t${text}`;
     const numbered =
-      full.length > maxChars
+      lineEnd - cursor > maxChars || full.length > maxChars
         ? `${full.slice(0, maxChars)} [line truncated]`
         : full;
     if (used + numbered.length + 1 > maxChars && kept.length > 0) break;
     kept.push(numbered);
     used += numbered.length + 1;
+    if (newline === -1) {
+      cursor = content.length + 1;
+      break;
+    }
+    cursor = newline + 1;
   }
   const end = start + kept.length - 1;
-  return end < lines.length
-    ? `${kept.join('\n')}\n[showing lines ${start}-${end} of ${lines.length}; continue with offset=${end + 1}]`
+  return cursor <= content.length
+    ? `${kept.join('\n')}\n[showing lines ${start}-${end}; continue with offset=${end + 1}]`
     : kept.join('\n');
 }
 

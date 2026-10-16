@@ -1,9 +1,8 @@
 import type { HookCallback, PostToolBatchHookOutput } from './types';
+import type { VerificationState } from './createVerifyBeforeStopHook';
 import {
   DEFAULT_TEST_PATTERN,
-  isShellEdit,
-  failed,
-  isTestRun,
+  applyToolBatch,
   statelessPattern,
 } from './createVerifyBeforeStopHook';
 import { Constants } from '@/common';
@@ -12,6 +11,8 @@ import { Constants } from '@/common';
  * Opt-in `PostToolBatch` hook for headless coding agents: ends the Run as
  * soon as a tool batch closes with a passing test run that follows the last
  * code change, so the model does not spend a further turn only to summarize.
+ * Calls in one batch run concurrently, so a test only verifies changes from
+ * earlier batches (or an edit earlier in its own shell command).
  * A batch that changes code after its passing test, a failing test, or a run
  * that has made no change never stops early. The hook keeps per-Run state, so
  * register a fresh instance for every Run.
@@ -45,32 +46,21 @@ export function createStopOnPassingCheckHook(
   const testPattern = statelessPattern(
     config.testCommandPattern ?? DEFAULT_TEST_PATTERN
   );
-  let changed = false;
+  const state: VerificationState = { changed: false, verified: false };
   return (input): PostToolBatchHookOutput => {
-    let verified = false;
-    for (const entry of input.entries) {
-      const command = shellNames.has(entry.toolName)
-        ? commandOf(entry.toolInput)
-        : '';
-      if (
-        entry.toolName === Constants.EDIT_FILE ||
-        entry.toolName === Constants.WRITE_FILE
-      ) {
-        if (entry.status === 'success') {
-          changed = true;
-          verified = false;
-        }
-        continue;
-      }
-      if (isShellEdit(command)) {
-        changed = true;
-        verified = false;
-      }
-      if (changed && isTestRun(command, testPattern)) {
-        verified =
-          entry.status === 'success' && !failed(outputText(entry.toolOutput));
-      }
-    }
+    state.verified = false;
+    const { changed, verified } = applyToolBatch(
+      state,
+      input.entries.map((entry) => ({
+        name: entry.toolName,
+        command: shellNames.has(entry.toolName)
+          ? commandOf(entry.toolInput)
+          : '',
+        succeeded: entry.status === 'success',
+        output: outputText(entry.toolOutput),
+      })),
+      testPattern
+    );
     return changed && verified
       ? {
         preventContinuation: true,

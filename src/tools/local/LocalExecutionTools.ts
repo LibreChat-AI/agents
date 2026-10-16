@@ -13,7 +13,7 @@ import {
   BashExecutionToolSchema,
   BashToolOutputReferencesGuide,
 } from '@/tools/BashExecutor';
-import { capHeadTail } from './toolResultCaps';
+import { capHeadTail, spillToFile } from './toolResultCaps';
 import {
   CodeExecutionToolName,
   CodeExecutionToolSchema,
@@ -128,6 +128,11 @@ export function createLocalCodeExecutionTool(
   );
 }
 
+/** Whether commands run on this host, so a host temp file is readable by later commands. */
+function runsOnHost(config: t.LocalExecutionConfig): boolean {
+  return config.exec?.spawn == null && config.exec?.fs == null && config.spawn == null;
+}
+
 export function createLocalBashExecutionTool(options?: {
   config?: t.LocalExecutionConfig;
   enableToolOutputReferences?: boolean;
@@ -150,7 +155,11 @@ export function createLocalBashExecutionTool(options?: {
       const formatted = formatLocalOutput(result, cwd);
       return [
         config.toolResultMaxChars != null && config.toolResultMaxChars > 0
-          ? capHeadTail(formatted, config.toolResultMaxChars)
+          ? capHeadTail(
+            formatted,
+            config.toolResultMaxChars,
+            runsOnHost(config) ? spillToFile : undefined
+          )
           : formatted,
         {
           session_id: getLocalSessionId(config),

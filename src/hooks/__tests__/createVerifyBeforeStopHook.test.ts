@@ -106,6 +106,38 @@ describe('verifiedSinceLastChange', () => {
     ).toBe(false);
   });
 
+  it('does not let a test verify an edit made in the same assistant turn', () => {
+    const editId = `call_${seq++}`;
+    const testId = `call_${seq++}`;
+    const turn: BaseMessage[] = [
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          {
+            id: editId,
+            name: 'edit_file',
+            args: { path: 'a.py' },
+            type: 'tool_call',
+          },
+          {
+            id: testId,
+            name: 'bash_tool',
+            args: { command: 'python3 -m pytest tests' },
+            type: 'tool_call',
+          },
+        ],
+      }),
+      new ToolMessage({ content: 'ok', tool_call_id: editId, name: 'edit_file' }),
+      new ToolMessage({
+        content: 'stdout:\n3 passed\n',
+        tool_call_id: testId,
+        name: 'bash_tool',
+      }),
+    ];
+    expect(verifiedSinceLastChange(turn)).toBe(false);
+    expect(verifiedSinceLastChange([...turn, ...test()])).toBe(true);
+  });
+
   it('ignores test runs whose exit code another command replaces', () => {
     for (const command of [
       'python3 -m pytest tests; echo done',

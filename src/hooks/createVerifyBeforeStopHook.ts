@@ -55,11 +55,11 @@ const NON_RUN_FLAGS =
   /\s(?:--collect-only|--co|--listTests|--list-tests|--list|--no-run|--dry-run|-list|-N|--help|-h|--version|-V|list)(?=\s|$)/;
 
 /**
- * The last command of a shell command line: the text after the final
- * `;`, `&`, `|` or newline that is outside quotes. Its exit code is the
- * one the shell reports.
+ * The commands of a shell command line, split at `;`, `&`, `|` and
+ * newlines outside quotes (redirections such as `2>&1` do not split).
  */
-export function lastShellSegment(command: string): string {
+export function shellSegments(command: string): string[] {
+  const segments: string[] = [];
   let quote: string | undefined;
   let start = 0;
   for (let i = 0; i < command.length; i++) {
@@ -74,10 +74,18 @@ export function lastShellSegment(command: string): string {
     } else if (char === '&' && isRedirection(command, i)) {
       continue;
     } else if (char === ';' || char === '&' || char === '|' || char === '\n') {
+      segments.push(command.slice(start, i));
       start = i + 1;
     }
   }
-  return command.slice(start);
+  segments.push(command.slice(start));
+  return segments;
+}
+
+/** The last command of a shell command line; its exit code is the one the shell reports. */
+export function lastShellSegment(command: string): string {
+  const segments = shellSegments(command);
+  return segments[segments.length - 1];
 }
 
 /**
@@ -102,14 +110,70 @@ export function statelessPattern(pattern: RegExp): RegExp {
     : pattern;
 }
 
-export const SHELL_EDIT_PATTERN = /\b(sed -i|perl -p?i|patch -p\d|git apply)\b/;
+/** A command segment that starts an in-place edit: `sed -i`, `perl -pi`, `patch`, `git apply`. */
+export const SHELL_EDIT_PATTERN =
+  /^\s*(?:\(\s*)?(?:\w+=\S*\s+)*(?:sudo\s+)?(?:(?:sed|perl)\s(?:.*\s)?-[a-zA-Z]*i\S*(?=\s|$)|patch\b|git\s+apply\b)/;
 
 /** Dry-run modes of the shell edit commands, which change no file. */
 const DRY_RUN_FLAGS = /\s(?:--check|--dry-run)(?=\s|$)/;
 
-/** Whether a shell command edits files in place (heuristic, by command text). */
+/**
+ * Whether a shell command edits files in place: some command of the line,
+ * outside quotes, starts an edit command that is not a dry run. A heuristic
+ * over the command text.
+ */
 export function isShellEdit(command: string): boolean {
-  return SHELL_EDIT_PATTERN.test(command) && !DRY_RUN_FLAGS.test(command);
+  return shellSegments(command).some(
+    (segment) =>
+      SHELL_EDIT_PATTERN.test(segment) && !DRY_RUN_FLAGS.test(segment)
+  );
+}
+
+/** One tool call of an assistant turn, as the verification rules see it. */
+export interface CheckedToolCall {
+  name: string;
+  /** The shell command, or `''` for other tools. */
+  command: string;
+  succeeded: boolean;
+  /** The output the model saw; `undefined` when there is none. */
+  output: string | undefined;
+}
+
+/** Whether a code change happened, and whether a passing test run followed it. */
+export interface VerificationState {
+  changed: boolean;
+  verified: boolean;
+}
+
+function isChange(call: CheckedToolCall): boolean {
+  return call.name === Constants.EDIT_FILE || call.name === Constants.WRITE_FILE
+    ? call.succeeded
+    : isShellEdit(call.command);
+}
+
+/**
+ * Applies the tool calls of one assistant turn. Those calls run
+ * concurrently, so a test run verifies changes from earlier turns, or an
+ * edit earlier in its own shell command, but never a sibling call's edit.
+ * Updates `state` in place and returns it.
+ */
+export function applyToolBatch(
+  state: VerificationState,
+  calls: readonly CheckedToolCall[],
+  testPattern: RegExp
+): VerificationState {
+  const changes = calls.map(isChange);
+  if (changes.some(Boolean)) {
+    state.changed = true;
+    state.verified = false;
+  }
+  calls.forEach((call, index) => {
+    if (!state.changed || !isTestRun(call.command, testPattern)) return;
+    if (changes.some((change, other) => change && other !== index)) return;
+    state.verified =
+      call.succeeded && call.output !== undefined && !failed(call.output);
+  });
+  return state;
 }
 
 const DEFAULT_MESSAGE =
@@ -173,32 +237,19 @@ export function verifiedSinceLastChange(
     if (errored) erroredIds.add(id);
     outputs.set(id, errored ? undefined : textOf(message));
   }
-  let changed = false;
-  let verified = false;
+  const state: VerificationState = { changed: false, verified: false };
   for (const message of messages) {
-    for (const call of toolCallsOf(message)) {
-      const command = shellNames.has(call.name) ? commandOf(call.args) : '';
-      if (
-        call.name === Constants.EDIT_FILE ||
-        call.name === Constants.WRITE_FILE
-      ) {
-        if (call.id === undefined || !erroredIds.has(call.id)) {
-          changed = true;
-          verified = false;
-        }
-        continue;
-      }
-      if (isShellEdit(command)) {
-        changed = true;
-        verified = false;
-      }
-      if (changed && isTestRun(command, testPattern)) {
-        const output = call.id === undefined ? undefined : outputs.get(call.id);
-        verified = output !== undefined && !failed(output);
-      }
-    }
+    const calls = toolCallsOf(message).map(
+      (call): CheckedToolCall => ({
+        name: call.name,
+        command: shellNames.has(call.name) ? commandOf(call.args) : '',
+        succeeded: call.id === undefined || !erroredIds.has(call.id),
+        output: call.id === undefined ? undefined : outputs.get(call.id),
+      })
+    );
+    if (calls.length > 0) applyToolBatch(state, calls, testPattern);
   }
-  return changed ? verified : undefined;
+  return state.changed ? state.verified : undefined;
 }
 
 export function createVerifyBeforeStopHook(

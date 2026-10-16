@@ -81,7 +81,10 @@ export function isProgrammaticRunnerAutoBound(
       getCloudflareConfig(config)
     ).has(name);
   }
-  return shouldUseLocalExecution(config);
+  return (
+    shouldUseLocalExecution(config) &&
+    (getSelectedLocalCodingToolNames(config?.local ?? {})?.has(name) ?? true)
+  );
 }
 
 /** Mirrors whether resolver policy creates or replaces this runner locally. */

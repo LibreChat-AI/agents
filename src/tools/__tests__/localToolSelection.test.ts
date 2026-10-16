@@ -1,6 +1,7 @@
 import { describe, it, expect } from '@jest/globals';
 import type * as t from '@/types';
 import {
+  isProgrammaticRunnerAutoBound,
   resolveLocalExecutionTools,
   resolveLocalImplementationNames,
   resolveLocalToolRegistry,
@@ -71,5 +72,23 @@ describe('local coding tool selection', () => {
     expect([
       ...resolveLocalImplementationNames([Constants.BASH_TOOL], toolExecution),
     ]).toEqual([Constants.READ_FILE]);
+  });
+
+  it('reports programmatic runners as auto-bound only when allowlisted', () => {
+    const toolExecution: t.ToolExecutionConfig = {
+      engine: 'local',
+      local: { codingToolNames: [Constants.READ_FILE] },
+    };
+    expect(
+      isProgrammaticRunnerAutoBound(
+        Constants.PROGRAMMATIC_TOOL_CALLING,
+        toolExecution
+      )
+    ).toBe(false);
+    expect(
+      isProgrammaticRunnerAutoBound(Constants.PROGRAMMATIC_TOOL_CALLING, {
+        engine: 'local',
+      })
+    ).toBe(true);
   });
 });

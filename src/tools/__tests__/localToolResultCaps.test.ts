@@ -84,7 +84,7 @@ describe('toolResultMaxChars', () => {
     );
     expect(capped.length).toBeLessThan(1150);
     expect(capped).toMatch(
-      /\[showing lines 1-\d+ of 500; continue with offset=\d+\]$/
+      /\[showing lines 1-\d+; continue with offset=\d+\]$/
     );
     const next = Number(/offset=(\d+)/.exec(capped)?.[1]);
     const rest = String(
@@ -129,7 +129,24 @@ describe('toolResultMaxChars', () => {
     expect(capped.length).toBeLessThan(1150);
     expect(capped).toMatch(/continue with offset=\d+\]$/);
     const short = String(await read.invoke({ path: 'wide.py', limit: 2 }));
-    expect(short).toMatch(/showing lines 1-2 of 50; continue with offset=3\]$/);
+    expect(short).toMatch(/showing lines 1-2; continue with offset=3\]$/);
+  });
+
+  it('names no spill file when commands run through a delegated runtime', () => {
+    const text = `${'a'.repeat(500)}\n${'b'.repeat(500)}`;
+    const capped = capHeadTail(text, 400);
+    expect(capped).toContain('full output not kept');
+    expect(capped.length).toBeLessThan(500);
+  });
+
+  it('reads the last line of a file without a trailing newline and stops at the end', async () => {
+    const cwd = await createTempDir();
+    await writeFile(join(cwd, 'tail.txt'), 'one\ntwo\nthree');
+    const read = createLocalReadFileTool({ cwd, toolResultMaxChars: 1000 });
+    expect(String(await read.invoke({ path: 'tail.txt', offset: 2 }))).toBe(
+      '     2\ttwo\n     3\tthree'
+    );
+    expect(String(await read.invoke({ path: 'tail.txt', offset: 9 }))).toBe('');
   });
 
   it('caps grep_search and bash_tool results only when set', async () => {

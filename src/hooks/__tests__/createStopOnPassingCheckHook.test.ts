@@ -35,6 +35,21 @@ const failingTest = entry(
 );
 
 describe('createStopOnPassingCheckHook', () => {
+  it('does not let a test verify an edit from the same concurrent batch', async () => {
+    const hook = createStopOnPassingCheckHook();
+    expect(await hook(batch(edit, passingTest), {} as never)).toEqual({});
+    expect(await hook(batch(passingTest), {} as never)).toMatchObject({
+      preventContinuation: true,
+    });
+  });
+
+  it('ignores edit commands that appear only as data', async () => {
+    const hook = createStopOnPassingCheckHook();
+    const search = entry('bash_tool', { command: 'rg \'sed -i\' scripts' });
+    expect(await hook(batch(search), {} as never)).toEqual({});
+    expect(await hook(batch(passingTest), {} as never)).toEqual({});
+  });
+
   it('does not treat a failed edit or a dry-run patch as a change', async () => {
     const hook = createStopOnPassingCheckHook();
     const failedEdit = { ...entry('edit_file', { path: 'a.py' }), status: 'error' };

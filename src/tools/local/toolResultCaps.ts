@@ -52,13 +52,13 @@ export function capLines(text: string, maxChars: number): string {
 
 /**
  * Caps free-form output (shell results): keeps the first 20% and the last 80%
- * of `maxChars`, where errors and test summaries are, and names a file that
- * holds the full text.
+ * of `maxChars`, where errors and test summaries are. With `spill`, names a
+ * file that holds the full text; without it, says the rest was not kept.
  */
 export function capHeadTail(
   text: string,
   maxChars: number,
-  spill: (text: string) => string = spillToFile
+  spill?: (text: string) => string
 ): string {
   if (text.length <= maxChars) {
     return text;
@@ -66,5 +66,7 @@ export function capHeadTail(
   const head = text.slice(0, Math.floor(maxChars * 0.2));
   const tail = tailTruncate(text, Math.floor(maxChars * 0.8));
   const omitted = text.length - head.length - tail.length;
-  return `${head}\n[... ${omitted} characters omitted; full output at ${spill(text)} ...]\n${tail}`;
+  const where =
+    spill == null ? 'full output not kept' : `full output at ${spill(text)}`;
+  return `${head}\n[... ${omitted} characters omitted; ${where} ...]\n${tail}`;
 }
