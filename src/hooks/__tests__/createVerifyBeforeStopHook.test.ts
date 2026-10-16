@@ -75,6 +75,12 @@ describe('verifiedSinceLastChange', () => {
       verifiedSinceLastChange([...edit(), ...run('npx jest --listTests')])
     ).toBe(false);
     expect(
+      verifiedSinceLastChange([...edit(), ...run('cargo test --no-run')])
+    ).toBe(false);
+    expect(
+      verifiedSinceLastChange([...edit(), ...run('npx vitest list')])
+    ).toBe(false);
+    expect(
       verifiedSinceLastChange([
         ...edit(),
         ...run('python3 -m pytest --collect-only -q'),

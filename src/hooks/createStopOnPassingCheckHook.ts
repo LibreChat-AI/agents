@@ -1,7 +1,7 @@
 import type { HookCallback, PostToolBatchHookOutput } from './types';
 import {
   DEFAULT_TEST_PATTERN,
-  SHELL_EDIT_PATTERN,
+  isShellEdit,
   failed,
   isTestRun,
   statelessPattern,
@@ -56,11 +56,13 @@ export function createStopOnPassingCheckHook(
         entry.toolName === Constants.EDIT_FILE ||
         entry.toolName === Constants.WRITE_FILE
       ) {
-        changed = true;
-        verified = false;
+        if (entry.status === 'success') {
+          changed = true;
+          verified = false;
+        }
         continue;
       }
-      if (SHELL_EDIT_PATTERN.test(command)) {
+      if (isShellEdit(command)) {
         changed = true;
         verified = false;
       }

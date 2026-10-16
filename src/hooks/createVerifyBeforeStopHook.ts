@@ -5,8 +5,8 @@
  * project's existing tests. A run that already verified its last change
  * costs nothing; a run that made no change is never held.
  *
- * Detection reads the Run's own messages: file changes are `edit_file` /
- * `write_file` calls (plus in-place `sed -i`, `perl -pi` and `patch` shell
+ * Detection is a heuristic over the Run's own messages: file changes are
+ * successful `edit_file` / `write_file` calls (plus in-place `sed -i`, `perl -pi` and `patch` shell
  * commands), and a test run is a shell call whose last command starts a
  * common test runner and whose result reports no non-zero `exit_code` or
  * timeout.
@@ -52,7 +52,7 @@ function isRedirection(command: string, index: number): boolean {
 
 /** Runner modes that list, describe or collect tests without running them. */
 const NON_RUN_FLAGS =
-  /\s(?:--collect-only|--co|--listTests|--list-tests|--list|--help|-h|--version|-V)(?=\s|$)/;
+  /\s(?:--collect-only|--co|--listTests|--list-tests|--list|--no-run|--help|-h|--version|-V|list)(?=\s|$)/;
 
 /**
  * The last command of a shell command line: the text after the final
@@ -101,6 +101,14 @@ export function statelessPattern(pattern: RegExp): RegExp {
 }
 
 export const SHELL_EDIT_PATTERN = /\b(sed -i|perl -p?i|patch -p\d|git apply)\b/;
+
+/** Dry-run modes of the shell edit commands, which change no file. */
+const DRY_RUN_FLAGS = /\s(?:--check|--dry-run)(?=\s|$)/;
+
+/** Whether a shell command edits files in place (heuristic, by command text). */
+export function isShellEdit(command: string): boolean {
+  return SHELL_EDIT_PATTERN.test(command) && !DRY_RUN_FLAGS.test(command);
+}
 
 const DEFAULT_MESSAGE =
   'Not finished yet: no passing test run follows your last code change. ' +
@@ -155,10 +163,12 @@ export function verifiedSinceLastChange(
   );
   /** Tool output text by call id; `undefined` for an errored tool result. */
   const outputs = new Map<string, string | undefined>();
+  const erroredIds = new Set<string>();
   for (const message of messages) {
     const id = (message as { tool_call_id?: unknown }).tool_call_id;
     if (typeof id !== 'string') continue;
     const errored = (message as { status?: unknown }).status === 'error';
+    if (errored) erroredIds.add(id);
     outputs.set(id, errored ? undefined : textOf(message));
   }
   let changed = false;
@@ -170,11 +180,13 @@ export function verifiedSinceLastChange(
         call.name === Constants.EDIT_FILE ||
         call.name === Constants.WRITE_FILE
       ) {
-        changed = true;
-        verified = false;
+        if (call.id === undefined || !erroredIds.has(call.id)) {
+          changed = true;
+          verified = false;
+        }
         continue;
       }
-      if (SHELL_EDIT_PATTERN.test(command)) {
+      if (isShellEdit(command)) {
         changed = true;
         verified = false;
       }

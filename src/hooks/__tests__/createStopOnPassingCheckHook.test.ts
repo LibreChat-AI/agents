@@ -35,6 +35,20 @@ const failingTest = entry(
 );
 
 describe('createStopOnPassingCheckHook', () => {
+  it('does not treat a failed edit or a dry-run patch as a change', async () => {
+    const hook = createStopOnPassingCheckHook();
+    const failedEdit = { ...entry('edit_file', { path: 'a.py' }), status: 'error' };
+    const dryRun = entry('bash_tool', {
+      command: 'git apply --check fix.patch && python3 -m pytest -q',
+    });
+    expect(
+      await hook(
+        batch(failedEdit as PostToolBatchEntry, dryRun, passingTest),
+        {} as never
+      )
+    ).toEqual({});
+  });
+
   it('stops after a passing test that follows an edit, across batches', async () => {
     const hook = createStopOnPassingCheckHook();
     expect(await hook(batch(edit), {} as never)).toEqual({});
