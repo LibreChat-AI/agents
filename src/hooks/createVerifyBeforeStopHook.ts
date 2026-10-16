@@ -110,6 +110,9 @@ export function runsConcurrently(command: string): boolean {
   return false;
 }
 
+/** A shell line that can leave before reaching its runner. */
+const EARLY_EXIT = /(?:^|[\s;&|(])(?:exit|return)(?=[\s;)]|$)/;
+
 /** Whether a shell command line has an `||` outside quotes. */
 function hasConditionalOr(command: string): boolean {
   let quote: string | undefined;
@@ -141,12 +144,12 @@ export function lastShellSegment(command: string): string {
  * Whether a shell command runs tests whose result is the command's exit
  * code: the last segment must start with a runner. `pytest; echo done`,
  * `pytest || true` and `pytest | tail` report another command's exit code,
- * so they do not count; neither does any line with `||`, whose runner may not run,
+ * so they do not count; neither does a line with `||`, `exit` or `return`, whose runner may not run,
  * or listing modes such as `--collect-only`, `--listTests` or `--help`.
  */
 export function isTestRun(command: string, pattern: RegExp): boolean {
   if (command === '') return false;
-  if (hasConditionalOr(command)) return false;
+  if (hasConditionalOr(command) || EARLY_EXIT.test(command)) return false;
   const segment = lastShellSegment(command);
   return pattern.test(segment) && !NON_RUN_FLAGS.test(segment);
 }
@@ -160,7 +163,7 @@ export function statelessPattern(pattern: RegExp): RegExp {
 
 /** A command segment that starts an in-place edit: `sed -i`, `perl -pi`, `patch`, `git apply`. */
 export const SHELL_EDIT_PATTERN =
-  /^\s*(?:\(\s*)?(?:\w+=\S*\s+)*(?:sudo\s+)?(?:(?:sed|perl)\s(?:.*\s)?-[a-zA-Z]*i\S*(?=\s|$)|patch\b|git\s+apply\b)/;
+  /^\s*(?:\(\s*)?(?:\w+=\S*\s+)*(?:sudo\s+)?(?:(?:sed|perl)\s(?:.*\s)?(?:-[a-zA-Z]*i\S*|--in-place\S*)(?=\s|$)|patch\b|git\s+apply\b)/;
 
 /** Dry-run modes of the shell edit commands, which change no file. */
 const DRY_RUN_FLAGS = /\s(?:--check|--dry-run)(?=\s|$)/;
