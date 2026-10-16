@@ -181,14 +181,17 @@ export function isTestRun(command: string, pattern: RegExp): boolean {
   if (command === '') return false;
   if (hasConditionalOr(command) || EARLY_EXIT.test(command)) return false;
   const segment = lastShellSegment(command);
+  pattern.lastIndex = 0;
   return pattern.test(segment) && !NON_RUN_FLAGS.test(segment);
 }
 
-/** A copy of `pattern` without the `g` and `y` flags, whose `test()` keeps no state between calls. */
+/**
+ * A private copy of `pattern` with the same flags, so resetting its
+ * `lastIndex` before each match (see `isTestRun`) never touches the
+ * caller's object and `g` or `y` patterns give the same answer every call.
+ */
 export function statelessPattern(pattern: RegExp): RegExp {
-  return pattern.global || pattern.sticky
-    ? new RegExp(pattern.source, pattern.flags.replace(/[gy]/g, ''))
-    : pattern;
+  return new RegExp(pattern.source, pattern.flags);
 }
 
 /** A command segment that starts an in-place edit: `sed -i`, `perl -pi`, `patch`, `git apply`. */
@@ -204,10 +207,15 @@ const DRY_RUN_FLAGS = /\s(?:--check|--dry-run)(?=\s|$)/;
  * over the command text.
  */
 export function isShellEdit(command: string): boolean {
-  return shellSegments(command).some(
-    (segment) =>
-      SHELL_EDIT_PATTERN.test(segment) && !DRY_RUN_FLAGS.test(segment)
-  );
+  return shellSegments(command).some((segment) => {
+    const options = blankQuotedText(segment);
+    return SHELL_EDIT_PATTERN.test(options) && !DRY_RUN_FLAGS.test(options);
+  });
+}
+
+/** Replaces the text inside quotes with nothing, so flags are read from options only. */
+function blankQuotedText(segment: string): string {
+  return segment.replace(/'[^']*'|"(?:[^"\\]|\\.)*"/g, '\'\'');
 }
 
 /** One tool call of an assistant turn, as the verification rules see it. */

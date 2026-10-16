@@ -203,6 +203,26 @@ describe('verifiedSinceLastChange', () => {
     expect(verifiedSinceLastChange(messages, config)).toBe(true);
   });
 
+  it('keeps sticky custom patterns anchored', () => {
+    const run = (command: string): BaseMessage[] =>
+      call('bash_tool', { command }, 'stdout:\nok\n');
+    const config = { testCommandPattern: /pytest/y };
+    expect(
+      verifiedSinceLastChange([...edit(), ...run('echo pytest')], config)
+    ).toBe(false);
+    expect(
+      verifiedSinceLastChange([...edit(), ...run('pytest tests')], config)
+    ).toBe(true);
+  });
+
+  it('does not read edit flags from quoted program text', () => {
+    expect(
+      verifiedSinceLastChange(
+        call('bash_tool', { command: 'sed -n \'/ -i /p\' README.md' }, 'ok')
+      )
+    ).toBeUndefined();
+  });
+
   it('does not count an errored test tool result as verification', () => {
     const id = `call_${seq++}`;
     const errored: BaseMessage[] = [
