@@ -85,6 +85,8 @@ describe('verifiedSinceLastChange', () => {
       'ctest -N',
       'rspec --dry-run',
       'git diff --quiet || npm test',
+      'true || (echo setup && python3 -m pytest)',
+      'go test -list=. ./...',
     ]) {
       expect(verifiedSinceLastChange([...edit(), ...run(command)])).toBe(false);
     }
@@ -136,6 +138,17 @@ describe('verifiedSinceLastChange', () => {
     ];
     expect(verifiedSinceLastChange(turn)).toBe(false);
     expect(verifiedSinceLastChange([...turn, ...test()])).toBe(true);
+  });
+
+  it('ignores trailing newlines and semicolons after a test run', () => {
+    for (const command of ['python3 -m pytest -q\n', 'python3 -m pytest -q;']) {
+      expect(
+        verifiedSinceLastChange([
+          ...edit(),
+          ...call('bash_tool', { command }, 'stdout:\n3 passed\n'),
+        ])
+      ).toBe(true);
+    }
   });
 
   it('ignores test runs whose exit code another command replaces', () => {

@@ -52,7 +52,7 @@ function isRedirection(command: string, index: number): boolean {
 
 /** Runner modes that list, describe or collect tests without running them. */
 const NON_RUN_FLAGS =
-  /\s(?:--collect-only|--co|--listTests|--list-tests|--list|--no-run|--dry-run|-list|-N|--help|-h|--version|-V|list)(?=\s|$)/;
+  /\s(?:--collect-only|--co|--listTests|--list-tests|--list|--no-run|--dry-run|-list|-N|--help|-h|--version|-V|list)(?=[\s=]|$)/;
 
 /**
  * The commands of a shell command line, split at `;`, `&`, `|` and
@@ -110,24 +110,44 @@ export function runsConcurrently(command: string): boolean {
   return false;
 }
 
+/** Whether a shell command line has an `||` outside quotes. */
+function hasConditionalOr(command: string): boolean {
+  let quote: string | undefined;
+  for (let i = 0; i < command.length; i++) {
+    const char = command[i];
+    if (quote != null) {
+      if (char === '\\' && quote === '"') i++;
+      else if (char === quote) quote = undefined;
+    } else if (char === '\\') {
+      i++;
+    } else if (char === '\'' || char === '"') {
+      quote = char;
+    } else if (char === '|' && command[i + 1] === '|') {
+      return true;
+    }
+  }
+  return false;
+}
+
 /** The last command of a shell command line; its exit code is the one the shell reports. */
 export function lastShellSegment(command: string): string {
-  const segments = shellSegments(command);
-  return segments[segments.length - 1];
+  const segments = shellSegments(command).filter(
+    (segment) => segment.trim() !== ''
+  );
+  return segments.length > 0 ? segments[segments.length - 1] : '';
 }
 
 /**
  * Whether a shell command runs tests whose result is the command's exit
  * code: the last segment must start with a runner. `pytest; echo done`,
  * `pytest || true` and `pytest | tail` report another command's exit code,
- * so they do not count; neither do a runner after `||`, which may not run,
+ * so they do not count; neither does any line with `||`, whose runner may not run,
  * or listing modes such as `--collect-only`, `--listTests` or `--help`.
  */
 export function isTestRun(command: string, pattern: RegExp): boolean {
   if (command === '') return false;
+  if (hasConditionalOr(command)) return false;
   const segment = lastShellSegment(command);
-  const before = command.slice(0, command.length - segment.length).trimEnd();
-  if (before.endsWith('||')) return false;
   return pattern.test(segment) && !NON_RUN_FLAGS.test(segment);
 }
 
