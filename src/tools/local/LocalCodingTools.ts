@@ -32,8 +32,8 @@ import { applyEdit, locateEdit } from './editStrategies';
 import { decodeFile, encodeFile } from './textEncoding';
 import { withIntent, withoutIntent } from '@/tools/intentArg';
 import { runPostEditSyntaxCheck } from './syntaxCheck';
-import { capLines } from './toolResultCaps';
-import { Constants } from '@/common';
+import { capHeadTail, capLines } from './toolResultCaps';
+import { Constants, LOCAL_CODING_BUNDLE_NAMES } from '@/common';
 
 const MAX_READ_CHARS = 256000;
 const DEFAULT_MAX_RESULTS = 200;
@@ -1250,8 +1250,12 @@ export function createLocalGrepSearchTool(
           (result.exitCode != null && result.exitCode > 1)
         ) {
           const detail = result.stderr.trim() || `rg exited ${result.exitCode}`;
+          const shown =
+            config.toolResultMaxChars != null && config.toolResultMaxChars > 0
+              ? capHeadTail(detail, config.toolResultMaxChars)
+              : detail;
           return [
-            `grep_search failed: ${detail}`,
+            `grep_search failed: ${shown}`,
             {
               matches: 0,
               engine: 'ripgrep',
@@ -1268,12 +1272,13 @@ export function createLocalGrepSearchTool(
           lines.length > 0
             ? lines.join('\n')
             : result.stderr.trim() || 'No matches found.';
-        const output =
-          config.toolResultMaxChars != null &&
-          config.toolResultMaxChars > 0 &&
-          lines.length > 0
-            ? capLines(joined, config.toolResultMaxChars)
-            : joined;
+        let output = joined;
+        if (config.toolResultMaxChars != null && config.toolResultMaxChars > 0) {
+          output =
+            lines.length > 0
+              ? capLines(joined, config.toolResultMaxChars)
+              : capHeadTail(joined, config.toolResultMaxChars);
+        }
         return [output, { matches: lines.length, engine: 'ripgrep' }];
       }
 
@@ -1452,36 +1457,38 @@ export function createLocalCodingTools(
     (config.fileCheckpointing === true
       ? createLocalFileCheckpointer({ fs: config.exec?.fs })
       : undefined);
-  return selectLocalCodingTools(config, [
-    createLocalReadFileTool(config),
-    createLocalWriteFileTool(config, checkpointer),
-    createLocalEditFileTool(config, checkpointer),
-    createLocalGrepSearchTool(config),
-    createLocalGlobSearchTool(config),
-    createLocalListDirectoryTool(config),
-    createCompileCheckTool(config),
-    createLocalBashExecutionTool({ config }),
-    createLocalCodeExecutionTool(config),
-    createLocalProgrammaticToolCallingTool(config),
-    createLocalBashProgrammaticToolCallingTool(config),
-  ]);
-}
-
-/** Applies `codingToolNames` and `toolIntentLabels` to a freshly built suite. */
-function selectLocalCodingTools(
-  config: t.LocalExecutionConfig,
-  tools: DynamicStructuredTool[]
-): DynamicStructuredTool[] {
+  const create = (name: string): DynamicStructuredTool => {
+    switch (name) {
+    case Constants.READ_FILE:
+      return createLocalReadFileTool(config);
+    case Constants.WRITE_FILE:
+      return createLocalWriteFileTool(config, checkpointer);
+    case Constants.EDIT_FILE:
+      return createLocalEditFileTool(config, checkpointer);
+    case Constants.GREP_SEARCH:
+      return createLocalGrepSearchTool(config);
+    case Constants.GLOB_SEARCH:
+      return createLocalGlobSearchTool(config);
+    case Constants.LIST_DIRECTORY:
+      return createLocalListDirectoryTool(config);
+    case Constants.COMPILE_CHECK:
+      return createCompileCheckTool(config);
+    case Constants.BASH_TOOL:
+      return createLocalBashExecutionTool({ config });
+    case Constants.EXECUTE_CODE:
+      return createLocalCodeExecutionTool(config);
+    case Constants.PROGRAMMATIC_TOOL_CALLING:
+      return createLocalProgrammaticToolCallingTool(config);
+    default:
+      return createLocalBashProgrammaticToolCallingTool(config);
+    }
+  };
+  // Select by name before constructing, so omitted tools are never built.
   const names =
-    config.codingToolNames == null
-      ? undefined
-      : new Set(config.codingToolNames);
-  const selected =
-    names == null ? tools : tools.filter((tool) => names.has(tool.name));
-  for (const tool of selected) {
-    applyIntentLabelOption(tool, config);
-  }
-  return selected;
+    config.codingToolNames == null ? undefined : new Set(config.codingToolNames);
+  return LOCAL_CODING_BUNDLE_NAMES.filter(
+    (name) => names == null || names.has(name)
+  ).map((name) => applyIntentLabelOption(create(name), config));
 }
 
 /** Drops the `intent` field from a local tool's schema when `toolIntentLabels` is false. */

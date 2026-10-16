@@ -23,6 +23,14 @@ describe('local coding tool selection', () => {
     expect(propsOf(read?.schema)[INTENT_ARG]).toBeDefined();
   });
 
+  it('constructs only the allowlisted tools', () => {
+    const tools = createLocalCodingTools({
+      codingToolNames: [Constants.READ_FILE],
+      fileCheckpointing: true,
+    });
+    expect(tools.map((tool) => tool.name)).toEqual([Constants.READ_FILE]);
+  });
+
   it('keeps only the allowlisted tools', () => {
     const names = [
       Constants.READ_FILE,
