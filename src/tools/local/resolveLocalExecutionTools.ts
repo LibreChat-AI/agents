@@ -10,6 +10,7 @@ import {
   createCloudflareExecutionTool,
 } from '@/tools/cloudflare';
 import {
+  applyIntentLabelOption,
   createLocalCodingToolBundle,
   createLocalCodingToolDefinitions,
   createLocalCodingTools,
@@ -176,6 +177,16 @@ function pruneCloudflareCodingToolAllowlist(
 }
 
 function createLocalExecutionTool(
+  name: string,
+  config: t.LocalExecutionConfig
+): t.GenericTool | undefined {
+  const created = createLocalExecutionToolByName(name, config) as
+    | (t.GenericTool & { schema: unknown })
+    | undefined;
+  return created == null ? undefined : applyIntentLabelOption(created, config);
+}
+
+function createLocalExecutionToolByName(
   name: string,
   config: t.LocalExecutionConfig
 ): t.GenericTool | undefined {
@@ -396,6 +407,29 @@ export function resolveLocalToolRegistry(args: {
     );
   }
   return registry;
+}
+
+/**
+ * Drops host-bound coding tools outside `local.codingToolNames`, so prompt
+ * projections (instruction tokens, runner guidance) see the same tools that
+ * are finally bound. Returns `tools` unchanged when no local allowlist applies.
+ */
+export function filterToolsByLocalAllowlist(
+  tools: t.GraphTools | undefined,
+  toolExecution?: t.ToolExecutionConfig
+): t.GraphTools | undefined {
+  if (
+    !shouldUseLocalExecution(toolExecution) ||
+    !shouldIncludeCodingTools(toolExecution)
+  ) {
+    return tools;
+  }
+  const selectedNames = getSelectedLocalCodingToolNames(
+    toolExecution?.local ?? {}
+  );
+  return selectedNames == null
+    ? tools
+    : filterCloudflareCodingToolAllowlist(tools, selectedNames);
 }
 
 /** Names that this execution config creates or replaces in the local tool map. */

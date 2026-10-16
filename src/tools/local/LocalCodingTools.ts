@@ -1451,15 +1451,21 @@ function selectLocalCodingTools(
       : new Set(config.codingToolNames);
   const selected =
     names == null ? tools : tools.filter((tool) => names.has(tool.name));
-  if (config.toolIntentLabels !== false) {
-    return selected;
-  }
   for (const tool of selected) {
-    tool.schema = withoutIntent(
-      tool.schema as t.JsonSchemaType
-    ) as DynamicStructuredTool['schema'];
+    applyIntentLabelOption(tool, config);
   }
   return selected;
+}
+
+/** Drops the `intent` field from a local tool's schema when `toolIntentLabels` is false. */
+export function applyIntentLabelOption<T extends { schema: unknown }>(
+  tool: T,
+  config: t.LocalExecutionConfig
+): T {
+  if (config.toolIntentLabels === false) {
+    tool.schema = withoutIntent(tool.schema as t.JsonSchemaType) as T['schema'];
+  }
+  return tool;
 }
 
 /**

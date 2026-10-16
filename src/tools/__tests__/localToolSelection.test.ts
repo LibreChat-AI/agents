@@ -1,6 +1,7 @@
 import { describe, it, expect } from '@jest/globals';
 import type * as t from '@/types';
 import {
+  filterToolsByLocalAllowlist,
   isProgrammaticRunnerAutoBound,
   resolveLocalExecutionTools,
   resolveLocalImplementationNames,
@@ -90,5 +91,36 @@ describe('local coding tool selection', () => {
         engine: 'local',
       })
     ).toBe(true);
+  });
+
+  it('filters host-bound tools for prompt projections with the same allowlist', () => {
+    const toolExecution: t.ToolExecutionConfig = {
+      engine: 'local',
+      local: { codingToolNames: [Constants.READ_FILE] },
+    };
+    const hostTools = [
+      { name: Constants.PROGRAMMATIC_TOOL_CALLING } as t.GenericTool,
+      { name: 'web_search' } as t.GenericTool,
+    ];
+    const filtered = filterToolsByLocalAllowlist(
+      hostTools,
+      toolExecution
+    ) as t.GenericTool[];
+    expect(filtered.map((tool) => tool.name)).toEqual(['web_search']);
+    expect(filterToolsByLocalAllowlist(hostTools, { engine: 'local' })).toBe(
+      hostTools
+    );
+  });
+
+  it('drops the intent label from replacement tools when coding tools are off', () => {
+    const tools = resolveLocalToolsForBinding({
+      tools: [{ name: Constants.BASH_TOOL } as t.GenericTool],
+      toolExecution: {
+        engine: 'local',
+        local: { includeCodingTools: false, toolIntentLabels: false },
+      },
+    }) as t.GenericTool[];
+    const bash = tools.find((tool) => tool.name === Constants.BASH_TOOL);
+    expect(propsOf((bash as { schema?: unknown }).schema)[INTENT_ARG]).toBeUndefined();
   });
 });

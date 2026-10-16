@@ -38,6 +38,7 @@ import {
 import {
   isProgrammaticRunnerAutoBound,
   isProgrammaticRunnerResolvedDirectly,
+  filterToolsByLocalAllowlist,
   resolveLocalImplementationNames,
   resolveLocalToolRegistry,
 } from '@/tools/local/resolveLocalExecutionTools';
@@ -537,7 +538,7 @@ export class AgentContext {
       tokenCounter != null && isTokenCounterCacheCompatible(tokenCounter)
         ? createExactTokenCountCache(tokenCounter)
         : undefined;
-    this.tools = tools;
+    this.tools = filterToolsByLocalAllowlist(tools, toolExecution);
     this.toolMap = toolMap;
     this.toolRegistry = resolveLocalToolRegistry({
       toolRegistry,
