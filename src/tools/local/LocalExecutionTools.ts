@@ -128,6 +128,26 @@ export function createLocalCodeExecutionTool(
   );
 }
 
+/**
+ * Applies `toolResultMaxChars` to stdout and stderr before formatting, so
+ * the status lines (`exit_code`, `timed_out`, `killed`) are always kept.
+ * stderr gets at most half of the budget.
+ */
+function capStreams<T extends { stdout: string; stderr: string }>(
+  result: T,
+  config: t.LocalExecutionConfig
+): T {
+  const maxChars = config.toolResultMaxChars;
+  if (maxChars == null || maxChars <= 0) return result;
+  const spill = runsOnHost(config) ? spillToFile : undefined;
+  const stderrBudget = Math.min(result.stderr.length, Math.floor(maxChars / 2));
+  return {
+    ...result,
+    stdout: capHeadTail(result.stdout, maxChars - stderrBudget, spill),
+    stderr: capHeadTail(result.stderr, Math.max(stderrBudget, 1), spill),
+  };
+}
+
 /** Whether commands run on this host, so a host temp file is readable by later commands. */
 function runsOnHost(config: t.LocalExecutionConfig): boolean {
   return config.exec?.spawn == null && config.exec?.fs == null && config.spawn == null;
@@ -152,15 +172,8 @@ export function createLocalBashExecutionTool(options?: {
         input.args != null && input.args.length > 0
           ? await executeLocalBashWithArgs(input.command, input.args, config)
           : await executeLocalBash(input.command, config);
-      const formatted = formatLocalOutput(result, cwd);
       return [
-        config.toolResultMaxChars != null && config.toolResultMaxChars > 0
-          ? capHeadTail(
-            formatted,
-            config.toolResultMaxChars,
-            runsOnHost(config) ? spillToFile : undefined
-          )
-          : formatted,
+        formatLocalOutput(capStreams(result, config), cwd),
         {
           session_id: getLocalSessionId(config),
           files: [],

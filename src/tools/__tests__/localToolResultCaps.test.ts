@@ -149,6 +149,16 @@ describe('toolResultMaxChars', () => {
     expect(String(await read.invoke({ path: 'tail.txt', offset: 9 }))).toBe('');
   });
 
+  it('keeps the exit status of a failing command under a tiny cap', async () => {
+    const cwd = await createTempDir();
+    const result = String(
+      await createLocalBashExecutionTool({
+        config: { cwd, toolResultMaxChars: 40 },
+      }).invoke({ command: 'seq 1 5000; exit 3' })
+    );
+    expect(result).toMatch(/exit_code: 3/);
+  });
+
   it('caps grep_search and bash_tool results only when set', async () => {
     const cwd = await createTempDir();
     await writeFile(
