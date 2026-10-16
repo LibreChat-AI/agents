@@ -1834,6 +1834,26 @@ describe('AgentContext', () => {
       expect(unfiltered.toolSchemaTokens).toBe(99999);
     });
 
+    it('keeps the cached total when a retained tool is a native schema the recount cannot measure', async () => {
+      const nativeSearch = {
+        type: 'function',
+        function: { name: 'web_search', parameters: {} },
+      } as unknown as t.GenericTool;
+      const ctx = createBasicContext({
+        agentConfig: {
+          tools: [createMockTool('bash_tool'), nativeSearch],
+          toolSchemaTokens: 99999,
+        },
+        tokenCounter: mockTokenCounter,
+        toolExecution: {
+          engine: 'local',
+          local: { codingToolNames: ['read_file'] },
+        },
+      });
+      await ctx.tokenCalculationPromise;
+      expect(ctx.toolSchemaTokens).toBe(99999);
+    });
+
     it('excludes deferred-undiscovered toolDefinitions from toolSchemaTokens', async () => {
       const activeDef: t.LCTool = {
         name: 'active_tool',

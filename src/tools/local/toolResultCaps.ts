@@ -19,12 +19,13 @@ export const CAPPED_GREP_LINE_CHARS = 300;
  * how many were left out.
  */
 export function capLines(
-  text: string,
+  text: string | readonly string[],
   maxChars: number,
   note: (omitted: number) => string = (omitted) =>
     `${omitted} more matching lines not shown; narrow the pattern or path`
 ): string {
-  const lines = text.split('\n');
+  // An array is capped line by line without joining it first.
+  const lines = typeof text === 'string' ? text.split('\n') : text;
   const lineChars = Math.max(1, Math.min(CAPPED_GREP_LINE_CHARS, maxChars));
   const kept: string[] = [];
   let used = 0;

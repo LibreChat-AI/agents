@@ -1069,7 +1069,7 @@ function capFallbackGrepDisplay(
     skipped.length === 0
       ? ''
       : capLines(
-        skipped.join('\n'),
+        skipped,
         Math.max(1, Math.floor(maxChars / 5)),
         (omitted) => `${omitted} more files skipped`
       );
@@ -1077,7 +1077,7 @@ function capFallbackGrepDisplay(
     return skipText === '' ? 'No matches found.' : skipText;
   }
   const matchText = capLines(
-    matches.join('\n'),
+    matches,
     Math.max(1, maxChars - skipText.length)
   );
   return skipText === '' ? matchText : `${matchText}\n${skipText}`;
@@ -1276,7 +1276,7 @@ export function createLocalGrepSearchTool(
         if (config.toolResultMaxChars != null && config.toolResultMaxChars > 0) {
           output =
             lines.length > 0
-              ? capLines(joined, config.toolResultMaxChars)
+              ? capLines(lines, config.toolResultMaxChars)
               : capHeadTail(joined, config.toolResultMaxChars);
         }
         return [output, { matches: lines.length, engine: 'ripgrep' }];

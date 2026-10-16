@@ -205,17 +205,27 @@ export class AgentContext {
       agentContext.baseIndexTokenCountMap = { ...tokenMap };
       agentContext.indexTokenCountMap = tokenMap;
 
-      /** A cached total counts the host's unfiltered tools; it no longer
-       *  applies once the local allowlist removed any of them. */
+      /** A cached total counts the host's unfiltered tools. Once the local
+       *  allowlist removed some, recount, but only when the recount can
+       *  measure every retained tool (it reads `.schema`); otherwise the
+       *  larger cached total is the safer budget. */
       const allowlistRemovedTools =
         (tools?.length ?? 0) !== (agentContext.tools?.length ?? 0) ||
         (toolDefinitions?.length ?? 0) !==
           (agentContext.toolDefinitions?.length ?? 0) ||
         (graphTools?.length ?? 0) !== (agentContext.graphTools?.length ?? 0);
+      const recountMeasuresAll = [
+        ...((agentContext.tools as unknown[] | undefined) ?? []),
+        ...((agentContext.graphTools as unknown[] | undefined) ?? []),
+      ].every(
+        (tool) =>
+          tool != null &&
+          typeof (tool as { schema?: unknown }).schema === 'object'
+      );
       if (
         toolSchemaTokens != null &&
         toolSchemaTokens > 0 &&
-        !allowlistRemovedTools
+        !(allowlistRemovedTools && recountMeasuresAll)
       ) {
         /** Use pre-computed (cached) tool schema tokens — skip calculateInstructionTokens */
         agentContext.toolSchemaTokens = toolSchemaTokens;
