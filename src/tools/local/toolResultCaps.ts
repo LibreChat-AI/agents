@@ -1,18 +1,3 @@
-import { tmpdir } from 'os';
-import { resolve } from 'path';
-import { writeFileSync } from 'fs';
-import { randomUUID } from 'crypto';
-
-/**
- * Writes text to a fresh file under the host temp dir and returns its path.
- * The file is readable by its owner only, since tool output may hold secrets.
- */
-export function spillToFile(text: string): string {
-  const path = resolve(tmpdir(), `lc-output-${randomUUID()}.txt`);
-  writeFileSync(path, text, { encoding: 'utf8', mode: 0o600 });
-  return path;
-}
-
 /** Keeps the last `maxChars` characters, starting at a line boundary when one is near. */
 export function tailTruncate(text: string, maxChars: number): string {
   if (text.length <= maxChars) {
@@ -52,21 +37,15 @@ export function capLines(text: string, maxChars: number): string {
 
 /**
  * Caps free-form output (shell results): keeps the first 20% and the last 80%
- * of `maxChars`, where errors and test summaries are. With `spill`, names a
- * file that holds the full text; without it, says the rest was not kept.
+ * of `maxChars`, where errors and test summaries are, and says how much was
+ * left out so the model can rerun a narrower command.
  */
-export function capHeadTail(
-  text: string,
-  maxChars: number,
-  spill?: (text: string) => string
-): string {
+export function capHeadTail(text: string, maxChars: number): string {
   if (text.length <= maxChars) {
     return text;
   }
   const head = text.slice(0, Math.floor(maxChars * 0.2));
   const tail = tailTruncate(text, Math.floor(maxChars * 0.8));
   const omitted = text.length - head.length - tail.length;
-  const where =
-    spill == null ? 'full output not kept' : `full output at ${spill(text)}`;
-  return `${head}\n[... ${omitted} characters omitted; ${where} ...]\n${tail}`;
+  return `${head}\n[... ${omitted} characters omitted; rerun with narrower output to see them ...]\n${tail}`;
 }

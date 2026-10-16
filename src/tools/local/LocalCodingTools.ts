@@ -1259,11 +1259,13 @@ export function createLocalGrepSearchTool(
         );
         // Artifact count: ONLY real matches (Codex P2 [43] —
         // skip sentinels used to inflate the count and the budget).
-        const fullDisplay = formatFallbackGrepDisplay({ matches, skipped });
+        // The cap applies to matches only; skip diagnostics always follow.
         const display =
-          config.toolResultMaxChars != null && config.toolResultMaxChars > 0
-            ? capLines(fullDisplay, config.toolResultMaxChars)
-            : fullDisplay;
+          config.toolResultMaxChars != null &&
+          config.toolResultMaxChars > 0 &&
+          matches.length > 0
+            ? [capLines(matches.join('\n'), config.toolResultMaxChars), ...skipped].join('\n')
+            : formatFallbackGrepDisplay({ matches, skipped });
         return [
           display,
           {

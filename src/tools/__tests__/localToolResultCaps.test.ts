@@ -1,19 +1,19 @@
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { existsSync, readFileSync, statSync, unlinkSync } from 'fs';
+import type { SpawnOptions } from 'child_process';
 import { mkdtemp, rm, writeFile } from 'fs/promises';
 import { describe, it, expect, afterEach } from '@jest/globals';
 import {
   createLocalGrepSearchTool,
-  createLocalReadFileTool,
+  createLocalReadFileTool, _resetRipgrepCacheForTests
 } from '../local/LocalCodingTools';
 import {
   capHeadTail,
   capLines,
-  spillToFile,
   tailTruncate,
 } from '../local/toolResultCaps';
 import { createLocalBashExecutionTool } from '../local/LocalExecutionTools';
+import type { LocalSpawn } from '@/types';
 
 const tempDirs: string[] = [];
 
@@ -27,22 +27,6 @@ afterEach(async () => {
   await Promise.all(
     tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true }))
   );
-});
-
-describe('spillToFile', () => {
-  it('writes the full text to a file only its owner can read', () => {
-    const path = spillToFile('full output\n');
-    try {
-      expect(readFileSync(path, 'utf8')).toBe('full output\n');
-      if (process.platform !== 'win32') {
-        expect(statSync(path).mode & 0o777).toBe(0o600);
-      }
-    } finally {
-      if (existsSync(path)) {
-        unlinkSync(path);
-      }
-    }
-  });
 });
 
 describe('tailTruncate', () => {
@@ -61,11 +45,11 @@ describe('toolResultMaxChars', () => {
     );
   });
 
-  it('keeps the head and tail of long shell output and names the full file', () => {
+  it('keeps the head and tail of long shell output and counts what it left out', () => {
     const text = `HEAD\n${'m\n'.repeat(2000)}TAIL summary\n`;
-    const capped = capHeadTail(text, 400, () => '/tmp/full.txt');
+    const capped = capHeadTail(text, 400);
     expect(capped.startsWith('HEAD')).toBe(true);
-    expect(capped).toContain('full output at /tmp/full.txt');
+    expect(capped).toMatch(/\[\.\.\. \d+ characters omitted; rerun with narrower output/);
     expect(capped.trimEnd().endsWith('TAIL summary')).toBe(true);
     expect(capped.length).toBeLessThan(600);
     expect(capHeadTail('short', 400)).toBe('short');
@@ -132,13 +116,6 @@ describe('toolResultMaxChars', () => {
     expect(short).toMatch(/showing lines 1-2; continue with offset=3\]$/);
   });
 
-  it('names no spill file when commands run through a delegated runtime', () => {
-    const text = `${'a'.repeat(500)}\n${'b'.repeat(500)}`;
-    const capped = capHeadTail(text, 400);
-    expect(capped).toContain('full output not kept');
-    expect(capped.length).toBeLessThan(500);
-  });
-
   it('reads the last line of a file without a trailing newline and stops at the end', async () => {
     const cwd = await createTempDir();
     await writeFile(join(cwd, 'tail.txt'), 'one\ntwo\nthree');
@@ -157,6 +134,32 @@ describe('toolResultMaxChars', () => {
       }).invoke({ command: 'seq 1 5000; exit 3' })
     );
     expect(result).toMatch(/exit_code: 3/);
+  });
+
+  it('keeps fallback grep skip notices when matches fill the cap', async () => {
+    _resetRipgrepCacheForTests();
+    const realSpawn = (
+      require('child_process') as typeof import('child_process')
+    ).spawn;
+    const noRg = ((cmd: string, args: string[], opts: SpawnOptions) =>
+      cmd === 'rg'
+        ? realSpawn('sh', ['-c', 'exit 127'], opts)
+        : realSpawn(cmd, args, opts)) as unknown as LocalSpawn;
+    const cwd = await createTempDir();
+    await writeFile(
+      join(cwd, 'many.py'),
+      Array.from({ length: 200 }, (_, i) => `needle_${i} = ${i}`).join('\n')
+    );
+    await writeFile(join(cwd, 'big.txt'), Buffer.alloc(6 * 1024 * 1024, 'a'));
+    const capped = String(
+      await createLocalGrepSearchTool({
+        cwd,
+        toolResultMaxChars: 300,
+        exec: { spawn: noRg },
+      }).invoke({ pattern: 'needle' })
+    );
+    expect(capped).toMatch(/more matching lines not shown/);
+    expect(capped).toMatch(/skipped/);
   });
 
   it('caps grep_search and bash_tool results only when set', async () => {
@@ -180,7 +183,7 @@ describe('toolResultMaxChars', () => {
         config: { cwd, toolResultMaxChars: 500 },
       }).invoke({ command: 'seq 1 2000; echo DONE' })
     );
-    expect(bash).toContain('full output at');
+    expect(bash).toContain('characters omitted');
     expect(bash).toContain('DONE');
   });
 });

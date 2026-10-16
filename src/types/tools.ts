@@ -995,8 +995,8 @@ export type LocalExecutionConfig = {
    * `read_file` keeps whole lines up to the cap (and its `limit`, when
    * given) with an `offset` hint to continue, `grep_search` cuts long match lines and stops
    * at the cap with a count of omitted lines, and `bash_tool` keeps the head
-   * and tail of long output with the full output saved to a file. Unset keeps
-   * the existing limits.
+   * and tail of long stdout and stderr with the status lines intact. Unset
+   * keeps the existing limits.
    */
   toolResultMaxChars?: number;
   /**

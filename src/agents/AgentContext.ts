@@ -545,7 +545,10 @@ export class AgentContext {
       toolExecution,
     });
     this.toolExecution = toolExecution;
-    this.toolDefinitions = toolDefinitions;
+    this.toolDefinitions = filterToolsByLocalAllowlist(
+      toolDefinitions as t.GraphTools | undefined,
+      toolExecution
+    ) as t.LCTool[] | undefined;
     this.instructions = instructions;
     this.additionalInstructions = additionalInstructions;
     if (reasoningKey) {

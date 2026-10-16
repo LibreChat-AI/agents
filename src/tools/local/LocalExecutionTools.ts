@@ -13,7 +13,7 @@ import {
   BashExecutionToolSchema,
   BashToolOutputReferencesGuide,
 } from '@/tools/BashExecutor';
-import { capHeadTail, spillToFile } from './toolResultCaps';
+import { capHeadTail } from './toolResultCaps';
 import {
   CodeExecutionToolName,
   CodeExecutionToolSchema,
@@ -139,18 +139,12 @@ function capStreams<T extends { stdout: string; stderr: string }>(
 ): T {
   const maxChars = config.toolResultMaxChars;
   if (maxChars == null || maxChars <= 0) return result;
-  const spill = runsOnHost(config) ? spillToFile : undefined;
   const stderrBudget = Math.min(result.stderr.length, Math.floor(maxChars / 2));
   return {
     ...result,
-    stdout: capHeadTail(result.stdout, maxChars - stderrBudget, spill),
-    stderr: capHeadTail(result.stderr, Math.max(stderrBudget, 1), spill),
+    stdout: capHeadTail(result.stdout, maxChars - stderrBudget),
+    stderr: capHeadTail(result.stderr, Math.max(stderrBudget, 1)),
   };
-}
-
-/** Whether commands run on this host, so a host temp file is readable by later commands. */
-function runsOnHost(config: t.LocalExecutionConfig): boolean {
-  return config.exec?.spawn == null && config.exec?.fs == null && config.spawn == null;
 }
 
 export function createLocalBashExecutionTool(options?: {

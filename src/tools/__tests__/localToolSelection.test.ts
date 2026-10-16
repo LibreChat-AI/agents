@@ -123,4 +123,20 @@ describe('local coding tool selection', () => {
     const bash = tools.find((tool) => tool.name === Constants.BASH_TOOL);
     expect(propsOf((bash as { schema?: unknown }).schema)[INTENT_ARG]).toBeUndefined();
   });
+
+  it('filters event-driven tool definitions with the local allowlist', () => {
+    const definitions = [
+      { name: Constants.READ_FILE },
+      { name: Constants.WRITE_FILE },
+      { name: 'web_search' },
+    ] as t.LCTool[];
+    const filtered = filterToolsByLocalAllowlist(
+      definitions as unknown as t.GraphTools,
+      { engine: 'local', local: { codingToolNames: [Constants.READ_FILE] } }
+    ) as unknown as t.LCTool[];
+    expect(filtered.map((def) => def.name)).toEqual([
+      Constants.READ_FILE,
+      'web_search',
+    ]);
+  });
 });
