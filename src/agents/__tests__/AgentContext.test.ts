@@ -1809,6 +1809,31 @@ describe('AgentContext', () => {
       expect(ctx.instructionTokens).toBeGreaterThan(initialTokens);
     });
 
+    it('ignores a cached toolSchemaTokens total once the local allowlist removes tools', async () => {
+      const defs: t.LCTool[] = ['read_file', 'bash_tool'].map((name) => ({
+        name,
+        description: name,
+        parameters: { type: 'object', properties: {} },
+      }));
+      const toolExecution: t.ToolExecutionConfig = {
+        engine: 'local',
+        local: { codingToolNames: ['read_file'] },
+      };
+      const filtered = createBasicContext({
+        agentConfig: { toolDefinitions: defs, toolSchemaTokens: 99999 },
+        tokenCounter: mockTokenCounter,
+        toolExecution,
+      });
+      const unfiltered = createBasicContext({
+        agentConfig: { toolDefinitions: defs, toolSchemaTokens: 99999 },
+        tokenCounter: mockTokenCounter,
+      });
+      await filtered.tokenCalculationPromise;
+      await unfiltered.tokenCalculationPromise;
+      expect(filtered.toolSchemaTokens).not.toBe(99999);
+      expect(unfiltered.toolSchemaTokens).toBe(99999);
+    });
+
     it('excludes deferred-undiscovered toolDefinitions from toolSchemaTokens', async () => {
       const activeDef: t.LCTool = {
         name: 'active_tool',

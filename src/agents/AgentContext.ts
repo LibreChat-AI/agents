@@ -205,7 +205,18 @@ export class AgentContext {
       agentContext.baseIndexTokenCountMap = { ...tokenMap };
       agentContext.indexTokenCountMap = tokenMap;
 
-      if (toolSchemaTokens != null && toolSchemaTokens > 0) {
+      /** A cached total counts the host's unfiltered tools; it no longer
+       *  applies once the local allowlist removed any of them. */
+      const allowlistRemovedTools =
+        (tools?.length ?? 0) !== (agentContext.tools?.length ?? 0) ||
+        (toolDefinitions?.length ?? 0) !==
+          (agentContext.toolDefinitions?.length ?? 0) ||
+        (graphTools?.length ?? 0) !== (agentContext.graphTools?.length ?? 0);
+      if (
+        toolSchemaTokens != null &&
+        toolSchemaTokens > 0 &&
+        !allowlistRemovedTools
+      ) {
         /** Use pre-computed (cached) tool schema tokens — skip calculateInstructionTokens */
         agentContext.toolSchemaTokens = toolSchemaTokens;
         agentContext.tokenCalculationPromise = Promise.resolve();
