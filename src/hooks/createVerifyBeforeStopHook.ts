@@ -52,7 +52,7 @@ function isRedirection(command: string, index: number): boolean {
 
 /** Runner modes that list, describe or collect tests without running them. */
 const NON_RUN_FLAGS =
-  /\s(?:--collect-only|--collectonly|--show-only|--co|--listTests|--list-tests|--list|--no-run|--dry-run|-list|-N|--setup-plan|--setup-only|--showConfig|--fixtures|--markers|--help|-h|--version|-V|list)(?=[\s=]|$)/;
+  /\s(?:--collect-only|--collectonly|--show-only|--co|--listTests|--list-tests|--list|--no-run|--dry-run|-list|-N|--setup-plan|--setup-only|--showConfig|--fixtures|--markers|--help|-h|--version|-V|list)(?=[\s=)]|$)/;
 
 /**
  * The commands of a shell command line, split at `;`, `&`, `|` and
