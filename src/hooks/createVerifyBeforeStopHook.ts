@@ -41,7 +41,7 @@ const RUNNER_WRAPPERS =
  * `rg pytest pyproject.toml`, is not a test run.
  */
 export const DEFAULT_TEST_PATTERN = new RegExp(
-  `^\\s*(?:\\(\\s*)?(?:\\w+=\\S*\\s+)*(?:${RUNNER_WRAPPERS}\\s+)*(?:\\S*/)?(?:${TEST_RUNNERS})\\b`
+  `^\\s*(?:\\(\\s*)?(?:\\w+=\\S*\\s+)*(?:${RUNNER_WRAPPERS}\\s+)*(?:\\S*/)?(?:${TEST_RUNNERS})(?=[\\s;&|)]|$)`
 );
 
 /** Whether the `&` at `index` belongs to a redirection (`2>&1`, `<&3`, `&>`) rather than a separator. */
@@ -211,6 +211,9 @@ export const SHELL_EDIT_PATTERN =
 /** Dry-run modes of the shell edit commands, which change no file. */
 const DRY_RUN_FLAGS = /\s(?:--check|--dry-run)(?=\s|$)/;
 
+/** `git apply` modes that only report on a patch, unless `--apply` is also given. */
+const REPORT_ONLY_FLAGS = /\s(?:--stat|--numstat|--summary)(?=\s|$)/;
+
 /**
  * Whether a shell command edits files in place: some command of the line,
  * outside quotes, starts an edit command that is not a dry run. A heuristic
@@ -219,7 +222,10 @@ const DRY_RUN_FLAGS = /\s(?:--check|--dry-run)(?=\s|$)/;
 export function isShellEdit(command: string): boolean {
   return shellSegments(command).some((segment) => {
     const options = blankQuotedText(segment);
-    return SHELL_EDIT_PATTERN.test(options) && !DRY_RUN_FLAGS.test(options);
+    if (!SHELL_EDIT_PATTERN.test(options) || DRY_RUN_FLAGS.test(options)) {
+      return false;
+    }
+    return !REPORT_ONLY_FLAGS.test(options) || /\s--apply(?=\s|$)/.test(options);
   });
 }
 

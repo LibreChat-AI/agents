@@ -92,6 +92,7 @@ describe('verifiedSinceLastChange', () => {
       'npx jest --showConfig',
       '# python3 -m pytest',
       'echo $(cd repo; python3 -m pytest tests)',
+      'mvn test-compile',
       'python3 -m pytest --collectonly',
       '(python3 -m pytest --collect-only)',
       'ctest --show-only=json-v1',
@@ -217,6 +218,16 @@ describe('verifiedSinceLastChange', () => {
   });
 
   it('does not read edit flags from quoted program text', () => {
+    expect(
+      verifiedSinceLastChange(
+        call('bash_tool', { command: 'git apply --stat changes.patch' }, 'ok')
+      )
+    ).toBeUndefined();
+    expect(
+      verifiedSinceLastChange(
+        call('bash_tool', { command: 'git apply --stat --apply c.patch' }, 'ok')
+      )
+    ).toBe(false);
     expect(
       verifiedSinceLastChange(
         call('bash_tool', { command: 'sed -n \'/ -i /p\' README.md' }, 'ok')
