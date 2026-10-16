@@ -32,8 +32,10 @@ import {
   runPlainExecution,
   formatCompletedResponse,
 } from './ProgrammaticToolCalling';
-import { logCodeApiDiagnostic } from '@/tools/diagnostics';
 import { resolveAttachedWorkspaceInstanceId } from '@/tools/workspaceIdentity';
+import { ProviderTextProtectionError } from '@/protection/providerText';
+import { normalizeToolResultError } from '@/protection/toolResult';
+import { logCodeApiDiagnostic } from '@/tools/diagnostics';
 import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { Constants } from '@/common';
 
@@ -583,7 +585,8 @@ export function createBashProgrammaticToolCallingTool(
             await executeTools(
               response.tool_calls ?? [],
               effectiveToolMap,
-              Constants.BASH_PROGRAMMATIC_TOOL_CALLING
+              Constants.BASH_PROGRAMMATIC_TOOL_CALLING,
+              { policy: toolCall.toolResultProtection, signal: config.signal }
             )
           );
 
@@ -618,6 +621,7 @@ export function createBashProgrammaticToolCallingTool(
 
         throw new CodeApiRequestError();
       } catch (error) {
+        if (error instanceof ProviderTextProtectionError) throw toolCall.toolResultProtection == null ? error : normalizeToolResultError(error);
         const messageWithReminder = appendFailedExecutionFileReminder(
           (error as Error).message,
           code

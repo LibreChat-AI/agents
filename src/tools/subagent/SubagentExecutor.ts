@@ -128,6 +128,7 @@ import {
   pickSubagentHostArgInput,
   getSubagentHostArgsDigest,
 } from './hostArgs';
+import { normalizeToolResultError, hasRequiredToolExecuteProtection, ToolResultProtectionError } from '@/protection/toolResult';
 import {
   rebindToolBatchReplayScope,
   rebindToolBatchReplayPayload,
@@ -997,6 +998,7 @@ export type SubagentExecutorOptions = {
    * graph's own resolved limits; without this the child would silently
    * revert to the defaults.
    */
+  toolResultProtection?: StandardGraphInput['toolResultProtection'];
   providerTextProtection?: StandardGraphInput['providerTextProtection'];
   streamLimits?: StandardGraphInput['streamLimits'];
   humanInTheLoop?: HumanInTheLoopConfig;
@@ -1075,6 +1077,7 @@ export class SubagentExecutor {
   private readonly executionContext: SubagentExecutionContext;
   private readonly langfuse?: StandardGraphInput['langfuse'];
   private readonly tokenCounter?: TokenCounter;
+  private readonly toolResultProtection?: StandardGraphInput['toolResultProtection'];
   private readonly providerTextProtection?: StandardGraphInput['providerTextProtection'];
   private readonly streamLimits?: StandardGraphInput['streamLimits'];
   private readonly humanInTheLoop?: HumanInTheLoopConfig;
@@ -1117,6 +1120,7 @@ export class SubagentExecutor {
     this.tokenCounter = options.tokenCounter;
     this.streamLimits = options.streamLimits;
     this.providerTextProtection = options.providerTextProtection;
+    this.toolResultProtection = options.toolResultProtection;
     this.humanInTheLoop = options.humanInTheLoop;
     this.checkpointer = isCheckpointSaver(options.checkpointer)
       ? options.checkpointer
@@ -1402,6 +1406,7 @@ export class SubagentExecutor {
       onResolutionFailure: this.onResolutionFailure,
       streamLimits: this.streamLimits,
       providerTextProtection: this.providerTextProtection,
+      toolResultProtection: this.toolResultProtection,
       humanInTheLoop:
         this.humanInTheLoop?.enabled === true ||
         this.humanInTheLoop?.backgroundPausePolicy === 'deny'
@@ -2741,6 +2746,7 @@ export class SubagentExecutor {
     executableConfig: ExecutableSubagentConfigEntry
   ): Promise<SubagentExecuteResult> {
     const { description, subagentType, threadId, parentToolCallId } = params;
+    if (params.taskRuntime != null && this.toolResultProtection != null) throw new ToolResultProtectionError('unsupported');
     /** Captured ONCE per execution, preferring the controller the parent
      * tool batch captured at ITS entry (before PreToolUse hooks): a failed
      * run's graph reset replaces the live controller, and resolving it here
@@ -2952,6 +2958,7 @@ export class SubagentExecutor {
       tokenCounter: this.tokenCounter,
       streamLimits: this.streamLimits,
       providerTextProtection: this.providerTextProtection,
+      toolResultProtection: this.toolResultProtection,
       subagentScope: true,
       subagentExecutionContext: childExecutionContext,
       subagentContext: this.subagentContext,
@@ -3752,11 +3759,15 @@ export class SubagentExecutor {
           const toolHandler = parentRegistry.getHandler(
             GraphEvents.ON_TOOL_EXECUTE
           );
-          if (toolHandler) {
-            await toolHandler.handle(
-              GraphEvents.ON_TOOL_EXECUTE,
-              data as ToolExecuteBatchRequest
-            );
+          const request = data as ToolExecuteBatchRequest;
+          const required = hasRequiredToolExecuteProtection(request);
+          try {
+            if (toolHandler) await toolHandler.handle(GraphEvents.ON_TOOL_EXECUTE, request);
+            else if (required) request.reject(new ToolResultProtectionError('unavailable'));
+          } catch (error) {
+            if (!required) throw error;
+            request.reject(normalizeToolResultError(error));
+            return;
           }
           /**
            * We also surface a short notice in the subagent-update stream so

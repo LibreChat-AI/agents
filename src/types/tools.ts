@@ -1,3 +1,4 @@
+import type { ToolResultProtection } from '@/protection/toolResult';
 // src/types/tools.ts
 import type {
   RunnableConfig,
@@ -263,6 +264,7 @@ export type ToolNodeOptions = {
    * Ignored when `toolOutputRegistry` is also provided (host-supplied
    * registry wins).
    */
+  toolResultProtection?: ToolResultProtection;
   toolOutputReferences?: ToolOutputReferencesConfig;
   /**
    * Pre-constructed registry instance shared across ToolNodes for the
@@ -1240,6 +1242,7 @@ export type ToolExecutionConfig = {
 };
 
 export type ProgrammaticCache = {
+  toolResultProtection?: ToolResultProtection;
   toolMap: ToolMap;
   toolDefs: LCTool[];
   /** Actual outer runner name used for caller-policy diagnostics. */
