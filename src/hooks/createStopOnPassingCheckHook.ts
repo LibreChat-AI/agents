@@ -3,6 +3,7 @@ import {
   DEFAULT_TEST_PATTERN,
   SHELL_EDIT_PATTERN,
   failed,
+  statelessPattern,
 } from './createVerifyBeforeStopHook';
 import { Constants } from '@/common';
 
@@ -40,7 +41,9 @@ export function createStopOnPassingCheckHook(
   config: StopOnPassingCheckConfig = {}
 ): HookCallback<'PostToolBatch'> {
   const shellNames = new Set(config.shellToolNames ?? [Constants.BASH_TOOL]);
-  const testPattern = config.testCommandPattern ?? DEFAULT_TEST_PATTERN;
+  const testPattern = statelessPattern(
+    config.testCommandPattern ?? DEFAULT_TEST_PATTERN
+  );
   let changed = false;
   return (input): PostToolBatchHookOutput => {
     let verified = false;

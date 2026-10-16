@@ -236,17 +236,22 @@ function lineWindow(
   };
 }
 
-/** Reads whole lines from `offset` until `maxChars`, then says how to continue. */
+/** Reads whole lines from `offset` until `maxChars` or `limit` lines, then says how to continue. */
 function cappedLineWindow(
   content: string,
   offset: number | undefined,
+  limit: number | undefined,
   maxChars: number
 ): string {
   const lines = content.split('\n');
   const start = Math.max(offset ?? 1, 1);
   const kept: string[] = [];
   let used = 0;
-  for (let i = start - 1; i < lines.length; i++) {
+  const stop =
+    limit != null && limit > 0
+      ? Math.min(lines.length, start - 1 + limit)
+      : lines.length;
+  for (let i = start - 1; i < stop; i++) {
     const full = `${String(i + 1).padStart(6, ' ')}\t${lines[i]}`;
     const numbered =
       full.length > maxChars
@@ -527,13 +532,14 @@ export function createLocalReadFileTool(
       }
 
       const content = await fs.readFile(path, 'utf8');
-      if (
-        config.toolResultMaxChars != null &&
-        config.toolResultMaxChars > 0 &&
-        input.limit == null
-      ) {
+      if (config.toolResultMaxChars != null && config.toolResultMaxChars > 0) {
         return [
-          cappedLineWindow(content, input.offset, config.toolResultMaxChars),
+          cappedLineWindow(
+            content,
+            input.offset,
+            input.limit,
+            config.toolResultMaxChars
+          ),
           { path, bytes: fileStat.size },
         ];
       }

@@ -992,8 +992,8 @@ export type LocalExecutionConfig = {
   toolIntentLabels?: boolean;
   /**
    * Opt-in cap, in characters, on the results the model reads most:
-   * `read_file` without a `limit` keeps whole lines up to the cap with an
-   * `offset` hint to continue, `grep_search` cuts long match lines and stops
+   * `read_file` keeps whole lines up to the cap (and its `limit`, when
+   * given) with an `offset` hint to continue, `grep_search` cuts long match lines and stops
    * at the cap with a count of omitted lines, and `bash_tool` keeps the head
    * and tail of long output with the full output saved to a file. Unset keeps
    * the existing limits.

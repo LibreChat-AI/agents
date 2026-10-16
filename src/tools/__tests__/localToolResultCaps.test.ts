@@ -116,6 +116,22 @@ describe('toolResultMaxChars', () => {
     expect(capped).toMatch(/continue with offset=2\]$/);
   });
 
+  it('applies the cap to reads with an explicit limit too', async () => {
+    const cwd = await createTempDir();
+    await writeFile(
+      join(cwd, 'wide.py'),
+      Array.from({ length: 50 }, (_, i) => `v${i} = '${'x'.repeat(200)}'`).join(
+        '\n'
+      )
+    );
+    const read = createLocalReadFileTool({ cwd, toolResultMaxChars: 1000 });
+    const capped = String(await read.invoke({ path: 'wide.py', limit: 40 }));
+    expect(capped.length).toBeLessThan(1150);
+    expect(capped).toMatch(/continue with offset=\d+\]$/);
+    const short = String(await read.invoke({ path: 'wide.py', limit: 2 }));
+    expect(short).toMatch(/showing lines 1-2 of 50; continue with offset=3\]$/);
+  });
+
   it('caps grep_search and bash_tool results only when set', async () => {
     const cwd = await createTempDir();
     await writeFile(

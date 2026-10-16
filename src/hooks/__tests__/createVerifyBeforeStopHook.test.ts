@@ -42,6 +42,27 @@ function stopInput(
 }
 
 describe('verifiedSinceLastChange', () => {
+  it('counts runner invocations but not commands that only mention a runner', () => {
+    const run = (command: string): BaseMessage[] =>
+      call('bash_tool', { command }, 'stdout:\nok\n');
+    expect(
+      verifiedSinceLastChange([...edit(), ...run('rg pytest pyproject.toml')])
+    ).toBe(false);
+    expect(
+      verifiedSinceLastChange([
+        ...edit(),
+        ...run('cd repo && PYTHONPATH=src python3 -m pytest -x tests'),
+      ])
+    ).toBe(true);
+  });
+
+  it('gives the same answer on every call for a global custom pattern', () => {
+    const messages = [...edit(), ...test()];
+    const config = { testCommandPattern: /pytest/g };
+    expect(verifiedSinceLastChange(messages, config)).toBe(true);
+    expect(verifiedSinceLastChange(messages, config)).toBe(true);
+  });
+
   it('does not count an errored test tool result as verification', () => {
     const id = `call_${seq++}`;
     const errored: BaseMessage[] = [

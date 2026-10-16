@@ -26,8 +26,28 @@ export interface VerifyBeforeStopConfig {
   message?: string;
 }
 
-export const DEFAULT_TEST_PATTERN =
-  /\b(pytest|py\.test|unittest|tox|nox|jest|vitest|mocha|ava|tap|go test|cargo test|ctest|rspec|phpunit|mvn test|gradle test|make (test|check)|(npm|pnpm|yarn|bun) (run )?test)\b/;
+const TEST_RUNNERS =
+  'pytest|py\\.test|unittest|tox|nox|jest|vitest|mocha|ava|tap|go test|cargo test|ctest|rspec|phpunit|mvn test|gradle test|make (?:test|check)|(?:npm|pnpm|yarn|bun) (?:run )?test';
+
+/** Common wrappers in front of a runner: `python3 -m`, `npx`, `uv run`, `timeout 60`. */
+const RUNNER_WRAPPERS =
+  '(?:sudo|env|time|npx|uvx|uv run|poetry run|pipenv run|hatch run|python[\\d.]* -m|timeout(?: -\\S+)* \\S+)';
+
+/**
+ * A test runner invoked as a command: at the start of a command segment,
+ * after env assignments and wrappers. A runner name elsewhere in a command,
+ * such as `rg pytest pyproject.toml`, is not a test run.
+ */
+export const DEFAULT_TEST_PATTERN = new RegExp(
+  `(?:^|[;&|(]|\\b(?:then|do)\\b)\\s*(?:\\w+=\\S*\\s+)*(?:${RUNNER_WRAPPERS}\\s+)*(?:\\S*/)?(?:${TEST_RUNNERS})\\b`
+);
+
+/** A copy of `pattern` without the `g` and `y` flags, whose `test()` keeps no state between calls. */
+export function statelessPattern(pattern: RegExp): RegExp {
+  return pattern.global || pattern.sticky
+    ? new RegExp(pattern.source, pattern.flags.replace(/[gy]/g, ''))
+    : pattern;
+}
 
 export const SHELL_EDIT_PATTERN = /\b(sed -i|perl -p?i|patch -p\d|git apply)\b/;
 
@@ -79,7 +99,9 @@ export function verifiedSinceLastChange(
   config: VerifyBeforeStopConfig = {}
 ): boolean | undefined {
   const shellNames = new Set(config.shellToolNames ?? [Constants.BASH_TOOL]);
-  const testPattern = config.testCommandPattern ?? DEFAULT_TEST_PATTERN;
+  const testPattern = statelessPattern(
+    config.testCommandPattern ?? DEFAULT_TEST_PATTERN
+  );
   /** Tool output text by call id; `undefined` for an errored tool result. */
   const outputs = new Map<string, string | undefined>();
   for (const message of messages) {
