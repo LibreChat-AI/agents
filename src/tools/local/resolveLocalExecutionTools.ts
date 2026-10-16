@@ -180,15 +180,24 @@ function filterCloudflareCodingToolAllowlist(
   return filtered as t.GraphTools;
 }
 
-/** Name of a bindable tool in any supported shape: `{ name }` or OpenAI's `{ function: { name } }`. */
+/**
+ * Name of a bindable tool in any supported shape: `{ name }`, OpenAI's
+ * `{ function: { name } }` or Bedrock's `{ toolSpec: { name } }`.
+ */
 function bindableToolName(tool: unknown): string | undefined {
   if (tool == null || typeof tool !== 'object') return undefined;
-  const { name, function: fn } = tool as {
+  const {
+    name,
+    function: fn,
+    toolSpec,
+  } = tool as {
     name?: unknown;
     function?: { name?: unknown };
+    toolSpec?: { name?: unknown };
   };
   if (typeof name === 'string') return name;
-  return typeof fn?.name === 'string' ? fn.name : undefined;
+  if (typeof fn?.name === 'string') return fn.name;
+  return typeof toolSpec?.name === 'string' ? toolSpec.name : undefined;
 }
 
 /** The `functionDeclarations` of a Google tool object, if it is one. */

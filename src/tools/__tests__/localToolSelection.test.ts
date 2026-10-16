@@ -156,8 +156,9 @@ describe('local coding tool selection', () => {
         { name: 'web_search' },
       ],
     };
+    const bedrockBash = { toolSpec: { name: Constants.BASH_TOOL } };
     const filtered = filterToolsByLocalAllowlist(
-      [openAiBash, openAiSearch, google] as unknown as t.GraphTools,
+      [openAiBash, openAiSearch, google, bedrockBash] as unknown as t.GraphTools,
       toolExecution
     ) as unknown as Array<Record<string, unknown>>;
     expect(filtered).toEqual([
