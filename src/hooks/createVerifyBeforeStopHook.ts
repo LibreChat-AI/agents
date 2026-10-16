@@ -54,6 +54,36 @@ function isRedirection(command: string, index: number): boolean {
 const NON_RUN_FLAGS =
   /\s(?:--collect-only|--collectonly|--show-only|--co|--listTests|--list-tests|--list|--no-run|--dry-run|-list|-N|--setup-plan|--setup-only|--showConfig|--fixtures|--markers|--help|-h|--version|-V|list)(?=[\s=)]|$)/;
 
+/** Drops unquoted shell comments: a `#` that starts a word, through the end of its line. */
+export function stripShellComments(command: string): string {
+  let out = '';
+  let quote: string | undefined;
+  for (let i = 0; i < command.length; i++) {
+    const char = command[i];
+    if (quote != null) {
+      if (char === '\\' && quote === '"') {
+        out += char + (command[i + 1] ?? '');
+        i++;
+        continue;
+      }
+      if (char === quote) quote = undefined;
+    } else if (char === '\\') {
+      out += char + (command[i + 1] ?? '');
+      i++;
+      continue;
+    } else if (char === '\'' || char === '"') {
+      quote = char;
+    } else if (char === '#' && (i === 0 || /\s/.test(command[i - 1]))) {
+      const newline = command.indexOf('\n', i);
+      if (newline === -1) break;
+      i = newline - 1;
+      continue;
+    }
+    out += char;
+  }
+  return out;
+}
+
 /**
  * The commands of a shell command line, split at `;`, `&`, `|` and
  * newlines outside quotes (redirections such as `2>&1` do not split).
@@ -211,9 +241,13 @@ function isChange(call: CheckedToolCall): boolean {
  */
 export function applyToolBatch(
   state: VerificationState,
-  calls: readonly CheckedToolCall[],
+  batch: readonly CheckedToolCall[],
   testPattern: RegExp
 ): VerificationState {
+  const calls = batch.map((call) => ({
+    ...call,
+    command: stripShellComments(call.command),
+  }));
   const changes = calls.map(isChange);
   if (changes.some(Boolean)) {
     state.changed = true;

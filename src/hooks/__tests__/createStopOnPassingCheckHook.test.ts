@@ -69,6 +69,14 @@ describe('createStopOnPassingCheckHook', () => {
     });
   });
 
+  it('ignores a test command inside a shell comment', async () => {
+    const hook = createStopOnPassingCheckHook();
+    const commented = entry('bash_tool', {
+      command: 'sed -i \'s/a/b/\' a.py # update && python3 -m pytest',
+    });
+    expect(await hook(batch(commented), {} as never)).toEqual({});
+  });
+
   it('ignores edit commands that appear only as data', async () => {
     const hook = createStopOnPassingCheckHook();
     const search = entry('bash_tool', { command: 'rg \'sed -i\' scripts' });

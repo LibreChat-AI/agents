@@ -90,6 +90,7 @@ describe('verifiedSinceLastChange', () => {
       'python3 -m pytest tests >/tmp/tests.log 2>&1 &',
       'python3 -m pytest --setup-plan',
       'npx jest --showConfig',
+      '# python3 -m pytest',
       'python3 -m pytest --collectonly',
       '(python3 -m pytest --collect-only)',
       'ctest --show-only=json-v1',
