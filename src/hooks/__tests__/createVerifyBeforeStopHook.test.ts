@@ -87,6 +87,9 @@ describe('verifiedSinceLastChange', () => {
       'git diff --quiet || npm test',
       'true || (echo setup && python3 -m pytest)',
       'go test -list=. ./...',
+      'python3 -m pytest tests >/tmp/tests.log 2>&1 &',
+      'python3 -m pytest --setup-plan',
+      'npx jest --showConfig',
     ]) {
       expect(verifiedSinceLastChange([...edit(), ...run(command)])).toBe(false);
     }

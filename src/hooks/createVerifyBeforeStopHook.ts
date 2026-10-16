@@ -52,7 +52,7 @@ function isRedirection(command: string, index: number): boolean {
 
 /** Runner modes that list, describe or collect tests without running them. */
 const NON_RUN_FLAGS =
-  /\s(?:--collect-only|--co|--listTests|--list-tests|--list|--no-run|--dry-run|-list|-N|--help|-h|--version|-V|list)(?=[\s=]|$)/;
+  /\s(?:--collect-only|--co|--listTests|--list-tests|--list|--no-run|--dry-run|-list|-N|--setup-plan|--setup-only|--showConfig|--fixtures|--markers|--help|-h|--version|-V|list)(?=[\s=]|$)/;
 
 /**
  * The commands of a shell command line, split at `;`, `&`, `|` and
@@ -203,8 +203,8 @@ function isChange(call: CheckedToolCall): boolean {
  * Applies the tool calls of one assistant turn. Those calls run
  * concurrently, so a test run verifies changes from earlier turns, or an
  * edit that completes earlier in its own shell command, but never a
- * sibling call's edit; one failing test in the turn leaves the change
- * unverified. Updates `state` in place and returns it.
+ * sibling call's edit; a test in the background or in a pipe does not count,
+ * and one failing test in the turn leaves the change unverified. Updates `state` in place and returns it.
  */
 export function applyToolBatch(
   state: VerificationState,
@@ -221,7 +221,7 @@ export function applyToolBatch(
   calls.forEach((call, index) => {
     if (!state.changed || !isTestRun(call.command, testPattern)) return;
     if (changes.some((change, other) => change && other !== index)) return;
-    if (changes[index] && runsConcurrently(call.command)) return;
+    if (runsConcurrently(call.command)) return;
     tests++;
     if (call.succeeded && call.output !== undefined && !failed(call.output)) {
       passed++;
