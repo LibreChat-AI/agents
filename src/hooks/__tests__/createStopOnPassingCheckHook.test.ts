@@ -72,6 +72,14 @@ describe('createStopOnPassingCheckHook', () => {
   it('ignores edit commands that appear only as data', async () => {
     const hook = createStopOnPassingCheckHook();
     const search = entry('bash_tool', { command: 'rg \'sed -i\' scripts' });
+    const longForm = entry('bash_tool', {
+      command: 'sed --in-place \'s/a/b/\' a.py',
+    });
+    const fresh = createStopOnPassingCheckHook();
+    expect(await fresh(batch(longForm), {} as never)).toEqual({});
+    expect(await fresh(batch(passingTest), {} as never)).toMatchObject({
+      preventContinuation: true,
+    });
     expect(await hook(batch(search), {} as never)).toEqual({});
     expect(await hook(batch(passingTest), {} as never)).toEqual({});
   });

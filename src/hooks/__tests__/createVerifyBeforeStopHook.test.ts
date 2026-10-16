@@ -144,6 +144,23 @@ describe('verifiedSinceLastChange', () => {
     expect(verifiedSinceLastChange([...turn, ...test()])).toBe(true);
   });
 
+  it('judges only the current user turn and treats negative exit codes as failures', () => {
+    expect(
+      verifiedSinceLastChange([...edit(), new HumanMessage('what changed?')])
+    ).toBeUndefined();
+    const meta = new HumanMessage({
+      content: 'run the tests',
+      additional_kwargs: { isMeta: true },
+    });
+    expect(verifiedSinceLastChange([...edit(), meta])).toBe(false);
+    expect(
+      verifiedSinceLastChange([
+        ...edit(),
+        ...test('stdout:\nkilled\nexit_code: -9\n'),
+      ])
+    ).toBe(false);
+  });
+
   it('ignores trailing newlines and semicolons after a test run', () => {
     for (const command of ['python3 -m pytest -q\n', 'python3 -m pytest -q;']) {
       expect(

@@ -268,14 +268,29 @@ function textOf(message: BaseMessage): string {
 
 export function failed(output: string): boolean {
   return (
-    /(^|\n)exit_code: [1-9]\d*/.test(output) ||
+    /(^|\n)exit_code: -?[1-9]\d*/.test(output) ||
     /(^|\n)timed_out: true/.test(output)
   );
 }
 
+/** Index of the last user message; hook-injected (`isMeta`) messages do not start a turn. */
+function currentTurnStart(messages: readonly BaseMessage[]): number {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (
+      message.getType() === 'human' &&
+      (message.additional_kwargs as { isMeta?: unknown } | undefined)
+        ?.isMeta !== true
+    ) {
+      return i;
+    }
+  }
+  return 0;
+}
+
 /**
- * Returns whether the last code change in `messages` is followed by a
- * passing test run. `undefined` when the messages contain no code change.
+ * Returns whether the last code change since the last user message is
+ * followed by a passing test run. `undefined` when there is no code change.
  */
 export function verifiedSinceLastChange(
   messages: readonly BaseMessage[],
@@ -296,7 +311,7 @@ export function verifiedSinceLastChange(
     outputs.set(id, errored ? undefined : textOf(message));
   }
   const state: VerificationState = { changed: false, verified: false };
-  for (const message of messages) {
+  for (const message of messages.slice(currentTurnStart(messages))) {
     const calls = toolCallsOf(message).map(
       (call): CheckedToolCall => ({
         name: call.name,
