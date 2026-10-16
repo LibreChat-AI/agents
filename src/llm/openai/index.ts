@@ -1061,7 +1061,10 @@ type ResponsesAnnotationsBoundaryEvent = {
 export function ensureResponsesOutputAnnotations(
   event: ResponsesAnnotationsBoundaryEvent
 ): void {
-  if (event.type !== 'response.completed' && event.type !== 'response.incomplete') {
+  if (
+    event.type !== 'response.completed' &&
+    event.type !== 'response.incomplete'
+  ) {
     return;
   }
   const output = event.response?.output;
@@ -1328,6 +1331,34 @@ async function completionWithFilteredOpenAIStream(
   return filterOpenAIChatCompletionStream(
     stream as AsyncIterable<OpenAIChatCompletionStreamItem>
   );
+}
+
+/** Mistral streams `delta.content` as typed `thinking`/`text` chunks; flatten them so the
+ *  stream, which skips non-string content, keeps their text and tool calls. */
+function flattenTypedDeltaContent(
+  delta: Record<string, unknown>
+): Record<string, unknown> {
+  if (!Array.isArray(delta.content)) {
+    return delta;
+  }
+  let text = '';
+  let reasoning = '';
+  for (const block of delta.content as Array<Record<string, unknown>>) {
+    if (block.type === 'text' && typeof block.text === 'string') {
+      text += block.text;
+    } else if (block.type === 'thinking' && Array.isArray(block.thinking)) {
+      for (const part of block.thinking as Array<Record<string, unknown>>) {
+        if (typeof part.text === 'string') {
+          reasoning += part.text;
+        }
+      }
+    }
+  }
+  return {
+    ...delta,
+    content: text,
+    ...(reasoning !== '' && delta.reasoning == null ? { reasoning } : {}),
+  };
 }
 
 function attachLibreChatDeltaFields(
@@ -1937,13 +1968,14 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
     rawResponse: OpenAIClient.Chat.Completions.ChatCompletionChunk,
     defaultRole?: OpenAIClient.Chat.ChatCompletionRole
   ): BaseMessageChunk {
+    const flatDelta = flattenTypedDeltaContent(delta);
     const message = attachLibreChatDeltaFields(
       super._convertCompletionsDeltaToBaseMessageChunk(
-        delta,
+        flatDelta,
         rawResponse,
         defaultRole
       ),
-      delta
+      flatDelta
     );
     if (isOfficialOpenAIBaseURL(this.clientConfig.baseURL)) {
       return stampSequentialStreamedToolCallAdapter(message);
@@ -2347,7 +2379,9 @@ class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
         cache_control: cacheControl,
       }),
     };
-    if (shouldIncludeEncryptedReasoning(this.model, params, this.astraRulesApply)) {
+    if (
+      shouldIncludeEncryptedReasoning(this.model, params, this.astraRulesApply)
+    ) {
       params.include = [
         ...new Set([
           ...(params.include ?? []),
@@ -2630,7 +2664,9 @@ class LibreChatAzureOpenAIResponses extends OriginalAzureChatOpenAIResponses {
       promptCacheExplicit: this.promptCacheExplicit,
       safetyIdentifier: this.safetyIdentifier,
     });
-    if (shouldIncludeEncryptedReasoning(this.model, params, this.astraRulesApply)) {
+    if (
+      shouldIncludeEncryptedReasoning(this.model, params, this.astraRulesApply)
+    ) {
       params.include = [
         ...new Set([
           ...(params.include ?? []),
