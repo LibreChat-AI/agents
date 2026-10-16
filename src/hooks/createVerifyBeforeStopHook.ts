@@ -192,7 +192,9 @@ export function isTestRun(command: string, pattern: RegExp): boolean {
   }
   const segment = lastShellSegment(command);
   pattern.lastIndex = 0;
-  return pattern.test(segment) && !NON_RUN_FLAGS.test(segment);
+  return (
+    pattern.test(segment) && !NON_RUN_FLAGS.test(segment.replace(/['"]/g, ''))
+  );
 }
 
 /**
