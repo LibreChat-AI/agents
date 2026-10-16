@@ -5,7 +5,9 @@ export function tailTruncate(text: string, maxChars: number): string {
   }
   const tail = text.slice(text.length - maxChars);
   const newline = tail.indexOf('\n');
-  return newline >= 0 && newline < 200 ? tail.slice(newline + 1) : tail;
+  return newline >= 0 && newline < 200 && newline < tail.length - 1
+    ? tail.slice(newline + 1)
+    : tail;
 }
 
 /** Longest grep match line kept when results are capped. */

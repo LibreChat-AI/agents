@@ -32,6 +32,7 @@ afterEach(async () => {
 describe('tailTruncate', () => {
   it('starts the kept tail at a line boundary when one is near', () => {
     expect(tailTruncate('first line\nsecond line\n', 15)).toBe('second line\n');
+    expect(capHeadTail(`${'x'.repeat(200)}FAILURE\n`, 40)).toContain('FAILURE');
   });
 });
 
