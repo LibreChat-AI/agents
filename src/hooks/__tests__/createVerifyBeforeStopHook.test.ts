@@ -156,6 +156,11 @@ describe('verifiedSinceLastChange', () => {
       additional_kwargs: { isMeta: true },
     });
     expect(verifiedSinceLastChange([...edit(), meta])).toBe(false);
+    const hookContext = new HumanMessage({
+      content: 'lint passed',
+      additional_kwargs: { role: 'system', source: 'hook' },
+    });
+    expect(verifiedSinceLastChange([...edit(), hookContext])).toBe(false);
     expect(
       verifiedSinceLastChange([
         ...edit(),
@@ -272,6 +277,16 @@ describe('createVerifyBeforeStopHook', () => {
       /tests/
     );
     expect(hook(stopInput([...edit()], 1), signal)).toEqual({});
+  });
+
+  it('does not block when the run has no continuation budget left', () => {
+    const hook = createVerifyBeforeStopHook({ maxContinuations: 2 });
+    const signal = new AbortController().signal;
+    const input = {
+      ...stopInput([...edit()]),
+      continuationBudgetRemaining: 0,
+    } as StopHookInput;
+    expect(hook(input, signal)).toEqual({});
   });
 
   it('lets verified and unchanged runs finish', () => {

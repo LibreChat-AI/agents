@@ -273,15 +273,23 @@ export function failed(output: string): boolean {
   );
 }
 
-/** Index of the last user message; hook-injected (`isMeta`) messages do not start a turn. */
+/** Whether a human message was injected by the runtime (hook context or meta) rather than written by the user. */
+function isSynthetic(message: BaseMessage): boolean {
+  const kwargs = message.additional_kwargs as
+    | { isMeta?: unknown; source?: unknown; role?: unknown }
+    | undefined;
+  return (
+    kwargs?.isMeta === true ||
+    kwargs?.source === 'hook' ||
+    kwargs?.role === 'system'
+  );
+}
+
+/** Index of the last user message; runtime-injected messages do not start a turn. */
 function currentTurnStart(messages: readonly BaseMessage[]): number {
   for (let i = messages.length - 1; i >= 0; i--) {
     const message = messages[i];
-    if (
-      message.getType() === 'human' &&
-      (message.additional_kwargs as { isMeta?: unknown } | undefined)
-        ?.isMeta !== true
-    ) {
+    if (message.getType() === 'human' && !isSynthetic(message)) {
       return i;
     }
   }
@@ -331,6 +339,7 @@ export function createVerifyBeforeStopHook(
   const maxContinuations = Math.max(0, config.maxContinuations ?? 1);
   return (input): StopHookOutput => {
     if (input.continuationCount >= maxContinuations) return {};
+    if (input.continuationBudgetRemaining <= 0) return {};
     if (verifiedSinceLastChange(input.messages, config) !== false) return {};
     return {
       decision: 'block',
