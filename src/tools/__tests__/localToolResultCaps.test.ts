@@ -164,6 +164,28 @@ describe('toolResultMaxChars', () => {
     expect(capped).toMatch(/skipped/);
   });
 
+  it('caps fallback grep pattern errors', async () => {
+    _resetRipgrepCacheForTests();
+    const realSpawn = (
+      require('child_process') as typeof import('child_process')
+    ).spawn;
+    const noRg = ((cmd: string, args: string[], opts: SpawnOptions) =>
+      cmd === 'rg'
+        ? realSpawn('sh', ['-c', 'exit 127'], opts)
+        : realSpawn(cmd, args, opts)) as unknown as LocalSpawn;
+    const cwd = await createTempDir();
+    await writeFile(join(cwd, 'a.py'), 'x = 1\n');
+    const refused = String(
+      await createLocalGrepSearchTool({
+        cwd,
+        toolResultMaxChars: 120,
+        exec: { spawn: noRg },
+      }).invoke({ pattern: `(${'a'.repeat(900)}` })
+    );
+    expect(refused).toMatch(/^grep_search refused the pattern/);
+    expect(refused.length).toBeLessThan(260);
+  });
+
   it('bounds many fallback grep skip notices by the cap', async () => {
     _resetRipgrepCacheForTests();
     const realSpawn = (

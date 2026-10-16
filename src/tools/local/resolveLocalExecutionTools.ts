@@ -153,15 +153,50 @@ function filterCloudflareCodingToolAllowlist(
   if (existingTools.length === 0) {
     return tools;
   }
-  return existingTools.filter((existingTool) => {
-    if (!('name' in existingTool) || typeof existingTool.name !== 'string') {
-      return true;
+  const keeps = (name: string | undefined): boolean =>
+    name == null ||
+    !LOCAL_CODING_BUNDLE_NAMES.includes(name) ||
+    selectedNames.has(name);
+  const filtered: unknown[] = [];
+  for (const existingTool of existingTools as unknown[]) {
+    const declarations = functionDeclarationsOf(existingTool);
+    if (declarations == null) {
+      if (keeps(bindableToolName(existingTool))) filtered.push(existingTool);
+      continue;
     }
-    return (
-      !LOCAL_CODING_BUNDLE_NAMES.includes(existingTool.name) ||
-      selectedNames.has(existingTool.name)
+    // Google tool objects group several functions; keep the allowed ones.
+    const kept = declarations.filter((declaration) =>
+      keeps(bindableToolName(declaration))
     );
-  });
+    if (kept.length === declarations.length) {
+      filtered.push(existingTool);
+    } else if (kept.length > 0) {
+      filtered.push({
+        ...(existingTool as object),
+        functionDeclarations: kept,
+      });
+    }
+  }
+  return filtered as t.GraphTools;
+}
+
+/** Name of a bindable tool in any supported shape: `{ name }` or OpenAI's `{ function: { name } }`. */
+function bindableToolName(tool: unknown): string | undefined {
+  if (tool == null || typeof tool !== 'object') return undefined;
+  const { name, function: fn } = tool as {
+    name?: unknown;
+    function?: { name?: unknown };
+  };
+  if (typeof name === 'string') return name;
+  return typeof fn?.name === 'string' ? fn.name : undefined;
+}
+
+/** The `functionDeclarations` of a Google tool object, if it is one. */
+function functionDeclarationsOf(tool: unknown): unknown[] | undefined {
+  if (tool == null || typeof tool !== 'object') return undefined;
+  const declarations = (tool as { functionDeclarations?: unknown })
+    .functionDeclarations;
+  return Array.isArray(declarations) ? declarations : undefined;
 }
 
 function pruneCloudflareCodingToolAllowlist(

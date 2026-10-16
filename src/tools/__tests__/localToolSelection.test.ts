@@ -136,4 +136,33 @@ describe('local coding tool selection', () => {
       'web_search',
     ]);
   });
+
+  it('filters provider-native tool schemas with the local allowlist', () => {
+    const toolExecution: t.ToolExecutionConfig = {
+      engine: 'local',
+      local: { codingToolNames: [Constants.READ_FILE] },
+    };
+    const openAiBash = {
+      type: 'function',
+      function: { name: Constants.BASH_TOOL, parameters: {} },
+    };
+    const openAiSearch = {
+      type: 'function',
+      function: { name: 'web_search', parameters: {} },
+    };
+    const google = {
+      functionDeclarations: [
+        { name: Constants.BASH_TOOL },
+        { name: 'web_search' },
+      ],
+    };
+    const filtered = filterToolsByLocalAllowlist(
+      [openAiBash, openAiSearch, google] as unknown as t.GraphTools,
+      toolExecution
+    ) as unknown as Array<Record<string, unknown>>;
+    expect(filtered).toEqual([
+      openAiSearch,
+      { functionDeclarations: [{ name: 'web_search' }] },
+    ]);
+  });
 });

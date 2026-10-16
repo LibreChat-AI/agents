@@ -1306,8 +1306,12 @@ export function createLocalGrepSearchTool(
         ];
       } catch (e) {
         if (e instanceof FallbackGrepError) {
+          const reason =
+            config.toolResultMaxChars != null && config.toolResultMaxChars > 0
+              ? capHeadTail(e.message, config.toolResultMaxChars)
+              : e.message;
           return [
-            `grep_search refused the pattern: ${e.message}`,
+            `grep_search refused the pattern: ${reason}`,
             {
               matches: 0,
               engine: 'node-fallback',
