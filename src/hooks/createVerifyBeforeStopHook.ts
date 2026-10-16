@@ -82,6 +82,34 @@ export function shellSegments(command: string): string[] {
   return segments;
 }
 
+/**
+ * Whether a shell command line runs commands concurrently: a background
+ * `&` or a `|` pipe outside quotes (`&&`, `||` and redirections are
+ * sequential).
+ */
+export function runsConcurrently(command: string): boolean {
+  let quote: string | undefined;
+  for (let i = 0; i < command.length; i++) {
+    const char = command[i];
+    if (quote != null) {
+      if (char === '\\' && quote === '"') i++;
+      else if (char === quote) quote = undefined;
+    } else if (char === '\\') {
+      i++;
+    } else if (char === '\'' || char === '"') {
+      quote = char;
+    } else if (char === '&' || char === '|') {
+      if (char === '&' && isRedirection(command, i)) continue;
+      if (command[i + 1] === char) {
+        i++;
+        continue;
+      }
+      return true;
+    }
+  }
+  return false;
+}
+
 /** The last command of a shell command line; its exit code is the one the shell reports. */
 export function lastShellSegment(command: string): string {
   const segments = shellSegments(command);
@@ -154,8 +182,9 @@ function isChange(call: CheckedToolCall): boolean {
 /**
  * Applies the tool calls of one assistant turn. Those calls run
  * concurrently, so a test run verifies changes from earlier turns, or an
- * edit earlier in its own shell command, but never a sibling call's edit.
- * Updates `state` in place and returns it.
+ * edit that completes earlier in its own shell command, but never a
+ * sibling call's edit; one failing test in the turn leaves the change
+ * unverified. Updates `state` in place and returns it.
  */
 export function applyToolBatch(
   state: VerificationState,
@@ -167,12 +196,18 @@ export function applyToolBatch(
     state.changed = true;
     state.verified = false;
   }
+  let tests = 0;
+  let passed = 0;
   calls.forEach((call, index) => {
     if (!state.changed || !isTestRun(call.command, testPattern)) return;
     if (changes.some((change, other) => change && other !== index)) return;
-    state.verified =
-      call.succeeded && call.output !== undefined && !failed(call.output);
+    if (changes[index] && runsConcurrently(call.command)) return;
+    tests++;
+    if (call.succeeded && call.output !== undefined && !failed(call.output)) {
+      passed++;
+    }
   });
+  if (tests > 0) state.verified = passed === tests;
   return state;
 }
 

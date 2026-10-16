@@ -43,6 +43,32 @@ describe('createStopOnPassingCheckHook', () => {
     });
   });
 
+  it('keeps a failing check in a batch even when a sibling test passes', async () => {
+    const hook = createStopOnPassingCheckHook();
+    expect(await hook(batch(edit), {} as never)).toEqual({});
+    expect(await hook(batch(failingTest, passingTest), {} as never)).toEqual(
+      {}
+    );
+  });
+
+  it('does not count a test that races a background edit in the same call', async () => {
+    const hook = createStopOnPassingCheckHook();
+    const racing = entry(
+      'bash_tool',
+      { command: 'sleep 5 && sed -i \'s/a/b/\' a.py & python3 -m pytest tests' },
+      '3 passed'
+    );
+    const sequential = entry(
+      'bash_tool',
+      { command: 'sed -i \'s/a/b/\' a.py && python3 -m pytest tests 2>&1' },
+      '3 passed'
+    );
+    expect(await hook(batch(racing), {} as never)).toEqual({});
+    expect(await hook(batch(sequential), {} as never)).toMatchObject({
+      preventContinuation: true,
+    });
+  });
+
   it('ignores edit commands that appear only as data', async () => {
     const hook = createStopOnPassingCheckHook();
     const search = entry('bash_tool', { command: 'rg \'sed -i\' scripts' });
