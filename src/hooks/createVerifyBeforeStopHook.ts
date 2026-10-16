@@ -140,6 +140,9 @@ export function runsConcurrently(command: string): boolean {
   return false;
 }
 
+/** Command substitution, whose runner exit code the outer command replaces. */
+const COMMAND_SUBSTITUTION = /\$\(|`/;
+
 /** A shell line that can leave before reaching its runner. */
 const EARLY_EXIT = /(?:^|[\s;&|(])(?:exit|return)(?=[\s;)]|$)/;
 
@@ -174,12 +177,19 @@ export function lastShellSegment(command: string): string {
  * Whether a shell command runs tests whose result is the command's exit
  * code: the last segment must start with a runner. `pytest; echo done`,
  * `pytest || true` and `pytest | tail` report another command's exit code,
- * so they do not count; neither does a line with `||`, `exit` or `return`, whose runner may not run,
+ * so they do not count; neither does a line with `||`, `exit`, `return` or a
+ * command substitution, whose runner may not run or report,
  * or listing modes such as `--collect-only`, `--listTests` or `--help`.
  */
 export function isTestRun(command: string, pattern: RegExp): boolean {
   if (command === '') return false;
-  if (hasConditionalOr(command) || EARLY_EXIT.test(command)) return false;
+  if (
+    hasConditionalOr(command) ||
+    EARLY_EXIT.test(command) ||
+    COMMAND_SUBSTITUTION.test(command)
+  ) {
+    return false;
+  }
   const segment = lastShellSegment(command);
   pattern.lastIndex = 0;
   return pattern.test(segment) && !NON_RUN_FLAGS.test(segment);

@@ -91,6 +91,7 @@ describe('verifiedSinceLastChange', () => {
       'python3 -m pytest --setup-plan',
       'npx jest --showConfig',
       '# python3 -m pytest',
+      'echo $(cd repo; python3 -m pytest tests)',
       'python3 -m pytest --collectonly',
       '(python3 -m pytest --collect-only)',
       'ctest --show-only=json-v1',
