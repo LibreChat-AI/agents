@@ -55,6 +55,9 @@ describe('verifiedSinceLastChange', () => {
       ])
     ).toBe(true);
     expect(
+      verifiedSinceLastChange([...edit(), ...run('python3 -m pytest -k list')])
+    ).toBe(true);
+    expect(
       verifiedSinceLastChange([
         ...edit(),
         ...run('rg \'pytest|jest\' package.json'),
@@ -93,6 +96,8 @@ describe('verifiedSinceLastChange', () => {
       '# python3 -m pytest',
       'echo $(cd repo; python3 -m pytest tests)',
       'mvn test-compile',
+      'mvn test -DskipTests',
+      'mvn test -Dmaven.test.skip=true',
       'python3 -m pytest \'--collect-only\'',
       'python3 -m pytest --collectonly',
       '(python3 -m pytest --collect-only)',

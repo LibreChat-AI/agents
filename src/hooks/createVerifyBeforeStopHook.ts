@@ -52,7 +52,7 @@ function isRedirection(command: string, index: number): boolean {
 
 /** Runner modes that list, describe or collect tests without running them. */
 const NON_RUN_FLAGS =
-  /\s(?:--collect-only|--collectonly|--show-only|--co|--listTests|--list-tests|--list|--no-run|--dry-run|-list|-N|--setup-plan|--setup-only|--showConfig|--fixtures|--markers|--help|-h|--version|-V|list)(?=[\s=)]|$)/;
+  /\s(?:--collect-only|--collectonly|--show-only|--co|--listTests|--list-tests|--list|--no-run|--dry-run|-list|-N|--setup-plan|--setup-only|--showConfig|--fixtures|--markers|--help|-h|--version|-V|-DskipTests\S*|-Dmaven\.test\.skip\S*)(?=[\s=)]|$)|\bvitest\s+list\b/;
 
 /** Drops unquoted shell comments: a `#` that starts a word, through the end of its line. */
 export function stripShellComments(command: string): string {
