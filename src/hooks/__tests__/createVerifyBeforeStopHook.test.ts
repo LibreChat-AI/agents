@@ -80,6 +80,14 @@ describe('verifiedSinceLastChange', () => {
     expect(
       verifiedSinceLastChange([...edit(), ...run('npx vitest list')])
     ).toBe(false);
+    for (const command of [
+      'go test -list . ./...',
+      'ctest -N',
+      'rspec --dry-run',
+      'git diff --quiet || npm test',
+    ]) {
+      expect(verifiedSinceLastChange([...edit(), ...run(command)])).toBe(false);
+    }
     expect(
       verifiedSinceLastChange([
         ...edit(),
