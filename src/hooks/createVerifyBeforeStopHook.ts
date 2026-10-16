@@ -7,8 +7,9 @@
  *
  * Detection reads the Run's own messages: file changes are `edit_file` /
  * `write_file` calls (plus in-place `sed -i`, `perl -pi` and `patch` shell
- * commands), and a test run is a shell call whose command matches a common
- * test runner and whose result reports no non-zero `exit_code` or timeout.
+ * commands), and a test run is a shell call whose last command starts a
+ * common test runner and whose result reports no non-zero `exit_code` or
+ * timeout.
  */
 
 import type { BaseMessage } from '@langchain/core/messages';
@@ -20,7 +21,7 @@ export interface VerifyBeforeStopConfig {
   maxContinuations?: number;
   /** Shell tool names whose `command` argument is inspected. */
   shellToolNames?: readonly string[];
-  /** Overrides the default test-runner pattern. */
+  /** Overrides the default test-runner pattern, matched against the last command of a shell line. */
   testCommandPattern?: RegExp;
   /** Overrides the instruction sent back to the model. */
   message?: string;
@@ -34,13 +35,48 @@ const RUNNER_WRAPPERS =
   '(?:sudo|env|time|npx|uvx|uv run|poetry run|pipenv run|hatch run|python[\\d.]* -m|timeout(?: -\\S+)* \\S+)';
 
 /**
- * A test runner invoked as a command: at the start of a command segment,
- * after env assignments and wrappers. A runner name elsewhere in a command,
- * such as `rg pytest pyproject.toml`, is not a test run.
+ * A command segment that starts a test runner, after env assignments and
+ * wrappers. Matched against the last segment of a shell command only (see
+ * `isTestRun`), so a runner name elsewhere, such as in
+ * `rg pytest pyproject.toml`, is not a test run.
  */
 export const DEFAULT_TEST_PATTERN = new RegExp(
-  `(?:^|[;&|(]|\\b(?:then|do)\\b)\\s*(?:\\w+=\\S*\\s+)*(?:${RUNNER_WRAPPERS}\\s+)*(?:\\S*/)?(?:${TEST_RUNNERS})\\b`
+  `^\\s*(?:\\(\\s*)?(?:\\w+=\\S*\\s+)*(?:${RUNNER_WRAPPERS}\\s+)*(?:\\S*/)?(?:${TEST_RUNNERS})\\b`
 );
+
+/**
+ * The last command of a shell command line: the text after the final
+ * `;`, `&`, `|` or newline that is outside quotes. Its exit code is the
+ * one the shell reports.
+ */
+export function lastShellSegment(command: string): string {
+  let quote: string | undefined;
+  let start = 0;
+  for (let i = 0; i < command.length; i++) {
+    const char = command[i];
+    if (quote != null) {
+      if (char === '\\' && quote === '"') i++;
+      else if (char === quote) quote = undefined;
+    } else if (char === '\\') {
+      i++;
+    } else if (char === "'" || char === '"') {
+      quote = char;
+    } else if (char === ';' || char === '&' || char === '|' || char === '\n') {
+      start = i + 1;
+    }
+  }
+  return command.slice(start);
+}
+
+/**
+ * Whether a shell command runs tests whose result is the command's exit
+ * code: the last segment must start with a runner. `pytest; echo done`,
+ * `pytest || true` and `pytest | tail` report another command's exit code,
+ * so they do not count.
+ */
+export function isTestRun(command: string, pattern: RegExp): boolean {
+  return command !== '' && pattern.test(lastShellSegment(command));
+}
 
 /** A copy of `pattern` without the `g` and `y` flags, whose `test()` keeps no state between calls. */
 export function statelessPattern(pattern: RegExp): RegExp {
@@ -124,7 +160,7 @@ export function verifiedSinceLastChange(
         verified = false;
         continue;
       }
-      if (changed && testPattern.test(command)) {
+      if (changed && isTestRun(command, testPattern)) {
         const output = call.id === undefined ? undefined : outputs.get(call.id);
         verified = output !== undefined && !failed(output);
       }

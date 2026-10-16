@@ -3,6 +3,7 @@ import {
   DEFAULT_TEST_PATTERN,
   SHELL_EDIT_PATTERN,
   failed,
+  isTestRun,
   statelessPattern,
 } from './createVerifyBeforeStopHook';
 import { Constants } from '@/common';
@@ -18,7 +19,7 @@ import { Constants } from '@/common';
 export interface StopOnPassingCheckConfig {
   /** Shell tool names whose `command` argument is inspected. */
   shellToolNames?: readonly string[];
-  /** Overrides the default test-runner pattern. */
+  /** Overrides the default test-runner pattern, matched against the last command of a shell line. */
   testCommandPattern?: RegExp;
 }
 
@@ -60,7 +61,7 @@ export function createStopOnPassingCheckHook(
         verified = false;
         continue;
       }
-      if (changed && testPattern.test(command)) {
+      if (changed && isTestRun(command, testPattern)) {
         verified =
           entry.status === 'success' && !failed(outputText(entry.toolOutput));
       }

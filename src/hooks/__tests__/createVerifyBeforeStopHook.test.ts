@@ -54,6 +54,27 @@ describe('verifiedSinceLastChange', () => {
         ...run('cd repo && PYTHONPATH=src python3 -m pytest -x tests'),
       ])
     ).toBe(true);
+    expect(
+      verifiedSinceLastChange([
+        ...edit(),
+        ...run("rg 'pytest|jest' package.json"),
+      ])
+    ).toBe(false);
+  });
+
+  it('ignores test runs whose exit code another command replaces', () => {
+    for (const command of [
+      'python3 -m pytest tests; echo done',
+      'python3 -m pytest tests || true',
+      'python3 -m pytest tests 2>&1 | tail -20',
+    ]) {
+      expect(
+        verifiedSinceLastChange([
+          ...edit(),
+          ...call('bash_tool', { command }, 'stdout:\n1 failed\n'),
+        ])
+      ).toBe(false);
+    }
   });
 
   it('gives the same answer on every call for a global custom pattern', () => {
