@@ -90,6 +90,8 @@ describe('verifiedSinceLastChange', () => {
       'python3 -m pytest tests >/tmp/tests.log 2>&1 &',
       'python3 -m pytest --setup-plan',
       'npx jest --showConfig',
+      'python3 -m pytest --collectonly',
+      'ctest --show-only=json-v1',
       'if [ ! -d tests ]; then exit 0; fi; python3 -m pytest tests',
     ]) {
       expect(verifiedSinceLastChange([...edit(), ...run(command)])).toBe(false);
