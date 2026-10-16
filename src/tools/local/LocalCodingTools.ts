@@ -1055,6 +1055,34 @@ function formatFallbackGrepDisplay(result: FallbackGrepResult): string {
   return 'No matches found.';
 }
 
+/**
+ * Fallback grep display under `toolResultMaxChars`: skip notices get at most
+ * a fifth of the budget (with a count of the ones left out), matches get the
+ * rest, so neither can push the result past the cap or hide the other.
+ */
+function capFallbackGrepDisplay(
+  matches: string[],
+  skipped: string[],
+  maxChars: number
+): string {
+  const skipText =
+    skipped.length === 0
+      ? ''
+      : capLines(
+        skipped.join('\n'),
+        Math.max(1, Math.floor(maxChars / 5)),
+        (omitted) => `${omitted} more files skipped`
+      );
+  if (matches.length === 0) {
+    return skipText === '' ? 'No matches found.' : skipText;
+  }
+  const matchText = capLines(
+    matches.join('\n'),
+    Math.max(1, maxChars - skipText.length)
+  );
+  return skipText === '' ? matchText : `${matchText}\n${skipText}`;
+}
+
 async function fallbackGrep(
   root: string,
   pattern: string,
@@ -1259,12 +1287,9 @@ export function createLocalGrepSearchTool(
         );
         // Artifact count: ONLY real matches (Codex P2 [43] —
         // skip sentinels used to inflate the count and the budget).
-        // The cap applies to matches only; skip diagnostics always follow.
         const display =
-          config.toolResultMaxChars != null &&
-          config.toolResultMaxChars > 0 &&
-          matches.length > 0
-            ? [capLines(matches.join('\n'), config.toolResultMaxChars), ...skipped].join('\n')
+          config.toolResultMaxChars != null && config.toolResultMaxChars > 0
+            ? capFallbackGrepDisplay(matches, skipped, config.toolResultMaxChars)
             : formatFallbackGrepDisplay({ matches, skipped });
         return [
           display,

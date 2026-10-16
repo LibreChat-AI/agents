@@ -163,6 +163,31 @@ describe('toolResultMaxChars', () => {
     expect(capped).toMatch(/skipped/);
   });
 
+  it('bounds many fallback grep skip notices by the cap', async () => {
+    _resetRipgrepCacheForTests();
+    const realSpawn = (
+      require('child_process') as typeof import('child_process')
+    ).spawn;
+    const noRg = ((cmd: string, args: string[], opts: SpawnOptions) =>
+      cmd === 'rg'
+        ? realSpawn('sh', ['-c', 'exit 127'], opts)
+        : realSpawn(cmd, args, opts)) as unknown as LocalSpawn;
+    const cwd = await createTempDir();
+    const big = Buffer.alloc(6 * 1024 * 1024, 'a');
+    for (let i = 0; i < 12; i++) {
+      await writeFile(join(cwd, `big-file-with-a-long-name-${i}.txt`), big);
+    }
+    const capped = String(
+      await createLocalGrepSearchTool({
+        cwd,
+        toolResultMaxChars: 400,
+        exec: { spawn: noRg },
+      }).invoke({ pattern: 'needle' })
+    );
+    expect(capped.length).toBeLessThan(500);
+    expect(capped).toMatch(/more files skipped\]$/);
+  });
+
   it('caps grep_search and bash_tool results only when set', async () => {
     const cwd = await createTempDir();
     await writeFile(

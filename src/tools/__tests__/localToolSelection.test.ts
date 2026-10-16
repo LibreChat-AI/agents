@@ -50,6 +50,16 @@ describe('local coding tool selection', () => {
     const registry = resolveLocalToolRegistry({ toolExecution });
     expect(registry?.has(Constants.READ_FILE)).toBe(true);
     expect(registry?.has(Constants.LIST_DIRECTORY)).toBe(false);
+    const withRunner = resolveLocalToolRegistry({
+      toolExecution,
+      toolRegistry: new Map([
+        [
+          Constants.BASH_TOOL,
+          { name: Constants.BASH_TOOL } as unknown as t.LCTool,
+        ],
+      ]) as t.LCToolRegistry,
+    });
+    expect(withRunner?.has(Constants.BASH_TOOL)).toBe(false);
   });
 
   it('drops host-bound coding tools outside the local allowlist on every path', () => {

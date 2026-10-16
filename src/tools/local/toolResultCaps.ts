@@ -18,7 +18,12 @@ export const CAPPED_GREP_LINE_CHARS = 300;
  * `CAPPED_GREP_LINE_CHARS`, and lines stop at `maxChars` with a note naming
  * how many were left out.
  */
-export function capLines(text: string, maxChars: number): string {
+export function capLines(
+  text: string,
+  maxChars: number,
+  note: (omitted: number) => string = (omitted) =>
+    `${omitted} more matching lines not shown; narrow the pattern or path`
+): string {
   const lines = text.split('\n');
   const kept: string[] = [];
   let used = 0;
@@ -33,7 +38,7 @@ export function capLines(text: string, maxChars: number): string {
   }
   const omitted = lines.length - kept.length;
   return omitted > 0
-    ? `${kept.join('\n')}\n[${omitted} more matching lines not shown; narrow the pattern or path]`
+    ? `${kept.join('\n')}\n[${note(omitted)}]`
     : kept.join('\n');
 }
 

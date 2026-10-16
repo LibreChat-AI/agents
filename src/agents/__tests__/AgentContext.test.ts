@@ -69,6 +69,21 @@ describe('AgentContext', () => {
       expect(hostGraphTools).toHaveLength(1);
     });
 
+    it('drops graphTools outside the local coding allowlist', () => {
+      const runner = createMockTool('run_tools_with_code');
+      const askTool = createMockTool('ask_user_question');
+      const ctx = createBasicContext({
+        agentConfig: { graphTools: [runner, askTool] },
+        toolExecution: {
+          engine: 'local',
+          local: { codingToolNames: ['read_file'] },
+        },
+      });
+      expect(
+        (ctx.graphTools as t.GenericTool[]).map((tool) => tool.name)
+      ).toEqual(['ask_user_question']);
+    });
+
     it('leaves graphTools undefined when the host supplies none (or an empty list)', () => {
       expect(createBasicContext().graphTools).toBeUndefined();
       expect(

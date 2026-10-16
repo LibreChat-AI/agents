@@ -184,7 +184,11 @@ export class AgentContext {
      * subagent) into this same array and must not mutate the host's input.
      */
     if (graphTools && graphTools.length > 0) {
-      agentContext.graphTools = [...graphTools];
+      agentContext.graphTools = [
+        ...((filterToolsByLocalAllowlist(graphTools, toolExecution) as
+          | t.GenericTool[]
+          | undefined) ?? []),
+      ] as t.GraphTools;
     }
 
     if (initialSummary?.text != null && initialSummary.text !== '') {

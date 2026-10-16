@@ -392,6 +392,12 @@ export function resolveLocalToolRegistry(args: {
     }
   }
 
+  if (localSelected != null) {
+    for (const name of LOCAL_CODING_BUNDLE_NAMES) {
+      if (!localSelected.has(name)) registry.delete(name);
+    }
+  }
+
   for (const definition of createLocalCodingToolDefinitions()) {
     const keep = selectedNames ?? localSelected;
     if (keep != null && !keep.has(definition.name)) {
