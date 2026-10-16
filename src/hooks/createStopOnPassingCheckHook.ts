@@ -54,12 +54,15 @@ export function createStopOnPassingCheckHook(
         : '';
       if (
         entry.toolName === Constants.EDIT_FILE ||
-        entry.toolName === Constants.WRITE_FILE ||
-        SHELL_EDIT_PATTERN.test(command)
+        entry.toolName === Constants.WRITE_FILE
       ) {
         changed = true;
         verified = false;
         continue;
+      }
+      if (SHELL_EDIT_PATTERN.test(command)) {
+        changed = true;
+        verified = false;
       }
       if (changed && isTestRun(command, testPattern)) {
         verified =

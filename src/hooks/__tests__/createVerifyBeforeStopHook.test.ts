@@ -57,8 +57,38 @@ describe('verifiedSinceLastChange', () => {
     expect(
       verifiedSinceLastChange([
         ...edit(),
-        ...run("rg 'pytest|jest' package.json"),
+        ...run('rg \'pytest|jest\' package.json'),
       ])
+    ).toBe(false);
+  });
+
+  it('handles redirections, listing modes and an edit followed by tests in one call', () => {
+    const run = (command: string, output = 'stdout:\nok\n'): BaseMessage[] =>
+      call('bash_tool', { command }, output);
+    expect(
+      verifiedSinceLastChange([
+        ...edit(),
+        ...run('python3 -m pytest tests 2>&1'),
+      ])
+    ).toBe(true);
+    expect(
+      verifiedSinceLastChange([...edit(), ...run('npx jest --listTests')])
+    ).toBe(false);
+    expect(
+      verifiedSinceLastChange([
+        ...edit(),
+        ...run('python3 -m pytest --collect-only -q'),
+      ])
+    ).toBe(false);
+    expect(
+      verifiedSinceLastChange(
+        run('sed -i \'s/a/b/\' a.py && python3 -m pytest tests')
+      )
+    ).toBe(true);
+    expect(
+      verifiedSinceLastChange(
+        run('python3 -m pytest tests && sed -i \'s/a/b/\' a.py')
+      )
     ).toBe(false);
   });
 

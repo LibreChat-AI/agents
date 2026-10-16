@@ -44,6 +44,16 @@ export const DEFAULT_TEST_PATTERN = new RegExp(
   `^\\s*(?:\\(\\s*)?(?:\\w+=\\S*\\s+)*(?:${RUNNER_WRAPPERS}\\s+)*(?:\\S*/)?(?:${TEST_RUNNERS})\\b`
 );
 
+/** Whether the `&` at `index` belongs to a redirection (`2>&1`, `<&3`, `&>`) rather than a separator. */
+function isRedirection(command: string, index: number): boolean {
+  const previous = command[index - 1];
+  return previous === '>' || previous === '<' || command[index + 1] === '>';
+}
+
+/** Runner modes that list, describe or collect tests without running them. */
+const NON_RUN_FLAGS =
+  /\s(?:--collect-only|--co|--listTests|--list-tests|--list|--help|-h|--version|-V)(?=\s|$)/;
+
 /**
  * The last command of a shell command line: the text after the final
  * `;`, `&`, `|` or newline that is outside quotes. Its exit code is the
@@ -59,8 +69,10 @@ export function lastShellSegment(command: string): string {
       else if (char === quote) quote = undefined;
     } else if (char === '\\') {
       i++;
-    } else if (char === "'" || char === '"') {
+    } else if (char === '\'' || char === '"') {
       quote = char;
+    } else if (char === '&' && isRedirection(command, i)) {
+      continue;
     } else if (char === ';' || char === '&' || char === '|' || char === '\n') {
       start = i + 1;
     }
@@ -72,10 +84,13 @@ export function lastShellSegment(command: string): string {
  * Whether a shell command runs tests whose result is the command's exit
  * code: the last segment must start with a runner. `pytest; echo done`,
  * `pytest || true` and `pytest | tail` report another command's exit code,
- * so they do not count.
+ * so they do not count, and neither do listing modes such as
+ * `--collect-only`, `--listTests` or `--help`.
  */
 export function isTestRun(command: string, pattern: RegExp): boolean {
-  return command !== '' && pattern.test(lastShellSegment(command));
+  if (command === '') return false;
+  const segment = lastShellSegment(command);
+  return pattern.test(segment) && !NON_RUN_FLAGS.test(segment);
 }
 
 /** A copy of `pattern` without the `g` and `y` flags, whose `test()` keeps no state between calls. */
@@ -153,12 +168,15 @@ export function verifiedSinceLastChange(
       const command = shellNames.has(call.name) ? commandOf(call.args) : '';
       if (
         call.name === Constants.EDIT_FILE ||
-        call.name === Constants.WRITE_FILE ||
-        SHELL_EDIT_PATTERN.test(command)
+        call.name === Constants.WRITE_FILE
       ) {
         changed = true;
         verified = false;
         continue;
+      }
+      if (SHELL_EDIT_PATTERN.test(command)) {
+        changed = true;
+        verified = false;
       }
       if (changed && isTestRun(command, testPattern)) {
         const output = call.id === undefined ? undefined : outputs.get(call.id);
