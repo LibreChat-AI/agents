@@ -33,6 +33,7 @@ import {
   CODE_EXECUTION_TOOLS,
   LOCAL_CODING_BUNDLE_NAMES,
 } from '@/common';
+import { resolveClientOptionsModel } from '@/llm/request';
 import {
   getMessageCreationContentMetadata,
   splitAssistantTextContentByPhase,
@@ -483,12 +484,40 @@ function getReasoningTextFromContentPart(
   );
 }
 
+interface ServingIdentity {
+  provider?: string;
+  model?: string;
+}
+
+const asNonEmpty = (value: unknown): string | undefined =>
+  typeof value === 'string' && value !== '' ? value : undefined;
+
+/**
+ * Identity of the model that actually served this call: the attempt stamp
+ * (primary or fallback), then what the graph resolved for the call (override
+ * model, `modelName` alias), then the configured client options.
+ */
+function resolveServingIdentity(
+  agentContext: AgentContext,
+  metadata?: Record<string, unknown>
+): ServingIdentity {
+  return {
+    provider:
+      asNonEmpty(metadata?.[Constants.INVOKED_PROVIDER]) ??
+      agentContext.reasoningReplaySource?.provider ??
+      agentContext.provider,
+    model:
+      asNonEmpty(metadata?.[Constants.INVOKED_MODEL]) ??
+      agentContext.reasoningReplaySource?.model ??
+      resolveClientOptionsModel(agentContext.clientOptions),
+  };
+}
+
 function getBedrockReasoningReplay(
   contentPart: t.MessageContentComplex,
-  agentContext: AgentContext
+  serving: ServingIdentity
 ): t.ProviderReasoningReplay | undefined {
-  const model = (agentContext.clientOptions as { model?: unknown } | undefined)
-    ?.model;
+  const model = serving.model;
   if (
     typeof model !== 'string' ||
     model === '' ||
@@ -543,10 +572,9 @@ function getBedrockReasoningReplay(
 
 function getAnthropicReasoningReplay(
   contentPart: t.MessageContentComplex,
-  agentContext: AgentContext
+  serving: ServingIdentity
 ): t.ProviderReasoningReplay | undefined {
-  const model = (agentContext.clientOptions as { model?: unknown } | undefined)
-    ?.model;
+  const model = serving.model;
   if (typeof model !== 'string' || model === '') {
     return undefined;
   }
@@ -2309,14 +2337,18 @@ hasToolCallChunks: ${hasToolCallChunks}
         stepId,
         {
           content: content.map((c) => {
+            const serving = resolveServingIdentity(agentContext, metadata);
             const isAnthropicReplayShape =
               c.type === ContentTypes.THINKING ||
               c.type === 'redacted_thinking' ||
               (c.type === ContentTypes.REASONING &&
                 typeof (c as { signature?: unknown }).signature === 'string');
-            const providerReplay = isAnthropicReplayShape
-              ? getAnthropicReasoningReplay(c, agentContext)
-              : getBedrockReasoningReplay(c, agentContext);
+            let providerReplay: t.ProviderReasoningReplay | undefined;
+            if (agentContext.providerReasoningReplay) {
+              providerReplay = isAnthropicReplayShape
+                ? getAnthropicReasoningReplay(c, serving)
+                : getBedrockReasoningReplay(c, serving);
+            }
             return {
               type: ContentTypes.THINK,
               think:
@@ -2429,6 +2461,9 @@ function mergeProviderReasoningReplay(
 ): t.ProviderReasoningReplay | undefined {
   if (incoming == null) {
     return existing;
+  }
+  if (incoming.invalidated === true) {
+    return { invalidated: true };
   }
   const anthropicModelChanged =
     incoming.anthropic != null &&

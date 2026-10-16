@@ -21,6 +21,8 @@ export type ScriptedReasoning =
 export interface ScriptedReply {
   /** Reasoning blocks before the output, in order. */
   reasoning?: ScriptedReasoning[];
+  /** Reasoning emitted after the text and before the calls (interleaved thinking). */
+  reasoningAfterText?: ScriptedReasoning[];
   text?: string;
   calls?: ScriptedCall[];
 }
@@ -151,23 +153,27 @@ function responsesStream(reply: ScriptedReply, n: number): string[] {
 function anthropicStream(reply: ScriptedReply, n: number): string[] {
   const event = (body: JsonObject): string => sse(body, String(body.type));
   const blocks: string[][] = [];
-  for (const reasoning of reply.reasoning ?? []) {
-    blocks.push(
-      'redacted' in reasoning
-        ? [JSON.stringify({ type: 'redacted_thinking', data: reasoning.redacted })]
-        : [
-          JSON.stringify({ type: 'thinking', thinking: '', signature: '' }),
-          JSON.stringify({ type: 'thinking_delta', thinking: reasoning.text }),
-          JSON.stringify({ type: 'signature_delta', signature: reasoning.signature }),
-        ]
-    );
-  }
+  const pushReasoning = (list: ScriptedReasoning[] | undefined): void => {
+    for (const reasoning of list ?? []) {
+      blocks.push(
+        'redacted' in reasoning
+          ? [JSON.stringify({ type: 'redacted_thinking', data: reasoning.redacted })]
+          : [
+            JSON.stringify({ type: 'thinking', thinking: '', signature: '' }),
+            JSON.stringify({ type: 'thinking_delta', thinking: reasoning.text }),
+            JSON.stringify({ type: 'signature_delta', signature: reasoning.signature }),
+          ]
+      );
+    }
+  };
+  pushReasoning(reply.reasoning);
   if (reply.text != null) {
     blocks.push([
       JSON.stringify({ type: 'text', text: '' }),
       JSON.stringify({ type: 'text_delta', text: reply.text }),
     ]);
   }
+  pushReasoning(reply.reasoningAfterText);
   (reply.calls ?? []).forEach((call, index) =>
     blocks.push([
       JSON.stringify({ type: 'tool_use', id: `toolu_${n}_${index}`, name: call.name, input: {} }),
@@ -232,17 +238,20 @@ function googleStream(reply: ScriptedReply): string[] {
 function bedrockEvents(reply: ScriptedReply, n: number): JsonObject[] {
   const events: JsonObject[] = [{ messageStart: { role: 'assistant' } }];
   let index = 0;
-  for (const reasoning of reply.reasoning ?? []) {
-    if ('redacted' in reasoning) {
-      continue;
+  const pushReasoning = (list: ScriptedReasoning[] | undefined): void => {
+    for (const reasoning of list ?? []) {
+      if ('redacted' in reasoning) {
+        continue;
+      }
+      events.push(
+        { contentBlockDelta: { contentBlockIndex: index, delta: { reasoningContent: { text: reasoning.text } } } },
+        { contentBlockDelta: { contentBlockIndex: index, delta: { reasoningContent: { signature: reasoning.signature } } } },
+        { contentBlockStop: { contentBlockIndex: index } }
+      );
+      index++;
     }
-    events.push(
-      { contentBlockDelta: { contentBlockIndex: index, delta: { reasoningContent: { text: reasoning.text } } } },
-      { contentBlockDelta: { contentBlockIndex: index, delta: { reasoningContent: { signature: reasoning.signature } } } },
-      { contentBlockStop: { contentBlockIndex: index } }
-    );
-    index++;
-  }
+  };
+  pushReasoning(reply.reasoning);
   if (reply.text != null) {
     events.push(
       { contentBlockDelta: { contentBlockIndex: index, delta: { text: reply.text } } },
@@ -250,6 +259,7 @@ function bedrockEvents(reply: ScriptedReply, n: number): JsonObject[] {
     );
     index++;
   }
+  pushReasoning(reply.reasoningAfterText);
   for (const [callIndex, call] of (reply.calls ?? []).entries()) {
     events.push(
       {

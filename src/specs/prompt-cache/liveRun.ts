@@ -5,6 +5,7 @@ import { ChatModelStreamHandler, createContentAggregator } from '@/stream';
 import { GraphEvents } from '@/common';
 import { formatAgentMessages } from '@/messages';
 import { CAPTURED } from './harness';
+import { createTokenCounter, encodingForModel } from '@/utils/tokens';
 import { Run } from '@/run';
 
 /**
@@ -82,9 +83,18 @@ export interface LiveRunOptions {
   aggregatedEvents?: GraphEvents[];
   /** Bedrock takes an injected client instead of `fetch`. */
   transport?: 'fetch' | 'bedrock';
+  /** Turns the context management on: pruning, fading and masking need counts. */
+  contextManagement?: boolean;
 }
 
 type Restore = () => void;
+
+/** A scripted reply that fails the call, to exercise fallbacks. */
+export interface ProviderFailure {
+  failWithStatus: number;
+  /** Error text, for providers whose errors carry one (Bedrock). */
+  message?: string;
+}
 
 /** Serves scripted replies in order; a call past the script is recorded and aborted. */
 function installTransport(
@@ -98,9 +108,15 @@ function installTransport(
     clientOptions.client = {
       send: async (command: { input: object }): Promise<object> => {
         requests.push(JSON.parse(JSON.stringify(command.input)) as JsonObject);
-        const events = queue.shift() as object[] | undefined;
+        const events = queue.shift() as object[] | ProviderFailure | undefined;
         if (events == null) {
           throw new Error(CAPTURED);
+        }
+        if (!Array.isArray(events)) {
+          throw Object.assign(new Error(events.message ?? 'scripted failure'), {
+            name: 'ValidationException',
+            $metadata: { httpStatusCode: events.failWithStatus },
+          });
         }
         return {
           stream: (async function* (): AsyncGenerator<object> {
@@ -126,9 +142,18 @@ function installTransport(
           ? await input.clone().text()
           : String(init?.body ?? '{}');
       requests.push(JSON.parse(raw) as JsonObject);
-      const frames = queue.shift() as string[] | undefined;
+      const frames = queue.shift() as string[] | ProviderFailure | undefined;
       if (frames == null) {
         throw new Error(CAPTURED);
+      }
+      if (!Array.isArray(frames)) {
+        return new Response(
+          JSON.stringify({
+            type: 'error',
+            error: { type: 'api_error', message: 'scripted failure' },
+          }),
+          { status: frames.failWithStatus }
+        );
       }
       return sseResponse(frames);
     });
@@ -151,6 +176,9 @@ export async function runLiveTurn(
       graphConfig: { type: 'standard', agents: [options.agent] },
       returnContent: true,
       skipCleanup: true,
+      ...(options.contextManagement === true
+        ? { tokenCounter: await createTokenCounter(encodingForModel('gpt-4')), indexTokenCountMap: {} }
+        : {}),
       ...(options.eventDriven
         ? { eagerEventToolExecution: { enabled: true } }
         : {}),
@@ -185,13 +213,20 @@ export async function runLiveTurn(
 /** History a host restores before the next turn from the stored parts. */
 export function restoreHistory(
   exchanges: Array<{ user: string; parts?: t.MessageContentComplex[] }>,
-  toolNames: Set<string>
+  toolNames: Set<string>,
+  replayProviderReasoning?: { provider: t.ProviderName; model: string }
 ): BaseMessage[] {
   const payload: t.TPayload = exchanges.flatMap(({ user, parts }) => [
     { role: 'user', content: user },
     ...(parts != null ? [{ role: 'assistant', content: parts }] : []),
   ]);
-  return formatAgentMessages(payload, undefined, toolNames).messages;
+  return formatAgentMessages(
+    payload,
+    undefined,
+    toolNames,
+    undefined,
+    replayProviderReasoning == null ? undefined : { replayProviderReasoning }
+  ).messages;
 }
 
 export function firstTurnMessages(user: string): BaseMessage[] {

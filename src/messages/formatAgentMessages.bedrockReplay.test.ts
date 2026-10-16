@@ -50,7 +50,9 @@ describe('formatAgentMessages Bedrock reasoning replay', () => {
       { 0: 500 },
       new Set(['calculator']),
       undefined,
-      { provider: Providers.BEDROCK, model }
+      {
+        replayProviderReasoning: { provider: Providers.BEDROCK, model },
+      }
     );
 
     expect(messages).toHaveLength(3);
@@ -73,26 +75,26 @@ describe('formatAgentMessages Bedrock reasoning replay', () => {
     ]);
     expect(messages[1]).toBeInstanceOf(ToolMessage);
     expect(messages[2].content).toBe('42');
-    expect(
-      Object.values(indexTokenCountMap ?? {}).reduce(
-        (total, count) => total + count,
-        0
-      )
-    ).toBe(500);
+    // Replayed blocks are not part of the stored weight, so it is recounted.
+    expect(indexTokenCountMap).toEqual({});
   });
 
-  it('does not replay a Bedrock signature to another provider and invalidates its token weight', () => {
+  it('does not replay a Bedrock signature to another provider and keeps its token weight', () => {
     const { messages, indexTokenCountMap } = formatAgentMessages(
       payload,
       { 0: 500 },
       new Set(['calculator']),
       undefined,
-      { provider: Providers.ANTHROPIC, model: 'claude-sonnet-5' }
+      {
+        replayProviderReasoning: { provider: Providers.ANTHROPIC, model: 'claude-sonnet-5' },
+      }
     );
 
     expect(JSON.stringify(messages)).not.toContain('sig-bedrock');
     expect(JSON.stringify(messages)).not.toContain('reasoning_content');
-    expect(indexTokenCountMap).toEqual({});
+    expect(
+      Object.values(indexTokenCountMap ?? {}).reduce((total, count) => total + count, 0)
+    ).toBe(500);
   });
 
   it('does not replay signed reasoning to another Bedrock model', () => {
@@ -101,12 +103,16 @@ describe('formatAgentMessages Bedrock reasoning replay', () => {
       { 0: 500 },
       new Set(['calculator']),
       undefined,
-      { provider: Providers.BEDROCK, model: 'amazon.nova-2-lite-v1:0' }
+      {
+        replayProviderReasoning: { provider: Providers.BEDROCK, model: 'amazon.nova-2-lite-v1:0' },
+      }
     );
 
     expect(JSON.stringify(messages)).not.toContain('sig-bedrock');
     expect(JSON.stringify(messages)).not.toContain('reasoning_content');
-    expect(indexTokenCountMap).toEqual({});
+    expect(
+      Object.values(indexTokenCountMap ?? {}).reduce((total, count) => total + count, 0)
+    ).toBe(500);
   });
 
   it('drops incomplete persisted reasoning instead of sending unsigned native content', () => {
@@ -124,7 +130,9 @@ describe('formatAgentMessages Bedrock reasoning replay', () => {
       undefined,
       new Set(['calculator']),
       undefined,
-      { provider: Providers.BEDROCK, model }
+      {
+        replayProviderReasoning: { provider: Providers.BEDROCK, model },
+      }
     );
 
     expect(JSON.stringify(messages)).not.toContain('reasoning_content');

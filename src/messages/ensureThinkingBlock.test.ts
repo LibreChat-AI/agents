@@ -1377,6 +1377,41 @@ describe('ensureThinkingBlockInMessages', () => {
       );
     });
 
+    test('preserves AI(tool_use) turns the run produced, wherever a compaction moved them', () => {
+      const own = new AIMessage({
+        content: '',
+        tool_calls: [
+          { id: 'c1', name: 'fetch', args: {}, type: 'tool_call' as const },
+        ],
+      });
+      const foreign = new AIMessage({
+        content: '',
+        tool_calls: [
+          { id: 'c0', name: 'older', args: {}, type: 'tool_call' as const },
+        ],
+      });
+      const messages = [
+        new HumanMessage({ content: 'fetch the data' }),
+        foreign,
+        new ToolMessage({ content: 'old', tool_call_id: 'c0' }),
+        own,
+        new ToolMessage({ content: 'data', tool_call_id: 'c1' }),
+      ];
+
+      const result = ensureThinkingBlockInMessages(
+        messages,
+        Providers.BEDROCK,
+        undefined,
+        /* runStartIndex, stale after a compaction */ 99,
+        undefined,
+        (message) => message === own
+      );
+
+      expect(result).toContain(own);
+      expect(result).not.toContain(foreign);
+      expect(getTextContent(result[1])).toContain('[Previous agent context]');
+    });
+
     test('still converts pre-runStartIndex history that lacks thinking blocks', () => {
       // Real handoff scenario: a prior non-thinking agent's tool calls
       // appear before this run started. They genuinely need the

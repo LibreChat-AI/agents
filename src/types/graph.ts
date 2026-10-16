@@ -1040,6 +1040,16 @@ interface AgentInputFields {
    * shared across conversations. The compaction summary follows it.
    */
   conversation_instructions?: string;
+  /**
+   * Opt-in persistence of signed provider reasoning (Anthropic `thinking` /
+   * `redacted_thinking`, Bedrock `reasoningContent`). When set, streamed
+   * `think` parts carry `provider_replay` with the blocks and the identity of
+   * the model that served the call, and Anthropic requests ask the API to
+   * drop thinking blocks that no longer match the conversation prefix instead
+   * of rejecting the request. Pair it with the `replayProviderReasoning`
+   * option of `formatAgentMessages`.
+   */
+  providerReasoningReplay?: boolean;
   reasoningKey?: 'reasoning_content' | 'reasoning';
   /** Format content blocks as strings (for legacy compatibility i.e. Ollama/Azure Serverless) */
   useLegacyContent?: boolean;

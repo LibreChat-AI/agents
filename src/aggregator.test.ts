@@ -1,5 +1,5 @@
 import type * as t from '@/types';
-import { GraphEvents, StepTypes, ContentTypes, Providers } from '@/common';
+import { GraphEvents, StepTypes, ContentTypes } from '@/common';
 import { createContentAggregator } from './stream';
 
 const bedrockModel = 'anthropic.claude-sonnet-5-v1:0';

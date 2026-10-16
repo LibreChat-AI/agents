@@ -66,6 +66,7 @@ import {
   resolveReasoningReplaySource,
 } from '@/llm/invoke';
 import { calculateMaxToolResultChars } from '@/utils/truncation';
+import { stripSignedReasoning } from '@/messages/reasoningTypes';
 import { makeIsDeferred } from '@/messages/anthropicToolCache';
 import { createRemoveAllMessage } from '@/messages/reducer';
 import { getProviderFamily } from '@/llm/providerRegistry';
@@ -680,11 +681,13 @@ async function executeSummarizationWithFallback(params: {
   let summaryUsage: Partial<UsageMetadata> | undefined;
   let usedMetadataStub = false;
   let summarizationMessages = messages;
-  let reasoningReplaySource: ReasoningReplaySource =
-    agentContext.reasoningReplaySource ?? {
-      provider: agentContext.provider,
-      model: resolveClientOptionsModel(agentContext.clientOptions),
-    };
+  let reasoningReplaySource: ReasoningReplaySource | undefined =
+    agentContext.providerReasoningReplay
+      ? (agentContext.reasoningReplaySource ?? {
+        provider: agentContext.provider,
+        model: resolveClientOptionsModel(agentContext.clientOptions),
+      })
+      : undefined;
 
   try {
     /**
@@ -712,19 +715,20 @@ async function executeSummarizationWithFallback(params: {
       tools: summarizationTools,
     }) as t.ChatModel;
 
-    const summarizationProvider = clientConfig.provider as Providers;
-    const summarizationReplaySource = resolveReasoningReplaySource({
-      model: summarizationModel,
-      provider: summarizationProvider,
-      clientOptions: clientConfig.clientOptions as t.ClientOptions,
-      callOptions: summarizeConfig,
-    });
-    summarizationMessages = filterReasoningReplayForInvocation({
-      messages,
-      source: reasoningReplaySource,
-      target: summarizationReplaySource,
-    });
-    reasoningReplaySource = summarizationReplaySource;
+    if (reasoningReplaySource != null) {
+      const summarizationReplaySource = resolveReasoningReplaySource({
+        model: summarizationModel,
+        provider: clientConfig.provider as Providers,
+        clientOptions: clientConfig.clientOptions as t.ClientOptions,
+        callOptions: summarizeConfig,
+      });
+      summarizationMessages = filterReasoningReplayForInvocation({
+        messages,
+        source: reasoningReplaySource,
+        target: summarizationReplaySource,
+      });
+      reasoningReplaySource = summarizationReplaySource;
+    }
 
     const result = await summarizeWithCacheHit({
       model: summarizationModel,
@@ -1271,7 +1275,10 @@ export function createSummarizeNode({
      * specific indices), so the same tailStartIndex slices both arrays
      * at the same turn boundary.
      */
-    const messagesToRetain = state.messages.slice(tailStartIndex);
+    /** The signatures bind each block to the history the summary now replaces. */
+    const messagesToRetain = stripSignedReasoning(
+      state.messages.slice(tailStartIndex)
+    );
 
     if (messagesToRefine.length === 0) {
       if (request.reason === 'manual') {
@@ -1471,7 +1478,7 @@ export function createSummarizeNode({
       usedMetadataStub,
     } = await executeSummarizationWithFallback({
       agentContext,
-      messages: messagesToRefine,
+      messages: stripSignedReasoning(messagesToRefine),
       clientConfig,
       summarizeConfig,
       stepId,

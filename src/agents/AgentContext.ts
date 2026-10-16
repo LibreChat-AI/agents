@@ -13,6 +13,7 @@ import type {
 } from '@langchain/core/messages';
 import type { RunnableConfig, Runnable } from '@langchain/core/runnables';
 import type { ExactTokenCountCache } from '@/llm/contextPressureMeter';
+import type { SentPrefix } from '@/messages/reasoningTypes';
 import type * as t from '@/types';
 import {
   type CallerCapabilityProjection,
@@ -149,6 +150,7 @@ export class AgentContext {
       subagentConfigs,
       maxSubagentDepth,
       graphTools,
+      providerReasoningReplay,
     } = agentConfig;
 
     const agentContext = new AgentContext({
@@ -192,6 +194,20 @@ export class AgentContext {
         };
     agentContext.subagentConfigs = subagentConfigs;
     agentContext.maxSubagentDepth = maxSubagentDepth;
+    if (providerReasoningReplay === true) {
+      agentContext.providerReasoningReplay = true;
+      if (provider === Providers.ANTHROPIC) {
+        agentContext.clientOptions = {
+          ...clientOptions,
+          dropMismatchedThinkingBlocks: true,
+        } as t.ClientOptions;
+      } else if (provider === Providers.BEDROCK) {
+        agentContext.clientOptions = {
+          ...clientOptions,
+          retryWithoutReasoningOnRejection: true,
+        } as t.ClientOptions;
+      }
+    }
     /**
      * Host-supplied direct tools (see `AgentInputs.graphTools`). Copied — never
      * aliased — because the SDK later pushes graph-managed tools (handoff /
@@ -305,6 +321,8 @@ export class AgentContext {
   resolvedInstructionOverhead?: number;
   private _pendingOriginalToolContent?: Map<number, string>;
   private pendingOriginalToolContentChars = 0;
+  /** What the last request sent, for dropping reasoning bound to a rewritten prefix. */
+  readonly sentPrefix: SentPrefix = { stale: new Set<string>() };
   /** Provider-bound projection for this Run; graph messages remain canonical. */
   private providerProjectedMessages?: BaseMessage[];
   /** Canonical object identities corresponding to the projected slots. */
@@ -387,6 +405,8 @@ export class AgentContext {
   tokenTypeSwitch?: 'reasoning' | 'content';
   /** Tracks how many reasoning→text transitions have occurred (ensures unique post-reasoning step keys) */
   reasoningTransitionCount = 0;
+  /** Streamed reasoning carries signed provider blocks (`provider_replay`). */
+  providerReasoningReplay = false;
   /** Native replay shape currently present in formatted conversation messages. */
   reasoningReplaySource?: {
     provider: t.ProviderName;

@@ -2137,6 +2137,85 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
     expect(messageDeltas[0]?.delta).toEqual({ content: [toolCallPart] });
   });
 
+  describe('provider reasoning capture identity', () => {
+    const signed = [
+      { type: ContentTypes.THINKING, thinking: 'thought', signature: 'sig' },
+    ] satisfies t.MessageContentComplex[];
+
+    const capture = async (
+      agentContext: Partial<AgentContext>,
+      metadata: Record<string, unknown> = {}
+    ): Promise<t.ProviderReasoningReplay | undefined> => {
+      const dispatchReasoningDelta = jest.fn<
+        StandardGraph['dispatchReasoningDelta']
+      >(async () => undefined);
+      const graph = createGraph({
+        dispatchReasoningDelta,
+        getAgentContext: jest.fn(
+          (): Partial<AgentContext> => ({
+            provider: Providers.ANTHROPIC,
+            reasoningKey: 'reasoning',
+            currentTokenType: ContentTypes.THINK,
+            toolDefinitions: [],
+            graphTools: [],
+            agentId: 'agent_1',
+            ...agentContext,
+          })
+        ) as unknown as StandardGraph['getAgentContext'],
+      });
+      await new ChatModelStreamHandler().handle(
+        GraphEvents.CHAT_MODEL_STREAM,
+        { chunk: { content: signed } as unknown as t.StreamChunk },
+        { langgraph_node: 'agent', ...metadata },
+        graph
+      );
+      const delta = dispatchReasoningDelta.mock.calls[0]?.[1] as
+        | { content: Array<{ provider_replay?: t.ProviderReasoningReplay }> }
+        | undefined;
+      return delta?.content[0]?.provider_replay;
+    };
+
+    it('captures nothing unless the agent opted in', async () => {
+      expect(
+        await capture({ clientOptions: { model: 'claude-primary' } })
+      ).toBeUndefined();
+    });
+
+    it('reads the model from the modelName alias', async () => {
+      const replay = await capture({
+        providerReasoningReplay: true,
+        clientOptions: { modelName: 'claude-alias' } as t.ClientOptions,
+      });
+      expect(replay?.anthropic?.model).toBe('claude-alias');
+    });
+
+    it('uses the model the graph resolved for the call over client options', async () => {
+      const replay = await capture({
+        providerReasoningReplay: true,
+        clientOptions: { model: 'claude-configured' },
+        reasoningReplaySource: {
+          provider: Providers.ANTHROPIC,
+          model: 'claude-override',
+        },
+      });
+      expect(replay?.anthropic?.model).toBe('claude-override');
+    });
+
+    it('attributes the blocks to the fallback that served the call', async () => {
+      const replay = await capture(
+        {
+          providerReasoningReplay: true,
+          clientOptions: { model: 'claude-primary' },
+        },
+        {
+          [Constants.INVOKED_PROVIDER]: Providers.ANTHROPIC,
+          [Constants.INVOKED_MODEL]: 'claude-fallback',
+        }
+      );
+      expect(replay?.anthropic?.model).toBe('claude-fallback');
+    });
+  });
+
   it('captures raw Anthropic thinking text and signatures for replay', async () => {
     const dispatchReasoningDelta = jest.fn<
       StandardGraph['dispatchReasoningDelta']
@@ -2148,6 +2227,7 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
           provider: Providers.ANTHROPIC,
           clientOptions: { model: 'claude-sonnet-5' },
           reasoningKey: 'reasoning',
+          providerReasoningReplay: true,
           currentTokenType: ContentTypes.THINK,
           toolDefinitions: [],
           graphTools: [],
@@ -2258,6 +2338,7 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
           provider: 'Raw Anthropic E2E' as Providers,
           clientOptions: { model: 'claude-sonnet-5' },
           reasoningKey: 'reasoning',
+          providerReasoningReplay: true,
           currentTokenType: ContentTypes.THINK,
           toolDefinitions: [],
           graphTools: [],

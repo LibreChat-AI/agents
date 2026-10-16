@@ -508,6 +508,7 @@ describe('createSummarizeNode', () => {
     const agentContext = createAgentContext({
       provider: Providers.BEDROCK,
       clientOptions: { model: 'claude-sonnet-primary' },
+      providerReasoningReplay: true,
       reasoningReplaySource: {
         provider: Providers.BEDROCK,
         model: 'claude-sonnet-primary',
@@ -555,7 +556,72 @@ describe('createSummarizeNode', () => {
     expect(JSON.stringify(capturedMessages[0])).toContain('visible answer');
   });
 
-  it('revalidates summarizer-native reasoning for the fallback that serves the call', async () => {
+  it('drops native reasoning for a different summarizer without replay opt-in', async () => {
+    captureEvents();
+
+    const capturedMessages: BaseMessage[][] = [];
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        model = 'gpt-5.4-mini';
+
+        invoke = jest.fn(async (messages: BaseMessage[]) => {
+          capturedMessages.push(messages);
+          return { content: 'Summary text' };
+        });
+      } as never
+    );
+
+    const agentContext = createAgentContext({
+      provider: Providers.BEDROCK,
+      clientOptions: { model: 'claude-sonnet-primary' },
+      reasoningReplaySource: {
+        provider: Providers.BEDROCK,
+        model: 'claude-sonnet-primary',
+      },
+      summarizationConfig: {
+        retainRecent: { turns: 0 },
+        provider: Providers.OPENAI,
+        model: 'gpt-5.4-mini',
+      },
+    });
+    const node = createSummarizeNode({
+      agentContext,
+      graph: mockGraph(),
+      generateStepId,
+    });
+
+    await node(
+      {
+        messages: [
+          new AIMessage({
+            content: [
+              {
+                type: ContentTypes.REASONING_CONTENT,
+                reasoningText: {
+                  text: 'private reasoning',
+                  signature: 'bedrock-main-signature',
+                },
+              },
+              { type: ContentTypes.TEXT, text: 'visible answer' },
+            ],
+          }),
+          new HumanMessage('Continue'),
+        ],
+        summarizationRequest: {
+          remainingContextTokens: 1000,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    expect(JSON.stringify(capturedMessages[0])).not.toContain(
+      'bedrock-main-signature'
+    );
+    expect(JSON.stringify(capturedMessages[0])).toContain('visible answer');
+  });
+
+  it('sends no signed reasoning to the summarizer or its fallback', async () => {
     captureEvents();
 
     const capturedInvocations: Array<{
@@ -592,6 +658,7 @@ describe('createSummarizeNode', () => {
           },
         ],
       },
+      providerReasoningReplay: true,
       reasoningReplaySource: {
         provider: Providers.BEDROCK,
         model: 'claude-sonnet-primary',
@@ -630,7 +697,7 @@ describe('createSummarizeNode', () => {
     );
 
     expect(capturedInvocations).toHaveLength(2);
-    expect(JSON.stringify(capturedInvocations[0].messages)).toContain(
+    expect(JSON.stringify(capturedInvocations[0].messages)).not.toContain(
       'summarizer-primary-signature'
     );
     expect(JSON.stringify(capturedInvocations[1].messages)).not.toContain(
@@ -2029,6 +2096,135 @@ describe('recency window — first-turn protection', () => {
     // Legacy: remove-all only, no tail re-injection.
     expect(result.messages).toHaveLength(1);
     expect(result.messages![0]?._getType()).toBe('remove');
+  });
+});
+
+describe('retained tail after a summary', () => {
+  it('drops signed reasoning from the tail and keeps its tool round', async () => {
+    captureEvents();
+
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return mockInvokeModel('Checkpoint');
+        }
+      } as never
+    );
+
+    const agentContext = createAgentContext({
+      summarizationConfig: { retainRecent: { turns: 2 } },
+      setSummary: jest.fn(),
+    } as never);
+    const summarizeNode = createSummarizeNode({
+      agentContext,
+      graph: mockGraph() as never,
+      generateStepId,
+    });
+    const signedThinking = (text: string): { type: 'thinking' } => ({
+      type: 'thinking',
+      thinking: text,
+      signature: `sig-${text}`,
+    } as { type: 'thinking' });
+    const toolCalls = [{ id: 'call_1', name: 'search', args: {} }];
+    const messages: BaseMessage[] = [
+      new HumanMessage('first question'),
+      new AIMessage({
+        content: [signedThinking('first'), { type: 'text', text: 'first answer' }],
+      }),
+      new HumanMessage('second question'),
+      new AIMessage({
+        content: [signedThinking('second'), { type: 'text', text: 'second answer' }],
+      }),
+      new HumanMessage('third question'),
+      new AIMessage({
+        content: [
+          signedThinking('live'),
+          { type: 'redacted_thinking', data: 'opaque' } as { type: 'redacted_thinking' },
+        ],
+        tool_calls: toolCalls,
+      }),
+      new ToolMessage({
+        content: 'tool output',
+        tool_call_id: 'call_1',
+        name: 'search',
+      }),
+    ];
+
+    const result = await summarizeNode(
+      {
+        messages,
+        summarizationRequest: { remainingContextTokens: 0, agentId: 'agent_0' },
+      },
+      {} as RunnableConfig
+    );
+
+    const tail = result.messages?.slice(1) ?? [];
+    expect(tail.map((m) => m.getType())).toEqual([
+      'human',
+      'ai',
+      'human',
+      'ai',
+      'tool',
+    ]);
+    expect(tail[1].content).toEqual([{ type: 'text', text: 'second answer' }]);
+    expect(tail[3].content).toEqual([]);
+    expect((tail[3] as AIMessage).tool_calls).toEqual([
+      expect.objectContaining({ id: 'call_1', name: 'search' }),
+    ]);
+    expect(tail[4].content).toBe('tool output');
+    expect(JSON.stringify(tail)).not.toMatch(/signature|redacted_thinking/);
+  });
+});
+
+describe('history sent to the summarizer', () => {
+  it('carries no signed reasoning, since the summarizer is another conversation', async () => {
+    captureEvents();
+
+    let sent: BaseMessage[] = [];
+    const invokeMock = jest.fn().mockImplementation((messages: unknown) => {
+      sent = messages as BaseMessage[];
+      return Promise.resolve({ content: 'Checkpoint' });
+    });
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return { invoke: invokeMock };
+        }
+      } as never
+    );
+
+    const summarizeNode = createSummarizeNode({
+      agentContext: createAgentContext({
+        summarizationConfig: { retainRecent: { turns: 1 } },
+        setSummary: jest.fn(),
+      } as never),
+      graph: mockGraph() as never,
+      generateStepId,
+    });
+
+    await summarizeNode(
+      {
+        messages: [
+          new HumanMessage('first question'),
+          new AIMessage({
+            content: [
+              {
+                type: 'thinking',
+                thinking: 'plan',
+                signature: 'sig-old',
+              } as { type: 'thinking' },
+              { type: 'text', text: 'first answer' },
+            ],
+          }),
+          new HumanMessage('second question'),
+        ],
+        summarizationRequest: { remainingContextTokens: 0, agentId: 'agent_0' },
+      },
+      {} as RunnableConfig
+    );
+
+    expect(JSON.stringify(sent)).toContain('first answer');
+    expect(JSON.stringify(sent)).not.toMatch(/sig-old|"thinking"/);
   });
 });
 

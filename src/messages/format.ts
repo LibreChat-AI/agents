@@ -401,8 +401,10 @@ interface FormatAssistantMessageOptions {
   intentToolNames?: ReadonlySet<string>;
   preserveUnpairedServerToolUses?: boolean;
   preserveReasoningContent?: boolean;
-  model?: string;
   provider?: ProviderName;
+  replayProviderReasoning?: ReplayProviderReasoning;
+  /** Source content index at or below which a part's signed reasoning is not replayed. */
+  replayAfterSourceIndex?: number;
   retainedSourceContentEnd?: number;
   sourceMessageId?: string;
   sourceContentPartOffset?: number;
@@ -412,9 +414,21 @@ interface FormatAssistantMessageOptions {
 
 type SourceContentPartIndices = number | readonly number[];
 
+/** Identity of the model a restored history is about to be sent to. */
+export interface ReplayProviderReasoning {
+  provider: ProviderName;
+  model: string;
+}
+
 export interface FormatAgentMessagesOptions {
-  model?: string;
   provider?: ProviderName;
+  /** Opt-in: puts signed Anthropic / Bedrock reasoning blocks stored on `THINK`
+   *  parts (`provider_replay`) back at the position of their part, so the
+   *  restored request carries the same blocks the live request of that turn
+   *  did. Applied only when `provider` and `model` equal the identity that
+   *  produced the blocks; anything else is dropped as before. Without this
+   *  option `provider_replay` is ignored. */
+  replayProviderReasoning?: ReplayProviderReasoning;
   /** Emit flattenable text content as the joined string the legacy-content
    *  projection would produce, so the per-request `formatContentStrings` pass
    *  finds nothing to convert and every history message keeps its identity —
@@ -566,43 +580,50 @@ function extractAnthropicReasoningReplay(
   return blocks.length > 0 ? { model: replay.model, blocks } : undefined;
 }
 
-function shouldInvalidateReplayTokenCount(
-  message: Partial<TMessage>,
-  options?: FormatAssistantMessageOptions
-): boolean {
-  if (!Array.isArray(message.content)) {
-    return false;
+function hasStoredReplay(message: Partial<TMessage>): boolean {
+  return (
+    Array.isArray(message.content) &&
+    (message.content as Array<MessageContentComplex | undefined | null>).some(
+      (part) =>
+        part?.type === ContentTypes.THINK &&
+        (extractAnthropicReasoningReplay(part) != null ||
+          extractBedrockReasoningReplay(part) != null)
+    )
+  );
+}
+
+/** A part whose blocks were taken off the request they were produced for. */
+function isWithdrawnReplay(part: MessageContentComplex): boolean {
+  return (
+    (part as { provider_replay?: { invalidated?: boolean } }).provider_replay
+      ?.invalidated === true
+  );
+}
+
+/**
+ * Replayed blocks of a `THINK` part, in stored order, when they were produced
+ * by the exact provider and model the history is restored for.
+ */
+function getReplayBlocks(
+  part: MessageContentComplex,
+  target: ReplayProviderReasoning | undefined
+): MessageContentComplex[] {
+  if (target == null || part.type !== ContentTypes.THINK) {
+    return [];
   }
-  let hasReplay = false;
-  let hasCompatibleReplay = false;
-  for (const part of message.content as Array<
-    MessageContentComplex | undefined | null
-  >) {
-    if (part?.type !== ContentTypes.THINK) {
-      continue;
-    }
-    const replay = (part as ReasoningContentText).provider_replay;
-    if (replay == null) {
-      continue;
-    }
-    if (replay.anthropic != null) {
-      hasReplay = true;
-      const anthropic = extractAnthropicReasoningReplay(part);
-      hasCompatibleReplay ||=
-        options?.provider === Providers.ANTHROPIC &&
-        options.model != null &&
-        anthropic?.model === options.model;
-    }
-    if (replay.bedrock != null) {
-      hasReplay = true;
-      const bedrock = extractBedrockReasoningReplay(part);
-      hasCompatibleReplay ||=
-        options?.provider === Providers.BEDROCK &&
-        options.model != null &&
-        bedrock?.model === options.model;
-    }
+  if (target.provider === Providers.ANTHROPIC) {
+    const replay = extractAnthropicReasoningReplay(part);
+    return replay?.model === target.model
+      ? (replay.blocks as MessageContentComplex[])
+      : [];
   }
-  return hasReplay && !hasCompatibleReplay;
+  if (target.provider === Providers.BEDROCK) {
+    const replay = extractBedrockReasoningReplay(part);
+    return replay?.model === target.model
+      ? (replay.blocks as MessageContentComplex[])
+      : [];
+  }
+  return [];
 }
 
 type ServerToolInput = Exclude<NonNullable<ToolCallPart['args']>, string>;
@@ -1770,8 +1791,6 @@ function formatAssistantMessage(
   let hasReasoning = false;
   let pendingReasoningContent = '';
   let pendingReasoningSourcePartIndices: number[] = [];
-  let pendingAnthropicReasoning: AnthropicReasoningReplay | undefined;
-  let pendingBedrockReasoning: BedrockReasoningReplay | undefined;
   const emittedServerToolUseIds = new Set<string>();
   const pendingServerToolUses = new Map<
     string,
@@ -1810,46 +1829,6 @@ function formatAssistantMessage(
     return { content, sourceContentPartIndices };
   };
 
-  const takePendingBedrockReasoning = (): BedrockReasoningReplayBlock[] => {
-    if (
-      options?.provider !== Providers.BEDROCK ||
-      options.model == null ||
-      pendingBedrockReasoning?.model !== options.model
-    ) {
-      pendingBedrockReasoning = undefined;
-      return [];
-    }
-    const blocks = pendingBedrockReasoning.blocks;
-    pendingBedrockReasoning = undefined;
-    return blocks;
-  };
-
-  const takePendingAnthropicReasoning = (): AnthropicReasoningReplayBlock[] => {
-    if (
-      options?.provider !== Providers.ANTHROPIC ||
-      options.model == null ||
-      pendingAnthropicReasoning?.model !== options.model
-    ) {
-      pendingAnthropicReasoning = undefined;
-      return [];
-    }
-    const blocks = pendingAnthropicReasoning.blocks;
-    pendingAnthropicReasoning = undefined;
-    return blocks;
-  };
-
-  const normalizeReplayContent = (
-    content: MessageContent
-  ): MessageContentComplex[] => {
-    if (typeof content !== 'string') {
-      return content as MessageContentComplex[];
-    }
-    if (content === '') {
-      return [];
-    }
-    return [{ type: ContentTypes.TEXT, text: content }];
-  };
-
   const createAIMessage = (
     content: MessageContent
   ): {
@@ -1857,19 +1836,9 @@ function formatAssistantMessage(
     reasoningSourceContentPartIndices: number[];
   } => {
     const reasoning = takePendingReasoningContent();
-    const anthropicReasoning = takePendingAnthropicReasoning();
-    const bedrockReasoning = takePendingBedrockReasoning();
-    let replayContent = content;
-    if (anthropicReasoning.length > 0 || bedrockReasoning.length > 0) {
-      replayContent = [
-        ...anthropicReasoning,
-        ...bedrockReasoning,
-        ...normalizeReplayContent(content),
-      ] as MessageContent;
-    }
     const message = withMessageRole(
       new AIMessage({
-        content: replayContent,
+        content,
         ...(reasoning.content != null && {
           additional_kwargs: { reasoning_content: reasoning.content },
         }),
@@ -1923,26 +1892,20 @@ function formatAssistantMessage(
     );
   };
 
-  const attachPendingBedrockReasoning = (aiMessage: AIMessage): void => {
-    const bedrockReasoning = takePendingBedrockReasoning();
-    if (bedrockReasoning.length === 0) {
+  const replayBlockSet = new WeakSet<object>();
+  const attachPendingReplayBlocks = (aiMessage: AIMessage): void => {
+    const moved = currentContent.filter((item) => replayBlockSet.has(item));
+    if (moved.length === 0) {
       return;
     }
-    aiMessage.content = [
-      ...normalizeReplayContent(aiMessage.content),
-      ...bedrockReasoning,
-    ] as MessageContent;
-  };
-
-  const attachPendingAnthropicReasoning = (aiMessage: AIMessage): void => {
-    const anthropicReasoning = takePendingAnthropicReasoning();
-    if (anthropicReasoning.length === 0) {
-      return;
+    currentContent = currentContent.filter((item) => !replayBlockSet.has(item));
+    let existing: MessageContentComplex[] = [];
+    if (typeof aiMessage.content !== 'string') {
+      existing = aiMessage.content as MessageContentComplex[];
+    } else if (aiMessage.content !== '') {
+      existing = [{ type: ContentTypes.TEXT, text: aiMessage.content }];
     }
-    aiMessage.content = [
-      ...normalizeReplayContent(aiMessage.content),
-      ...anthropicReasoning,
-    ] as MessageContent;
+    aiMessage.content = toLangChainContent([...existing, ...moved]);
   };
 
   const flushPendingServerToolUse = (toolUseId: string): void => {
@@ -2191,8 +2154,7 @@ function formatAssistantMessage(
         } else {
           attachPendingReasoningContent(lastAIMessage);
           appendSourcePartIndices(lastAIMessage, 'model', sourcePartIndices);
-          attachPendingAnthropicReasoning(lastAIMessage);
-          attachPendingBedrockReasoning(lastAIMessage);
+          attachPendingReplayBlocks(lastAIMessage);
         }
 
         const tool_call: ToolCallPart = _tool_call;
@@ -2285,10 +2247,18 @@ function formatAssistantMessage(
           pendingReasoningSourcePartIndices,
           sourcePartIndices
         );
-        pendingAnthropicReasoning =
-          extractAnthropicReasoningReplay(part) ?? pendingAnthropicReasoning;
-        pendingBedrockReasoning =
-          extractBedrockReasoningReplay(part) ?? pendingBedrockReasoning;
+        const replayBlocks =
+          Math.min(...[sourcePartIndices].flat()) >
+          (options?.replayAfterSourceIndex ?? -1)
+            ? getReplayBlocks(part, options?.replayProviderReasoning)
+            : [];
+        if (replayBlocks.length > 0) {
+          for (const block of replayBlocks) {
+            replayBlockSet.add(block);
+          }
+          currentContent.push(...replayBlocks);
+          appendCurrentContentProvenance(sourcePartIndices, 'model', true);
+        }
         continue;
       } else if (part.type === ContentTypes.STEER) {
         /*
@@ -2358,8 +2328,6 @@ function formatAssistantMessage(
         hasReasoning = false;
         pendingReasoningContent = '';
         pendingReasoningSourcePartIndices = [];
-        pendingAnthropicReasoning = undefined;
-        pendingBedrockReasoning = undefined;
       } else if (
         part.type === ContentTypes.ERROR ||
         part.type === ContentTypes.AGENT_UPDATE ||
@@ -2792,6 +2760,14 @@ function extractToolNamesFromSearchOutput(output: string): string[] {
   return [];
 }
 
+/** Where the summary part itself sits in the payload, whichever way the
+ *  boundary is expressed: what comes after it was produced with the summary
+ *  already in the prompt. */
+interface SummaryCarrier {
+  carrierIndex: number;
+  carrierContentIndex: number;
+}
+
 /**
  * How far back a persisted summary reaches.
  *
@@ -2802,20 +2778,22 @@ function extractToolNamesFromSearchOutput(output: string): string[] {
  * — the block's own location is the boundary, which is why it cannot
  * distinguish a retained tail from covered history.
  */
-type SummaryBoundary =
-  | {
-      mode: 'coverage';
-      messageIndex: number;
-      text: string;
-      tokenCount: number;
-    }
-  | {
-      mode: 'positional';
-      messageIndex: number;
-      contentIndex: number;
-      text: string;
-      tokenCount: number;
-    };
+type SummaryBoundary = SummaryCarrier &
+  (
+    | {
+        mode: 'coverage';
+        messageIndex: number;
+        text: string;
+        tokenCount: number;
+      }
+    | {
+        mode: 'positional';
+        messageIndex: number;
+        contentIndex: number;
+        text: string;
+        tokenCount: number;
+      }
+  );
 
 type SummaryTokenAdjustment = {
   original: number;
@@ -2907,6 +2885,8 @@ function scanSummaryBlocks(payload: TPayload): SummaryScan {
           ? {
             mode: 'coverage',
             messageIndex: retainedIndex,
+            carrierIndex: i,
+            carrierContentIndex: j,
             text: summaryText,
             tokenCount,
           }
@@ -2914,6 +2894,8 @@ function scanSummaryBlocks(payload: TPayload): SummaryScan {
             mode: 'positional',
             messageIndex: i,
             contentIndex: j,
+            carrierIndex: i,
+            carrierContentIndex: j,
             text: summaryText,
             tokenCount,
           };
@@ -3059,6 +3041,61 @@ function isSdkManagedToolName(name: unknown): name is string {
   );
 }
 
+/** Where signed reasoning may be replayed from: a payload index, and for the
+ *  message that carries the summary only the parts after `afterContentIndex`
+ *  (-1 admits every part). */
+interface ReplayStart {
+  messageIndex: number;
+  afterContentIndex: number;
+}
+
+/**
+ * First payload position whose signed reasoning may be replayed. A thinking
+ * block is bound to everything before it, so a hole before it (an assistant
+ * message with reasoning that cannot be replayed: not stored, edited away,
+ * over a cap, another model) invalidates every later block, and only a leading
+ * run may be left out. Replay therefore starts after the last such hole.
+ * Content a summary replaced changed the prefix too: replay starts at the
+ * message that carries the summary, where only the parts after the summary
+ * part were produced with it in the prompt. Earlier parts of that message are
+ * neither replayed nor holes.
+ */
+function findReplayStart(
+  payload: TPayload,
+  target: ReplayProviderReasoning,
+  summaryBoundary: SummaryBoundary | undefined
+): ReplayStart {
+  const carrierIndex = summaryBoundary?.carrierIndex ?? -1;
+  const carrierContentIndex = summaryBoundary?.carrierContentIndex ?? -1;
+  let start = Math.max(carrierIndex, 0);
+  for (let i = start; i < payload.length; i++) {
+    const message = payload[i];
+    if (message.role !== 'assistant' || !Array.isArray(message.content)) {
+      continue;
+    }
+    const afterContentIndex = i === carrierIndex ? carrierContentIndex : -1;
+    const thinks = (
+      message.content as Array<MessageContentComplex | undefined | null>
+    ).filter(
+      (part, index) =>
+        index > afterContentIndex && part?.type === ContentTypes.THINK
+    );
+    if (
+      thinks.some(
+        (part) =>
+          !isWithdrawnReplay(part as MessageContentComplex) &&
+          getReplayBlocks(part as MessageContentComplex, target).length === 0
+      )
+    ) {
+      start = i + 1;
+    }
+  }
+  return {
+    messageIndex: start,
+    afterContentIndex: start === carrierIndex ? carrierContentIndex : -1,
+  };
+}
+
 /**
  * Formats an array of messages for LangChain, handling tool calls and creating ToolMessage instances.
  *
@@ -3163,6 +3200,10 @@ export const formatAgentMessages = (
   const indexMapping: Record<number, number[] | undefined> = {};
   const invalidatedReplayTokenCounts = new Set<number>();
   const { boundary: summaryBoundary } = scanSummaryBlocks(payload);
+  const replayStart: ReplayStart =
+    options?.replayProviderReasoning != null
+      ? findReplayStart(payload, options.replayProviderReasoning, summaryBoundary)
+      : { messageIndex: 0, afterContentIndex: -1 };
 
   // Summary metadata is returned to the caller so it can be forwarded to the
   // agent run and included in the single system message via AgentContext.
@@ -3401,10 +3442,18 @@ export const formatAgentMessages = (
       sourceContentPartOffset,
       sourceContentPartIndices: processedSourceContentPartIndices,
       toolSourceContentPartIndices: processedToolSourceContentPartIndices,
-      model: options?.model,
+      replayProviderReasoning:
+        i >= replayStart.messageIndex
+          ? options?.replayProviderReasoning
+          : undefined,
+      replayAfterSourceIndex:
+        i === replayStart.messageIndex
+          ? replayStart.afterContentIndex
+          : undefined,
     };
     if (
-      shouldInvalidateReplayTokenCount(processedMessage, assistantFormatOptions)
+      assistantFormatOptions.replayProviderReasoning != null &&
+      hasStoredReplay(processedMessage)
     ) {
       invalidatedReplayTokenCounts.add(i);
     }
@@ -4552,6 +4601,10 @@ function appendToolCalls(
  *   foreign history. Without the signal the function falls back to its
  *   prior heuristic (`chainHasThinkingBlock`), preserving backward
  *   compatibility for callers that don't yet pass the boundary.
+ * @param isRunProduced - Tells whether this run produced a message. A
+ *   compaction rewrites the message array, so `runStartIndex` no longer
+ *   points at the run's own work afterwards; the messages the run produced
+ *   are never folded, whatever their position.
  * @returns The messages array with tool sequences converted to buffer strings if necessary
  */
 export function ensureThinkingBlockInMessages(
@@ -4559,7 +4612,8 @@ export function ensureThinkingBlockInMessages(
   _provider: ProviderName,
   config?: RunnableConfig,
   runStartIndex?: number,
-  preparation: ToolHistoryPreparation = createToolHistoryPreparation()
+  preparation: ToolHistoryPreparation = createToolHistoryPreparation(),
+  isRunProduced?: (message: BaseMessage) => boolean
 ): BaseMessage[] {
   if (messages.length === 0) {
     return messages;
@@ -4654,7 +4708,10 @@ export function ensureThinkingBlockInMessages(
       // result, and re-runs the tool to verify (which then often fails
       // because subsequent calls land in fresh sandboxes without the
       // file). Skip the conversion when we know this is in-run.
-      if (runStartIndex !== undefined && i >= runStartIndex) {
+      if (
+        (runStartIndex !== undefined && i >= runStartIndex) ||
+        isRunProduced?.(msg) === true
+      ) {
         result.push(msg);
         i++;
         continue;

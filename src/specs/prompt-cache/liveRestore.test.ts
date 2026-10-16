@@ -210,34 +210,52 @@ const BEDROCK_THINKING = {
 };
 
 /**
- * Regression cases for reasoning the provider requires back on tool rounds:
- * signed `thinking` (including empty text) and `redacted_thinking` must reach
- * the follow-up request of their turn unchanged. Restored history does not
- * replay reasoning of earlier turns (unchanged SDK behavior), so the turn
- * boundary is compared with those blocks set aside.
+ * Reasoning the provider requires back on tool rounds: signed `thinking`
+ * (including empty text) and `redacted_thinking` must reach the follow-up
+ * request of their turn unchanged. Every scripted reply gets its own
+ * signatures, so a block restored from the wrong reply or position shows up.
+ *
+ * `keepsPriorThinking` cases run the host side of reasoning replay (the agent
+ * captures `provider_replay`, history is restored with
+ * `replayProviderReasoning`) and must keep earlier turns' thinking blocks
+ * byte for byte at the turn boundary. The other cases are the baseline
+ * without replay, which sets those blocks aside.
  */
-const THINKING_CASES: Array<[ProviderCase, ScriptedReasoning[]]> = [
-  [
-    thinkingCase('anthropic thinking', 'anthropic', ANTHROPIC_THINKING),
-    [{ text: 'Reasoning.', signature: 'SIG_SIGNED' }],
-  ],
-  [
-    thinkingCase('anthropic thinking redacted', 'anthropic', ANTHROPIC_THINKING),
-    [{ redacted: 'REDACTED_DATA' }, { text: '', signature: 'SIG_EMPTY_TEXT' }],
-  ],
-  [
-    thinkingCase('anthropic promptCache thinking', 'anthropic promptCache', ANTHROPIC_THINKING),
-    [{ text: 'Reasoning.', signature: 'SIG_SIGNED' }],
-  ],
-  [
-    thinkingCase('bedrock thinking', 'bedrock', BEDROCK_THINKING),
-    [{ text: 'Reasoning.', signature: 'SIG_SIGNED' }],
-  ],
+interface ThinkingCase {
+  providerCase: ProviderCase;
+  reasoning: ScriptedReasoning[];
+  /** Reasoning emitted after the text of a reply (interleaved thinking). */
+  reasoningAfterText?: ScriptedReasoning[];
+  keepsPriorThinking: boolean;
+}
+
+const SIGNED = [{ text: 'Reasoning.', signature: 'SIG_SIGNED' }];
+const REDACTED_AND_EMPTY = [
+  { redacted: 'REDACTED_DATA' },
+  { text: '', signature: 'SIG_EMPTY_TEXT' },
+];
+const MID_REPLY = [{ text: 'Reasoning after the text.', signature: 'SIG_AFTER' }];
+
+const THINKING_CASES: ThinkingCase[] = [
+  { providerCase: thinkingCase('anthropic thinking', 'anthropic', ANTHROPIC_THINKING), reasoning: SIGNED, keepsPriorThinking: false },
+  { providerCase: thinkingCase('anthropic thinking redacted', 'anthropic', ANTHROPIC_THINKING), reasoning: REDACTED_AND_EMPTY, keepsPriorThinking: false },
+  { providerCase: thinkingCase('anthropic promptCache thinking', 'anthropic promptCache', ANTHROPIC_THINKING), reasoning: SIGNED, keepsPriorThinking: false },
+  { providerCase: thinkingCase('bedrock thinking', 'bedrock', BEDROCK_THINKING), reasoning: SIGNED, keepsPriorThinking: false },
+  { providerCase: thinkingCase('anthropic thinking replay', 'anthropic', ANTHROPIC_THINKING), reasoning: SIGNED, keepsPriorThinking: true },
+  { providerCase: thinkingCase('anthropic thinking redacted replay', 'anthropic', ANTHROPIC_THINKING), reasoning: REDACTED_AND_EMPTY, keepsPriorThinking: true },
+  { providerCase: thinkingCase('anthropic thinking interleaved replay', 'anthropic', ANTHROPIC_THINKING), reasoning: SIGNED, reasoningAfterText: MID_REPLY, keepsPriorThinking: true },
+  { providerCase: thinkingCase('anthropic promptCache thinking replay', 'anthropic promptCache', ANTHROPIC_THINKING), reasoning: SIGNED, keepsPriorThinking: true },
+  { providerCase: thinkingCase('bedrock thinking replay', 'bedrock', BEDROCK_THINKING), reasoning: SIGNED, keepsPriorThinking: true },
+  { providerCase: thinkingCase('bedrock thinking interleaved replay', 'bedrock', BEDROCK_THINKING), reasoning: SIGNED, reasoningAfterText: MID_REPLY, keepsPriorThinking: true },
 ];
 
-const cases: Array<[ProviderCase, ScriptedReasoning[] | undefined]> = [
+const cases: ThinkingCase[] = [
   ...PROVIDER_CASES.filter((providerCase) => providerCase.name in PROTOCOLS).map(
-    (providerCase): [ProviderCase, undefined] => [providerCase, undefined]
+    (providerCase): ThinkingCase => ({
+      providerCase,
+      reasoning: [],
+      keepsPriorThinking: false,
+    })
   ),
   ...THINKING_CASES,
 ];
@@ -247,60 +265,179 @@ const REASONING_BLOCK = /\{"type":"(?:thinking|redacted_thinking)"[^{}]*\},?|\{"
 const withoutReasoning = (segment: string): string =>
   segment.replace(REASONING_BLOCK, '');
 
-describe.each(cases.map(([providerCase, reasoning]) => [providerCase.name, providerCase, reasoning] as const))(
+const protocolOf = (providerCase: ProviderCase): Protocol =>
+  PROTOCOLS[providerCase.name] ??
+  (providerCase.provider === Providers.BEDROCK ? 'bedrock' : 'anthropic');
+
+/** Signatures and opaque reasoning data of a request body, in wire order. */
+const reasoningMarkers = (body: Json): string[] =>
+  JSON.stringify(body).match(/"(?:signature|data)":"[A-Z_]+_\d+"/g) ?? [];
+
+let signatureSerial = 0;
+
+/** Gives every reply of a scripted turn its own signatures. */
+function withReasoning(
+  reply: ScriptedReply,
+  reasoning: ScriptedReasoning[],
+  afterText: ScriptedReasoning[] | undefined
+): { reply: ScriptedReply; markers: string[] } {
+  const serial = ++signatureSerial;
+  const markers: string[] = [];
+  const unique = (block: ScriptedReasoning): ScriptedReasoning => {
+    if ('redacted' in block) {
+      markers.push(`"data":"${block.redacted}_${serial}"`);
+      return { redacted: `${block.redacted}_${serial}` };
+    }
+    markers.push(`"signature":"${block.signature}_${serial}"`);
+    return { ...block, signature: `${block.signature}_${serial}` };
+  };
+  if (reasoning.length === 0) {
+    return { reply, markers };
+  }
+  const isCallingText = (reply.text ?? '') !== '' && (reply.calls?.length ?? 0) > 0;
+  return {
+    reply: {
+      ...reply,
+      reasoning: reasoning.map(unique),
+      ...(afterText != null && isCallingText
+        ? { reasoningAfterText: afterText.map(unique) }
+        : {}),
+    },
+    markers,
+  };
+}
+
+interface PlayedTurns {
+  turns: LiveTurn[];
+  /** Per turn and request: markers of the replies sent before it. */
+  expectedMarkers: string[][][];
+}
+
+async function playTurns(
+  testCase: ThinkingCase,
+  replay: boolean
+): Promise<PlayedTurns> {
+  const { providerCase, reasoning, reasoningAfterText } = testCase;
+  const protocol = protocolOf(providerCase);
+  const model = (providerCase.clientOptions() as { model: string }).model;
+  const names = new Set(TOOL_OUTPUTS.keys());
+  const turns: LiveTurn[] = [];
+  const expectedMarkers: string[][][] = [];
+  const exchanges: Array<{ user: string; parts?: t.MessageContentComplex[] }> = [];
+  for (const turn of TURNS) {
+    exchanges.push({ user: turn.user });
+    const scripted = turn.replies.map((reply) =>
+      withReasoning(reply, reasoning, reasoningAfterText)
+    );
+    const live = await runLiveTurn(
+      {
+        agent: {
+          ...agentFor(providerCase.clientOptions(), providerCase.provider, true),
+          ...(replay ? { providerReasoningReplay: true } : {}),
+        },
+        toolResults: TOOL_OUTPUTS,
+        eventDriven: true,
+        transport: protocol === 'bedrock' ? 'bedrock' : 'fetch',
+        aggregatedEvents: [GraphEvents.ON_PROVIDER_OUTPUT_ITEMS],
+      },
+      restoreHistory(
+        exchanges,
+        names,
+        replay ? { provider: providerCase.provider, model } : undefined
+      ),
+      scripted.map(({ reply }) => scriptReply(protocol, reply))
+    );
+    expect(live.requests).toHaveLength(turn.replies.length);
+    exchanges[exchanges.length - 1].parts = live.contentParts;
+    turns.push(live);
+    expectedMarkers.push(
+      scripted.map((_, index) =>
+        scripted.slice(0, index).flatMap(({ markers }) => markers)
+      )
+    );
+  }
+  return { turns, expectedMarkers };
+}
+
+const boundaryPairs = (
+  providerCase: ProviderCase,
+  turns: LiveTurn[],
+  comparable: (segment: string) => string
+): Array<{ before: string[]; after: string[] }> => {
+  const marked = providerCase.breakpoints != null;
+  return turns.slice(1).map((turn, index) => {
+    const previous = turns[index].requests;
+    return {
+      before: segments(providerCase.reduce, previous[previous.length - 1], marked).map(comparable),
+      after: segments(providerCase.reduce, turn.requests[0], marked).map(comparable),
+    };
+  });
+};
+
+describe.each(cases.map((testCase) => [testCase.providerCase.name, testCase] as const))(
   'live and restored requests: %s',
-  (_name, providerCase, reasoning) => {
-    const protocol =
-      PROTOCOLS[providerCase.name] ??
-      (providerCase.provider === Providers.BEDROCK ? 'bedrock' : 'anthropic');
+  (_name, testCase) => {
+    const { providerCase, reasoning, keepsPriorThinking } = testCase;
     const marked = providerCase.breakpoints != null;
 
     it('turn N+1 starts with the bytes of turn N', async () => {
-      const eventDriven = true;
-      const turns: LiveTurn[] = [];
-      const exchanges: Array<{ user: string; parts?: t.MessageContentComplex[] }> = [];
-      for (const turn of TURNS) {
-        exchanges.push({ user: turn.user });
-        const live = await runLiveTurn(
-          {
-            agent: agentFor(providerCase.clientOptions(), providerCase.provider, eventDriven),
-            toolResults: TOOL_OUTPUTS,
-            eventDriven,
-            transport: protocol === 'bedrock' ? 'bedrock' : 'fetch',
-            aggregatedEvents: [GraphEvents.ON_PROVIDER_OUTPUT_ITEMS],
-          },
-          restoreHistory(exchanges, new Set(TOOL_OUTPUTS.keys())),
-          turn.replies.map((reply) =>
-            scriptReply(protocol, reasoning != null ? { ...reply, reasoning } : reply)
-          )
-        );
-        expect(live.requests).toHaveLength(turn.replies.length);
-        exchanges[exchanges.length - 1].parts = live.contentParts;
-        turns.push(live);
-      }
-      for (const { requests } of turns) {
+      const { turns, expectedMarkers } = await playTurns(testCase, keepsPriorThinking);
+      turns.forEach(({ requests }, turnIndex) => {
         for (let i = 1; i < requests.length; i++) {
           const before = segments(providerCase.reduce, requests[i - 1], marked);
           const after = segments(providerCase.reduce, requests[i], marked);
           expect(after.slice(0, before.length)).toEqual(before);
-          const sent = after.slice(before.length).join('\n');
-          for (const block of reasoning ?? []) {
-            expect(sent).toContain(
-              'redacted' in block
-                ? `"data":"${block.redacted}"`
-                : `"signature":"${block.signature}"`
-            );
+          const sent = JSON.stringify(requests[i]);
+          for (const marker of expectedMarkers[turnIndex][i]) {
+            expect(sent).toContain(marker);
           }
         }
+      });
+      if (keepsPriorThinking) {
+        /** Append-only: no thinking block is ever removed from the middle. */
+        const all = turns.flatMap(({ requests }) => requests);
+        for (let i = 1; i < all.length; i++) {
+          const before = reasoningMarkers(all[i - 1]);
+          expect(reasoningMarkers(all[i]).slice(0, before.length)).toEqual(before);
+        }
+        expect(reasoningMarkers(all[all.length - 1]).length).toBeGreaterThan(
+          reasoningMarkers(all[0]).length
+        );
       }
       const comparable = (segment: string): string =>
-        reasoning != null ? withoutReasoning(segment) : segment;
-      for (let i = 1; i < turns.length; i++) {
-        const previous = turns[i - 1].requests;
-        const before = segments(providerCase.reduce, previous[previous.length - 1], marked).map(comparable);
-        const after = segments(providerCase.reduce, turns[i].requests[0], marked).map(comparable);
+        reasoning.length > 0 && !keepsPriorThinking
+          ? withoutReasoning(segment)
+          : segment;
+      for (const { before, after } of boundaryPairs(providerCase, turns, comparable)) {
         expect(after.slice(0, before.length)).toEqual(before);
       }
     });
+
+    if (keepsPriorThinking) {
+      it('carries earlier turns thinking in the restored history', async () => {
+        const { turns, expectedMarkers } = await playTurns(testCase, true);
+        const lastOfFirstTurn = JSON.stringify(turns[0].requests[turns[0].requests.length - 1]);
+        const firstOfSecondTurn = JSON.stringify(turns[1].requests[0]);
+        for (const marker of expectedMarkers[0][expectedMarkers[0].length - 1]) {
+          expect(lastOfFirstTurn).toContain(marker);
+          expect(firstOfSecondTurn).toContain(marker);
+        }
+      });
+
+      /** Reverting replay (capture, restore or the agent flag) breaks the boundary. */
+      it('breaks the turn boundary when replay is off', async () => {
+        const { turns } = await playTurns(testCase, false);
+        const full = boundaryPairs(providerCase, turns, (segment) => segment);
+        expect(
+          full.some(({ before, after }) => {
+            const head = after.slice(0, before.length);
+            return JSON.stringify(head) !== JSON.stringify(before);
+          })
+        ).toBe(true);
+        for (const { before, after } of boundaryPairs(providerCase, turns, withoutReasoning)) {
+          expect(after.slice(0, before.length)).toEqual(before);
+        }
+      });
+    }
   }
 );

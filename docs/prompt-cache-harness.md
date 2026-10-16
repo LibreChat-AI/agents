@@ -113,12 +113,44 @@ breakpoint needs a block).
 
 Reasoning: signed `thinking` (including empty text) and `redacted_thinking`
 reach the follow-up request of their own turn unchanged, and Bedrock signed
-`reasoning_content` likewise; the suite checks this as a regression. Restored
-history does not replay reasoning of earlier turns, which is unchanged SDK
-behavior, so the turn boundary is compared with those blocks set aside.
-Unsigned `thinking` (as some proxies emit) is dropped on both paths, as
-before, because the Anthropic API rejects it. None of this was verified
-against the real Anthropic or Bedrock APIs; the suite drives scripted streams.
+`reasoning_content` likewise; the suite checks this as a regression. Without
+the opt-in below, restored history does not replay reasoning of earlier turns,
+so the turn boundary is compared with those blocks set aside. Unsigned
+`thinking` (as some proxies emit) is dropped on both paths, as before,
+because the Anthropic API rejects it. None of this was verified against the
+real Anthropic or Bedrock APIs; the suite drives scripted streams.
+
+#### Replaying signed reasoning (opt-in)
+
+Models that keep earlier turns' thinking (a signed block binds the model and
+the conversation before it) need those blocks back in the restored history, or
+the cached prefix ends at the first thinking block of the previous turn. A
+host opts in on both sides: `AgentInputs.providerReasoningReplay` makes the
+aggregator store the blocks on the `think` part (`provider_replay`, with the
+model that served the call), and `formatAgentMessages(..., {
+replayProviderReasoning: { provider, model } })` puts them back, at the slot of
+their part, only for that provider and model. Anthropic requests of an agent
+with the opt-in also carry `thinking.block_binding.prefix_mismatch_behavior:
+"drop_block"` and its beta header, so a block that no longer matches is dropped
+by the API instead of failing the call; the response's `input_transformations`
+is kept in `response_metadata`.
+
+A signed block is valid only if everything before it is unchanged, so replay
+starts after the last hole: any assistant message with reasoning that cannot be
+replayed (not stored, edited away, over a host cap, signed by another model)
+and the message that carries a summary drop every block before them, and only
+the unbroken run after it is sent. Bedrock cannot drop a mismatching block, so
+an agent with the opt-in retries a request once without signed reasoning when
+Bedrock rejects it for that (one warning).
+
+The `... replay` cases of `liveRestore.test.ts` (`keepsPriorThinking`) compare
+the turn boundary with the reasoning blocks included: signed, redacted, empty
+text, thinking after the text of a response, Anthropic and Bedrock, through
+the dispatcher too. Each scripted reply has its own signatures, the replayed
+history must be append-only (no thinking block disappears from the middle),
+and the same scenario without the opt-in must break the boundary, which
+catches a reverted replay. `reasoningReplay.test.ts` covers a model change
+between turns and a call served by a fallback model.
 
 [`restoredToolRounds.test.ts`](../src/specs/prompt-cache/restoredToolRounds.test.ts)
 and [`responsesToolRounds.test.ts`](../src/specs/prompt-cache/responsesToolRounds.test.ts)

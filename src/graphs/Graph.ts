@@ -180,6 +180,7 @@ import {
   messagesStateReducer,
 } from '@/messages/reducer';
 import { createToolHistoryPreparation } from '@/messages/toolHistoryProjection';
+import { dropReasoningOfRewrittenPrefix } from '@/messages/reasoningTypes';
 import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
 import { shouldTraceToolNodeForLangfuse } from '@/langfuseToolOutputTracing';
 import { createLocalCodingToolBundle } from '@/tools/local/LocalCodingTools';
@@ -809,6 +810,10 @@ export abstract class Graph<
   protected stopContinuationExecutionId = '';
   protected streamSegment = 0;
   stepKeyIds: Map<string, string[]> = new Map<string, string[]>();
+  /** Reasoning steps of the model call in flight whose delta carried signed blocks. */
+  protected replayStepIdsOfCall: string[] = [];
+  /** Those steps by the AI turn of this run that produced them. */
+  protected replayStepIdsByMessageId = new Map<string, string[]>();
   contentIndexMap: Map<string, number> = new Map();
   toolCallStepIds: Map<string, string> = new Map();
   /** Model-call step base key -> round id stamped on its tool-calls steps. */
@@ -947,6 +952,8 @@ export abstract class Graph<
     this.streamSegment = 0;
     this.contentIndexMap = new Map();
     this.stepKeyIds = new Map();
+    this.replayStepIdsOfCall = [];
+    this.replayStepIdsByMessageId.clear();
     this.toolRoundIds = new Map();
     this.toolCallStepIds.clear();
     this.pendingToolCallsByStep.clear();
@@ -2607,7 +2614,17 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       agentContext.currentTokenType === ContentTypes.THINK ||
       agentContext.currentTokenType === 'think_and_text'
     ) {
-      keyList.push('reasoning');
+      /**
+       * With provider reasoning replay, reasoning that resumes after text
+       * gets a step of its own: merged into the earlier reasoning part it
+       * would lose its position between the text and the tool calls.
+       */
+      keyList.push(
+        agentContext.providerReasoningReplay &&
+          agentContext.reasoningTransitionCount > 0
+          ? `reasoning-${agentContext.reasoningTransitionCount}`
+          : 'reasoning'
+      );
     } else if (agentContext.tokenTypeSwitch === 'content') {
       keyList.push(`post-reasoning-${agentContext.reasoningTransitionCount}`);
     }
@@ -2716,6 +2733,40 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       id !== '' &&
       this.runProducedAiMessageIds.has(id)
     );
+  }
+
+  /**
+   * Tells the host to forget the signed blocks of turns that were taken off
+   * the request, so the history it restores next turn equals what was sent.
+   */
+  private async withdrawReasoningReplay(
+    dropped: BaseMessage[],
+    metadata: Record<string, unknown>
+  ): Promise<void> {
+    for (const message of dropped) {
+      const stepIds =
+        message.id == null
+          ? undefined
+          : this.replayStepIdsByMessageId.get(message.id);
+      for (const stepId of stepIds ?? []) {
+        await this.dispatchReasoningDelta(
+          stepId,
+          {
+            content: [
+              {
+                type: ContentTypes.THINK,
+                think: '',
+                provider_replay: { invalidated: true },
+              },
+            ],
+          },
+          metadata
+        );
+      }
+      if (message.id != null) {
+        this.replayStepIdsByMessageId.delete(message.id);
+      }
+    }
   }
 
   getContentParts(): t.MessageContentComplex[] | undefined {
@@ -3661,12 +3712,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           .withConfig({ runName: AGENT_MODEL_CALL_RUN_NAME });
       }
 
-      agentContext.reasoningReplaySource = resolveReasoningReplaySource({
-        model: (this.overrideModel ?? model) as t.ChatModel,
-        provider: agentContext.provider,
-        clientOptions: agentContext.clientOptions,
-        callOptions: config,
-      });
+      agentContext.reasoningReplaySource = agentContext.providerReasoningReplay
+        ? resolveReasoningReplaySource({
+          model: (this.overrideModel ?? model) as t.ChatModel,
+          provider: agentContext.provider,
+          clientOptions: agentContext.clientOptions,
+          callOptions: config,
+        })
+        : undefined;
 
       let finalMessages = messagesToUse;
       /** Primary wire shaping is lossy; each fallback starts from pruned source history. */
@@ -3816,7 +3869,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               provider,
               callConfig,
               this.startIndex,
-              history
+              history,
+              (message) => this.isRunProducedMessage(message)
             )
           );
         }
@@ -4037,6 +4091,15 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         }
       }
 
+      const rewritten = dropReasoningOfRewrittenPrefix(
+        finalMessages,
+        agentContext.sentPrefix
+      );
+      finalMessages = rewritten.messages;
+      await this.withdrawReasoningReplay(
+        rewritten.dropped,
+        config.metadata as Record<string, unknown>
+      );
       finalMessages = projectProviderReferences(
         applyProviderMessageTransforms(finalMessages)
       );
@@ -4700,10 +4763,12 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                 }) => {
                   const fallbackToolHistory = createToolHistoryPreparation();
                   const replayValidatedFallbackMessages =
-                    trackProviderMessageOrigins(
-                      fallbackBaseMessages,
-                      fallbackMessages
-                    );
+                    agentContext.providerReasoningReplay
+                      ? trackProviderMessageOrigins(
+                        fallbackBaseMessages,
+                        fallbackMessages
+                      )
+                      : fallbackMessages;
                   const fallbackToolResultChars =
                     agentContext.maxToolResultChars ??
                     calculateMaxToolResultChars(
@@ -4938,6 +5003,13 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           responseMessage.lc_kwargs.id = responseMessage.id;
         }
         this.runProducedAiMessageIds.add(responseMessage.id);
+        if (this.replayStepIdsOfCall.length > 0) {
+          this.replayStepIdsByMessageId.set(
+            responseMessage.id,
+            this.replayStepIdsOfCall
+          );
+        }
+        this.replayStepIdsOfCall = [];
       }
       const toolCalls = (responseMessage as AIMessageChunk | undefined)
         ?.tool_calls;
@@ -6348,6 +6420,17 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     };
     if (hasReasoningDeltaContent(delta.content)) {
       this.reasoningStepHasDeltas.add(stepId);
+    }
+    if (
+      Array.isArray(delta.content) &&
+      delta.content.some(
+        (part) =>
+          (part as t.ReasoningContentText).provider_replay != null &&
+          (part as t.ReasoningContentText).provider_replay?.invalidated !==
+            true
+      )
+    ) {
+      this.replayStepIdsOfCall.push(stepId);
     }
     const handler = this.handlerRegistry?.getHandler(
       GraphEvents.ON_REASONING_DELTA
