@@ -25,12 +25,13 @@ export function capLines(
     `${omitted} more matching lines not shown; narrow the pattern or path`
 ): string {
   const lines = text.split('\n');
+  const lineChars = Math.max(1, Math.min(CAPPED_GREP_LINE_CHARS, maxChars));
   const kept: string[] = [];
   let used = 0;
   for (const raw of lines) {
     const line =
-      raw.length > CAPPED_GREP_LINE_CHARS
-        ? `${raw.slice(0, CAPPED_GREP_LINE_CHARS)} [line truncated]`
+      raw.length > lineChars
+        ? `${raw.slice(0, lineChars)} [line truncated]`
         : raw;
     if (used + line.length + 1 > maxChars && kept.length > 0) break;
     kept.push(line);

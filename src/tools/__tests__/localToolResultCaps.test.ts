@@ -41,6 +41,7 @@ describe('toolResultMaxChars', () => {
     const long = `a.py:1:${'x'.repeat(500)}`;
     const capped = capLines([long, 'b.py:2:y', 'c.py:3:z'].join('\n'), 320);
     expect(capped.split('\n')[0]).toMatch(/\[line truncated\]$/);
+    expect(capLines(long, 40).length).toBeLessThan(80);
     expect(capped).toMatch(
       /\[2 more matching lines not shown; narrow the pattern or path\]$/
     );
