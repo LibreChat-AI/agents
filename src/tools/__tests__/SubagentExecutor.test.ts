@@ -29,6 +29,7 @@ import {
   summarizeEvent,
 } from '../subagent';
 import { sanitizeForwardedSubagentUpdateData } from '../subagent/SubagentExecutor';
+import { TOOL_REPLAY_CONFIGS_KEY } from '../toolBatchReplay';
 import { SUBAGENT_PARENT_BATCH_CONFIG_KEY } from '../subagent/SubagentReplay';
 import { Constants, Providers, GraphEvents, StepTypes } from '@/common';
 import { StreamLimitExceededError } from '@/llm/streamLimits';
@@ -58,6 +59,9 @@ const makeConfig = (
   agentInputs: makeChildInputs(),
   ...overrides,
 });
+
+const makeAgentContexts = ({ agents }: StandardGraphInput): Map<string, AgentContext> =>
+  new Map(agents.map(agent => [agent.agentId, AgentContext.fromConfig(agent)]));
 
 describe('filterSubagentResult', () => {
   it('treats a result member with no new AI message as textless completion', () => {
@@ -984,8 +988,9 @@ describe('SubagentExecutor', () => {
           return { content: `${result.content} delivered` };
         },
       },
-      createChildGraph: (): StandardGraph =>
+      createChildGraph: (input): StandardGraph =>
         ({
+          agentContexts: makeAgentContexts(input),
           createWorkflow: () => ({ invoke }),
           clearHeavyState: jest.fn(),
         }) as unknown as StandardGraph,
@@ -1028,8 +1033,9 @@ describe('SubagentExecutor', () => {
     const executor = createExecutor({
       taskConfig: { store, scopeId: 'owner:conversation' },
       subagentContext: { prepare: async () => ({}), complete },
-      createChildGraph: (): StandardGraph =>
+      createChildGraph: (input): StandardGraph =>
         ({
+          agentContexts: makeAgentContexts(input),
           createWorkflow: () => ({ invoke }),
           clearHeavyState: jest.fn(),
         }) as unknown as StandardGraph,
@@ -1822,7 +1828,7 @@ describe('SubagentExecutor', () => {
     expect(result.messages).toEqual([]);
   });
 
-  it('fails graph HITL before factories, hooks, events, or usage can run', async () => {
+  it('requires a parent call ID for graph HITL before factories, hooks, events, or usage can run', async () => {
     const graphConfig: GraphSubagentConfig = {
       kind: 'graph',
       type: 'graph-team',
@@ -1862,13 +1868,32 @@ describe('SubagentExecutor', () => {
     });
 
     expect(result.content).toBe(
-      'Error: Human-in-the-loop execution is not yet supported for graph subagents.'
+      'Error: Resumable subagent execution requires a parent tool call ID.'
     );
     expect(createChildGraph).not.toHaveBeenCalled();
     expect(createChildGraphByKind).not.toHaveBeenCalled();
     expect(hook).not.toHaveBeenCalled();
     expect(update).not.toHaveBeenCalled();
     expect(usageSink).not.toHaveBeenCalled();
+  });
+
+  it('retains the designated graph result when recovering an already completed child checkpoint', async () => {
+    const graphConfig: GraphSubagentConfig = { kind: 'graph', type: 'recovered-team', name: 'Recovered', description: 'Already completed', agents: [makeChildInputs('entry'), makeChildInputs('result')], edges: [{ from: 'entry', to: 'result', edgeType: 'direct' }], entryAgentId: 'entry', resultAgentId: 'result' };
+    const finalMessage = new AIMessage('Designated graph result');
+    const invoke = jest.fn();
+    const updateState = jest.fn().mockResolvedValue({});
+    const executor = createExecutor({
+      configs: new Map([[graphConfig.type, graphConfig]]),
+      humanInTheLoop: { enabled: true },
+      createChildGraphByKind: () => ({
+        createWorkflow: () => ({ getState: jest.fn().mockResolvedValue({ values: { messages: [new AIMessage('Worker output'), finalMessage], subagentResult: { agentId: 'result', message: finalMessage } }, next: [], tasks: [] }), invoke, updateState }),
+        clearHeavyState: jest.fn(),
+      }) as unknown as StandardGraph,
+    });
+    const result = await executor.execute({ description: 'Recover the team', subagentType: graphConfig.type, threadId: 'recovered-team-thread', parentToolCallId: 'recovered-spawn' });
+    expect(result.content).toBe('Designated graph result');
+    expect(invoke).not.toHaveBeenCalled();
+    expect(updateState).toHaveBeenCalled();
   });
 
   it('fails closed when resumable execution has no parent tool call ID', async () => {
@@ -3170,8 +3195,9 @@ describe('SubagentExecutor', () => {
       configs: new Map([[hitlConfig.type, hitlConfig]]),
       humanInTheLoop: { enabled: true },
       checkpointer: new MemorySaver(),
-      createChildGraph: (): StandardGraph =>
+      createChildGraph: (input): StandardGraph =>
         ({
+          agentContexts: makeAgentContexts(input),
           sessions: childSessions,
           createWorkflow: () => ({
             getState: jest.fn().mockResolvedValue({
@@ -3363,6 +3389,7 @@ describe('SubagentExecutor', () => {
           checkpoint_map: { parent: 'checkpoint' },
           checkpoint_ns: 'parent-checkpoint-ns',
           [SUBAGENT_PARENT_BATCH_CONFIG_KEY]: 'assistant-batch',
+          [TOOL_REPLAY_CONFIGS_KEY]: new Map([['foreign-owner', {}]]),
           requestBody: { messageId: 'msg-1' },
           thread_id: 'parent-thread',
           user: { id: 'user_abc' },
@@ -3380,6 +3407,7 @@ describe('SubagentExecutor', () => {
       expect(configurable.checkpoint_map).toBeUndefined();
       expect(configurable.checkpoint_ns).toBeUndefined();
       expect(configurable[SUBAGENT_PARENT_BATCH_CONFIG_KEY]).toBeUndefined();
+      expect(configurable[TOOL_REPLAY_CONFIGS_KEY]).toBeUndefined();
       expect(configurable.requestBody).toEqual({ messageId: 'msg-1' });
       expect(configurable.thread_id).toBe('parent-thread');
       expect(configurable.user).toEqual({ id: 'user_abc' });
