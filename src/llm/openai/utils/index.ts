@@ -381,6 +381,14 @@ export function _convertMessagesToOpenAIParams(
         message.content,
         HARD_MAX_TOOL_RESULT_CHARS
       ).content;
+    } else if (
+      role === 'tool' &&
+      options?.preserveToolCacheControl === true &&
+      message.content !== ''
+    ) {
+      // The tail breakpoint needs a text block; sending every tool result as
+      // one keeps its bytes the same before and after the marker moves on.
+      content = [{ type: 'text', text: message.content }];
     } else if (typeof message.content === 'string') {
       content = message.content;
     } else {
