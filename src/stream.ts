@@ -1,3 +1,4 @@
+import { isStructuredGoogleContentPart } from '@/messages/structuredGoogle';
 // src/stream.ts
 import type { ToolCall, ToolCallChunk } from '@langchain/core/messages/tool';
 import type { ChatOpenAIReasoningSummary } from '@langchain/openai';
@@ -450,12 +451,6 @@ function hasDirectToolCallChunkStateInStep(args: {
   return false;
 }
 
-function isGoogleServerSideToolContentPart(
-  contentPart: t.MessageContentComplex
-): boolean {
-  return contentPart.type === 'toolCall' || contentPart.type === 'toolResponse';
-}
-
 function isTextContentPart(contentPart: t.MessageContentComplex): boolean {
   return contentPart.type?.startsWith(ContentTypes.TEXT) ?? false;
 }
@@ -486,7 +481,7 @@ function getReasoningTextFromChunk(
   return reasoning?.summary?.[0]?.text ?? '';
 }
 
-const googleServerSideToolStepIdsByGraph = new WeakMap<
+const structuredGoogleStepIdsByGraph = new WeakMap<
   StandardGraph,
   Set<string>
 >();
@@ -495,16 +490,16 @@ function markGoogleServerSideToolMessageStep(
   graph: StandardGraph,
   stepId: string
 ): void {
-  const stepIds = googleServerSideToolStepIdsByGraph.get(graph) ?? new Set();
+  const stepIds = structuredGoogleStepIdsByGraph.get(graph) ?? new Set();
   stepIds.add(stepId);
-  googleServerSideToolStepIdsByGraph.set(graph, stepIds);
+  structuredGoogleStepIdsByGraph.set(graph, stepIds);
 }
 
 function isGoogleServerSideToolMessageStep(
   graph: StandardGraph,
   stepId: string
 ): boolean {
-  return googleServerSideToolStepIdsByGraph.get(graph)?.has(stepId) === true;
+  return structuredGoogleStepIdsByGraph.get(graph)?.has(stepId) === true;
 }
 
 function shouldStartFreshMessageStepAfterGoogleServerSideTool({
@@ -578,7 +573,7 @@ async function dispatchMessageContentParts({
       content: [contentPart],
       metadata,
     });
-    if (isGoogleServerSideToolContentPart(contentPart)) {
+    if (isStructuredGoogleContentPart(contentPart)) {
       markGoogleServerSideToolMessageStep(graph, currentStepId);
     }
     await graph.dispatchMessageDelta(
@@ -663,7 +658,7 @@ async function dispatchGoogleServerSideToolStreamContent({
   const messageContent = content.filter(
     (contentPart) =>
       isTextContentPart(contentPart) ||
-      isGoogleServerSideToolContentPart(contentPart)
+      isStructuredGoogleContentPart(contentPart)
   );
   await dispatchMessageContentParts({
     graph,
@@ -1433,7 +1428,7 @@ export function getChunkContent({
   if (
     isGoogleLike(provider) &&
     Array.isArray(chunk?.content) &&
-    chunk.content.some((c) => isGoogleServerSideToolContentPart(c))
+    chunk.content.some((c) => isStructuredGoogleContentPart(c))
   ) {
     return chunk.content;
   }
@@ -1825,11 +1820,11 @@ export class ChatModelStreamHandler implements t.EventHandler {
     let hasToolCalls = false;
     const hasToolCallChunks =
       (chunk.tool_call_chunks && chunk.tool_call_chunks.length > 0) ?? false;
-    const hasGoogleServerSideToolContent =
+    const hasStructuredGoogleContent =
       isGoogleLike(agentContext.provider) &&
       Array.isArray(content) &&
-      content.some((c) => isGoogleServerSideToolContentPart(c));
-    if (hasGoogleServerSideToolContent && Array.isArray(content)) {
+      content.some((c) => isStructuredGoogleContentPart(c));
+    if (hasStructuredGoogleContent && Array.isArray(content)) {
       await dispatchGoogleServerSideToolStreamContent({
         graph,
         stepKey,
@@ -1969,7 +1964,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
       return;
     }
 
-    if (hasGoogleServerSideToolContent) {
+    if (hasStructuredGoogleContent) {
       return;
     }
 
@@ -2503,6 +2498,9 @@ export function createContentAggregator(): t.ContentAggregatorResult {
       } else if (currentContent.citations !== undefined) {
         update.citations = currentContent.citations;
       }
+      if (contentPart.native_media != null) {
+        update.native_media = contentPart.native_media;
+      }
       contentParts[index] = update;
     } else if (
       partType.startsWith(ContentTypes.THINK) &&
@@ -2526,6 +2524,11 @@ export function createContentAggregator(): t.ContentAggregatorResult {
       };
 
       contentParts[index] = update;
+    } else if (
+      partType === ContentTypes.IMAGE_FILE &&
+      'image_file' in contentPart
+    ) {
+      contentParts[index] = { ...contentPart };
     } else if (partType === 'toolCall' || partType === 'toolResponse') {
       contentParts[index] = contentPart;
     } else if (partType === ContentTypes.SUMMARY) {

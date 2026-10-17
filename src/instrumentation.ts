@@ -17,6 +17,7 @@ import {
   getLangfuseSpanProcessorParams,
   registerLangfuseManagedSpan,
   registerLangfuseTraceAnchorSpan,
+  captureLangfuseSpan,
 } from '@/langfuseSpanRegistry';
 import {
   resolveLangfuseConfigForSpan,
@@ -140,6 +141,7 @@ class RoutingLangfuseSpanProcessor implements SpanProcessor {
       langfuse
     );
     registerLangfuseManagedSpan(span, destinationKey);
+    captureLangfuseSpan(span, parentContext);
     const traceAnchor = resolveLangfuseTraceAnchor(parentContext);
     if (traceAnchor != null) {
       registerLangfuseTraceAnchorSpan(

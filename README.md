@@ -202,6 +202,7 @@ npx eslint src/
 
 - [Multi-agent patterns](./docs/multi-agent-patterns.md)
 - [Summarization behavior](./docs/summarization-behavior.md)
+- [Native Google media](./docs/native-media.md)
 
 ## License
 
