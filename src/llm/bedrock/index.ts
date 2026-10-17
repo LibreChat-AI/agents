@@ -272,8 +272,7 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
   ): Promise<ChatResult> {
     if (
       isBedrockOpenAIModel(this.model) ||
-      (modelDisallowsAssistantPrefill(this.model) &&
-        messages[messages.length - 1]?.getType() === 'ai')
+      modelDisallowsAssistantPrefill(this.model)
     ) {
       return this.generateWithLocalConverter(messages, options);
     }

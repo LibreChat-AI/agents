@@ -1,4 +1,8 @@
-import { AIMessage, HumanMessage } from '@langchain/core/messages';
+import {
+  AIMessage,
+  HumanMessage,
+  SystemMessage,
+} from '@langchain/core/messages';
 import {
   ConverseCommand,
   ConverseStreamCommand,
@@ -133,6 +137,16 @@ describe('CustomChatBedrockConverse assistant prefill', () => {
     );
     const command = send.mock.calls[0][0] as ConverseCommand;
     expect(command).toBeInstanceOf(ConverseCommand);
+    expect(command.input.messages?.map((m) => m.role)).toEqual(['user']);
+  });
+
+  test('strips a prefill followed by a system message on invoke', async () => {
+    const send = jest.fn().mockResolvedValue(converseResponse);
+    await createModel('anthropic.claude-sonnet-4-6', send).invoke([
+      ...history,
+      new SystemMessage('Be brief.'),
+    ]);
+    const command = send.mock.calls[0][0] as ConverseCommand;
     expect(command.input.messages?.map((m) => m.role)).toEqual(['user']);
   });
 
