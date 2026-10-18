@@ -121,6 +121,8 @@ export type DecisionFailure =
   | 'aborted'
   | 'rate_limited'
   | 'unauthorized'
+  /** HTTP 402: the credential is out of credits; never retried. */
+  | 'quota'
   | 'bad_request'
   | 'server_error'
   | 'network'

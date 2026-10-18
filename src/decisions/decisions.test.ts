@@ -12,6 +12,7 @@ import {
   toWireQuestion,
   readAnswer,
   parseEnvelope,
+  failureForStatus,
 } from './index';
 
 type FetchCall = {
@@ -826,6 +827,32 @@ describe('HTTP decisionModel', () => {
       'Bearer new',
     ]);
     expect(seen).toEqual([false, true]);
+  });
+
+  it('maps HTTP 402 to a quota failure that is never retried', async () => {
+    const outOfCredits = fakeFetch([
+      { status: 402, body: 'private echoed content: insufficient credits' },
+    ]);
+    const sleep = jest.fn(async () => {});
+    const error: unknown = await createHttpDecisionModel({
+      endpoint: 'https://s1.example',
+      apiKey: 'k',
+      dialect: 'systemone',
+      maxRetries: 3,
+      fetch: outOfCredits.fetch,
+      sleep,
+    })
+      .decide({ state: {}, questions: { q: booleanQuestion('?') } })
+      .catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(DecisionError);
+    expect(error).toMatchObject({
+      failure: 'quota',
+      status: 402,
+      message: 'decision model returned HTTP 402',
+    });
+    expect(failureForStatus(402)).toBe('quota');
+    expect(outOfCredits.calls).toHaveLength(1);
+    expect(sleep).not.toHaveBeenCalled();
   });
 
   it('mints one token per call and retains a refreshed token across subsequent retries', async () => {
