@@ -25,6 +25,7 @@ import { ChatBedrockConverse } from '@langchain/aws';
 import { AIMessageChunk } from '@langchain/core/messages';
 import { ChatGenerationChunk, ChatResult } from '@langchain/core/outputs';
 import {
+  ConverseCommand,
   ConverseStreamCommand,
   type ConverseStreamOutput,
   type GuardrailConfiguration,
@@ -38,6 +39,7 @@ import type { ContentBlockDeltaEvent } from './types';
 import {
   convertToConverseMessages,
   createConverseToolUseStopChunk,
+  convertConverseMessageToLangChainMessage,
   handleConverseStreamContentBlockStart,
   handleConverseStreamContentBlockDelta,
   handleConverseStreamMetadata,
@@ -47,11 +49,30 @@ import {
   supportsBedrockToolCache,
   type PromptCacheTtl,
 } from '@/messages/cache';
-import { smoothStream, resolveStreamDelay, isSignalAborted } from '@/llm/stream/smoother';
+import {
+  applyCachePointsToConversePayload,
+  stripUnsupportedConversePrefill,
+} from './cachePoints';
+import {
+  smoothStream,
+  resolveStreamDelay,
+  isSignalAborted,
+} from '@/llm/stream/smoother';
+import { modelDisallowsAssistantPrefill } from '@/llm/anthropic/utils/message_inputs';
 import { linkStreamLimitCanonical } from '@/llm/streamLimits';
 import { isReasoningRejection, stripBedrockReasoning } from './reasoningRetry';
-import { applyCachePointsToConversePayload } from './cachePoints';
+import { isBedrockOpenAIModel } from './utils/message_inputs';
+import { neutralizeHarmonyToolConfig } from './utils/harmony';
 import { insertBedrockToolCachePoint } from './toolCache';
+
+/**
+ * A `200 OK` ConverseStream whose event stream closes before a single event: no
+ * `messageStart`, no `messageStop`, no exception event. OpenAI models do this for a
+ * request their chat template cannot render (see `./utils/harmony`). Surfaced as an error
+ * so the turn fails with this explanation instead of resolving to no message at all.
+ */
+export const BEDROCK_EMPTY_STREAM_MESSAGE =
+  'Amazon Bedrock ended the response stream without sending any events. The model could not process this request; it may contain text the model rejects.';
 
 /**
  * Service tier type for Bedrock invocations.
@@ -213,10 +234,13 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
 
   /**
    * Get the model ID to use for API calls.
-   * Returns applicationInferenceProfile if set, otherwise returns this.model.
+   * Returns applicationInferenceProfile if set and non-empty, otherwise returns this.model.
    */
   protected getModelId(): string {
-    return this.applicationInferenceProfile ?? this.model;
+    return this.applicationInferenceProfile != null &&
+      this.applicationInferenceProfile !== ''
+      ? this.applicationInferenceProfile
+      : this.model;
   }
 
   /**
@@ -228,14 +252,17 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
     serviceTier?: { type: ServiceTierType };
   } {
     const baseParams = super.invocationParams(options);
+    const baseToolConfig = isBedrockOpenAIModel(this.model)
+      ? neutralizeHarmonyToolConfig(baseParams.toolConfig)
+      : baseParams.toolConfig;
     const toolConfig =
       this.promptCache === true && supportsBedrockToolCache(this.cacheModelId)
         ? insertBedrockToolCachePoint(
-          baseParams.toolConfig,
+          baseToolConfig,
           true,
           resolveBedrockPromptCacheTtl(this.promptCacheTtl, this.cacheModelId)
         )
-        : baseParams.toolConfig;
+        : baseToolConfig;
 
     /** Service tier from options or fall back to class-level setting */
     const serviceTierType = options?.serviceTier ?? this.serviceTier;
@@ -256,6 +283,20 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
     options: this['ParsedCallOptions'] & CustomChatBedrockConverseCallOptions,
     runManager?: CallbackManagerForLLMRun
   ): Promise<ChatResult> {
+    if (
+      isBedrockOpenAIModel(this.model) ||
+      modelDisallowsAssistantPrefill(this.model)
+    ) {
+      try {
+        return await this.generateWithLocalConverter(messages, options);
+      } catch (error) {
+        const retry = this.reasoningRetryMessages(error, messages);
+        if (retry == null) {
+          throw error;
+        }
+        return await this.generateWithLocalConverter(retry, options);
+      }
+    }
     const originalModel = this.model;
     if (
       this.applicationInferenceProfile != null &&
@@ -277,6 +318,58 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
     } finally {
       this.model = originalModel;
     }
+  }
+
+  /**
+   * Non-streaming Converse through this package's converter, as the stream already uses.
+   * The parent's converter replays reasoning and sends harmony control tokens as written,
+   * both of which OpenAI models on Bedrock fail on, and it cannot strip a trailing
+   * assistant prefill that Claude 4.6 and later reject.
+   */
+  private async generateWithLocalConverter(
+    messages: BaseMessage[],
+    options: this['ParsedCallOptions'] & CustomChatBedrockConverseCallOptions
+  ): Promise<ChatResult> {
+    const { converseMessages: convertedMessages, converseSystem } =
+      convertToConverseMessages(messages, { model: this.model });
+    const converseMessages = stripUnsupportedConversePrefill(
+      convertedMessages,
+      this.model
+    );
+    const params = this.invocationParams(options);
+    const modelId = this.getModelId();
+    applyCachePointsToConversePayload({
+      cacheControl: options.cache_control,
+      system: converseSystem,
+      messages: converseMessages,
+      params,
+      modelId,
+    });
+    const { output, ...responseMetadata } = await this.client.send(
+      new ConverseCommand({
+        modelId,
+        messages: converseMessages,
+        ...(converseSystem.length > 0 ? { system: converseSystem } : {}),
+        requestMetadata: options.requestMetadata,
+        ...(params as Record<string, unknown>),
+      }),
+      { abortSignal: options.signal }
+    );
+    if (output?.message == null) {
+      throw new Error('No message found in Bedrock response.');
+    }
+    const message = convertConverseMessageToLangChainMessage(
+      output.message,
+      responseMetadata
+    );
+    return {
+      generations: [
+        {
+          text: typeof message.content === 'string' ? message.content : '',
+          message,
+        },
+      ],
+    };
   }
 
   /**
@@ -353,9 +446,11 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
     options: this['ParsedCallOptions'] & CustomChatBedrockConverseCallOptions,
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
-    const { converseMessages, converseSystem } = convertToConverseMessages(
-      messages,
-      { model: this.model }
+    const { converseMessages: convertedMessages, converseSystem } =
+      convertToConverseMessages(messages, { model: this.model });
+    const converseMessages = stripUnsupportedConversePrefill(
+      convertedMessages,
+      this.model
     );
     const params = this.invocationParams(options);
 
@@ -396,8 +491,10 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
       const stream: AsyncIterable<ConverseStreamOutput> | undefined =
         response.stream;
       if (!stream) {
-        return;
+        throw new Error(BEDROCK_EMPTY_STREAM_MESSAGE);
       }
+      const isStreamAborted = (): boolean =>
+        streamAbortController.signal.aborted;
 
       const seenBlockIndices = new Set<number>();
       const toolUseBlockIndices = new Set<number>();
@@ -470,7 +567,9 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
       const source = (async function* (): AsyncGenerator<
         SmoothItem<BedrockEmittedChunk>
         > {
+        let sawEvent = false;
         for await (const event of stream) {
+          sawEvent = true;
           if (event.contentBlockStart != null) {
             const startChunk = handleConverseStreamContentBlockStart(
               event.contentBlockStart
@@ -549,7 +648,10 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
             yield {
               text: '',
               smooth: false,
-              emit: (): BedrockEmittedChunk => ({ chunk: metadataChunk, callbackToken: '' }),
+              emit: (): BedrockEmittedChunk => ({
+                chunk: metadataChunk,
+                callbackToken: '',
+              }),
             };
           } else if (event.contentBlockStop != null) {
             const stopIdx = event.contentBlockStop.contentBlockIndex;
@@ -579,9 +681,15 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
             yield {
               text: '',
               smooth: false,
-              emit: (): BedrockEmittedChunk => ({ chunk: eventChunk, callbackToken: '' }),
+              emit: (): BedrockEmittedChunk => ({
+                chunk: eventChunk,
+                callbackToken: '',
+              }),
             };
           }
+        }
+        if (!sawEvent && !isStreamAborted()) {
+          throw new Error(BEDROCK_EMPTY_STREAM_MESSAGE);
         }
       })();
 
