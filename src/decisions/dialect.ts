@@ -5,6 +5,27 @@ import type {
 } from './types';
 import { isDecisionObject } from './types';
 
+/**
+ * Hosts in front of System One (ClickHouse gateway, OpenRouter) round every reported number to
+ * two decimals, so each value can sit up to half a hundredth from the measured one. A sum of `n`
+ * rounded probabilities can then miss one by `n` half-steps, and a rounded score can miss the
+ * expectation of its rounded probabilities by one half-step plus one per level index:
+ * `0.005 * (1 + L(L-1)/2)` for `L` levels. `FLOAT_SLACK` absorbs binary floating-point error at
+ * those exact bounds; anything further out is an inconsistent answer, not rounding.
+ */
+const REPORTED_HALF_STEP = 0.005;
+const FLOAT_SLACK = 1e-9;
+
+/** Worst-case distance from one of `n` rounded probabilities summing to exactly one. */
+function probabilitySumTolerance(n: number): number {
+  return REPORTED_HALF_STEP * n + FLOAT_SLACK;
+}
+
+/** Worst-case distance between a rounded score and the expectation of `levels` rounded probabilities. */
+function scoreTolerance(levels: number): number {
+  return REPORTED_HALF_STEP * (1 + (levels * (levels - 1)) / 2) + FLOAT_SLACK;
+}
+
 interface WireQuestion {
   type: string;
   instructions: DecisionQuestion['instructions'];
@@ -100,11 +121,9 @@ function probabilitiesOf(
   ) {
     return undefined;
   }
-  const roundingTolerance = Math.min(
-    0.02,
-    Math.max(0.01, entries.length * 0.00005 + 0.001)
-  );
-  return Math.abs(total - 1) <= roundingTolerance ? probabilities : undefined;
+  return Math.abs(total - 1) <= probabilitySumTolerance(entries.length)
+    ? probabilities
+    : undefined;
 }
 
 /** A validated answer, or `null` for one that cannot safely be read. */
@@ -180,13 +199,9 @@ export function readAnswer(
       weightedScore += Number(level) * probability;
       levels += 1;
     }
-    const roundingTolerance = Math.min(
-      0.02,
-      0.00005 * (1 + (levels * (levels - 1)) / 2) + 0.001
-    );
     if (
       !Number.isFinite(weightedScore) ||
-      Math.abs(record.score - weightedScore) > roundingTolerance
+      Math.abs(record.score - weightedScore) > scoreTolerance(levels)
     ) {
       return null;
     }

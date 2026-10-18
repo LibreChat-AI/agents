@@ -207,8 +207,10 @@ describe('decision dialect', () => {
     const manyProbabilities = Object.fromEntries(
       Array.from({ length: 2000 }, (_, index) => [`k${index}`, 0])
     );
-    manyProbabilities.k0 = 1;
-    manyProbabilities.k1 = 0.05;
+    // 2000 rounded probabilities may drift by 10 in total; twelve certainties drift by 11.
+    for (let index = 0; index < 12; index++) {
+      manyProbabilities[`k${index}`] = 1;
+    }
     expect(
       readAnswer(
         { type: 'choice', choice: 'k0', probabilities: manyProbabilities },
