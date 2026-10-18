@@ -185,4 +185,50 @@ describe('CustomChatBedrockConverse assistant prefill', () => {
       'assistant',
     ]);
   });
+
+  test('retries once without signed reasoning on invoke for Claude Haiku 5.5', async () => {
+    const warn = jest
+      .spyOn(console, 'warn')
+      .mockImplementation(() => undefined);
+    const rejection = Object.assign(
+      new Error('thinking signature is not valid'),
+      {
+        name: 'ValidationException',
+      }
+    );
+    const send = jest
+      .fn()
+      .mockRejectedValueOnce(rejection)
+      .mockResolvedValueOnce(converseResponse);
+    const model = new CustomChatBedrockConverse({
+      region: 'us-east-1',
+      credentials,
+      model: 'global.anthropic.claude-haiku-5-5',
+      client: { send } as unknown as BedrockRuntimeClient,
+      retryWithoutReasoningOnRejection: true,
+    });
+    try {
+      await model.invoke([
+        new HumanMessage('Hello'),
+        new AIMessage({
+          content: [
+            {
+              type: 'reasoning_content',
+              reasoningText: { text: 'Thinking.', signature: 'SIG' },
+            },
+            { type: 'text', text: 'Hello back' },
+          ],
+        }),
+        new HumanMessage('Continue'),
+      ]);
+    } finally {
+      warn.mockRestore();
+    }
+    const sent = send.mock.calls.map(([command]) =>
+      JSON.stringify((command as ConverseCommand).input.messages)
+    );
+    expect(sent).toHaveLength(2);
+    expect(sent[0]).toContain('SIG');
+    expect(sent[1]).not.toContain('SIG');
+  });
 });
