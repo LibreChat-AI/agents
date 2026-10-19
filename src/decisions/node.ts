@@ -4,7 +4,7 @@
  */
 import { exec } from 'node:child_process';
 import type { ExecException } from 'node:child_process';
-import type { DecisionTokenMinter } from './types';
+import type { DecisionFailure, DecisionTokenMinter } from './types';
 import { DecisionError } from './types';
 import { redact } from './redact';
 
@@ -40,20 +40,52 @@ function lastLine(text: string): string {
   return lines.length > 0 ? lines[lines.length - 1] : '';
 }
 
+/**
+ * Only a run that finished and exited non-zero is a refusal. A run killed at
+ * `timeoutMs` is a `timeout`; a spawn error, an output overflow, or a signal
+ * from outside is `network`. None of these says anything about the
+ * credential, so none may trip a breaker. `code` is typed as a number, but
+ * Node sets a string code on spawn and output-overflow errors.
+ */
+function classify(error: ExecException): {
+  failure: DecisionFailure;
+  reason: string;
+} {
+  const code: unknown = error.code;
+  if (typeof code === 'number') {
+    return {
+      failure: 'unauthorized',
+      reason: `token command exited with code ${code}`,
+    };
+  }
+  if (code == null && error.killed === true && error.signal != null) {
+    return {
+      failure: 'timeout',
+      reason: `token command timed out (${error.signal})`,
+    };
+  }
+  if (code == null && error.signal != null) {
+    return {
+      failure: 'network',
+      reason: `token command was killed (${error.signal})`,
+    };
+  }
+  return { failure: 'network', reason: 'token command failed' };
+}
+
+/** The command text and each of its words long enough to be a credential, so a shell that echoes the line cannot leak it. */
+function commandSecrets(command: string): string[] {
+  return [command, ...command.split(/[\s'"`=]+/)].filter(
+    (word) => word.trim().length >= MIN_SECRET_LENGTH
+  );
+}
+
 /** Names how the command failed; never its text, stdout, or `error.message`, which echoes both. */
 function describeFailure(
-  error: ExecException,
+  reason: string,
   stderr: string,
   secrets: string[]
 ): string {
-  let reason: string;
-  if (error.killed === true && error.signal != null) {
-    reason = `token command was killed (${error.signal})`;
-  } else if (typeof error.code === 'number') {
-    reason = `token command exited with code ${error.code}`;
-  } else {
-    reason = 'token command failed';
-  }
   const detail = redact(stderr, secrets).replace(/\s+/g, ' ').trim();
   return detail === '' ? reason : `${reason}: ${detail.slice(0, STDERR_LIMIT)}`;
 }
@@ -63,9 +95,13 @@ function describeFailure(
  * token (for example `dataplanectl chai auth token`); the last non-empty line
  * of stdout is the token. The token is reused for `ttlMs` (default 50
  * minutes), concurrent calls share one run of the command, and a `refresh`
- * (the transport asks after a 401) runs it again. A failed run rejects with an
- * `unauthorized` `DecisionError` whose message carries the exit status and a
- * redacted stderr excerpt, never stdout, the command, or a token.
+ * (the transport asks after a 401) runs it again. A run that exits non-zero or
+ * prints nothing rejects with an `unauthorized` `DecisionError`; a run killed
+ * at `timeoutMs` rejects with `timeout`, and a spawn failure or output
+ * overflow with `network`, so a slow command or one that cannot start never
+ * trips a breaker.
+ * The message carries the exit status and a redacted stderr excerpt, never
+ * stdout, the command, or a token.
  */
 export function commandToken(
   command: string,
@@ -87,6 +123,7 @@ export function commandToken(
   let cached: string | null = null;
   let expiresAt = 0;
   let pending: Promise<string> | null = null;
+  const echoed = commandSecrets(command);
 
   const run = (): Promise<string> =>
     new Promise<string>((resolve, reject) => {
@@ -103,13 +140,16 @@ export function commandToken(
           const printed = String(stdout);
           if (error) {
             /** Partial stdout may hold a token; shorter lines are not credentials and would garble the excerpt. */
-            const secrets = [cached ?? '', ...printed.split(/\r?\n/)].filter(
-              (line) => line.trim().length >= MIN_SECRET_LENGTH
-            );
+            const secrets = [
+              ...echoed,
+              cached ?? '',
+              ...printed.split(/\r?\n/),
+            ].filter((line) => line.trim().length >= MIN_SECRET_LENGTH);
+            const { failure, reason } = classify(error);
             reject(
               new DecisionError(
-                'unauthorized',
-                describeFailure(error, String(stderr), secrets),
+                failure,
+                describeFailure(reason, String(stderr), secrets),
                 { provider: COMMAND_TOKEN_PROVIDER }
               )
             );

@@ -97,16 +97,26 @@ describe('commandToken', () => {
   });
 
   it('mints again on refresh and after the ttl expires', async () => {
-    const mint = commandToken(
-      await script('process.stdout.write("token-" + n + "\\n");'),
-      { ttlMs: 40 }
-    );
-    await expect(mint({ refresh: false })).resolves.toBe('token-1');
-    await expect(mint({ refresh: true })).resolves.toBe('token-2');
-    await expect(mint({ refresh: false })).resolves.toBe('token-2');
-    await new Promise((resolve) => setTimeout(resolve, 60));
-    await expect(mint({ refresh: false })).resolves.toBe('token-3');
-    expect(await runs()).toBe(3);
+    /** Expiry runs on a skewed clock, so a slow spawn cannot expire a fresh token. */
+    const realNow = Date.now.bind(Date);
+    let skewMs = 0;
+    const clock = jest
+      .spyOn(Date, 'now')
+      .mockImplementation(() => realNow() + skewMs);
+    try {
+      const mint = commandToken(
+        await script('process.stdout.write("token-" + n + "\\n");'),
+        { ttlMs: 60_000 }
+      );
+      await expect(mint({ refresh: false })).resolves.toBe('token-1');
+      await expect(mint({ refresh: true })).resolves.toBe('token-2');
+      await expect(mint({ refresh: false })).resolves.toBe('token-2');
+      skewMs = 60_001;
+      await expect(mint({ refresh: false })).resolves.toBe('token-3');
+      expect(await runs()).toBe(3);
+    } finally {
+      clock.mockRestore();
+    }
   });
 
   it('fails as unauthorized with a redacted stderr excerpt and never the token', async () => {
@@ -150,6 +160,64 @@ describe('commandToken', () => {
       failure: 'unauthorized',
       message: 'token command printed no token',
     });
+  });
+
+  it('reports a run killed at timeoutMs as a timeout that leaves a breaker closed', async () => {
+    let requests = 0;
+    const fetch: DecisionFetch = async () => {
+      requests += 1;
+      return new Response(answered, { status: 200 });
+    };
+    const model = withBreaker(
+      createHttpDecisionModel({
+        endpoint: 'https://decisions.example/v1/systemone',
+        apiKey: commandToken(
+          await script(
+            'setTimeout(() => process.stdout.write("token-" + n + "\\n"), 3_000);'
+          ),
+          { timeoutMs: 300 }
+        ),
+        dialect: 'systemone',
+        fetch,
+        timeoutMs: 10_000,
+      })
+    );
+
+    const error = await rejection(model.decide(request));
+    expect(error).toMatchObject({ failure: 'timeout', provider: 'command' });
+    expect(error.message).toMatch(/^token command timed out \(SIG[A-Z]+\)/);
+    expect(model.breaker.open).toBe(false);
+    expect(requests).toBe(0);
+  });
+
+  it('reports output past the buffer limit as a network failure', async () => {
+    const mint = commandToken(
+      await script('process.stdout.write("x".repeat(2 * 1024 * 1024));')
+    );
+    const error = await rejection(mint({ refresh: false }));
+    expect(error).toMatchObject({
+      failure: 'network',
+      message: 'token command failed',
+    });
+  });
+
+  it('redacts the command when the shell echoes it into stderr', async () => {
+    const base = await script(
+      [
+        'const line = [JSON.stringify(process.execPath), JSON.stringify(__filename), ...process.argv.slice(2)].join(" ");',
+        'process.stderr.write("sh: -c: line 1: " + line + "\\n");',
+        'process.stderr.write("unknown flag " + process.argv[2] + "\\n");',
+        'process.exit(2);',
+      ].join('\n')
+    );
+    const command = `${base} --key=sk_short123`;
+    const error = await rejection(commandToken(command)({ refresh: false }));
+    expect(error.failure).toBe('unauthorized');
+    expect(error.message).toBe(
+      'token command exited with code 2: sh: -c: line 1: [REDACTED] unknown flag --key=[REDACTED]'
+    );
+    expect(error.message).not.toContain('sk_short123');
+    expect(error.message).not.toContain('mint.js');
   });
 
   it('rejects an empty command and invalid timing at construction', () => {

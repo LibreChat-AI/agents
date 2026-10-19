@@ -37,7 +37,7 @@ The structured-chat adapter sends the original state to the provider. Its prompt
 
 ## Credentials, Breakers, and Probes
 
-`commandToken(command, { ttlMs, timeoutMs })` from `@librechat/agents/decisions/node` turns a shell command that prints a short-lived bearer token (for example `dataplanectl chai auth token`) into a `DecisionCredential`. The last non-empty stdout line is the token; it is reused for `ttlMs` (default 50 minutes), concurrent calls share one run, and the transport's refresh after a 401 runs the command again. A failed run is an `unauthorized` `DecisionError` naming the exit status with a redacted stderr excerpt, never stdout, the command, or a token. It needs `node:child_process`, so it lives on its own Node-only subpath.
+`commandToken(command, { ttlMs, timeoutMs })` from `@librechat/agents/decisions/node` turns a shell command that prints a short-lived bearer token (for example `dataplanectl chai auth token`) into a `DecisionCredential`. The last non-empty stdout line is the token; it is reused for `ttlMs` (default 50 minutes), concurrent calls share one run, and the transport's refresh after a 401 runs the command again. A run that exits non-zero or prints nothing is an `unauthorized` `DecisionError`; a run killed at `timeoutMs` is a `timeout`, and a spawn failure or output overflow is `network`, so a slow token command never trips a breaker. The message names the exit status with a redacted stderr excerpt, never stdout, a token, the command, or any word of it long enough to be a credential. It needs `node:child_process`, so it lives on its own Node-only subpath.
 
 ```ts
 import { commandToken } from '@librechat/agents/decisions/node';
@@ -60,7 +60,7 @@ if (!ready.ok) {
 }
 ```
 
-`unauthorized` and `quota` belong to the credential, not the request, so `withBreaker(model, breaker?)` opens on the first one: every later `decide()` rejects at once, without a request, with the same failure and status and `circuitOpen: true`, until `breaker.reset()`. Rate limits, server errors, timeouts, and network failures never trip it. Share one `createBreaker()` between models that share a credential. `probe(model)` asks one tiny boolean question and resolves `{ ok: true, model }` or `{ ok: false, failure, status?, circuitOpen, detail }`; a non-SDK exception reads as `network` and its message is dropped. `redact(text, secrets?)` removes listed secrets, bearer values, JWTs, and long opaque tokens from text bound for a log line or status row.
+`unauthorized` and `quota` belong to the credential, not the request, so `withBreaker(model, breaker?)` opens on the first one: every later `decide()` rejects at once, without a request, with the same failure and status and `circuitOpen: true`, until `breaker.reset()`. Rate limits, server errors, timeouts, and network failures never trip it, and a fatal failure from a call that started before a `reset()` does not reopen it. Share one `createBreaker()` between models that share a credential. `probe(model)` asks one tiny boolean question and resolves `{ ok: true, model }` or `{ ok: false, failure, status?, circuitOpen, detail }`; a non-SDK exception reads as `network` and its message is dropped. `redact(text, secrets?)` removes listed secrets, bearer values, JWTs, and long opaque tokens from text bound for a log line or status row.
 
 ## Light Entry Point
 
