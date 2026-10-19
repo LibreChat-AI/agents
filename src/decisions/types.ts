@@ -97,10 +97,14 @@ export interface DecisionModel {
 
 export type DecisionDialect = 'port' | 'systemone';
 
+/** Mints a bearer token; `refresh` asks for a new one after the last was refused with a 401. */
+export type DecisionTokenMinter = (options: {
+  refresh: boolean;
+  signal?: AbortSignal;
+}) => Promise<string>;
+
 /** A bearer key, or a per-request token minter; a 401 requests one fresh token for that call. */
-export type DecisionCredential =
-  | string
-  | ((options: { refresh: boolean; signal?: AbortSignal }) => Promise<string>);
+export type DecisionCredential = string | DecisionTokenMinter;
 
 export interface DecisionProviderSettings {
   /** Full URL of the decision endpoint, not a base path. */
@@ -135,17 +139,20 @@ export class DecisionError extends Error {
   readonly provider: string;
   readonly status?: number;
   retryAfterMs?: number;
+  /** True when a breaker refused the call without a request; see `withBreaker`. */
+  readonly circuitOpen: boolean;
 
   constructor(
     failure: DecisionFailure,
     message: string,
-    options?: { provider?: string; status?: number }
+    options?: { provider?: string; status?: number; circuitOpen?: boolean }
   ) {
     super(message);
     this.name = 'DecisionError';
     this.failure = failure;
     this.provider = options?.provider ?? 'unknown';
     this.status = options?.status;
+    this.circuitOpen = options?.circuitOpen ?? false;
   }
 }
 
