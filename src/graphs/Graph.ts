@@ -5003,6 +5003,23 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           responseMessage.lc_kwargs.id = responseMessage.id;
         }
         this.runProducedAiMessageIds.add(responseMessage.id);
+        const inputTransformations = (
+          responseMessage as AIMessageChunk
+        ).response_metadata.input_transformations as unknown;
+        if (
+          Array.isArray(inputTransformations) &&
+          inputTransformations.length > 0
+        ) {
+          /** The provider rewrote the history it was sent, e.g. dropped signed reasoning. */
+          emitAgentLog(
+            config,
+            'warn',
+            'graph',
+            'The provider changed the request history',
+            { count: inputTransformations.length, inputTransformations },
+            { runId: this.runId, agentId }
+          );
+        }
         if (this.replayStepIdsOfCall.length > 0) {
           this.replayStepIdsByMessageId.set(
             responseMessage.id,
