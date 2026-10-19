@@ -17,8 +17,9 @@ import {
   createCrossEncoderReranker,
 } from './core';
 import {
-  createBreaker,
   withBreaker,
+  createBreaker,
+  DecisionError,
   decisionPreset,
   createDecisionModel,
 } from '@/decisions';
@@ -509,6 +510,61 @@ describe('System One per-document ranking', () => {
     ).toEqual([]);
   });
 
+  it('reports a model that times out every request on its own clock as timeout, charged as abandoned', async () => {
+    const slow: DecisionModel = {
+      id: 'capped',
+      model: 'jev-1.13.0',
+      decide: () =>
+        new Promise((_, reject) =>
+          setTimeout(
+            () =>
+              reject(
+                new DecisionError('timeout', 'decision model timed out', {
+                  provider: 'capped',
+                })
+              ),
+            20
+          )
+        ),
+    };
+    const reranker = createSystemOneReranker({
+      model: slow,
+      rubric,
+      timeoutMs: 10_000,
+    });
+    const outcome = await reranker.rank({ query: 'q', documents: ['a', 'b'] });
+    expect(outcome).toMatchObject({
+      status: 'skipped',
+      reason: 'timeout',
+      usage: { calls: 4, estimatedTokens: 2_400 },
+    });
+    expect(order(outcome)).toEqual([0, 1]);
+    await expect(
+      reranker.rerank({ query: 'q', documents: ['a', 'b'] })
+    ).rejects.toMatchObject({ failure: 'timeout' });
+  });
+
+  it('reports an oversized candidate set as too_many_documents in both modes, without a request', async () => {
+    const server = await stub(scored(SCORES));
+    for (const mode of ['document', 'batch'] as const) {
+      const outcome = await createSystemOneReranker({
+        model: jev(server.url),
+        rubric,
+        mode,
+        maxDocuments: 2,
+      }).rank({ query: 'q', documents: ['a', 'b', 'c'] });
+      expect(outcome).toMatchObject({
+        status: 'skipped',
+        reason: 'too_many_documents',
+      });
+      expect(outcome.attempts.map((attempt) => attempt.status)).toEqual([
+        'skipped',
+      ]);
+      expect(order(outcome)).toEqual([0, 1, 2]);
+    }
+    expect(server.calls).toHaveLength(0);
+  });
+
   it('rejects document-mode options in batch mode', () => {
     const model = createDecisionModel(
       { ...decisionPreset('laya'), baseURL: 'http://127.0.0.1:1/v1/systemone' },
@@ -992,6 +1048,66 @@ describe('withFallback', () => {
     expect(() => withFallback([{ reranker: step, deadlineMs: 0.5 }])).toThrow(
       'invalid reranker chain'
     );
+  });
+
+  it('answers an invalid request with identity order over every document', async () => {
+    const step = scripted('bm25', () => {
+      throw new Error('unreachable');
+    });
+    const chain = withFallback([
+      { reranker: step },
+      { reranker: noneReranker() },
+    ]);
+    for (const request of [
+      { query: '  ', documents: ['a', 'b'] },
+      { query: 'q', documents: ['a', 'b'], deadlineMs: 0 },
+    ]) {
+      const outcome = await chain.rank(request);
+      expect(outcome).toMatchObject({
+        status: 'skipped',
+        reason: 'invalid_request',
+      });
+      expect(outcome.results).toEqual([
+        { index: 0, score: null },
+        { index: 1, score: null },
+      ]);
+    }
+    expect(step.requests).toHaveLength(0);
+  });
+
+  it('bounds the whole chain by the request deadline, not the sum of its steps', async () => {
+    const server = await stub((call) => {
+      const reply = relevance(RELEVANCE)(call);
+      return reply === 'hang' ? reply : { ...reply, delayMs: 600 };
+    });
+    const slow = (): OutcomeReranker =>
+      createCrossEncoderReranker({
+        url: `${server.url}/rerank`,
+        model: 'qwen3-reranker-8b',
+        apiKey: 'key',
+      });
+    const startedAt = performance.now();
+    const outcome = await withFallback([
+      { reranker: slow(), deadlineMs: 400 },
+      { reranker: slow(), deadlineMs: 400 },
+      { reranker: noneReranker() },
+    ]).rank({ query: 'q', documents: DOCUMENTS, deadlineMs: 150 });
+    const took = performance.now() - startedAt;
+    expect(outcome).toMatchObject({ status: 'skipped', reason: 'timeout' });
+    expect(order(outcome)).toEqual([0, 1, 2, 3]);
+    expect(server.calls).toHaveLength(1);
+    expect(took).toBeLessThan(350);
+
+    const unbounded = scripted('bm25', (request) =>
+      noneReranker().rank(request)
+    );
+    await withFallback([{ reranker: unbounded }]).rank({
+      query: 'q',
+      documents: ['a'],
+      deadlineMs: 100,
+    });
+    expect(unbounded.requests[0].deadlineMs).toBeLessThanOrEqual(100);
+    expect(unbounded.requests[0].signal).toBeInstanceOf(AbortSignal);
   });
 });
 

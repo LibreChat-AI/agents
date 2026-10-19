@@ -17,10 +17,13 @@ import { createTransport } from '../decisions/transport';
 export interface CrossEncoderRerankerOptions {
   /**
    * Full URL of a Cohere-shaped rerank endpoint: Cohere's `/v2/rerank`,
-   * Jina's `/v1/rerank`, a TEI or Infinity server, or the ClickHouse gateway's
+   * Jina's `/v1/rerank`, an Infinity server, or the ClickHouse gateway's
    * `${GATEWAY_URL}/rerank` (no `/v1`), which serves `qwen3-reranker-8b` and
-   * `cohere-rerank-v3-5`. Without one, every ranking is skipped with
-   * `no_endpoint`.
+   * `cohere-rerank-v3-5`. TEI's `/rerank` takes `texts` and answers a bare
+   * array, so it does not fit. A response is capped at 256 KiB, so a host
+   * that echoes each document back (Jina does by default) fails a large
+   * shortlist as `bad_response`. Without a URL, every ranking is skipped
+   * with `no_endpoint`.
    */
   url?: string;
   model: string;

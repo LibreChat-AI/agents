@@ -266,7 +266,24 @@ export function createSystemOneReranker(
       model: model.model,
       mode,
       rerank: rerankBatch,
-      rank: batch.rank,
+      async rank(request: RankRequest): Promise<RerankOutcome> {
+        const documents = documentCount(request);
+        if (
+          rankRequestProblem(request) === undefined &&
+          documents > maxDocuments
+        ) {
+          // The caller's size problem, as document mode and the cross-encoder report it, not the model's `unsupported`.
+          return stepOutcome({
+            kind: 'systemone',
+            documents,
+            startedAt: performance.now(),
+            model: model.model,
+            reason: 'too_many_documents',
+            called: false,
+          });
+        }
+        return batch.rank(request);
+      },
     };
   }
 
@@ -435,16 +452,20 @@ export function createSystemOneReranker(
         }
       }
     };
+    /** Called only while the step's signal is live, so a timeout here is the model's own, not the step's. */
     const refused = (error: unknown): void => {
       const reason = rerankReasonOf(error);
-      if (reason === 'timeout' || reason === 'aborted') {
-        return;
-      }
-      run.replied += 1;
       const decisionError =
         error instanceof DecisionError
           ? error
           : fail('network', 'reranker request failed');
+      if (reason === 'timeout' || reason === 'aborted') {
+        // Not a reply: the host may still bill it, so it is estimated as abandoned.
+        run.failure ??= reason;
+        run.failureError ??= decisionError;
+        return;
+      }
+      run.replied += 1;
       if (STEP_FATAL.has(reason)) {
         run.stop ??= reason;
         run.stopError ??= decisionError;

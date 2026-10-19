@@ -1,3 +1,4 @@
+import vm from 'node:vm';
 import {
   corpusStats,
   tokenizeCode,
@@ -60,6 +61,39 @@ describe('createBm25Reranker', () => {
         avgdl: 3,
       })
     ).toThrow('corpusStats');
+  });
+
+  it('accepts any ReadonlyMap of idf, including a Map from another realm', async () => {
+    const stats = corpusStats(CORPUS);
+    const wrapper: ReadonlyMap<string, number> = {
+      get: (term) => stats.idf.get(term),
+      has: (term) => stats.idf.has(term),
+      forEach: (callback) => stats.idf.forEach(callback),
+      entries: () => stats.idf.entries(),
+      keys: () => stats.idf.keys(),
+      values: () => stats.idf.values(),
+      get size(): number {
+        return stats.idf.size;
+      },
+      [Symbol.iterator]: () => stats.idf[Symbol.iterator](),
+    };
+    const foreign = vm.runInNewContext('new Map(entries)', {
+      entries: [...stats.idf],
+    }) as ReadonlyMap<string, number>;
+    expect(foreign instanceof Map).toBe(false);
+    const query = 'where is with_fallback defined';
+    const expected = await createBm25Reranker(stats).rank({
+      query,
+      documents: CORPUS,
+    });
+    for (const idf of [wrapper, foreign]) {
+      const outcome = await createBm25Reranker({
+        idf,
+        avgdl: stats.avgdl,
+      }).rank({ query, documents: CORPUS });
+      expect(outcome.status).toBe('ok');
+      expect(outcome.results).toEqual(expected.results);
+    }
   });
 
   it('ranks the lexical match first at no cost, splitting identifiers in the query and documents', async () => {

@@ -215,6 +215,22 @@ async function runStep(
 }
 
 /**
+ * A step's own deadline bounded by what is left of the chain's; a step
+ * without one gets the rest of the chain's. `undefined` only when neither
+ * the step nor the request has a deadline.
+ */
+function stepDeadline(
+  own: number | undefined,
+  expiresAt: number
+): number | undefined {
+  if (expiresAt === Infinity) {
+    return own;
+  }
+  const remaining = Math.max(1, Math.ceil(expiresAt - performance.now()));
+  return own === undefined ? remaining : Math.min(own, remaining);
+}
+
+/**
  * A chain of steps tried in order; the first that answers wins. Step 0
  * answering is `ok`; a later step is `degraded` with the first failed step's
  * reason; none answering is `skipped` in identity order with that reason. A
@@ -222,8 +238,12 @@ async function runStep(
  * the answering step only, so falling back to a cross-encoder never carries a
  * System One threshold. A step that throws, rejects, returns something other
  * than a full permutation, or outlives its deadline plus `STEP_GRACE_MS` is a
- * failed step. Usage sums every attempt: spend counts what was sent, not what
- * answered. Never throws.
+ * failed step. A request's `deadlineMs` bounds the whole chain: each step
+ * gets the lesser of its own deadline and what is left, a step without one
+ * gets what is left, and once nothing is left the chain stops with
+ * `timeout`. Usage sums every attempt: spend counts what was sent, not what
+ * answered. An invalid request is identity order over every document. Never
+ * throws.
  */
 export function withFallback(
   steps: readonly FallbackStep[],
@@ -259,7 +279,7 @@ export function withFallback(
       const startedAt = performance.now();
       const documents = documentCount(request);
       if (rankRequestProblem(request) === 'invalid_request') {
-        return identityOutcome(0, {
+        return identityOutcome(documents, {
           reason: 'invalid_request',
           durationMs: elapsedMs(startedAt),
         });
@@ -272,11 +292,17 @@ export function withFallback(
       }
       const attempts: RerankAttempt[] = [];
       const usage = emptyRerankUsage();
+      const budget = validDeadline(request.deadlineMs);
+      const expiresAt = budget === undefined ? Infinity : startedAt + budget;
       let first: string | null = null;
       for (let index = 0; index < chain.length; index++) {
-        const { reranker, deadlineMs } = chain[index];
+        const { reranker } = chain[index];
         if (isAborted(request.signal)) {
           first ??= 'aborted';
+          break;
+        }
+        if (performance.now() >= expiresAt) {
+          first ??= 'timeout';
           break;
         }
         if (gate && reranker.kind !== 'none') {
@@ -303,7 +329,7 @@ export function withFallback(
           reranker,
           request.query,
           request.documents,
-          deadlineMs,
+          stepDeadline(chain[index].deadlineMs, expiresAt),
           request.signal
         );
         try {

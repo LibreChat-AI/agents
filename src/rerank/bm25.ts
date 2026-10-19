@@ -76,6 +76,18 @@ export interface Bm25RerankerOptions {
   tokenize?: Tokenize;
 }
 
+/** Any `ReadonlyMap`, including a wrapper or a `Map` from another realm, where `instanceof Map` is false. */
+function isIdfMap(value: unknown): value is ReadonlyMap<string, number> {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    'get' in value &&
+    'values' in value &&
+    typeof value.get === 'function' &&
+    typeof value.values === 'function'
+  );
+}
+
 /**
  * In-process Okapi BM25. Corpus statistics are required: idf over a 50-document
  * shortlist alone is close to degenerate. A term the corpus never saw counts
@@ -89,7 +101,7 @@ export function createBm25Reranker(
   const tokenize = options.tokenize ?? tokenizeCode;
   const { idf, avgdl } = options;
   let idfOf: ((term: string) => number) | undefined;
-  if (idf instanceof Map) {
+  if (isIdfMap(idf)) {
     let rarest = 0;
     for (const value of idf.values()) {
       rarest = Math.max(rarest, value);
