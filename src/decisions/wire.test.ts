@@ -198,4 +198,55 @@ describe('System One wire fidelity', () => {
       )
     ).toBeNull();
   });
+
+  it('caps rounding drift at what values summing to one can produce, however many there are', () => {
+    const zeros = (length: number): Record<string, number> =>
+      Object.fromEntries(
+        Array.from({ length }, (_, index) => [`k${index}`, 0])
+      );
+    // 250 half-steps would allow a drift of 1.25, but two certainties each need at least 0.995.
+    const twoCertainties = { ...zeros(250), k0: 1, k1: 1 };
+    expect(
+      readAnswer(
+        { type: 'choice', choice: 'k0', probabilities: twoCertainties },
+        'systemone'
+      )
+    ).toBeNull();
+    // A zero hides at most a half-step, so 0.5 and 0.52 among zeros cannot come from one.
+    expect(
+      readAnswer(
+        {
+          type: 'choice',
+          choice: 'b',
+          probabilities: { a: 0.5, b: 0.52, c: 0, d: 0 },
+        },
+        'systemone'
+      )
+    ).toBeNull();
+    const spread = Object.fromEntries(
+      Array.from({ length: 250 }, (_, index) => [
+        `k${index}`,
+        index < 200 ? 0.01 : 0,
+      ])
+    );
+    // Two hundred true values of 0.005 round up to 0.01 each: a sum of two, still a rounding.
+    expect(
+      readAnswer(
+        { type: 'choice', choice: 'k0', probabilities: spread },
+        'systemone'
+      )
+    ).toMatchObject({ type: 'choice', choice: 'k0' });
+
+    const levels = Object.fromEntries(
+      Array.from({ length: 300 }, (_, level) => [String(level), 0])
+    );
+    levels['0'] = 1;
+    // Level zero holds at least 0.995, so the expectation stays under 1.5; 210 is no rounding.
+    expect(
+      readAnswer(
+        { type: 'score', score: 210, probabilities: levels },
+        'systemone'
+      )
+    ).toBeNull();
+  });
 });

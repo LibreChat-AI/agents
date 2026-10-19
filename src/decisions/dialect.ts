@@ -7,23 +7,37 @@ import { isDecisionObject } from './types';
 
 /**
  * Hosts in front of System One (ClickHouse gateway, OpenRouter) round every reported number to
- * two decimals, so each value can sit up to half a hundredth from the measured one. A sum of `n`
- * rounded probabilities can then miss one by `n` half-steps, and a rounded score can miss the
- * expectation of its rounded probabilities by one half-step plus one per level index:
- * `0.005 * (1 + L(L-1)/2)` for `L` levels. `FLOAT_SLACK` absorbs binary floating-point error at
- * those exact bounds; anything further out is an inconsistent answer, not rounding.
+ * two decimals, so each value can sit up to half a hundredth from the measured one, and never
+ * outside `[0, 1]`. A rounded distribution is accepted only when some measured distribution
+ * summing to exactly one rounds to it, which bounds the drift by `n` half-steps for `n` values and
+ * by one in total, since true values summing to one move at most 200 of them by a half-step. A
+ * rounded score can miss the expectation of its rounded probabilities by one half-step plus one
+ * per level index of the (at most 200) moved values: `0.005 * (1 + L(L-1)/2)` for `L <= 200`
+ * levels. `FLOAT_SLACK` absorbs binary floating-point error at those exact bounds; anything
+ * further out is an inconsistent answer, not rounding.
  */
 const REPORTED_HALF_STEP = 0.005;
 const FLOAT_SLACK = 1e-9;
+/** Values summing to one can move at most this many rounded values by a full half-step. */
+const MAX_ROUNDED_TERMS = Math.round(1 / REPORTED_HALF_STEP);
 
-/** Worst-case distance from one of `n` rounded probabilities summing to exactly one. */
-function probabilitySumTolerance(n: number): number {
-  return REPORTED_HALF_STEP * n + FLOAT_SLACK;
+/** Whether a measured distribution summing to exactly one could round to these values. */
+function roundsFromUnitSum(values: readonly number[]): boolean {
+  let lowest = 0;
+  let highest = 0;
+  for (const value of values) {
+    lowest += Math.max(0, value - REPORTED_HALF_STEP);
+    highest += Math.min(1, value + REPORTED_HALF_STEP);
+  }
+  return lowest <= 1 + FLOAT_SLACK && highest >= 1 - FLOAT_SLACK;
 }
 
 /** Worst-case distance between a rounded score and the expectation of `levels` rounded probabilities. */
 function scoreTolerance(levels: number): number {
-  return REPORTED_HALF_STEP * (1 + (levels * (levels - 1)) / 2) + FLOAT_SLACK;
+  const moved = Math.min(levels, MAX_ROUNDED_TERMS);
+  /** The sum of the `moved` highest level indices, `L(L-1)/2` when every level can move. */
+  const movedIndices = (moved * (2 * levels - moved - 1)) / 2;
+  return REPORTED_HALF_STEP * (1 + movedIndices) + FLOAT_SLACK;
 }
 
 interface WireQuestion {
@@ -95,7 +109,6 @@ function probabilitiesOf(
     return undefined;
   }
   const probabilities: Record<string, number> = Object.create(null);
-  let total = 0;
   let maximum = 0;
   for (const [key, value] of entries) {
     if (!isProbability(value)) {
@@ -111,7 +124,6 @@ function probabilitiesOf(
       return undefined;
     }
     probabilities[key] = value;
-    total += value;
     maximum = Math.max(maximum, value);
   }
   if (
@@ -121,7 +133,7 @@ function probabilitiesOf(
   ) {
     return undefined;
   }
-  return Math.abs(total - 1) <= probabilitySumTolerance(entries.length)
+  return roundsFromUnitSum(Object.values(probabilities))
     ? probabilities
     : undefined;
 }
