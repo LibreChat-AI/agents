@@ -21,8 +21,14 @@ export interface DecisionBreaker {
   readonly open: boolean;
   /** The first error that tripped the breaker, or `null` while it is closed. */
   readonly error: DecisionError | null;
-  /** Records `error` unless the breaker is already open; the first error wins. */
-  trip(error: DecisionError): void;
+  /** Counts resets; a call captures it before its request so a stale failure cannot reopen a reset breaker. */
+  readonly generation: number;
+  /**
+   * Records `error` unless the breaker is already open; the first error wins.
+   * With `generation`, records it only if no `reset` happened since that
+   * generation was read.
+   */
+  trip(error: DecisionError, generation?: number): void;
   reset(): void;
 }
 
@@ -32,6 +38,7 @@ export interface BreakerDecisionModel extends DecisionModel {
 
 export function createBreaker(): DecisionBreaker {
   let tripped: DecisionError | null = null;
+  let generation = 0;
   return {
     get open(): boolean {
       return tripped !== null;
@@ -39,11 +46,18 @@ export function createBreaker(): DecisionBreaker {
     get error(): DecisionError | null {
       return tripped;
     },
-    trip(error: DecisionError): void {
+    get generation(): number {
+      return generation;
+    },
+    trip(error: DecisionError, seen?: number): void {
+      if (seen !== undefined && seen !== generation) {
+        return;
+      }
       tripped ??= error;
     },
     reset(): void {
       tripped = null;
+      generation += 1;
     },
   };
 }
@@ -53,7 +67,8 @@ export function createBreaker(): DecisionBreaker {
  * call rejects at once, without a request, with the same failure, status, and
  * `circuitOpen: true`, until `breaker.reset()`. Rate limits, server errors,
  * timeouts, and network failures never trip it; the transport retries those.
- * Share one breaker between models that share a credential.
+ * A fatal failure from a call that started before a `reset()` does not reopen
+ * it. Share one breaker between models that share a credential.
  */
 export function withBreaker(
   model: DecisionModel,
@@ -76,11 +91,12 @@ export function withBreaker(
           }
         );
       }
+      const generation = breaker.generation;
       try {
         return await model.decide(request);
       } catch (error) {
         if (isFatalDecisionError(error)) {
-          breaker.trip(error);
+          breaker.trip(error, generation);
         }
         throw error;
       }

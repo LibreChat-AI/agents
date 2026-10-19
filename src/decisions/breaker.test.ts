@@ -173,6 +173,60 @@ describe('withBreaker', () => {
     expect(auth).toHaveLength(2);
   });
 
+  it('does not reopen after a reset when a call from before the reset fails', async () => {
+    const auth: Array<string | undefined> = [];
+    const pending: Array<(response: Response) => void> = [];
+    const fetch: DecisionFetch = (_url, init) => {
+      auth.push(init.headers.Authorization);
+      return new Promise<Response>((resolve) => pending.push(resolve));
+    };
+    const model = withBreaker(
+      createHttpDecisionModel({
+        endpoint: ENDPOINT,
+        apiKey: KEY,
+        dialect: 'systemone',
+        fetch,
+      })
+    );
+
+    const first = failure(model);
+    const stale = failure(model);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(pending).toHaveLength(2);
+
+    pending[0](new Response('refused', { status: 402 }));
+    await expect(first).resolves.toMatchObject({ failure: 'quota' });
+    expect(model.breaker.open).toBe(true);
+
+    model.breaker.reset();
+    pending[1](new Response('refused', { status: 402 }));
+    await expect(stale).resolves.toMatchObject({
+      failure: 'quota',
+      circuitOpen: false,
+    });
+    expect(model.breaker.open).toBe(false);
+    expect(model.breaker.generation).toBe(1);
+
+    const next = model.decide(request);
+    await new Promise((resolve) => setImmediate(resolve));
+    pending[2](new Response(answered, { status: 200 }));
+    await expect(next).resolves.toMatchObject({ model: 'jev-1.13.0' });
+    expect(auth).toHaveLength(3);
+  });
+
+  it('ignores a trip carrying a generation from before a reset', () => {
+    const breaker = createBreaker();
+    const seen = breaker.generation;
+    breaker.reset();
+    breaker.trip(new DecisionError('quota', 'stale', { status: 402 }), seen);
+    expect(breaker.open).toBe(false);
+    breaker.trip(
+      new DecisionError('quota', 'current', { status: 402 }),
+      breaker.generation
+    );
+    expect(breaker.open).toBe(true);
+  });
+
   it('shares one breaker between models that share a credential', async () => {
     const breaker = createBreaker();
     const refused = replies([401]);
