@@ -1,6 +1,6 @@
 # Typed Decisions
 
-A `DecisionModel` asks typed boolean, choice, or score questions about one state. It is not a chat-model subclass. Construct one decision model per provider and tenant and pass signals, labels, state, and questions per call. This SDK does not cache credentials or host inference weights.
+A `DecisionModel` asks typed boolean, choice, or score questions about one state. It is not a chat-model subclass. Construct one decision model per provider and tenant and pass signals, labels, state, and questions per call. This SDK does not host inference weights, and caches a credential only through the opt-in `commandToken` helper.
 
 ## Backends
 
@@ -35,9 +35,36 @@ Use the request's `signal` and `timeoutMs` to bound a call. HTTP timeouts cover 
 
 The structured-chat adapter sends the original state to the provider. Its prompt carries a marker so Langfuse can drop the **entire state and question text** from generation inputs when any tool-output redaction policy is active. Selectively removing identifiable tool fields would still leak a private result quoted in free-form state or instructions. With no active redaction policy, prompts remain visible. Configure provider-side logging separately. No defaults should change until quality, calibration, latency, and cost have been evaluated for each backend and use case.
 
+## Credentials, Breakers, and Probes
+
+`commandToken(command, { ttlMs, timeoutMs })` from `@librechat/agents/decisions/node` turns a shell command that prints a short-lived bearer token (for example `dataplanectl chai auth token`) into a `DecisionCredential`. The last non-empty stdout line is the token; it is reused for `ttlMs` (default 50 minutes), concurrent calls share one run, and the transport's refresh after a 401 runs the command again. A failed run is an `unauthorized` `DecisionError` naming the exit status with a redacted stderr excerpt, never stdout, the command, or a token. It needs `node:child_process`, so it lives on its own Node-only subpath.
+
+```ts
+import { commandToken } from '@librechat/agents/decisions/node';
+import {
+  createDecisionModel,
+  decisionPreset,
+  probe,
+  withBreaker,
+} from '@librechat/agents/decisions';
+
+const model = withBreaker(
+  createDecisionModel(
+    decisionPreset('clickhouse')!,
+    commandToken('dataplanectl chai auth token')
+  )
+);
+const ready = await probe(model, { timeoutMs: 15_000 });
+if (!ready.ok) {
+  // ready.failure, ready.status, ready.detail (redacted); never thrown.
+}
+```
+
+`unauthorized` and `quota` belong to the credential, not the request, so `withBreaker(model, breaker?)` opens on the first one: every later `decide()` rejects at once, without a request, with the same failure and status and `circuitOpen: true`, until `breaker.reset()`. Rate limits, server errors, timeouts, and network failures never trip it. Share one `createBreaker()` between models that share a credential. `probe(model)` asks one tiny boolean question and resolves `{ ok: true, model }` or `{ ok: false, failure, status?, circuitOpen, detail }`; a non-SDK exception reads as `network` and its message is dropped. `redact(text, secrets?)` removes listed secrets, bearer values, JWTs, and long opaque tokens from text bound for a log line or status row.
+
 ## Light Entry Point
 
-`@librechat/agents/decisions` exports the System One HTTP stack (types, question builders, presets, `createHttpDecisionModel`, the dialect parser, `createTransport`, `failureForStatus`, `retryAfterMs`, and `withDecisionDeadline`) without loading LangChain or any other third-party package. `createStructuredChatDecisionModel` binds a LangChain chat model, so it is exported only from the root entry. The root `@librechat/agents` entry still exports everything. `npm run test:light-entries` loads the built subpath and fails if it reaches a non-built-in package.
+`@librechat/agents/decisions` exports the System One HTTP stack (types, question builders, presets, `createHttpDecisionModel`, the dialect parser, `createTransport`, `failureForStatus`, `retryAfterMs`, `withDecisionDeadline`, `withBreaker`, `probe`, and `redact`) without loading LangChain, any other third-party package, or a Node built-in. `@librechat/agents/decisions/node` adds `commandToken` and reaches only `node:child_process`. `createStructuredChatDecisionModel` binds a LangChain chat model, so it is exported only from the root entry. The root `@librechat/agents` entry still exports everything. `npm run test:light-entries` loads each built subpath and fails if it reaches a non-built-in package, or, for the platform-neutral subpaths, any Node built-in.
 
 ## Structured Output Capabilities
 
