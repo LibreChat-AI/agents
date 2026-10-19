@@ -240,6 +240,100 @@ describe('ContentAggregator Anthropic reasoning replay', () => {
   });
 });
 
+describe('ContentAggregator consecutive signed reasoning blocks', () => {
+  const stream = (blocks: t.ReasoningContentText[]): t.ReasoningContentText[] =>
+    blocks;
+
+  it('keeps Anthropic blocks apart when omitted thinking display leaves only their signatures', () => {
+    const { contentParts, aggregateContent } = createContentAggregator();
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP,
+      data: createRunStep('step_anthropic_two_blocks'),
+    });
+
+    for (const signature of ['sig-first', 'sig-second']) {
+      for (const content of stream([
+        {
+          type: ContentTypes.THINK,
+          think: '',
+          provider_replay: {
+            anthropic: {
+              model: anthropicModel,
+              blocks: [{ type: ContentTypes.THINKING, signature }],
+            },
+          },
+        },
+      ])) {
+        aggregateContent({
+          event: GraphEvents.ON_REASONING_DELTA,
+          data: {
+            id: 'step_anthropic_two_blocks',
+            delta: { content: [content] },
+          },
+        });
+      }
+    }
+
+    expect(contentParts[0]).toMatchObject({
+      provider_replay: {
+        anthropic: {
+          blocks: [
+            { type: ContentTypes.THINKING, signature: 'sig-first' },
+            { type: ContentTypes.THINKING, signature: 'sig-second' },
+          ],
+        },
+      },
+    });
+  });
+
+  it('keeps Bedrock blocks apart when only their signatures are streamed', () => {
+    const { contentParts, aggregateContent } = createContentAggregator();
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP,
+      data: createRunStep('step_bedrock_two_blocks'),
+    });
+
+    for (const signature of ['sig-first', 'sig-second']) {
+      aggregateContent({
+        event: GraphEvents.ON_REASONING_DELTA,
+        data: {
+          id: 'step_bedrock_two_blocks',
+          delta: {
+            content: [
+              {
+                type: ContentTypes.THINK,
+                think: '',
+                provider_replay: {
+                  bedrock: {
+                    model: bedrockModel,
+                    blocks: [
+                      {
+                        type: ContentTypes.REASONING_CONTENT,
+                        reasoningText: { signature },
+                      },
+                    ],
+                  },
+                },
+              },
+            ],
+          },
+        },
+      });
+    }
+
+    expect(contentParts[0]).toMatchObject({
+      provider_replay: {
+        bedrock: {
+          blocks: [
+            { reasoningText: { signature: 'sig-first' } },
+            { reasoningText: { signature: 'sig-second' } },
+          ],
+        },
+      },
+    });
+  });
+});
+
 describe('ContentAggregator resumed tool completions', () => {
   it('matches a completion to seeded content when a rebuilt run has no step id', () => {
     const { contentParts, aggregateContent } = createContentAggregator();

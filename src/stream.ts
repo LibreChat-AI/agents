@@ -2478,9 +2478,15 @@ function mergeProviderReasoningReplay(
   ) {
     for (const incomingBlock of incoming.anthropic.blocks) {
       const lastBlock = anthropic.blocks[anthropic.blocks.length - 1];
+      /**
+       * A signature closes its block and arrives whole, so a later block starts at its thinking
+       * text or at its own signature; with omitted thinking display only the signature is sent.
+       */
       const startsNewSignedBlock =
         incomingBlock.type === ContentTypes.THINKING &&
-        typeof incomingBlock.thinking === 'string' &&
+        (typeof incomingBlock.thinking === 'string' ||
+          (typeof incomingBlock.signature === 'string' &&
+            incomingBlock.signature !== '')) &&
         anthropic.blocks.length > 0 &&
         lastBlock.type === ContentTypes.THINKING &&
         typeof lastBlock.signature === 'string' &&
@@ -2517,7 +2523,9 @@ function mergeProviderReasoningReplay(
       const lastReasoningText =
         bedrock.blocks.length > 0 ? lastBlock.reasoningText : undefined;
       const startsNewSignedBlock =
-        typeof incomingReasoningText?.text === 'string' &&
+        (typeof incomingReasoningText?.text === 'string' ||
+          (typeof incomingReasoningText?.signature === 'string' &&
+            incomingReasoningText.signature !== '')) &&
         lastReasoningText?.signature != null;
       if (
         incomingReasoningText != null &&
