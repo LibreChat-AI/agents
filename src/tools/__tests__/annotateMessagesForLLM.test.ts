@@ -122,13 +122,12 @@ describe('annotateMessagesForLLM', () => {
     expect(annotateMessagesForLLM(messages, registry, 'r1')).toBe(messages);
   });
 
-  it('leaves content untouched but strips framework metadata when _refKey is stale', () => {
+  it('annotates a _refKey the registry no longer holds and strips framework metadata', () => {
     /**
-     * Stale `_refKey` (not in registry) doesn't trigger annotation,
-     * but the message still gets projected so framework keys are
-     * removed from `additional_kwargs` before the bytes leave for the
-     * provider. This protects against custom or future serializers
-     * that transmit `additional_kwargs`.
+     * The label is the output's persisted name, not a registry lookup,
+     * so a restored message is labelled exactly like it was live. The
+     * framework keys are still removed from `additional_kwargs` before
+     * the bytes leave for the provider.
      */
     const registry = new ToolOutputReferenceRegistry();
     const tm = makeToolMessage({
@@ -136,7 +135,7 @@ describe('annotateMessagesForLLM', () => {
       additional_kwargs: { _refKey: 'tool0turn0', userField: 'preserved' },
     });
     const out = annotateMessagesForLLM([tm], registry, 'r1');
-    expect(out[0].content).toBe('output');
+    expect(out[0].content).toBe('[ref: tool0turn0]\noutput');
     expect(out[0]).not.toBe(tm);
     const projectedKwargs = (out[0] as ToolMessage).additional_kwargs;
     expect(projectedKwargs._refKey).toBeUndefined();
@@ -378,7 +377,7 @@ describe('annotateMessagesForLLM', () => {
     expect(out[2]).not.toBe(tm);
   });
 
-  it('projects (to strip metadata) but does not annotate when only stale _refKey is present', () => {
+  it('annotates by _refKey even when the registry holds only other keys', () => {
     const registry = new ToolOutputReferenceRegistry();
     registry.set('r1', 'tool1turn0', 'somethingelse');
     const tm = makeToolMessage({
@@ -388,7 +387,7 @@ describe('annotateMessagesForLLM', () => {
     const messages = [tm];
     const out = annotateMessagesForLLM(messages, registry, 'r1');
     expect(out).not.toBe(messages);
-    expect(out[0].content).toBe('output');
+    expect(out[0].content).toBe('[ref: tool0turn0]\noutput');
     expect((out[0] as ToolMessage).additional_kwargs._refKey).toBeUndefined();
   });
 
@@ -423,36 +422,13 @@ describe('annotateMessagesForLLM', () => {
     );
   });
 
-  it('uses _refScope for the registry lookup when present, ignoring runId', () => {
-    /**
-     * Anonymous ToolNode batches register under a synthetic scope
-     * (`\0anon-<n>`) that `config.configurable.run_id` cannot recover.
-     * The transform must follow the message-stamped `_refScope`
-     * instead of the config-derived runId.
-     */
+  it('labels by _refKey alone, without a runId or a stamped _refScope', () => {
     const registry = new ToolOutputReferenceRegistry();
-    const anonScope = '\0anon-3';
-    registry.set(anonScope, 'tool0turn0', 'raw');
-
-    const tm = makeToolMessage({
-      content: 'output',
-      additional_kwargs: {
-        _refKey: 'tool0turn0',
-        _refScope: anonScope,
-      },
-    });
-    const out = annotateMessagesForLLM([tm], registry, undefined);
-    expect(out[0].content).toBe('[ref: tool0turn0]\noutput');
-  });
-
-  it('falls back to runId when _refScope is absent (legacy / pre-scope messages)', () => {
-    const registry = new ToolOutputReferenceRegistry();
-    registry.set('r1', 'tool0turn0', 'raw');
     const tm = makeToolMessage({
       content: 'output',
       additional_kwargs: { _refKey: 'tool0turn0' },
     });
-    const out = annotateMessagesForLLM([tm], registry, 'r1');
+    const out = annotateMessagesForLLM([tm], registry, undefined);
     expect(out[0].content).toBe('[ref: tool0turn0]\noutput');
   });
 
@@ -546,7 +522,7 @@ describe('annotateMessagesForLLM', () => {
     expect(out[1].content).toBe('[ref: tool0turn0]\nlive-output');
   });
 
-  it('treats stale _refKey but live unresolved as unresolved-only', () => {
+  it('combines the restored _refKey label with unresolved refs', () => {
     const registry = new ToolOutputReferenceRegistry();
     const tm = makeToolMessage({
       content: 'output',
@@ -556,6 +532,8 @@ describe('annotateMessagesForLLM', () => {
       },
     });
     const out = annotateMessagesForLLM([tm], registry, 'r1');
-    expect(out[0].content).toBe('output\n[unresolved refs: tool9turn9]');
+    expect(out[0].content).toBe(
+      '[ref: tool0turn0]\noutput\n[unresolved refs: tool9turn9]'
+    );
   });
 });
