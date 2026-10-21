@@ -163,6 +163,36 @@ describe('createBm25Reranker', () => {
       ],
     });
   });
+
+  it('answers an already-aborted request as aborted without tokenizing anything', async () => {
+    const tokenized: string[] = [];
+    const reranker = createBm25Reranker({
+      idf: () => 1,
+      avgdl: 2,
+      tokenize: (text) => {
+        tokenized.push(text);
+        return text.split(' ');
+      },
+    });
+    const controller = new AbortController();
+    controller.abort();
+    expect(
+      await reranker.rank({
+        query: 'q',
+        documents: ['a', 'b'],
+        signal: controller.signal,
+      })
+    ).toMatchObject({
+      status: 'skipped',
+      reason: 'aborted',
+      results: [
+        { index: 0, score: null },
+        { index: 1, score: null },
+      ],
+      attempts: [{ status: 'skipped', reason: 'aborted' }],
+    });
+    expect(tokenized).toEqual([]);
+  });
 });
 
 describe('estimatedUsage', () => {

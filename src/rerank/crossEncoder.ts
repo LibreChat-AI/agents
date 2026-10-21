@@ -8,6 +8,7 @@ import {
   validDeadline,
   estimatedUsage,
   rerankReasonOf,
+  isTokenEstimate,
   emptyRerankUsage,
   rankRequestProblem,
 } from './outcome';
@@ -37,7 +38,10 @@ export interface CrossEncoderRerankerOptions {
   maxRetries?: number;
   /** Defaults to 1,000, Cohere's limit; larger sets are skipped, never truncated. */
   maxDocuments?: number;
-  /** The estimate charged for a request a deadline abandoned. Defaults to 200. */
+  /**
+   * The estimate charged for a request a deadline abandoned. Defaults to 200;
+   * anything but a finite number of at least 0 throws at construction.
+   */
   estimatedTokensPerDocument?: number;
   fetch?: DecisionFetch;
 }
@@ -150,7 +154,8 @@ export function createCrossEncoderReranker(
     maxRetries < 0 ||
     maxRetries > 5 ||
     !Number.isSafeInteger(maxDocuments) ||
-    maxDocuments < 1
+    maxDocuments < 1 ||
+    !isTokenEstimate(options.estimatedTokensPerDocument)
   ) {
     throw new DecisionError('bad_request', 'invalid reranker configuration', {
       provider: 'cross-encoder',

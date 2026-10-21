@@ -83,9 +83,10 @@ const ATTEMPT_STATUSES: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * Grace after a step's deadline for a reranker that honors its abort to
- * report its own timeout and spend. A full answer that arrives within it is
- * accepted: waiting for it costs nothing the timeout would not.
+ * Grace after a step's deadline or the caller's abort for a reranker that
+ * honors its abort to report its own timeout and spend. A full answer that
+ * arrives within it is accepted: waiting for it costs nothing the timeout
+ * would not.
  */
 export const STEP_GRACE_MS = 50;
 
@@ -153,7 +154,11 @@ function isAttempt(value: unknown): value is RerankAttempt {
   );
 }
 
-/** The whole `RerankOutcome` contract, since a step's results and attempts are passed through as they are. */
+/**
+ * The whole `RerankOutcome` contract, since a step's results and attempts are
+ * passed through as they are: an answer (`ok` or `degraded`) scores every
+ * document, and `kept` comes only with the `threshold` behind it.
+ */
 function isOutcome(value: unknown, documents: number): value is RerankOutcome {
   return (
     isDecisionObject(value) &&
@@ -164,6 +169,10 @@ function isOutcome(value: unknown, documents: number): value is RerankOutcome {
     isReason(value.reason) &&
     isRerankPermutation(value.results, documents) &&
     isRankedOrder(value.results) &&
+    (value.status === 'skipped' ||
+      value.results.every((entry) => entry.score !== null)) &&
+    (value.threshold !== undefined ||
+      value.results.every((entry) => entry.kept === undefined)) &&
     Array.isArray(value.attempts) &&
     value.attempts.every(isAttempt) &&
     (value.threshold === undefined || isFiniteNumber(value.threshold)) &&
@@ -258,8 +267,9 @@ function asTimeout(outcome: RerankOutcome): RerankOutcome {
 
 /**
  * One step under its own deadline: an abort signal the reranker should honor,
- * and a timer that ends the wait regardless, so a step that ignores its abort
- * cannot hold the chain.
+ * and timers that end the wait `STEP_GRACE_MS` after its deadline or the
+ * caller's abort regardless, so a step that ignores its abort cannot hold the
+ * chain or its caller.
  */
 async function runStep(
   reranker: OutcomeReranker,
@@ -304,33 +314,59 @@ async function runStep(
       },
       () => failedStep(reranker, n, 'error', elapsedMs(startedAt))
     );
-  if (deadlineMs === undefined) {
+  if (deadlineMs === undefined && outer === undefined) {
     return work;
   }
-  timers.push(setTimeout(() => deadline.abort(), deadlineMs));
-  const late = new Promise<RerankOutcome>((resolve) => {
-    timers.push(
-      setTimeout(
-        () =>
-          resolve(
-            failedStep(
-              reranker,
-              n,
-              'timeout',
-              elapsedMs(startedAt),
-              abandonedUsage(reranker.kind, n)
-            )
-          ),
-        deadlineMs + STEP_GRACE_MS
-      )
+  /** A step still pending this long is abandoned, charged as if every document was sent. */
+  const abandon = (
+    reason: 'timeout' | 'aborted',
+    afterMs: number
+  ): Promise<RerankOutcome> =>
+    new Promise<RerankOutcome>((resolve) => {
+      timers.push(
+        setTimeout(
+          () =>
+            resolve(
+              failedStep(
+                reranker,
+                n,
+                reason,
+                elapsedMs(startedAt),
+                abandonedUsage(reranker.kind, n)
+              )
+            ),
+          afterMs
+        )
+      );
+    });
+  const contenders = [work];
+  if (deadlineMs !== undefined) {
+    timers.push(setTimeout(() => deadline.abort(), deadlineMs));
+    contenders.push(abandon('timeout', deadlineMs + STEP_GRACE_MS));
+  }
+  let release = (): void => {};
+  if (outer !== undefined) {
+    contenders.push(
+      new Promise<RerankOutcome>((resolve) => {
+        const onAbort = (): void => {
+          resolve(abandon('aborted', STEP_GRACE_MS));
+        };
+        if (outer.aborted) {
+          onAbort();
+          return;
+        }
+        outer.addEventListener('abort', onAbort, { once: true });
+        release = (): void => outer.removeEventListener('abort', onAbort);
+      })
     );
-  });
+  }
   try {
-    const outcome = await Promise.race([work, late]);
+    const outcome = await Promise.race(contenders);
     return deadline.signal.aborted && !isAborted(outer)
       ? asTimeout(outcome)
       : outcome;
   } finally {
+    release();
     for (const timer of timers) {
       clearTimeout(timer);
     }
@@ -361,12 +397,13 @@ function stepDeadline(
  * the answering step only, so falling back to a cross-encoder never carries a
  * System One threshold. A step that throws, rejects, returns something that
  * breaks the `RerankOutcome` contract (a full permutation in score order,
- * well-formed attempts and fields), or outlives its deadline plus
- * `STEP_GRACE_MS` is a failed step; a step that ran but reported no attempt
- * is recorded as one. A request's `deadlineMs` bounds the whole chain, gates
- * included: each step gets the lesser of its own deadline and what is left, a
- * step without one gets what is left, and once nothing is left the chain
- * stops with `timeout`. Usage sums every attempt: spend counts what was sent,
+ * every document scored when it answers, `kept` only with a `threshold`,
+ * well-formed attempts and fields), or outlives its deadline or the caller's
+ * abort by `STEP_GRACE_MS` is a failed step; a step that ran but reported no
+ * attempt is recorded as one. A request's `deadlineMs` bounds the whole
+ * chain, gates included: each step gets the lesser of its own deadline and
+ * what is left, a step without one gets what is left, and once nothing is
+ * left the chain stops with `timeout`. Usage sums every attempt: spend counts what was sent,
  * not what answered. An invalid request is identity order over every
  * document. Never throws.
  */

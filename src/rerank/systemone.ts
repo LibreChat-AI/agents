@@ -25,6 +25,7 @@ import {
   estimatedUsage,
   rerankReasonOf,
   validDeadline,
+  isTokenEstimate,
   emptyRerankUsage,
   toOutcomeReranker,
   rankRequestProblem,
@@ -55,14 +56,19 @@ export interface SystemOneRerankerOptions {
   rubric: readonly string[];
   /** Reject oversized candidate sets instead of silently dropping candidates. Defaults to 128. */
   maxDocuments?: number;
-  /** One deadline for the whole ranking, re-issues included. Defaults to 10 seconds. */
+  /**
+   * One deadline for the whole ranking, counted from the call: building
+   * states, cache lookups, and re-issues included, and no request is sent
+   * after it. A ranking the cache answers in full is served even when the
+   * lookups outran it. Defaults to 10 seconds.
+   */
   timeoutMs?: number;
   mode?: SystemOneMode;
   /** Document mode: the question asked about each candidate. */
   instructions?: DecisionText;
   /** Document mode: the state one candidate is judged in. Defaults to `{ query, document }`. */
   state?: (query: string, document: string) => DecisionState;
-  /** Document mode: requests in flight at once, when no `semaphore` is shared. Defaults to 64. */
+  /** Document mode: requests in flight at once, a positive integer, when no `semaphore` is shared. Defaults to 64. */
   concurrency?: number;
   /** Document mode: a semaphore shared with other rerankers calling the same host. */
   semaphore?: RerankSemaphore;
@@ -70,7 +76,10 @@ export interface SystemOneRerankerOptions {
   cache?: RerankScoreCache;
   /** Document mode: every response must echo this model, and `kept` needs its threshold. */
   pin?: SystemOnePin;
-  /** Document mode: the estimate charged for a request a deadline abandoned. Defaults to 600. */
+  /**
+   * Document mode: the estimate charged for a request a deadline abandoned.
+   * Defaults to 600; anything but a finite number of at least 0 throws.
+   */
   estimatedTokensPerDocument?: number;
 }
 
@@ -147,7 +156,8 @@ export function createSystemOneReranker(
     options.concurrency !== undefined ||
     options.semaphore !== undefined ||
     options.cache !== undefined ||
-    options.pin !== undefined;
+    options.pin !== undefined ||
+    options.estimatedTokensPerDocument !== undefined;
   if (
     !Array.isArray(options.rubric) ||
     options.rubric.length < 2 ||
@@ -156,6 +166,11 @@ export function createSystemOneReranker(
     ) ||
     !Number.isSafeInteger(maxDocuments) ||
     maxDocuments < 1 ||
+    validDeadline(timeoutMs) === undefined ||
+    (options.concurrency !== undefined &&
+      (!Number.isSafeInteger(options.concurrency) ||
+        options.concurrency < 1)) ||
+    !isTokenEstimate(options.estimatedTokensPerDocument) ||
     !MODES.includes(mode) ||
     (mode === 'batch' && documentOnly) ||
     (options.pin !== undefined &&
@@ -291,10 +306,16 @@ export function createSystemOneReranker(
   const pin = options.pin
     ? { model: options.pin.model.trim(), threshold: options.pin.threshold }
     : undefined;
-  const question = scoreQuestion(
-    options.instructions ?? DEFAULT_INSTRUCTIONS,
-    rubric
-  );
+  /** A snapshot: the question sent and the cache key derived from it never drift when the caller mutates its object. */
+  let instructions: DecisionText;
+  try {
+    instructions = JSON.parse(
+      JSON.stringify(options.instructions ?? DEFAULT_INSTRUCTIONS)
+    ) as DecisionText;
+  } catch {
+    throw fail('bad_request', 'invalid reranker configuration');
+  }
+  const question = scoreQuestion(instructions, rubric);
   const stateOf =
     options.state ??
     ((query: string, document: string): DecisionState => ({
@@ -304,7 +325,7 @@ export function createSystemOneReranker(
   const semaphore =
     options.semaphore ?? createSemaphore(options.concurrency ?? 64);
   const { cache } = options;
-  const rubricKey = JSON.stringify([question.instructions, rubric]);
+  const rubricKey = JSON.stringify([instructions, rubric]);
   const configured = model.model;
   const perDocument = options.estimatedTokensPerDocument;
 
@@ -426,12 +447,26 @@ export function createSystemOneReranker(
       }
     }
 
-    const expiresAt = performance.now() + deadlineMs;
     /** Read after every await: the deadline or the outcome may have ended the run meanwhile. */
     const live = (signal: AbortSignal): boolean =>
       !run.settled && !signal.aborted;
     const unscored = (): number[] =>
       run.scores.flatMap((score, index) => (score === null ? [index] : []));
+    // The deadline counts from the call, so state building and cache lookups spend it too.
+    const expiresAt = startedAt + deadlineMs;
+    const remaining = Math.ceil(expiresAt - performance.now());
+    if (remaining <= 0 && unscored().length > 0) {
+      run.settled = true;
+      return conclude(run, {
+        ...base,
+        n,
+        interrupted: new DecisionError(
+          'timeout',
+          'decision model deadline exceeded',
+          { provider: model.id }
+        ),
+      });
+    }
     const record = (index: number, response: unknown): void => {
       run.replied += 1;
       run.answered += 1;
@@ -509,7 +544,7 @@ export function createSystemOneReranker(
     try {
       await withDecisionDeadline(
         model.id,
-        deadlineMs,
+        Math.max(1, remaining),
         request.signal,
         async (signal, waitFor) => {
           const ask = (index: number): Promise<void> =>
@@ -522,18 +557,25 @@ export function createSystemOneReranker(
                 let response: DecisionResult;
                 try {
                   response = await waitFor(
-                    Promise.resolve().then(() =>
-                      model.decide({
-                        state: stateFor(index),
+                    Promise.resolve().then(() => {
+                      const state = stateFor(index);
+                      const left = Math.ceil(expiresAt - performance.now());
+                      if (left <= 0) {
+                        // Building the state spent the deadline: nothing is sent, so none is counted or charged.
+                        run.usage.calls -= 1;
+                        throw fail(
+                          'timeout',
+                          'decision model deadline exceeded'
+                        );
+                      }
+                      return model.decide({
+                        state,
                         questions: { [QUESTION_ID]: question },
                         signal,
-                        timeoutMs: Math.max(
-                          1,
-                          Math.ceil(expiresAt - performance.now())
-                        ),
+                        timeoutMs: left,
                         label: 'rerank',
-                      })
-                    )
+                      });
+                    })
                   );
                 } catch (error) {
                   if (error instanceof DecisionError && error.circuitOpen) {

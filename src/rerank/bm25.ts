@@ -1,5 +1,6 @@
 import type { RankRequest, RerankOutcome, OutcomeReranker } from './types';
 import {
+  isAborted,
   stepOutcome,
   documentCount,
   emptyRerankUsage,
@@ -92,6 +93,8 @@ function isIdfMap(value: unknown): value is ReadonlyMap<string, number> {
  * In-process Okapi BM25. Corpus statistics are required: idf over a 50-document
  * shortlist alone is close to degenerate. A term the corpus never saw counts
  * as rare as its rarest term. Never throws once built, and costs nothing.
+ * Scoring is synchronous: an already-aborted `signal` is `aborted` before any
+ * work, and neither an abort nor `deadlineMs` stops a pass once it starts.
  */
 export function createBm25Reranker(
   options: Bm25RerankerOptions
@@ -143,6 +146,10 @@ export function createBm25Reranker(
       const problem = rankRequestProblem(request);
       if (problem !== undefined) {
         return stepOutcome({ ...base, reason: problem, called: false });
+      }
+      // Scoring runs to the end once started, so a cancelled caller is honored only before it.
+      if (isAborted(request.signal)) {
+        return stepOutcome({ ...base, reason: 'aborted', called: false });
       }
       try {
         const terms = tokenize(request.query);

@@ -88,6 +88,11 @@ export function estimatedUsage(
   };
 }
 
+/** An `estimatedTokensPerDocument` option: absent, or a finite count of at least zero. */
+export const isTokenEstimate = (value: unknown): boolean =>
+  value === undefined ||
+  (typeof value === 'number' && Number.isFinite(value) && value >= 0);
+
 /** Prices in USD for one model; the SDK ships none. */
 export interface RerankPrice {
   inputPerMTok?: number;
