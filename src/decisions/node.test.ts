@@ -289,6 +289,39 @@ describe('commandToken', () => {
     expect(error.message).not.toContain('mint.js');
   });
 
+  it('redacts a stdout token shorter than eight characters when its first run fails', async () => {
+    const leaked = 'Zq7xK2p';
+    const mint = commandToken(
+      await script(
+        [
+          `process.stdout.write(${JSON.stringify(`${leaked}\n`)});`,
+          `process.stderr.write(${JSON.stringify(`verify failed: token ${leaked} rejected\n`)});`,
+          'process.exit(1);',
+        ].join('\n')
+      )
+    );
+    const error = await rejection(mint({ refresh: false }));
+    expect(error.message).toBe(
+      'token command exited with code 1: verify failed: token [REDACTED] rejected'
+    );
+    expect(error.message).not.toContain(leaked);
+  });
+
+  it('redacts a short inline secret that the command quotes back', async () => {
+    const base = await script(
+      [
+        'process.stderr.write("bad password " + process.argv[2].split("=")[1] + "\\n");',
+        'process.exit(2);',
+      ].join('\n')
+    );
+    const error = await rejection(
+      commandToken(`${base} --pw=abc12`)({ refresh: false })
+    );
+    expect(error.message).toBe(
+      'token command exited with code 2: bad password [REDACTED]'
+    );
+  });
+
   it('does not cache a failed run', async () => {
     const mint = commandToken(
       await script(
@@ -367,7 +400,7 @@ describe('commandToken', () => {
     const error = await rejection(commandToken(command)({ refresh: false }));
     expect(error.failure).toBe('unauthorized');
     expect(error.message).toBe(
-      'token command exited with code 2: sh: -c: line 1: [REDACTED] unknown flag --key=[REDACTED]'
+      'token command exited with code 2: sh: -c: line 1: [REDACTED] unknown flag [REDACTED]=[REDACTED]'
     );
     expect(error.message).not.toContain('sk_short123');
     expect(error.message).not.toContain('mint.js');

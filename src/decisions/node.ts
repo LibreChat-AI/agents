@@ -15,7 +15,6 @@ const DEFAULT_TIMEOUT_MS = 60_000;
 const DEFAULT_KILL_GRACE_MS = 2_000;
 const MAX_OUTPUT_BYTES = 1024 * 1024;
 const STDERR_LIMIT = 200;
-const MIN_SECRET_LENGTH = 8;
 const KILL_SIGNAL = 'SIGTERM';
 const FORCE_SIGNAL = 'SIGKILL';
 const GROUP_KILL = process.platform !== 'win32';
@@ -166,10 +165,14 @@ function collect(
   return () => Buffer.concat(chunks).toString('utf8');
 }
 
-/** The command text and each of its words long enough to be a credential, so a shell that echoes the line cannot leak it. */
+/**
+ * The command text and every word of it whatever its length, so neither a
+ * shell that echoes the line nor a program that quotes an argument back can
+ * leak an inline secret; a short word may garble the excerpt instead.
+ */
 function commandSecrets(command: string): string[] {
   return [command, ...command.split(/[\s'"`=]+/)].filter(
-    (word) => word.trim().length >= MIN_SECRET_LENGTH
+    (word) => word.trim() !== ''
   );
 }
 
@@ -205,8 +208,9 @@ function describeFailure(
  * ends only the shell, not the command the shell launched.
  *
  * The message carries the exit status and a redacted stderr excerpt, never
- * stdout, the command, or a minted token of any length, including a refused
- * token whose refresh failed.
+ * a line of stdout, the command or any word of it (split at whitespace,
+ * quotes, and `=`), or a minted token, whatever their length, including a
+ * refused token whose refresh failed.
  */
 export function commandToken(
   command: string,
@@ -290,17 +294,11 @@ export function commandToken(
           return;
         }
         /**
-         * Partial stdout may hold a token; its shorter lines are not
-         * credentials and would garble the excerpt. The cached token is a
-         * known credential, so it is listed whatever its length.
+         * Any stdout line may be the token, since a successful run accepts
+         * one of any length, and the cached token is a known credential; all
+         * are listed whatever their length, at the cost of a garbled excerpt.
          */
-        const secrets = [
-          ...echoed,
-          ...stdout()
-            .split(/\r?\n/)
-            .filter((line) => line.trim().length >= MIN_SECRET_LENGTH),
-          cached,
-        ];
+        const secrets = [...echoed, ...stdout().split(/\r?\n/), cached];
         const { failure, reason } = classify(end);
         reject(
           new DecisionError(
