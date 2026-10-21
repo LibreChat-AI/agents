@@ -54,6 +54,24 @@ const USAGE_KEYS = [
 const count = (value: unknown): number =>
   typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0;
 
+/** Every usage counter present as a finite number of at least zero. */
+export function isRerankUsage(value: unknown): value is RerankUsage {
+  if (!isDecisionObject(value)) {
+    return false;
+  }
+  for (const key of USAGE_KEYS) {
+    const counter = value[key];
+    if (
+      typeof counter !== 'number' ||
+      !Number.isFinite(counter) ||
+      counter < 0
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
 /** Adds `usage` into `sum`; anything that is not a positive finite count adds nothing. */
 export function addRerankUsage(sum: RerankUsage, usage: unknown): RerankUsage {
   if (!isDecisionObject(usage)) {
@@ -93,7 +111,11 @@ export const isTokenEstimate = (value: unknown): boolean =>
   value === undefined ||
   (typeof value === 'number' && Number.isFinite(value) && value >= 0);
 
-/** Prices in USD for one model; the SDK ships none. */
+/**
+ * Prices in USD for one model; the SDK ships none. A rate is a finite number
+ * of at least zero: `0` prices a dimension as free, while an absent or invalid
+ * rate leaves usage of that dimension unpriced.
+ */
 export interface RerankPrice {
   inputPerMTok?: number;
   outputPerMTok?: number;
@@ -111,7 +133,10 @@ export type RerankPrices = Readonly<
 export interface RerankCost {
   /** Every attempt, estimates included. */
   usd: number;
-  /** Attempts that used something the table has no price for; their spend is not in `usd`. */
+  /**
+   * Attempts that used something the table has no rate for (no entry, or an
+   * entry without a rate for a dimension they used); their spend is not in `usd`.
+   */
   unpriced: Array<{ provider: RerankKind; model: string }>;
 }
 
@@ -138,7 +163,60 @@ function priceFor(
   return best === undefined ? undefined : table[best];
 }
 
-/** What an outcome's attempts cost under `prices`; reported and estimated usage are priced alike. */
+/** A rate the table sets, or `undefined` when it sets none it can be priced by. */
+const rateOf = (value: unknown): number | undefined =>
+  typeof value === 'number' && Number.isFinite(value) && value >= 0
+    ? value
+    : undefined;
+
+/**
+ * One attempt's spend under `price`, or `undefined` when part of it has no
+ * rate. Each reported dimension needs its own rate. An estimate books tokens
+ * and search units together because the SDK cannot tell which one the host
+ * bills, so it is priced by the rates the entry has and is unpriced only when
+ * the entry has a rate for neither.
+ */
+function attemptCost(
+  usage: RerankAttempt['usage'],
+  price: unknown
+): number | undefined {
+  if (!isDecisionObject(price)) {
+    return undefined;
+  }
+  const input = rateOf(price.inputPerMTok);
+  const output = rateOf(price.outputPerMTok);
+  const unit = rateOf(price.perSearchUnit);
+  const tokens = count(usage.inputTokens);
+  const outputTokens = count(usage.outputTokens);
+  const units = count(usage.searchUnits);
+  const estimatedTokens = count(usage.estimatedTokens);
+  const estimatedUnits = count(usage.estimatedSearchUnits);
+  if (
+    (tokens > 0 && input === undefined) ||
+    (outputTokens > 0 && output === undefined) ||
+    (units > 0 && unit === undefined)
+  ) {
+    return undefined;
+  }
+  if (
+    (estimatedTokens > 0 || estimatedUnits > 0) &&
+    !(estimatedTokens > 0 && input !== undefined) &&
+    !(estimatedUnits > 0 && unit !== undefined)
+  ) {
+    return undefined;
+  }
+  return (
+    ((tokens + estimatedTokens) * (input ?? 0)) / 1e6 +
+    (outputTokens * (output ?? 0)) / 1e6 +
+    (units + estimatedUnits) * (unit ?? 0)
+  );
+}
+
+/**
+ * What an outcome's attempts cost under `prices`; reported and estimated
+ * usage are priced alike. An attempt with usage the table has no rate for is
+ * listed in `unpriced` and adds nothing to `usd`, never counted as free.
+ */
 export function rerankCost(
   outcome: Pick<RerankOutcome, 'attempts'>,
   prices: RerankPrices
@@ -155,8 +233,11 @@ export function rerankCost(
     if (tokens === 0 && output === 0 && units === 0) {
       continue;
     }
-    const price = priceFor(prices[attempt.provider], attempt.model);
-    if (!price) {
+    const spent = attemptCost(
+      attempt.usage,
+      priceFor(prices[attempt.provider], attempt.model)
+    );
+    if (spent === undefined) {
       if (
         !unpriced.some(
           (seen) =>
@@ -167,10 +248,7 @@ export function rerankCost(
       }
       continue;
     }
-    usd +=
-      (tokens * count(price.inputPerMTok)) / 1e6 +
-      (output * count(price.outputPerMTok)) / 1e6 +
-      units * count(price.perSearchUnit);
+    usd += spent;
   }
   return { usd: Math.round(usd * 1e9) / 1e9, unpriced };
 }
@@ -394,6 +472,23 @@ export function validDeadline(value: unknown): number | undefined {
   return ms <= MAX_RERANK_DEADLINE_MS ? ms : undefined;
 }
 
+/**
+ * `test` holds for every slot of `values`, holes included. `some` and `every`
+ * skip the holes of a sparse array, which a spread, an index, or
+ * `JSON.stringify` later reads as `undefined` or `null`.
+ */
+export function everySlot<T>(
+  values: readonly T[],
+  test: (value: T | undefined) => boolean
+): boolean {
+  for (let index = 0; index < values.length; index++) {
+    if (!test(values[index])) {
+      return false;
+    }
+  }
+  return true;
+}
+
 /** A non-empty query and string documents, or the reason the request cannot be ranked. */
 export function rankRequestProblem(request: unknown): RerankReason | undefined {
   if (
@@ -401,7 +496,10 @@ export function rankRequestProblem(request: unknown): RerankReason | undefined {
     !Array.isArray(request.documents) ||
     typeof request.query !== 'string' ||
     !request.query.trim() ||
-    request.documents.some((document) => typeof document !== 'string')
+    !everySlot(
+      request.documents as unknown[],
+      (document) => typeof document === 'string'
+    )
   ) {
     return 'invalid_request';
   }

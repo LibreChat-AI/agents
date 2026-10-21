@@ -19,6 +19,7 @@ import type {
 import type { RerankScoreCache, RerankCacheKey } from './cache';
 import type { RerankSemaphore } from './semaphore';
 import {
+  everySlot,
   isAborted,
   stepOutcome,
   documentCount,
@@ -34,6 +35,7 @@ import { DecisionError, isDecisionObject } from '../decisions/types';
 import { withDecisionDeadline } from '../decisions/deadline';
 import { scoreQuestion } from '../decisions/questions';
 import { createSemaphore } from './semaphore';
+import { callHook } from '../decisions/hook';
 
 /**
  * `document` (the default) asks one score question per candidate, one request
@@ -161,8 +163,9 @@ export function createSystemOneReranker(
   if (
     !Array.isArray(options.rubric) ||
     options.rubric.length < 2 ||
-    options.rubric.some(
-      (level) => typeof level !== 'string' || !level.trim()
+    !everySlot(
+      options.rubric as unknown[],
+      (level) => typeof level === 'string' && level.trim() !== ''
     ) ||
     !Number.isSafeInteger(maxDocuments) ||
     maxDocuments < 1 ||
@@ -434,15 +437,11 @@ export function createSystemOneReranker(
         if (key === null) {
           continue;
         }
-        try {
-          const hit = cache.get(key);
-          // An out-of-rubric value from a host store is a miss, never a score.
-          if (inRubric(hit)) {
-            run.scores[index] = hit;
-            run.usage.cached += 1;
-          }
-        } catch {
-          // A failing host cache is a miss, never a failed ranking.
+        // A failing host cache is a miss, never a failed ranking; an out-of-rubric value is a miss, never a score.
+        const hit = callHook(() => cache.get(key));
+        if (inRubric(hit)) {
+          run.scores[index] = hit;
+          run.usage.cached += 1;
         }
       }
     }
@@ -507,15 +506,17 @@ export function createSystemOneReranker(
       run.scores[index] = answer.score;
       const key = keys?.[index] ?? null;
       if (cache && key !== null && said === configured) {
-        try {
-          cache.set(key, answer.score);
-        } catch {
-          // The score stands; only reuse is lost.
-        }
+        // The score stands even when the store throws or rejects; only reuse is lost.
+        const score = answer.score;
+        callHook(() => cache.set(key, score));
       }
     };
-    /** Called only while the step's signal is live, so a timeout here is the model's own, not the step's. */
-    const refused = (error: unknown): void => {
+    /**
+     * Called only while the step's signal is live, so a timeout here is the
+     * model's own, not the step's. `sent` is false for a failure before
+     * dispatch, which is neither a call nor a reply.
+     */
+    const refused = (error: unknown, sent: boolean): void => {
       const reason = rerankReasonOf(error);
       const decisionError =
         error instanceof DecisionError
@@ -527,8 +528,7 @@ export function createSystemOneReranker(
         run.failureError ??= decisionError;
         return;
       }
-      // An open breaker refused before dispatch: `ask` took back the call, so it is no reply either.
-      if (reason !== 'circuit_open') {
+      if (sent) {
         run.replied += 1;
       }
       if (STEP_FATAL.has(reason)) {
@@ -553,7 +553,8 @@ export function createSystemOneReranker(
                 if (run.stop !== null || !live(signal)) {
                   return;
                 }
-                run.usage.calls += 1;
+                /** Set at dispatch: a failure before it (a throwing `state`, a spent deadline) sent nothing. */
+                const dispatch = { sent: false };
                 let response: DecisionResult;
                 try {
                   response = await waitFor(
@@ -562,12 +563,13 @@ export function createSystemOneReranker(
                       const left = Math.ceil(expiresAt - performance.now());
                       if (left <= 0) {
                         // Building the state spent the deadline: nothing is sent, so none is counted or charged.
-                        run.usage.calls -= 1;
                         throw fail(
                           'timeout',
                           'decision model deadline exceeded'
                         );
                       }
+                      dispatch.sent = true;
+                      run.usage.calls += 1;
                       return model.decide({
                         state,
                         questions: { [QUESTION_ID]: question },
@@ -578,12 +580,17 @@ export function createSystemOneReranker(
                     })
                   );
                 } catch (error) {
-                  if (error instanceof DecisionError && error.circuitOpen) {
+                  if (
+                    dispatch.sent &&
+                    error instanceof DecisionError &&
+                    error.circuitOpen
+                  ) {
                     // Refused before dispatch: no request left, so none is counted or charged.
                     run.usage.calls -= 1;
+                    dispatch.sent = false;
                   }
                   if (live(signal)) {
-                    refused(error);
+                    refused(error, dispatch.sent);
                   }
                   return;
                 }

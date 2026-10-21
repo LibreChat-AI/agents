@@ -1104,6 +1104,31 @@ describe('HTTP decisionModel', () => {
     expect(onAnswered).toHaveBeenCalledWith('gate', expect.any(Number));
   });
 
+  it('ignores an async onAnswered that rejects, without an unhandled rejection', async () => {
+    const seen: unknown[] = [];
+    const listener = (reason: unknown): void => {
+      seen.push(reason);
+    };
+    process.on('unhandledRejection', listener);
+    try {
+      const ok = fakeFetch([{ status: 200, body: measured }]);
+      const result = await createHttpDecisionModel({
+        endpoint: 'https://s1.example',
+        apiKey: 'k',
+        dialect: 'systemone',
+        fetch: ok.fetch,
+        onAnswered: async () => {
+          throw new Error('observability');
+        },
+      }).decide({ state: {}, questions: { q: booleanQuestion('?') } });
+      expect(result.answers.q).toMatchObject({ type: 'boolean' });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    } finally {
+      process.off('unhandledRejection', listener);
+    }
+    expect(seen).toEqual([]);
+  });
+
   it('keeps concurrent credential refreshes and request signals independent', async () => {
     const seen: Array<{ refresh: boolean; signal?: AbortSignal }> = [];
     const calls: FetchCall[] = [];

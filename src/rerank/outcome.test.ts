@@ -7,6 +7,7 @@ import type {
   DecisionProviderSettings,
 } from '@/decisions';
 import type { RankRequest, RerankOutcome, OutcomeReranker } from './types';
+import type { FallbackStep } from './core';
 import {
   probePin,
   rerankCost,
@@ -15,6 +16,7 @@ import {
   estimatedUsage,
   createScoreCache,
   toOutcomeReranker,
+  createBm25Reranker,
   createSystemOneReranker,
   createCrossEncoderReranker,
 } from './core';
@@ -168,6 +170,24 @@ function spin(ms: number): void {
   while (performance.now() < end) {
     // Busy-wait: no timer can fire meanwhile.
   }
+}
+
+/** Rejections nobody handled while `run` and the turns after it ran. */
+async function unhandledDuring(
+  run: () => Promise<unknown>
+): Promise<unknown[]> {
+  const seen: unknown[] = [];
+  const listener = (reason: unknown): void => {
+    seen.push(reason);
+  };
+  process.on('unhandledRejection', listener);
+  try {
+    await run();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  } finally {
+    process.off('unhandledRejection', listener);
+  }
+  return seen;
 }
 
 /** An in-process decision model answering `score(request)` after `delayMs`, recording when each request was sent. */
@@ -851,6 +871,71 @@ describe('System One per-document ranking', () => {
       status: 'skipped',
       reason: 'timeout',
       usage: { calls: 1, estimatedTokens: 600 },
+    });
+  });
+
+  it('counts nothing for a custom state that throws, since no request is sent', async () => {
+    const { model, sent } = fakeJev(() => 2);
+    const outcome = await createSystemOneReranker({
+      model,
+      rubric,
+      state: () => {
+        throw new Error('boom');
+      },
+    }).rank({ query: 'q', documents: ['a', 'b', 'c'] });
+    expect(sent).toHaveLength(0);
+    expect(outcome).toMatchObject({
+      status: 'skipped',
+      reason: 'error',
+      usage: emptyUsage,
+    });
+    expect(outcome.attempts).toEqual([
+      expect.objectContaining({
+        status: 'skipped',
+        reason: 'error',
+        usage: emptyUsage,
+      }),
+    ]);
+    const partial = await createSystemOneReranker({
+      model,
+      rubric,
+      state: (query, document) => {
+        if (document === 'b') {
+          throw new Error('boom');
+        }
+        return { query, document };
+      },
+    }).rank({ query: 'q', documents: ['a', 'b', 'c'] });
+    expect(sent).toHaveLength(2);
+    expect(partial).toMatchObject({
+      status: 'skipped',
+      reason: 'partial',
+      usage: { calls: 2, inputTokens: 20, estimatedTokens: 0 },
+    });
+  });
+
+  it('ignores a score cache whose methods reject, without an unhandled rejection', async () => {
+    const { model, sent } = fakeJev(() => 2);
+    const cache = {
+      get: (() => Promise.reject(new Error('get'))) as unknown as (
+        key: unknown
+      ) => number | undefined,
+      set: async (): Promise<void> => {
+        throw new Error('set');
+      },
+    };
+    let outcome: RerankOutcome | undefined;
+    const unhandled = await unhandledDuring(async () => {
+      outcome = await createSystemOneReranker({ model, rubric, cache }).rank({
+        query: 'q',
+        documents: ['a', 'b'],
+      });
+    });
+    expect(unhandled).toEqual([]);
+    expect(sent).toHaveLength(2);
+    expect(outcome).toMatchObject({
+      status: 'ok',
+      usage: { calls: 2, cached: 0 },
     });
   });
 
@@ -1720,6 +1805,113 @@ describe('withFallback', () => {
     expect(step.requests).toHaveLength(0);
   });
 
+  it('treats an attempt with a malformed usage counter or duration as a broken step', async () => {
+    const answer = (attempt: Partial<RerankOutcome['attempts'][number]>) =>
+      scripted('cross-encoder', () => ({
+        results: [
+          { index: 1, score: 0.9 },
+          { index: 0, score: 0.1 },
+        ],
+        provider: 'cross-encoder',
+        model: 'cross-encoder-model',
+        status: 'ok',
+        reason: null,
+        attempts: [
+          {
+            provider: 'cross-encoder',
+            model: 'cross-encoder-model',
+            status: 'ok',
+            reason: null,
+            durationMs: 1,
+            usage: { ...emptyUsage, calls: 1, inputTokens: 10 },
+            ...attempt,
+          },
+        ],
+        durationMs: 1,
+        usage: { ...emptyUsage, calls: 1, inputTokens: 10 },
+      }));
+    for (const attempt of [
+      { usage: { ...emptyUsage, calls: -3, inputTokens: Number.NaN } },
+      { usage: {} as typeof emptyUsage },
+      {
+        usage: { ...emptyUsage, outputTokens: undefined as unknown as number },
+      },
+      { durationMs: -1 },
+    ]) {
+      const outcome = await withFallback([
+        { reranker: answer(attempt) },
+        { reranker: noneReranker() },
+      ]).rank({ query: 'q', documents: ['a', 'b'] });
+      expect(outcome).toMatchObject({ status: 'skipped', provider: 'none' });
+      expect(outcome.attempts[0]).toMatchObject({
+        provider: 'cross-encoder',
+        status: 'failed',
+      });
+      for (const { usage, durationMs } of outcome.attempts) {
+        expect(durationMs).toBeGreaterThanOrEqual(0);
+        for (const value of Object.values(usage)) {
+          expect(Number.isFinite(value) && value >= 0).toBe(true);
+        }
+        expect(Object.keys(usage).sort()).toEqual(
+          Object.keys(emptyUsage).sort()
+        );
+      }
+    }
+    const healthy = await withFallback([
+      { reranker: answer({}) },
+      { reranker: noneReranker() },
+    ]).rank({ query: 'q', documents: ['a', 'b'] });
+    expect(healthy).toMatchObject({ status: 'ok', provider: 'cross-encoder' });
+  });
+
+  it('treats a sparse attempts array as a broken step', async () => {
+    const holes = scripted('bm25', () => ({
+      results: [
+        { index: 1, score: 3 },
+        { index: 0, score: 1 },
+      ],
+      provider: 'bm25',
+      model: 'okapi',
+      status: 'ok',
+      reason: null,
+      attempts: new Array<RerankOutcome['attempts'][number]>(1),
+      durationMs: 1,
+      usage: { ...emptyUsage },
+    }));
+    const outcome = await withFallback([
+      { reranker: holes },
+      { reranker: noneReranker() },
+    ]).rank({ query: 'q', documents: ['a', 'b'] });
+    expect(outcome).toMatchObject({ status: 'skipped', provider: 'none' });
+    expect(outcome.attempts).not.toContain(undefined);
+    expect(outcome.attempts[0]).toMatchObject({ status: 'failed' });
+  });
+
+  it('refuses a sparse chain at construction', () => {
+    expect(() => withFallback(new Array<FallbackStep>(2))).toThrow(
+      'invalid reranker chain'
+    );
+  });
+
+  it('ignores an async onAttempt that rejects, without an unhandled rejection', async () => {
+    let outcome: RerankOutcome | undefined;
+    const unhandled = await unhandledDuring(async () => {
+      outcome = await withFallback(
+        [
+          { reranker: createBm25Reranker({ idf: () => 1, avgdl: 2 }) },
+          { reranker: noneReranker() },
+        ],
+        {
+          onAttempt: async () => {
+            throw new Error('bookkeeping');
+          },
+        }
+      ).rank({ query: 'alpha', documents: ['alpha beta', 'gamma'] });
+    });
+    expect(unhandled).toEqual([]);
+    expect(outcome).toMatchObject({ status: 'ok', provider: 'bm25' });
+  });
+
   it('bounds the whole chain by the request deadline, not the sum of its steps', async () => {
     const server = await stub((call) => {
       const reply = relevance(RELEVANCE)(call);
@@ -1753,6 +1945,50 @@ describe('withFallback', () => {
     });
     expect(unbounded.requests[0].deadlineMs).toBeLessThanOrEqual(100);
     expect(unbounded.requests[0].signal).toBeInstanceOf(AbortSignal);
+  });
+});
+
+describe('sparse document arrays', () => {
+  const sparse = (): string[] => new Array<string>(2);
+
+  it('is invalid_request for every reranker, before any request', async () => {
+    const server = await stub(relevance(RELEVANCE));
+    const { model, sent } = fakeJev(() => 2);
+    const rerankers: OutcomeReranker[] = [
+      createSystemOneReranker({ model, rubric }),
+      createSystemOneReranker({ model, rubric, mode: 'batch' }),
+      createCrossEncoderReranker({
+        url: `${server.url}/rerank`,
+        model: 'm',
+        apiKey: 'k',
+      }),
+      createBm25Reranker({ idf: () => 1, avgdl: 2 }),
+      withFallback([
+        { reranker: createBm25Reranker({ idf: () => 1, avgdl: 2 }) },
+        { reranker: noneReranker() },
+      ]),
+    ];
+    for (const reranker of rerankers) {
+      const outcome = await reranker.rank({ query: 'q', documents: sparse() });
+      expect(outcome).toMatchObject({
+        status: 'skipped',
+        reason: 'invalid_request',
+        usage: emptyUsage,
+      });
+      expect(outcome.results).toEqual([
+        { index: 0, score: null },
+        { index: 1, score: null },
+      ]);
+    }
+    expect(sent).toHaveLength(0);
+    expect(server.calls).toHaveLength(0);
+  });
+
+  it('refuses a sparse rubric at construction', () => {
+    const { model } = fakeJev(() => 2);
+    expect(() =>
+      createSystemOneReranker({ model, rubric: new Array<string>(3) })
+    ).toThrow('invalid reranker configuration');
   });
 });
 
@@ -1910,6 +2146,110 @@ describe('toOutcomeReranker and rerankCost', () => {
     expect(cost).toEqual({
       usd: 0.088,
       unpriced: [{ provider: 'cross-encoder', model: 'unlisted' }],
+    });
+  });
+});
+
+describe('rerankCost rates', () => {
+  const attempt = (
+    provider: RerankOutcome['provider'],
+    model: string,
+    usage: Partial<typeof emptyUsage>
+  ): RerankOutcome['attempts'][number] => ({
+    provider,
+    model,
+    status: 'ok',
+    reason: null,
+    durationMs: 1,
+    usage: { ...emptyUsage, ...usage },
+  });
+
+  it('lists an attempt as unpriced when its entry has no rate for a reported dimension it used', () => {
+    expect(
+      rerankCost(
+        { attempts: [attempt('cross-encoder', 'jina', { inputTokens: 5000 })] },
+        { 'cross-encoder': { '*': { perSearchUnit: 0.002 } } }
+      )
+    ).toEqual({
+      usd: 0,
+      unpriced: [{ provider: 'cross-encoder', model: 'jina' }],
+    });
+    expect(
+      rerankCost(
+        {
+          attempts: [
+            attempt('cross-encoder', 'm', {
+              inputTokens: 1_000_000,
+              searchUnits: 10,
+            }),
+          ],
+        },
+        { 'cross-encoder': { m: { inputPerMTok: 0.05 } } }
+      )
+    ).toEqual({
+      usd: 0,
+      unpriced: [{ provider: 'cross-encoder', model: 'm' }],
+    });
+    expect(
+      rerankCost(
+        { attempts: [attempt('systemone', 'jev', { inputTokens: 1_000_000 })] },
+        { systemone: { jev: {} } }
+      )
+    ).toEqual({ usd: 0, unpriced: [{ provider: 'systemone', model: 'jev' }] });
+  });
+
+  it('treats an invalid rate as missing, and an explicit 0 as free', () => {
+    for (const inputPerMTok of [Number.NaN, -1, '0.05' as unknown as number]) {
+      expect(
+        rerankCost(
+          { attempts: [attempt('systemone', 'jev', { inputTokens: 10 })] },
+          { systemone: { jev: { inputPerMTok } } }
+        )
+      ).toEqual({
+        usd: 0,
+        unpriced: [{ provider: 'systemone', model: 'jev' }],
+      });
+    }
+    expect(
+      rerankCost(
+        {
+          attempts: [
+            attempt('cross-encoder', 'm', {
+              inputTokens: 1_000_000,
+              searchUnits: 10,
+            }),
+          ],
+        },
+        { 'cross-encoder': { m: { inputPerMTok: 0, perSearchUnit: 0.002 } } }
+      )
+    ).toEqual({ usd: 0.02, unpriced: [] });
+  });
+
+  it('prices an estimate by whichever of its rates the entry has, and lists it only when it has neither', () => {
+    const abandoned = attempt('cross-encoder', 'm', {
+      estimatedTokens: 800,
+      estimatedSearchUnits: 1,
+    });
+    expect(
+      rerankCost(
+        { attempts: [abandoned] },
+        { 'cross-encoder': { m: { perSearchUnit: 0.002 } } }
+      )
+    ).toEqual({ usd: 0.002, unpriced: [] });
+    expect(
+      rerankCost(
+        { attempts: [abandoned] },
+        { 'cross-encoder': { m: { inputPerMTok: 1 } } }
+      )
+    ).toEqual({ usd: 0.0008, unpriced: [] });
+    expect(
+      rerankCost(
+        { attempts: [abandoned] },
+        { 'cross-encoder': { m: { outputPerMTok: 1 } } }
+      )
+    ).toEqual({
+      usd: 0,
+      unpriced: [{ provider: 'cross-encoder', model: 'm' }],
     });
   });
 });

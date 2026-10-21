@@ -2,6 +2,7 @@ import type { AwaitWithinDeadline } from './deadline';
 import type { DecisionCredential } from './types';
 import { withDecisionDeadline } from './deadline';
 import { DecisionError } from './types';
+import { callHook } from './hook';
 
 const DEFAULT_TIMEOUT_MS = 4_000;
 const DEFAULT_MAX_RETRIES = 2;
@@ -30,7 +31,10 @@ export interface TransportOptions {
   maxRetries?: number;
   fetch?: DecisionFetch;
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
-  /** Called only after the response parses, with no state, answers, or credentials. */
+  /**
+   * Called only after the response parses, with no state, answers, or
+   * credentials. Not awaited; a throw or a rejected promise is ignored.
+   */
   onAnswered?: (label: string, ms: number) => void;
 }
 
@@ -294,11 +298,8 @@ export function createTransport(options: TransportOptions): Transport {
             }
             const body = await readResponse(response.body, waitFor, providerId);
             const result = await waitFor(Promise.resolve(parse(body)));
-            try {
-              onAnswered?.(label, performance.now() - started);
-            } catch {
-              // Observability must not turn a valid answer into a retried request.
-            }
+            // Observability, sync or async, must not turn a valid answer into a retried request.
+            callHook(() => onAnswered?.(label, performance.now() - started));
             return result;
           } catch (error) {
             if (wasAborted()) {

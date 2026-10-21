@@ -15,7 +15,12 @@ export interface RerankCacheKey {
   state: string;
 }
 
-/** Per-document scores; a host can supply its own (for example, hashed keys or a shared store). */
+/**
+ * Per-document scores; a host can supply its own (for example, hashed keys or
+ * a shared store). Both are synchronous: a throw from either is a miss, `set`
+ * is not awaited, and a promise either returns is ignored (its rejection
+ * included), so an asynchronous store must be fronted by a synchronous one.
+ */
 export interface RerankScoreCache {
   get(key: RerankCacheKey): number | undefined;
   set(key: RerankCacheKey, score: number): void;

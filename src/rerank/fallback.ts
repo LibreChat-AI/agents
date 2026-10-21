@@ -18,10 +18,13 @@ import {
   identityOutcome,
   isRankedOrder,
   emptyRerankUsage,
+  everySlot,
+  isRerankUsage,
   rankRequestProblem,
   isRerankPermutation,
 } from './outcome';
 import { DecisionError, isDecisionObject } from '../decisions/types';
+import { callHook } from '../decisions/hook';
 
 /**
  * Identity order, never a request: the last step of a chain, or the whole
@@ -67,7 +70,10 @@ export interface FallbackOptions {
   gate?: (
     reranker: OutcomeReranker
   ) => string | null | undefined | Promise<string | null | undefined>;
-  /** Sees every step that ran, for backoff bookkeeping; a throw is ignored. */
+  /**
+   * Sees every step that ran, for backoff bookkeeping. Not awaited; a throw
+   * or a rejected promise is ignored.
+   */
   onAttempt?: (reranker: OutcomeReranker, outcome: RerankOutcome) => void;
 }
 
@@ -150,7 +156,8 @@ function isAttempt(value: unknown): value is RerankAttempt {
     ATTEMPT_STATUSES.has(value.status) &&
     isReason(value.reason) &&
     isFiniteNumber(value.durationMs) &&
-    isDecisionObject(value.usage)
+    value.durationMs >= 0 &&
+    isRerankUsage(value.usage)
   );
 }
 
@@ -174,7 +181,7 @@ function isOutcome(value: unknown, documents: number): value is RerankOutcome {
     (value.threshold !== undefined ||
       value.results.every((entry) => entry.kept === undefined)) &&
     Array.isArray(value.attempts) &&
-    value.attempts.every(isAttempt) &&
+    everySlot(value.attempts as unknown[], isAttempt) &&
     (value.threshold === undefined || isFiniteNumber(value.threshold)) &&
     (value.pinVerified === undefined || typeof value.pinVerified === 'boolean')
   );
@@ -398,9 +405,10 @@ function stepDeadline(
  * System One threshold. A step that throws, rejects, returns something that
  * breaks the `RerankOutcome` contract (a full permutation in score order,
  * every document scored when it answers, `kept` only with a `threshold`,
- * well-formed attempts and fields), or outlives its deadline or the caller's
- * abort by `STEP_GRACE_MS` is a failed step; a step that ran but reported no
- * attempt is recorded as one. A request's `deadlineMs` bounds the whole
+ * well-formed attempts whose usage counters and durations are finite counts
+ * of at least zero, and well-formed fields), or outlives its deadline or the
+ * caller's abort by `STEP_GRACE_MS` is a failed step; a step that ran but
+ * reported no attempt is recorded as one. A request's `deadlineMs` bounds the whole
  * chain, gates included: each step gets the lesser of its own deadline and
  * what is left, a step without one gets what is left, and once nothing is
  * left the chain stops with `timeout`. Usage sums every attempt: spend counts what was sent,
@@ -414,16 +422,17 @@ export function withFallback(
   if (
     !Array.isArray(steps) ||
     steps.length === 0 ||
-    steps.some(
+    !everySlot(
+      steps,
       (step) =>
-        step === null ||
-        typeof step !== 'object' ||
-        typeof step.reranker?.rank !== 'function' ||
-        !isRerankKind(step.reranker.kind) ||
-        typeof step.reranker.model !== 'string' ||
-        (step.deadlineMs !== undefined &&
-          (!Number.isSafeInteger(step.deadlineMs) ||
-            validDeadline(step.deadlineMs) === undefined))
+        step !== null &&
+        typeof step === 'object' &&
+        typeof step.reranker?.rank === 'function' &&
+        isRerankKind(step.reranker.kind) &&
+        typeof step.reranker.model === 'string' &&
+        (step.deadlineMs === undefined ||
+          (Number.isSafeInteger(step.deadlineMs) &&
+            validDeadline(step.deadlineMs) !== undefined))
     )
   ) {
     throw new DecisionError('bad_request', 'invalid reranker chain', {
@@ -504,11 +513,8 @@ export function withFallback(
           stepDeadline(chain[index].deadlineMs, expiresAt),
           request.signal
         );
-        try {
-          onAttempt?.(reranker, outcome);
-        } catch {
-          // Bookkeeping must not break a ranking.
-        }
+        // Bookkeeping, sync or async, must not break a ranking.
+        callHook(() => onAttempt?.(reranker, outcome));
         attempts.push(
           ...(outcome.attempts.length > 0
             ? outcome.attempts
