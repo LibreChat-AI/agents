@@ -174,6 +174,24 @@ describe('commandToken', () => {
     expect(error.message).not.toContain(refused);
   });
 
+  it('redacts a cached token shorter than eight characters when its refresh fails', async () => {
+    const refused = 'Zq7xK2p';
+    const mint = commandToken(
+      await script(
+        [
+          `if (n === 1) { process.stdout.write(${JSON.stringify(`${refused}\n`)}); process.exit(0); }`,
+          `process.stderr.write(${JSON.stringify(`refresh failed: token ${refused} was refused\n`)});`,
+          'process.exit(1);',
+        ].join('\n')
+      )
+    );
+    await expect(mint({ refresh: false })).resolves.toBe(refused);
+    const error = await rejection(mint({ refresh: true, refused }));
+    expect(error.message).toBe(
+      'token command exited with code 1: refresh failed: token [REDACTED] was refused'
+    );
+  });
+
   it('hands a refresh that refused an older token the one minted since', async () => {
     const mint = commandToken(
       await script('process.stdout.write("token-" + n + "\\n");')

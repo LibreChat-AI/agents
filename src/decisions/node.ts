@@ -177,7 +177,7 @@ function commandSecrets(command: string): string[] {
 function describeFailure(
   reason: string,
   stderr: string,
-  secrets: string[]
+  secrets: ReadonlyArray<string | null>
 ): string {
   const detail = redact(stderr, secrets).replace(/\s+/g, ' ').trim();
   return detail === '' ? reason : `${reason}: ${detail.slice(0, STDERR_LIMIT)}`;
@@ -205,8 +205,8 @@ function describeFailure(
  * ends only the shell, not the command the shell launched.
  *
  * The message carries the exit status and a redacted stderr excerpt, never
- * stdout, the command, or a token, including a refused token whose refresh
- * failed.
+ * stdout, the command, or a minted token of any length, including a refused
+ * token whose refresh failed.
  */
 export function commandToken(
   command: string,
@@ -289,12 +289,18 @@ export function commandToken(
         if (!finish()) {
           return;
         }
-        /** Partial stdout may hold a token; shorter lines are not credentials and would garble the excerpt. */
+        /**
+         * Partial stdout may hold a token; its shorter lines are not
+         * credentials and would garble the excerpt. The cached token is a
+         * known credential, so it is listed whatever its length.
+         */
         const secrets = [
           ...echoed,
-          cached ?? '',
-          ...stdout().split(/\r?\n/),
-        ].filter((line) => line.trim().length >= MIN_SECRET_LENGTH);
+          ...stdout()
+            .split(/\r?\n/)
+            .filter((line) => line.trim().length >= MIN_SECRET_LENGTH),
+          cached,
+        ];
         const { failure, reason } = classify(end);
         reject(
           new DecisionError(
