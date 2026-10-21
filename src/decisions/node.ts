@@ -24,6 +24,8 @@ const DRAIN_MS = 100;
 /** How often a killed run checks whether its process group has emptied, so the `SIGKILL` escalation stops waiting. */
 const REAP_POLL_MS = 25;
 const MAX_EXIT_CODE = 255;
+/** How many recent tokens, cached or not, a failed run's stderr is redacted against. */
+const KNOWN_TOKENS = 8;
 const KILL_SIGNAL = 'SIGTERM';
 const FORCE_SIGNAL = 'SIGKILL';
 const GROUP_KILL = process.platform !== 'win32';
@@ -320,8 +322,9 @@ function validExitCodes(codes: ReadonlyArray<number> | undefined): boolean {
  *
  * The message carries the exit status and a redacted stderr excerpt, never
  * a line of stdout, the command or any word of it (split at whitespace,
- * quotes, and `=`), or a minted token, whatever their length, including a
- * refused token whose refresh failed.
+ * quotes, and `=`), or any of the last eight tokens it minted or was told
+ * were refused, cached or not, whatever their length, including a refused
+ * token whose refresh failed.
  */
 export function commandToken(
   command: string,
@@ -362,6 +365,21 @@ export function commandToken(
   let expiresAt = 0;
   let pending: SharedRun | null = null;
   const echoed = commandSecrets(command);
+  /**
+   * The last tokens minted or refused, cached or not: a run detached by a
+   * breaker reset hands out a token it never caches, and the command's own
+   * store may still hold it or an older one when a later run fails.
+   */
+  const known: string[] = [];
+  const remember = (token: string): void => {
+    if (known.includes(token)) {
+      return;
+    }
+    known.push(token);
+    if (known.length > KNOWN_TOKENS) {
+      known.shift();
+    }
+  };
 
   /** `feedsCache` says whether a token this run mints may still be cached when it lands. */
   const run = (
@@ -442,10 +460,16 @@ export function commandToken(
         }
         /**
          * Any stdout line may be the token, since a successful run accepts
-         * one of any length, and the cached token is a known credential; all
-         * are listed whatever their length, at the cost of a garbled excerpt.
+         * one of any length, and the cached and recent tokens are known
+         * credentials; all are listed whatever their length, at the cost of a
+         * garbled excerpt.
          */
-        const secrets = [...echoed, ...stdout().split(/\r?\n/), cached];
+        const secrets = [
+          ...echoed,
+          ...stdout().split(/\r?\n/),
+          cached,
+          ...known,
+        ];
         const { failure, reason } = classify(end, refusals);
         reject(
           new DecisionError(
@@ -480,6 +504,7 @@ export function commandToken(
           );
           return;
         }
+        remember(token);
         if (!abandoned.aborted && feedsCache()) {
           cached = token;
           /** From completion, so a slow command cannot hand out a token that is already expired. */
@@ -557,6 +582,9 @@ export function commandToken(
   return ({ refresh, refused, signal }): Promise<string> => {
     if (signal?.aborted === true) {
       return Promise.reject(abandonedError());
+    }
+    if (refused !== undefined) {
+      remember(refused);
     }
     /** A run from before a breaker reset carries the credential state the reset was meant to clear; its callers keep it, new ones start fresh. */
     if (pending !== null && pending.generation !== breaker?.generation) {

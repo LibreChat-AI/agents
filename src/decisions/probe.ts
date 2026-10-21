@@ -4,6 +4,7 @@ import { DecisionError } from './types';
 import { redact } from './redact';
 
 const DETAIL_LIMIT = 200;
+const PROBE_FAILED = 'decision model probe failed';
 
 export type DecisionProbe =
   | { ok: true; model: string }
@@ -64,7 +65,7 @@ export async function probe(
         ok: false,
         failure: 'network',
         circuitOpen: false,
-        detail: 'decision model probe failed',
+        detail: PROBE_FAILED,
       };
     }
     return {
@@ -72,7 +73,19 @@ export async function probe(
       failure: error.failure,
       ...(error.status !== undefined ? { status: error.status } : {}),
       circuitOpen: error.circuitOpen,
-      detail: redact(error.message, options.secrets).slice(0, DETAIL_LIMIT),
+      detail: safeDetail(error.message, options.secrets),
     };
+  }
+}
+
+/** The redacted message, or a fixed detail when `secrets` cannot be read: never the raw message, never a throw. */
+function safeDetail(
+  message: string,
+  secrets: DecisionProbeOptions['secrets']
+): string {
+  try {
+    return redact(message, secrets).slice(0, DETAIL_LIMIT);
+  } catch {
+    return PROBE_FAILED;
   }
 }

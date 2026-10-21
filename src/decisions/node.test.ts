@@ -236,6 +236,34 @@ describe('commandToken', () => {
     );
   });
 
+  it('redacts a token a run detached by a breaker reset minted, though it was never cached', async () => {
+    const breaker = createBreaker();
+    const detached = 'Ab3dE6';
+    const mint = commandToken(
+      await script(
+        [
+          `if (n === 1) setTimeout(() => process.stdout.write(${JSON.stringify(`${detached}\n`)}), 300);`,
+          'else if (n === 2) process.stdout.write("Qw9rT2\\n");',
+          `else { process.stderr.write(${JSON.stringify(`cannot refresh ${detached}\n`)}); process.exit(1); }`,
+        ].join('\n')
+      ),
+      { breaker }
+    );
+    const before = mint({ refresh: false });
+    while ((await runs()) < 1) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    breaker.reset();
+    await expect(mint({ refresh: false })).resolves.toBe('Qw9rT2');
+    /** The command's own store now holds the token the detached run minted last. */
+    await expect(before).resolves.toBe(detached);
+    const error = await rejection(mint({ refresh: true, refused: 'Qw9rT2' }));
+    expect(error.message).toBe(
+      'token command exited with code 1: cannot refresh [REDACTED]'
+    );
+    expect(await runs()).toBe(3);
+  });
+
   it('hands a refresh that refused an older token the one minted since', async () => {
     const mint = commandToken(
       await script('process.stdout.write("token-" + n + "\\n");')

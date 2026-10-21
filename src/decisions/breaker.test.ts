@@ -1,4 +1,9 @@
-import type { DecisionFetch, DecisionModel, DecisionCredential } from './core';
+import type {
+  DecisionFetch,
+  DecisionModel,
+  DecisionCredential,
+  DecisionProbeOptions,
+} from './core';
 import {
   probe,
   redact,
@@ -366,6 +371,24 @@ describe('probe', () => {
     expect(result).toMatchObject({
       ok: false,
       detail: 'token [REDACTED] was refused',
+    });
+  });
+
+  it('still resolves, without the message, when the secrets it was handed cannot be read', async () => {
+    const leaky: DecisionModel = {
+      id: 'leaky',
+      model: 'leaky',
+      decide: async () => {
+        throw new DecisionError('unauthorized', 'token short-1 was refused');
+      },
+    };
+    /** A JavaScript host passing a missing config value through. */
+    const options = JSON.parse('{"secrets":null}') as DecisionProbeOptions;
+    await expect(probe(leaky, options)).resolves.toEqual({
+      ok: false,
+      failure: 'unauthorized',
+      circuitOpen: false,
+      detail: 'decision model probe failed',
     });
   });
 });
