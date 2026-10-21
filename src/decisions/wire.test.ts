@@ -215,6 +215,38 @@ describe('System One wire fidelity', () => {
     ).toBeNull();
   });
 
+  it('reads a score and its distribution under one rounding model', () => {
+    // On the grid, but summing to 1.02: only a rounding of some true distribution.
+    const drifted = { '0': 0.25, '1': 0.25, '2': 0.25, '3': 0.27 };
+    expect(
+      readAnswer(
+        { type: 'score', score: 1.53, probabilities: drifted },
+        'systemone'
+      )
+    ).toMatchObject({ score: 1.53 });
+    // These scores are no rounding, so the distribution must sum to one within four decimals as
+    // well, even though each is within the four-decimal bound of the reported expectation 1.56.
+    for (const score of [1.5599, 1.5601]) {
+      expect(
+        readAnswer(
+          { type: 'score', score, probabilities: drifted },
+          'systemone'
+        )
+      ).toBeNull();
+    }
+    // An unrounded score keeps working with a distribution that sums to one.
+    expect(
+      readAnswer(
+        {
+          type: 'score',
+          score: 1.5001,
+          probabilities: { '0': 0.25, '1': 0.25, '2': 0.25, '3': 0.25 },
+        },
+        'systemone'
+      )
+    ).toMatchObject({ score: 1.5001 });
+  });
+
   it('accepts a distribution whose rounding drift scales with its size, and nothing further', () => {
     const kind = questions.kind;
     // True 0.196 x4 + 0.216 rounds to 0.20 x4 + 0.22: a sum of 1.02, inside 0.005 * 5.

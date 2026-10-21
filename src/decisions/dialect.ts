@@ -8,10 +8,11 @@ import { isDecisionObject } from './types';
 /**
  * Hosts in front of System One (ClickHouse gateway, OpenRouter) round every reported number to
  * two decimals, so each value can sit up to half a hundredth from the measured one, and never
- * outside `[0, 1]`. A `systemone` answer whose numbers all sit on that grid is read under this
- * rounding model: its distribution must be one that some measured distribution summing to exactly
- * one rounds to, and its score must round from the expectation of such a distribution. Any other
- * answer, including every `port` answer, keeps the four-decimal bounds. `FLOAT_SLACK` absorbs
+ * outside `[0, 1]`. A `systemone` answer whose probabilities and score all sit on that grid is read
+ * under this rounding model: its distribution must be one that some measured distribution summing
+ * to exactly one rounds to, and its score must round from the expectation of such a distribution.
+ * The model is chosen once per answer, so a single off-grid number puts the whole answer, score
+ * and distribution alike, under the four-decimal bounds, as it does every `port` answer. `FLOAT_SLACK` absorbs
  * binary floating-point error at the exact bounds; anything further out is an inconsistent answer.
  */
 const REPORTED_HALF_STEP = 0.005;
@@ -157,11 +158,13 @@ function isProbability(value: unknown): value is number {
   );
 }
 
-/** `undefined` means malformed; `null` means no distribution was reported. */
+/**
+ * `undefined` means malformed; `null` means no distribution was reported. Whether the values sum
+ * to one depends on the rounding model of the whole answer, so `readAnswer` checks that.
+ */
 function probabilitiesOf(
   raw: unknown,
   answerType: 'choice' | 'score',
-  dialect: DecisionDialect,
   question?: DecisionQuestion,
   selectedChoice?: string
 ): Record<string, number> | null | undefined {
@@ -207,12 +210,7 @@ function probabilitiesOf(
   ) {
     return undefined;
   }
-  const values = Object.values(probabilities);
-  const consistent =
-    dialect === 'systemone' && values.every(isTwoDecimal)
-      ? roundsFromUnitSum(values)
-      : sumsToOne(values);
-  return consistent ? probabilities : undefined;
+  return probabilities;
 }
 
 /** A validated answer, or `null` for one that cannot safely be read. */
@@ -247,13 +245,25 @@ export function readAnswer(
   const probabilities = probabilitiesOf(
     record.probabilities,
     record.type,
-    dialect,
     question,
     record.type === 'choice' && typeof record.choice === 'string'
       ? record.choice
       : undefined
   );
   if (probabilities === undefined) {
+    return null;
+  }
+  const values = probabilities === null ? [] : Object.values(probabilities);
+  /** One rounding model for the answer: its score and its distribution are read under it together. */
+  const rounded =
+    dialect === 'systemone' &&
+    values.every(isTwoDecimal) &&
+    (record.type !== 'score' ||
+      (typeof record.score === 'number' && isTwoDecimal(record.score)));
+  if (
+    probabilities !== null &&
+    !(rounded ? roundsFromUnitSum(values) : sumsToOne(values))
+  ) {
     return null;
   }
   if (record.type === 'choice') {
@@ -288,12 +298,9 @@ export function readAnswer(
     for (const [level, probability] of Object.entries(probabilities)) {
       byLevel[Number(level)] = probability;
     }
-    const consistent =
-      dialect === 'systemone' &&
-      isTwoDecimal(record.score) &&
-      byLevel.every(isTwoDecimal)
-        ? roundsFromExpectation(record.score, byLevel)
-        : nearExpectation(record.score, byLevel);
+    const consistent = rounded
+      ? roundsFromExpectation(record.score, byLevel)
+      : nearExpectation(record.score, byLevel);
     if (!consistent) {
       return null;
     }
