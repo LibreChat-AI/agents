@@ -2327,6 +2327,24 @@ describe('probePin', () => {
       })
     ).toEqual({ verified: false, reason: 'error' });
   });
+
+  it('reports no sentinel status when an open breaker refused the sentinel without a request', async () => {
+    const server = await stub(() => ({ status: 402 }));
+    const breaker = createBreaker();
+    const modelFor = (model: string) =>
+      withBreaker(jev(server.url, { model }, 'key'), breaker);
+    expect(await probePin({ modelFor, pin: 'jev-1.13.0' })).toEqual({
+      verified: false,
+      reason: 'quota',
+      sentinelStatus: 402,
+    });
+    expect(breaker.open).toBe(true);
+    expect(await probePin({ modelFor, pin: 'jev-1.13.0' })).toEqual({
+      verified: false,
+      reason: 'circuit_open',
+    });
+    expect(server.calls).toHaveLength(1);
+  });
 });
 
 describe('probePin input and deadlines', () => {
@@ -2928,6 +2946,107 @@ describe('a deadline during backoff charges no estimate and reports the reply', 
       reason: 'rate_limited',
     });
     expect(outcome.usage.calls).toBe(3);
+  });
+});
+
+describe('a stopped System One step sends nothing more', () => {
+  it('a 429 stops the step at once: the transport does not retry it, though the model allows retries', async () => {
+    const server = await stub(() => ({ status: 429 }));
+    const started = performance.now();
+    const outcome = await createSystemOneReranker({
+      model: jev(server.url, { maxRetries: 2 }),
+      rubric,
+    }).rank({ query: 'q', documents: ['alpha', 'beta', 'gamma'] });
+    // The transport's two backoffs would take a second: none was waited out.
+    expect(performance.now() - started).toBeLessThan(1_000);
+    expect(server.calls).toHaveLength(3);
+    expect(outcome).toMatchObject({
+      status: 'skipped',
+      reason: 'rate_limited',
+    });
+    expect(outcome.usage).toMatchObject({ calls: 3, estimatedTokens: 0 });
+  });
+
+  it('rejects rerank() with the 429 and its Retry-After instead of waiting it out', async () => {
+    const server = await stub(() => ({
+      status: 429,
+      headers: { 'retry-after': '5' },
+    }));
+    const started = performance.now();
+    const error = await createSystemOneReranker({
+      model: jev(server.url, { maxRetries: 2 }),
+      rubric,
+      concurrency: 1,
+    })
+      .rerank({ query: 'q', documents: ['alpha', 'beta', 'gamma'] })
+      .then(
+        () => undefined,
+        (thrown: unknown) => thrown
+      );
+    expect(performance.now() - started).toBeLessThan(1_000);
+    expect(server.calls).toHaveLength(1);
+    expect(error).toBeInstanceOf(DecisionError);
+    expect(error).toMatchObject({
+      failure: 'rate_limited',
+      status: 429,
+      retryAfterMs: 5_000,
+    });
+  });
+
+  it('halts a document backing off from a 5xx once another document stops the step', async () => {
+    const server = await stub((call) =>
+      documentOf(call) === 'alpha'
+        ? { status: 503 }
+        : { status: 402, delayMs: 50 }
+    );
+    const outcome = await createSystemOneReranker({
+      model: jev(server.url, { maxRetries: 2 }),
+      rubric,
+    }).rank({ query: 'q', documents: ['alpha', 'beta'] });
+    expect(outcome).toMatchObject({ status: 'skipped', reason: 'quota' });
+    // The 503 would be retried 250 ms later; the 402 stopped the step first.
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    expect(server.calls.map(documentOf).sort()).toEqual(['alpha', 'beta']);
+    expect(outcome.usage).toMatchObject({ calls: 2, estimatedTokens: 0 });
+  });
+
+  it('rejects rerank() with the error of the failure that stopped the step first', async () => {
+    /** `alpha` answers as another checkpoint at once; `beta` is refused 20 ms later. */
+    const model: DecisionModel = {
+      id: 'mixed',
+      model: 'jev-1.13.0',
+      decide: async (request) => {
+        if ((request.state as { document: string }).document !== 'alpha') {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          throw new DecisionError('unauthorized', 'refused', { status: 401 });
+        }
+        return {
+          model: 'jev-0.9.0',
+          answers: {
+            relevance: {
+              type: 'score',
+              score: 1,
+              confidence: null,
+              probabilities: null,
+            },
+          },
+          usage: null,
+        };
+      },
+    };
+    const reranker = createSystemOneReranker({
+      model,
+      rubric,
+      pin: { model: 'jev-1.13.0' },
+    });
+    const outcome = await reranker.rank({
+      query: 'q',
+      documents: ['alpha', 'beta'],
+    });
+    expect(outcome.reason).toBe('pin_mismatch');
+    await expect(
+      reranker.rerank({ query: 'q', documents: ['alpha', 'beta'] })
+    ).rejects.toMatchObject({ failure: 'malformed_response' });
   });
 });
 

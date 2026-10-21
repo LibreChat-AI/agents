@@ -99,7 +99,9 @@ const MODES: readonly string[] = ['document', 'batch'];
 /**
  * Failures that belong to the host, credential, or model, not to one
  * document: stop sending the rest, and re-issue nothing. A 429 is the host
- * asking for less traffic, so it is one of them.
+ * asking for less traffic, so it is one of them, and for a model that reports
+ * its requests it stops the step on the reply, before the transport would
+ * retry it.
  */
 const STEP_FATAL: ReadonlySet<RerankReason> = new Set<RerankReason>([
   'unauthorized',
@@ -117,7 +119,7 @@ const isCount = (value: unknown): value is number =>
 interface DocumentState {
   scores: Array<number | null>;
   usage: RerankUsage;
-  /** A failure that ends the step for every document. */
+  /** A failure that ends the step for every document, and the error it stands for. */
   stop: RerankReason | null;
   stopError: DecisionError | null;
   /** The first failure that belonged to one document. */
@@ -137,6 +139,20 @@ interface DocumentState {
   outputReports: number;
   /** Set once the outcome is taken; later replies are ignored. */
   settled: boolean;
+}
+
+/** One document's `decide()`. */
+interface Dispatch {
+  /** Whether a request left: at dispatch, or for a model that reports its requests, at its first report. */
+  sent: boolean;
+  /** Requests it reported through `onRequest`. */
+  requests: number;
+  /** For a model that reports its requests, whether one is on the wire; between them (a token mint, a backoff, a 401 refresh) it is not. */
+  onWire: boolean;
+  /** Set once a reply carried an answer: nothing more is sent for it. */
+  answered: boolean;
+  /** Ends it between requests once the step has stopped, so it sends nothing more. */
+  halt: AbortController;
 }
 
 interface DocumentRun {
@@ -510,6 +526,25 @@ export function createSystemOneReranker(
         ),
       });
     }
+    /** `decide()` calls of a model that reports its requests, until each settles. */
+    const dispatches = new Set<Dispatch>();
+    /**
+     * Ends the step for every document: no document is sent after it, and
+     * every reported dispatch between requests is halted, so nothing is
+     * retried into the host. A request on the wire may finish. The first stop
+     * wins, with its own error.
+     */
+    function stopStep(reason: RerankReason, error: DecisionError): void {
+      if (run.stop === null) {
+        run.stop = reason;
+        run.stopError = error;
+      }
+      for (const dispatch of dispatches) {
+        if (!dispatch.onWire && !dispatch.answered) {
+          dispatch.halt.abort();
+        }
+      }
+    }
     const record = (index: number, response: unknown): void => {
       if (!reports) {
         run.replied += 1;
@@ -533,7 +568,13 @@ export function createSystemOneReranker(
           : null;
       if (pin && said !== pin.model) {
         run.echoed = said ?? run.echoed;
-        run.stop ??= 'pin_mismatch';
+        stopStep(
+          'pin_mismatch',
+          fail(
+            'malformed_response',
+            'reranker response did not echo its pinned model'
+          )
+        );
         return;
       }
       run.echoed ??= said;
@@ -579,19 +620,36 @@ export function createSystemOneReranker(
         run.replied += 1;
       }
       if (STEP_FATAL.has(reason)) {
-        run.stop ??= reason;
-        run.stopError ??= decisionError;
+        stopStep(reason, decisionError);
       } else {
         run.failure ??= reason;
         run.failureError ??= decisionError;
       }
     };
 
-    /** A reported request's end, for a model that reports them. */
-    const ended = (status: number | null): void => {
-      if (!run.settled) {
-        run.replied += 1;
-        run.backoff ??= retriedReply(model.id, status);
+    /**
+     * A reported request's end, for a model that reports them. A 429 stops
+     * the step at once rather than after the transport's retries, and a
+     * request that ends without an answer once the step has stopped is
+     * halted, so neither is retried nor re-sent after a 401 refresh.
+     */
+    const ended = (
+      dispatch: Dispatch,
+      status: number | null,
+      retryAfterMs?: number
+    ): void => {
+      if (run.settled) {
+        return;
+      }
+      run.replied += 1;
+      dispatch.onWire = false;
+      dispatch.answered = status !== null && status >= 200 && status < 300;
+      const reply = retriedReply(model.id, status, retryAfterMs);
+      run.backoff ??= reply;
+      if (status === 429 && reply !== null) {
+        stopStep('rate_limited', reply);
+      } else if (run.stop !== null && !dispatch.answered) {
+        dispatch.halt.abort();
       }
     };
 
@@ -602,78 +660,101 @@ export function createSystemOneReranker(
         Math.max(1, remaining),
         request.signal,
         async (signal, waitFor) => {
+          /** One document's request; for a model that reports requests, a stop can halt it between them. */
+          const askOne = async (index: number): Promise<void> => {
+            /**
+             * `sent` is set at dispatch, so a failure before it (a throwing
+             * `state`, a spent deadline) sent nothing; for a model that
+             * reports its requests, only a reported request is sent.
+             */
+            const dispatch: Dispatch = {
+              sent: false,
+              requests: 0,
+              onWire: false,
+              answered: false,
+              halt: new AbortController(),
+            };
+            if (reports) {
+              dispatches.add(dispatch);
+            }
+            const endedHere = (
+              status: number | null,
+              retryAfterMs?: number
+            ): void => ended(dispatch, status, retryAfterMs);
+            let response: DecisionResult;
+            try {
+              response = await waitFor(
+                Promise.resolve().then(() => {
+                  const state = stateFor(index);
+                  const left = Math.ceil(expiresAt - performance.now());
+                  if (left <= 0 || signal.aborted) {
+                    // The state spent the deadline, or the step ended meanwhile: nothing is sent, counted, or charged.
+                    throw fail('timeout', 'decision model deadline exceeded');
+                  }
+                  if (!reports) {
+                    dispatch.sent = true;
+                    run.usage.calls += 1;
+                  }
+                  return model.decide({
+                    state,
+                    questions: { [QUESTION_ID]: question },
+                    signal: reports
+                      ? AbortSignal.any([signal, dispatch.halt.signal])
+                      : signal,
+                    timeoutMs: left,
+                    label: 'rerank',
+                    onRequest: () => {
+                      if (run.settled) {
+                        return;
+                      }
+                      dispatch.requests += 1;
+                      if (reports) {
+                        dispatch.onWire = true;
+                        dispatch.sent = true;
+                        run.usage.calls += 1;
+                      } else if (dispatch.requests > 1) {
+                        // The first request was counted at dispatch; a later one is a retry, so the one before it ended.
+                        run.usage.calls += 1;
+                        run.replied += 1;
+                      }
+                    },
+                    ...(reports ? { onResponse: endedHere } : {}),
+                  });
+                })
+              );
+            } catch (error) {
+              dispatches.delete(dispatch);
+              if (dispatch.halt.signal.aborted) {
+                // Halted between requests by the step's stop: every request it sent was reported and ended.
+                return;
+              }
+              if (
+                !reports &&
+                dispatch.sent &&
+                error instanceof DecisionError &&
+                error.circuitOpen
+              ) {
+                // Refused before dispatch: no request left, so none is counted or charged.
+                run.usage.calls -= 1;
+                dispatch.sent = false;
+              }
+              if (live(signal)) {
+                refused(error, dispatch.sent);
+              }
+              return;
+            }
+            dispatches.delete(dispatch);
+            if (live(signal)) {
+              record(index, response);
+            }
+          };
           const ask = (index: number): Promise<void> =>
             semaphore
               .run(async (): Promise<void> => {
                 if (run.stop !== null || !live(signal)) {
                   return;
                 }
-                /**
-                 * `sent` is set at dispatch, so a failure before it (a throwing
-                 * `state`, a spent deadline) sent nothing; for a model that
-                 * reports its requests, only a reported request is sent.
-                 */
-                const dispatch = { sent: false, requests: 0 };
-                let response: DecisionResult;
-                try {
-                  response = await waitFor(
-                    Promise.resolve().then(() => {
-                      const state = stateFor(index);
-                      const left = Math.ceil(expiresAt - performance.now());
-                      if (left <= 0 || signal.aborted) {
-                        // The state spent the deadline, or the step ended meanwhile: nothing is sent, counted, or charged.
-                        throw fail(
-                          'timeout',
-                          'decision model deadline exceeded'
-                        );
-                      }
-                      if (!reports) {
-                        dispatch.sent = true;
-                        run.usage.calls += 1;
-                      }
-                      return model.decide({
-                        state,
-                        questions: { [QUESTION_ID]: question },
-                        signal,
-                        timeoutMs: left,
-                        label: 'rerank',
-                        onRequest: () => {
-                          if (run.settled) {
-                            return;
-                          }
-                          dispatch.requests += 1;
-                          if (reports) {
-                            dispatch.sent = true;
-                            run.usage.calls += 1;
-                          } else if (dispatch.requests > 1) {
-                            // The first request was counted at dispatch; a later one is a retry, so the one before it ended.
-                            run.usage.calls += 1;
-                            run.replied += 1;
-                          }
-                        },
-                        ...(reports ? { onResponse: ended } : {}),
-                      });
-                    })
-                  );
-                } catch (error) {
-                  if (
-                    !reports &&
-                    dispatch.sent &&
-                    error instanceof DecisionError &&
-                    error.circuitOpen
-                  ) {
-                    // Refused before dispatch: no request left, so none is counted or charged.
-                    run.usage.calls -= 1;
-                    dispatch.sent = false;
-                  }
-                  if (live(signal)) {
-                    refused(error, dispatch.sent);
-                  }
-                  return;
-                }
-                if (live(signal)) {
-                  record(index, response);
-                }
+                await askOne(index);
               })
               .catch(() => {});
           await waitFor(Promise.all(unscored().map(ask)));
@@ -731,16 +812,8 @@ export function createSystemOneReranker(
         'reranker requires a valid score for every candidate'
       );
     let failed: { reason: RerankReason; error: DecisionError } | null = null;
-    if (run.stop !== null) {
-      failed = {
-        reason: run.stop,
-        error:
-          run.stopError ??
-          fail(
-            'malformed_response',
-            'reranker response did not echo its pinned model'
-          ),
-      };
+    if (run.stop !== null && run.stopError !== null) {
+      failed = { reason: run.stop, error: run.stopError };
     } else if (left > 0 && interrupted !== null) {
       failed = { reason: rerankReasonOf(interrupted), error: interrupted };
     } else if (left > 0 && left === n - run.usage.cached) {

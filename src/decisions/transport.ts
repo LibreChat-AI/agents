@@ -43,7 +43,8 @@ export interface TransportOptions {
  * retries and every re-send after a 401 included. `onResponse` is called once
  * per such request that ended before the deadline or the caller's abort, with
  * its HTTP status (after a successful body is read in full) or `null` when the
- * fetch failed; a request interrupted in flight gets none. Neither is awaited;
+ * fetch failed, and a reply's `Retry-After` in milliseconds when it was not OK
+ * and sent one; a request interrupted in flight gets none. Neither is awaited;
  * a throw or a rejected promise is ignored.
  */
 export type Transport = <T>(
@@ -52,7 +53,7 @@ export type Transport = <T>(
   label: string,
   timeoutOverrideMs?: number,
   onRequest?: () => void,
-  onResponse?: (status: number | null) => void
+  onResponse?: (status: number | null, retryAfterMs?: number) => void
 ) => Promise<T>;
 
 export function failureForStatus(
@@ -294,9 +295,12 @@ export function createTransport(options: TransportOptions): Transport {
             }
             /** Reports the request's end once, unless the deadline or the caller's abort interrupted it. */
             let open = true;
-            const ended = (status: number | null): void => {
+            const ended = (
+              status: number | null,
+              retryAfter?: number
+            ): void => {
               if (open && !wasAborted() && onResponse !== undefined) {
-                callHook(() => onResponse(status));
+                callHook(() => onResponse(status, retryAfter));
               }
               open = false;
             };
@@ -319,16 +323,17 @@ export function createTransport(options: TransportOptions): Transport {
               throw error;
             }
             if (!response.ok) {
-              ended(response.status);
+              const retryAfter = retryAfterMs(
+                response.headers.get('retry-after')
+              );
+              ended(response.status, retryAfter);
               void response.body?.cancel().catch(() => {});
               const error = new DecisionError(
                 failureForStatus(response.status),
                 `decision model returned HTTP ${response.status}`,
                 { provider: providerId, status: response.status }
               );
-              error.retryAfterMs = retryAfterMs(
-                response.headers.get('retry-after')
-              );
+              error.retryAfterMs = retryAfter;
               throw error;
             }
             let body: string;

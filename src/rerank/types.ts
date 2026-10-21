@@ -13,10 +13,11 @@ export interface RerankRequest {
   onRequest?: () => void;
   /**
    * Called once per reported request that ended with a reply (its HTTP
-   * status) or a failure without one (`null`), for one that reports them
+   * status, and its `Retry-After` in milliseconds when it was not OK and
+   * sent one) or a failure without one (`null`), for one that reports them
    * (see `DecisionRequest.onResponse`). Not awaited; a throw is ignored.
    */
-  onResponse?: (status: number | null) => void;
+  onResponse?: (status: number | null, retryAfterMs?: number) => void;
 }
 
 export interface RankedDocument {

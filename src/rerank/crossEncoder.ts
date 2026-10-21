@@ -232,9 +232,9 @@ export function createCrossEncoderReranker(
           () => {
             usage.calls += 1;
           },
-          (status) => {
+          (status, retryAfterMs) => {
             tally.ended += 1;
-            tally.backoff ??= retriedReply(id, status);
+            tally.backoff ??= retriedReply(id, status, retryAfterMs);
           }
         );
         usage.inputTokens = parsed.tokens;

@@ -35,6 +35,7 @@ export type PinProbe =
        */
       reason: 'sentinel_accepted' | 'echo_mismatch' | RerankReason;
       echoed?: string;
+      /** The HTTP status the sentinel request got, when it got a reply. */
       sentinelStatus?: number;
     };
 
@@ -103,12 +104,15 @@ export async function probePin(options: PinProbeOptions): Promise<PinProbe> {
     };
   } catch (error) {
     if (!(error instanceof DecisionError) || error.status !== 404) {
+      // An open breaker refuses with the status that tripped it, not one the sentinel got.
+      const replied =
+        error instanceof DecisionError &&
+        error.status !== undefined &&
+        !error.circuitOpen;
       return {
         verified: false,
         reason: rerankReasonOf(error),
-        ...(error instanceof DecisionError && error.status !== undefined
-          ? { sentinelStatus: error.status }
-          : {}),
+        ...(replied ? { sentinelStatus: error.status } : {}),
       };
     }
   }

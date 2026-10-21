@@ -474,16 +474,19 @@ export function rerankReasonOf(error: unknown): RerankReason {
  */
 export function retriedReply(
   provider: string,
-  status: number | null
+  status: number | null,
+  retryAfterMs?: number
 ): DecisionError | null {
   if (status === null || (status !== 429 && status < 500)) {
     return null;
   }
-  return new DecisionError(
+  const error = new DecisionError(
     failureForStatus(status),
     `decision model returned HTTP ${status}`,
     { provider, status }
   );
+  error.retryAfterMs = retryAfterMs;
+  return error;
 }
 
 /** A positive integer deadline no longer than an hour, or `undefined` when it is not one. */
@@ -601,10 +604,13 @@ export function toOutcomeReranker(
       let settled = false;
       try {
         const deadlineMs = validDeadline(request.deadlineMs);
-        const onResponse = (status: number | null): void => {
+        const onResponse = (
+          status: number | null,
+          retryAfterMs?: number
+        ): void => {
           if (!settled) {
             tally.ended += 1;
-            tally.backoff ??= retriedReply(reranker.id, status);
+            tally.backoff ??= retriedReply(reranker.id, status, retryAfterMs);
           }
         };
         const call = (
