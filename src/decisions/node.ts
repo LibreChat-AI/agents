@@ -12,10 +12,12 @@ import { redact } from './redact';
 /** Fifty minutes: under the ClickHouse gateway's hourly token. */
 const DEFAULT_TTL_MS = 50 * 60_000;
 const DEFAULT_TIMEOUT_MS = 60_000;
+const DEFAULT_KILL_GRACE_MS = 2_000;
 const MAX_OUTPUT_BYTES = 1024 * 1024;
 const STDERR_LIMIT = 200;
 const MIN_SECRET_LENGTH = 8;
 const KILL_SIGNAL = 'SIGTERM';
+const FORCE_SIGNAL = 'SIGKILL';
 const GROUP_KILL = process.platform !== 'win32';
 
 export const COMMAND_TOKEN_PROVIDER = 'command';
@@ -29,6 +31,12 @@ export interface CommandTokenOptions {
   ttlMs?: number;
   /** Bounds one run of the command. */
   timeoutMs?: number;
+  /**
+   * How long a killed run gets to exit on `SIGTERM` before it is sent
+   * `SIGKILL`, so a command that traps or ignores `SIGTERM` cannot outlive
+   * its run; `0` escalates at once. Defaults to two seconds.
+   */
+  killGraceMs?: number;
 }
 
 interface SharedRun {
@@ -100,20 +108,40 @@ function classify(end: RunEnd): { failure: DecisionFailure; reason: string } {
 /**
  * Off Windows the shell leads its own process group, so a kill reaches the
  * command it forked (dash does not `exec` it) and anything that command
- * started, not only the shell.
+ * started, not only the shell. On Windows it reaches only the shell.
  */
-function killRun(child: ChildProcess): void {
+function killRun(child: ChildProcess, signal: NodeJS.Signals): void {
   if (child.pid === undefined) {
     return;
   }
   try {
     if (GROUP_KILL) {
-      process.kill(-child.pid, KILL_SIGNAL);
+      process.kill(-child.pid, signal);
     } else {
-      child.kill(KILL_SIGNAL);
+      child.kill(signal);
     }
   } catch {
     // Already gone.
+  }
+}
+
+/** Whether anything a kill would reach is still running: off Windows, any member of the run's process group. */
+function runAlive(child: ChildProcess): boolean {
+  if (child.pid === undefined) {
+    return false;
+  }
+  if (!GROUP_KILL) {
+    return child.exitCode === null && child.signalCode === null;
+  }
+  try {
+    process.kill(-child.pid, 0);
+    return true;
+  } catch (error) {
+    return !(
+      error instanceof Error &&
+      'code' in error &&
+      error.code === 'ESRCH'
+    );
   }
 }
 
@@ -168,8 +196,11 @@ function describeFailure(
  * fresh one. A run that exits non-zero or prints nothing rejects with an
  * `unauthorized` `DecisionError`; a run killed at `timeoutMs` rejects with
  * `timeout`, and a spawn failure or output overflow with `network`, so a slow
- * command or one that cannot start never trips a breaker. Off Windows a kill
- * reaches the command's whole process group, not only the shell.
+ * command or one that cannot start never trips a breaker. A kill sends
+ * `SIGTERM`, then `SIGKILL` once `killGraceMs` passes with the run still
+ * alive, so a killed run overlaps the next one for at most that grace. Off
+ * Windows a kill reaches the command's whole process group; on Windows it
+ * ends only the shell, not the command the shell launched.
  *
  * The message carries the exit status and a redacted stderr excerpt, never
  * stdout, the command, or a token, including a refused token whose refresh
@@ -181,12 +212,17 @@ export function commandToken(
 ): DecisionTokenMinter {
   const ttlMs = options.ttlMs ?? DEFAULT_TTL_MS;
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const killGraceMs = options.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
   if (typeof command !== 'string' || command.trim() === '') {
     throw new DecisionError('bad_request', 'token command is empty', {
       provider: COMMAND_TOKEN_PROVIDER,
     });
   }
-  if (!validMs(ttlMs, true) || !validMs(timeoutMs, false)) {
+  if (
+    !validMs(ttlMs, true) ||
+    !validMs(timeoutMs, false) ||
+    !validMs(killGraceMs, true)
+  ) {
     throw new DecisionError('bad_request', 'invalid token command timing', {
       provider: COMMAND_TOKEN_PROVIDER,
     });
@@ -218,8 +254,16 @@ export function commandToken(
         return;
       }
       let settled = false;
+      /** Armed by the first kill; outlives the shell, since a forked command may ignore the `SIGTERM` that ended it. */
+      let escalation: NodeJS.Timeout | undefined;
       const stop = (end: RunEnd): void => {
-        killRun(child);
+        if (escalation === undefined) {
+          killRun(child, KILL_SIGNAL);
+          escalation = setTimeout(
+            () => killRun(child, FORCE_SIGNAL),
+            killGraceMs
+          );
+        }
         child.stdout?.destroy();
         child.stderr?.destroy();
         fail(end);
@@ -260,6 +304,11 @@ export function commandToken(
       }
 
       child.once('error', () => fail({ kind: 'spawn' }));
+      child.once('exit', () => {
+        if (escalation !== undefined && !runAlive(child)) {
+          clearTimeout(escalation);
+        }
+      });
       child.once('close', (code: number | null, signal: string | null) => {
         if (code !== 0) {
           fail(

@@ -355,6 +355,49 @@ describe('commandToken', () => {
     expect(() => commandToken('true', { timeoutMs: 0 })).toThrow(
       'invalid token command timing'
     );
+    expect(() => commandToken('true', { killGraceMs: -1 })).toThrow(
+      'invalid token command timing'
+    );
+  });
+
+  it('force-kills a timed-out command that ignores SIGTERM after the shell that forked it dies', async () => {
+    const pidFile = path.join(dir, 'pid');
+    const mint = commandToken(
+      `${await script(
+        [
+          'process.on("SIGTERM", () => {});',
+          `fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));`,
+          'setTimeout(() => process.stdout.write("token-" + n + "\\n"), 30_000);',
+        ].join('\n')
+      )}; true`,
+      { timeoutMs: 500, killGraceMs: 200 }
+    );
+    const error = await rejection(mint({ refresh: false }));
+    expect(error).toMatchObject({ failure: 'timeout', provider: 'command' });
+    expect(await exited(Number(await readFile(pidFile, 'utf8')))).toBe(true);
+  });
+
+  it('force-kills an abandoned command that ignores SIGTERM', async () => {
+    const pidFile = path.join(dir, 'pid');
+    const mint = commandToken(
+      await script(
+        [
+          'process.on("SIGTERM", () => {});',
+          `if (n === 1) { fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setTimeout(() => process.stdout.write("token-1\\n"), 30_000); }`,
+          'else process.stdout.write("token-" + n + "\\n");',
+        ].join('\n')
+      ),
+      { killGraceMs: 200 }
+    );
+    const caller = new AbortController();
+    const first = mint({ refresh: false, signal: caller.signal });
+    while (!(await readFile(pidFile, 'utf8').catch(() => ''))) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    caller.abort();
+    expect(await rejection(first)).toMatchObject({ failure: 'aborted' });
+    expect(await exited(Number(await readFile(pidFile, 'utf8')))).toBe(true);
+    await expect(mint({ refresh: false })).resolves.toBe('token-2');
   });
 
   it('re-mints through the transport after a 401, then opens the breaker on a second', async () => {
