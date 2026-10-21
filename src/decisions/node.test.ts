@@ -174,6 +174,24 @@ describe('commandToken', () => {
     expect(error.message).not.toContain(refused);
   });
 
+  it('hands a refresh that refused an older token the one minted since', async () => {
+    const mint = commandToken(
+      await script('process.stdout.write("token-" + n + "\\n");')
+    );
+    await expect(mint({ refresh: false })).resolves.toBe('token-1');
+    await expect(mint({ refresh: true, refused: 'token-1' })).resolves.toBe(
+      'token-2'
+    );
+    await expect(mint({ refresh: true, refused: 'token-1' })).resolves.toBe(
+      'token-2'
+    );
+    expect(await runs()).toBe(2);
+    await expect(mint({ refresh: true, refused: 'token-2' })).resolves.toBe(
+      'token-3'
+    );
+    expect(await runs()).toBe(3);
+  });
+
   it('kills a run once its only caller aborts and starts fresh for the next call', async () => {
     const pidFile = path.join(dir, 'pid');
     const mint = commandToken(
@@ -398,6 +416,57 @@ describe('commandToken', () => {
     expect(await rejection(first)).toMatchObject({ failure: 'aborted' });
     expect(await exited(Number(await readFile(pidFile, 'utf8')))).toBe(true);
     await expect(mint({ refresh: false })).resolves.toBe('token-2');
+  });
+
+  it('retries a stale 401 with the token another call already refreshed, without minting again', async () => {
+    const auth: string[] = [];
+    let refreshed!: () => void;
+    const replaced = new Promise<void>((resolve) => {
+      refreshed = resolve;
+    });
+    let staleSeen = 0;
+    const fetch: DecisionFetch = async (_url, init) => {
+      const header = init.headers.Authorization;
+      auth.push(header);
+      if (header === 'Bearer token-1') {
+        staleSeen += 1;
+        /** The second call's 401 lands only after the first has refreshed and succeeded. */
+        if (staleSeen === 2) {
+          await replaced;
+        }
+        return new Response('refused', { status: 401 });
+      }
+      const response = new Response(answered, { status: 200 });
+      refreshed();
+      return response;
+    };
+    const model = withBreaker(
+      createHttpDecisionModel({
+        endpoint: 'https://decisions.example/v1/systemone',
+        apiKey: commandToken(
+          await script(
+            'if (n === 3) process.exit(1); process.stdout.write("token-" + n + "\\n");'
+          )
+        ),
+        dialect: 'systemone',
+        fetch,
+        timeoutMs: 10_000,
+      })
+    );
+
+    const outcomes = await Promise.allSettled([
+      model.decide(request),
+      model.decide(request),
+    ]);
+    expect(outcomes.map((outcome) => outcome.status)).toEqual([
+      'fulfilled',
+      'fulfilled',
+    ]);
+    expect(await runs()).toBe(2);
+    expect(auth.filter((header) => header === 'Bearer token-2')).toHaveLength(
+      2
+    );
+    expect(model.breaker.open).toBe(false);
   });
 
   it('re-mints through the transport after a 401, then opens the breaker on a second', async () => {

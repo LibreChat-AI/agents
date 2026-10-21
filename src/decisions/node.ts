@@ -189,7 +189,9 @@ function describeFailure(
  * of stdout is the token, and the command reads no stdin. The token is reused
  * for `ttlMs` (default 50 minutes) after the run that minted it finishes,
  * concurrent calls share one run of the command, and a `refresh` (the
- * transport asks after a 401) runs it again.
+ * transport asks after a 401) runs it again unless the token it `refused` has
+ * already been replaced, in which case the newer token (or the run minting
+ * it) is shared instead.
  *
  * A caller whose `signal` aborts rejects at once with `aborted`; the run is
  * killed when every caller sharing it has aborted, and the next call starts a
@@ -386,11 +388,12 @@ export function commandToken(
       );
     });
 
-  return ({ refresh, signal }): Promise<string> => {
+  return ({ refresh, refused, signal }): Promise<string> => {
     if (signal?.aborted === true) {
       return Promise.reject(abandonedError());
     }
-    if (refresh) {
+    /** A refusal of an older token says nothing about the one cached since. */
+    if (refresh && (refused === undefined || refused === cached)) {
       /** The cached token was refused; never hand it out again. */
       expiresAt = 0;
     }

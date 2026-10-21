@@ -179,7 +179,7 @@ export function createTransport(options: TransportOptions): Transport {
   }
 
   async function resolveKey(
-    refresh: boolean,
+    refused: string | undefined,
     signal: AbortSignal
   ): Promise<string | null> {
     if (typeof credential === 'string') {
@@ -188,7 +188,11 @@ export function createTransport(options: TransportOptions): Transport {
     if (!credential) {
       return null;
     }
-    const minted: string = await credential({ refresh, signal });
+    const minted: string = await credential(
+      refused === undefined
+        ? { refresh: false, signal }
+        : { refresh: true, refused, signal }
+    );
     const token = typeof minted === 'string' ? minted.trim() : '';
     if (!token) {
       throw new DecisionError(
@@ -233,7 +237,8 @@ export function createTransport(options: TransportOptions): Transport {
             'decision model request interrupted',
             { provider: providerId }
           );
-        let refreshed = false;
+        /** The key a 401 refused; set once, since a call refreshes at most once. */
+        let refused: string | undefined;
         let key: string | null | undefined;
         let lastError: DecisionError | undefined;
         for (let attemptNo = 0; attemptNo <= maxRetries; attemptNo++) {
@@ -242,7 +247,7 @@ export function createTransport(options: TransportOptions): Transport {
           }
           try {
             if (key === undefined) {
-              key = await waitFor(resolveKey(refreshed, signal));
+              key = await waitFor(resolveKey(refused, signal));
             }
             const response = await waitFor(
               fetchImpl(endpoint, {
@@ -292,9 +297,10 @@ export function createTransport(options: TransportOptions): Transport {
             if (
               lastError.status === 401 &&
               typeof credential === 'function' &&
-              !refreshed
+              refused === undefined &&
+              typeof key === 'string'
             ) {
-              refreshed = true;
+              refused = key;
               key = undefined;
               attemptNo -= 1;
               continue;

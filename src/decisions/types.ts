@@ -97,9 +97,15 @@ export interface DecisionModel {
 
 export type DecisionDialect = 'port' | 'systemone';
 
-/** Mints a bearer token; `refresh` asks for a new one after the last was refused with a 401. */
+/**
+ * Mints a bearer token; `refresh` asks for a new one after a 401. On a
+ * refresh, `refused` is the token the 401 refused (as sent, trimmed), so a
+ * caching minter can hand out a token minted since then instead of
+ * discarding it.
+ */
 export type DecisionTokenMinter = (options: {
   refresh: boolean;
+  refused?: string;
   signal?: AbortSignal;
 }) => Promise<string>;
 
