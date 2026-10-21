@@ -365,6 +365,24 @@ describe('redact', () => {
     }
   });
 
+  it('still recognizes shaped credentials that a listed secret overlaps', () => {
+    expect(redact('Bearer live-token', ['ear'])).toBe(
+      'B[REDACTED]er [REDACTED]'
+    );
+    expect(
+      redact('Authorization: Bearer tok12345', ['Authorization: Bearer'])
+    ).toBe('[REDACTED] [REDACTED]');
+    const jwt =
+      'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.c2lnbmF0dXJlLXZhbHVl';
+    expect(redact(`jwt=${jwt}`, ['eyJhbGciOiJIUzI1NiJ9'])).toBe(
+      'jwt=[REDACTED]'
+    );
+    const opaque = `${'a'.repeat(25)}-split-me-${'b'.repeat(27)}`;
+    expect(redact(`key=${opaque} end`, ['-split-me-'])).toBe(
+      'key=[REDACTED] end'
+    );
+  });
+
   it('replaces a longer secret before a shorter one it contains', () => {
     expect(redact('a=secret-value-long', ['secret', 'secret-value-long'])).toBe(
       'a=[REDACTED]'
