@@ -113,11 +113,13 @@ describe('System One wire fidelity', () => {
     expect(callsRejectedBefore).toBe(30);
   });
 
-  it('accepts a score at the two-decimal bound and rejects one past it', () => {
+  it('accepts a score only where the expectation of its distribution can round to it', () => {
     const score = questions.readability;
     const probabilities = { '0': 0, '1': 0, '2': 0.5, '3': 0.5 };
-    // Four levels: 0.005 * (1 + 4 * 3 / 2) = 0.035 around the expectation of 2.5.
-    for (const value of [2.465, 2.535]) {
+    // Measured values summing to one put the expectation in [2.48, 2.505], so it rounds to 2.48
+    // through 2.51; a bound from the level count alone would also allow 2.47 and 2.52. 2.475 is
+    // no two-decimal number, so it gets the four-decimal bound around 2.5.
+    for (const value of [2.48, 2.49, 2.5, 2.51]) {
       expect(
         readAnswer(
           { type: 'score', score: value, probabilities },
@@ -126,7 +128,7 @@ describe('System One wire fidelity', () => {
         )
       ).toMatchObject({ type: 'score', score: value });
     }
-    for (const value of [2.46, 2.54, 3]) {
+    for (const value of [2.465, 2.47, 2.475, 2.52, 2.535, 3]) {
       expect(
         readAnswer(
           { type: 'score', score: value, probabilities },
@@ -135,6 +137,82 @@ describe('System One wire fidelity', () => {
         )
       ).toBeNull();
     }
+    const nines = Object.fromEntries(
+      Array.from({ length: 10 }, (_, level) => [
+        String(level),
+        level === 9 ? 1 : 0,
+      ])
+    );
+    // Level nine holds at least 0.995, so the expectation is at least 8.955.
+    expect(
+      readAnswer(
+        { type: 'score', score: 8.95, probabilities: nines },
+        'systemone'
+      )
+    ).toMatchObject({ type: 'score', score: 8.95 });
+    expect(
+      readAnswer(
+        { type: 'score', score: 8.94, probabilities: nines },
+        'systemone'
+      )
+    ).toBeNull();
+  });
+
+  it('keeps the four-decimal bounds for the port dialect and for unrounded numbers', () => {
+    const spread = (length: number, value: number): Record<string, number> =>
+      Object.fromEntries(
+        Array.from({ length }, (_, index) => [`k${index}`, value])
+      );
+    const uniform = { '0': 0.25, '1': 0.25, '2': 0.25, '3': 0.25 };
+    for (const dialect of ['port', 'systemone'] as const) {
+      // 0.015 is no two-decimal rounding, so 100 of them summing to 1.5 is never a rounded one.
+      expect(
+        readAnswer(
+          { type: 'choice', choice: 'k0', probabilities: spread(100, 0.015) },
+          dialect
+        )
+      ).toBeNull();
+      expect(
+        readAnswer(
+          { type: 'choice', choice: 'k0', probabilities: spread(10, 0.105) },
+          dialect
+        )
+      ).toBeNull();
+      expect(
+        readAnswer(
+          { type: 'score', score: 1.53, probabilities: uniform },
+          dialect
+        )
+      ).toBeNull();
+      // Unrounded numbers that agree to four decimals read under either dialect.
+      expect(
+        readAnswer(
+          {
+            type: 'score',
+            score: 1.3766,
+            probabilities: { '0': 0.1234, '1': 0.3766, '2': 0.5 },
+          },
+          dialect
+        )
+      ).toMatchObject({ type: 'score', score: 1.3766 });
+    }
+    // Two-decimal rounding drift is a System One host's, not a generic HTTP host's.
+    const rounded = {
+      type: 'choice',
+      choice: 'k0',
+      probabilities: { ...spread(5, 0.2), k0: 0.22 },
+    };
+    expect(readAnswer(rounded, 'systemone')).toMatchObject({ choice: 'k0' });
+    expect(readAnswer(rounded, 'port')).toBeNull();
+    expect(
+      readAnswer(
+        { type: 'score', score: 1.52, probabilities: uniform },
+        'systemone'
+      )
+    ).toMatchObject({ score: 1.52 });
+    expect(
+      readAnswer({ type: 'score', score: 1.52, probabilities: uniform }, 'port')
+    ).toBeNull();
   });
 
   it('accepts a distribution whose rounding drift scales with its size, and nothing further', () => {
@@ -241,12 +319,17 @@ describe('System One wire fidelity', () => {
       Array.from({ length: 300 }, (_, level) => [String(level), 0])
     );
     levels['0'] = 1;
-    // Level zero holds at least 0.995, so the expectation stays under 1.5; 210 is no rounding.
+    // Level zero holds at least 0.995, so the expectation is at most 1.495 and rounds to 1.5 at most.
     expect(
       readAnswer(
-        { type: 'score', score: 210, probabilities: levels },
+        { type: 'score', score: 1.49, probabilities: levels },
         'systemone'
       )
-    ).toBeNull();
+    ).toMatchObject({ type: 'score', score: 1.49 });
+    for (const score of [1.51, 2, 210]) {
+      expect(
+        readAnswer({ type: 'score', score, probabilities: levels }, 'systemone')
+      ).toBeNull();
+    }
   });
 });
