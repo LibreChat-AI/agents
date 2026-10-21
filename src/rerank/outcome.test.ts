@@ -11,6 +11,7 @@ import {
   rerankCost,
   noneReranker,
   withFallback,
+  estimatedUsage,
   createScoreCache,
   toOutcomeReranker,
   createSystemOneReranker,
@@ -149,6 +150,16 @@ function scored(
 
 const order = (outcome: RerankOutcome): number[] =>
   outcome.results.map((entry) => entry.index);
+
+const emptyUsage = {
+  calls: 0,
+  inputTokens: 0,
+  outputTokens: 0,
+  searchUnits: 0,
+  cached: 0,
+  estimatedTokens: 0,
+  estimatedSearchUnits: 0,
+};
 
 const SCORES = { alpha: 0.4, beta: 2.6, gamma: 1.2, delta: 2.9 };
 const DOCUMENTS = ['alpha', 'beta', 'gamma', 'delta'];
@@ -476,6 +487,121 @@ describe('System One per-document ranking', () => {
       (await reranker.rank({ query: 'q', documents: ['a', 'b'] })).reason
     ).toBe('circuit_open');
     expect(server.calls).toHaveLength(1);
+
+    const wide = await createSystemOneReranker({
+      model: withBreaker(jev(server.url, {}, 'key'), breaker),
+      rubric,
+      concurrency: 4,
+    }).rank({ query: 'q', documents: DOCUMENTS });
+    expect(wide).toMatchObject({
+      reason: 'circuit_open',
+      usage: { calls: 0, estimatedTokens: 0 },
+    });
+    expect(wide.attempts[0]).toMatchObject({
+      status: 'skipped',
+      reason: 'circuit_open',
+    });
+    const batch = await createSystemOneReranker({
+      model: withBreaker(jev(server.url, {}, 'key'), breaker),
+      rubric,
+      mode: 'batch',
+    }).rank({ query: 'q', documents: DOCUMENTS });
+    expect(batch).toMatchObject({
+      reason: 'circuit_open',
+      usage: { calls: 0, estimatedTokens: 0 },
+    });
+    expect(batch.attempts[0].status).toBe('skipped');
+    expect(server.calls).toHaveLength(1);
+  });
+
+  it('treats an out-of-rubric score from a host cache as a miss', async () => {
+    const server = await stub(scored(SCORES));
+    const outcome = await createSystemOneReranker({
+      model: jev(server.url),
+      rubric,
+      cache: {
+        get: (key) => ({ alpha: 99, beta: -5 })[key.document],
+        set: () => {},
+      },
+    }).rank({ query: 'q', documents: ['alpha', 'beta'] });
+    expect(server.calls.map(documentOf).sort()).toEqual(['alpha', 'beta']);
+    expect(outcome).toMatchObject({ status: 'ok', usage: { cached: 0 } });
+    expect(outcome.results).toEqual([
+      { index: 1, score: 2.6 },
+      { index: 0, score: 0.4 },
+    ]);
+  });
+
+  it('keys cached scores on a custom state, so rerankers judging in different states never share one', async () => {
+    const server = await stub((call) => ({
+      body: {
+        model: call.body.model,
+        answers: {
+          relevance: {
+            type: 'score',
+            score: (call.body.state as Json).tenant === 'a' ? 0 : 2,
+          },
+        },
+      },
+    }));
+    const cache = createScoreCache();
+    const tenant = (name: string) => (query: string, document: string) => ({
+      query,
+      document,
+      tenant: name,
+    });
+    const a = await createSystemOneReranker({
+      model: jev(server.url),
+      rubric,
+      cache,
+      state: tenant('a'),
+    }).rank({ query: 'q', documents: ['d'] });
+    const b = await createSystemOneReranker({
+      model: jev(server.url),
+      rubric,
+      cache,
+      state: tenant('b'),
+    }).rank({ query: 'q', documents: ['d'] });
+    expect(a.results[0].score).toBe(0);
+    expect(b.results[0].score).toBe(2);
+    expect(b.usage).toMatchObject({ calls: 1, cached: 0 });
+    expect(server.calls).toHaveLength(2);
+    const again = await createSystemOneReranker({
+      model: jev(server.url),
+      rubric,
+      cache,
+      state: tenant('b'),
+    }).rank({ query: 'q', documents: ['d'] });
+    expect(again.usage).toMatchObject({ calls: 0, cached: 1 });
+  });
+
+  it('refuses a score cache bound that would unbound it', () => {
+    for (const options of [
+      { max: Number.NaN },
+      { max: Infinity },
+      { max: 0 },
+      { max: 1.5 },
+      { ttlMs: Number.NaN },
+      { ttlMs: Infinity },
+      { ttlMs: -1 },
+    ]) {
+      expect(() => createScoreCache(options)).toThrow(
+        'invalid score cache configuration'
+      );
+    }
+    const cache = createScoreCache({ max: 2 });
+    const key = (document: string) => ({
+      query: 'q',
+      document,
+      model: 'm',
+      rubric: 'r',
+      state: '',
+    });
+    cache.set(key('a'), 1);
+    cache.set(key('b'), 1);
+    cache.set(key('c'), 1);
+    expect(cache.size).toBe(2);
+    expect(cache.get(key('a'))).toBeUndefined();
   });
 
   it('never throws: a throwing model, invalid input, and an empty list are outcomes', async () => {
@@ -753,6 +879,30 @@ describe('cross-encoder ranking', () => {
     expect(outcome.usage.calls).toBe(2);
   });
 
+  it('estimates search units from the document count even with no token estimate', async () => {
+    expect(estimatedUsage('cross-encoder', 4, 0)).toEqual({
+      estimatedTokens: 0,
+      estimatedSearchUnits: 1,
+    });
+    const server = await stub(() => 'hang');
+    const outcome = await createCrossEncoderReranker({
+      url: `${server.url}/rerank`,
+      model: 'm',
+      apiKey: 'k',
+      estimatedTokensPerDocument: 0,
+    }).rank({ query: 'q', documents: DOCUMENTS, deadlineMs: 200 });
+    expect(outcome.usage).toMatchObject({
+      calls: 1,
+      estimatedTokens: 0,
+      estimatedSearchUnits: 1,
+    });
+    expect(
+      rerankCost(outcome, {
+        'cross-encoder': { '*': { perSearchUnit: 0.002 } },
+      })
+    ).toEqual({ usd: 0.002, unpriced: [] });
+  });
+
   it('returns at its deadline as timeout, charged one estimated request', async () => {
     const server = await stub(() => 'hang');
     const started = performance.now();
@@ -945,6 +1095,80 @@ describe('withFallback', () => {
         attempts: [],
       },
     ],
+    ...(
+      [
+        [
+          'unsorted scores',
+          {
+            results: [
+              { index: 0, score: 0.1 },
+              { index: 1, score: 0.9 },
+            ],
+          },
+        ],
+        [
+          'a null score before a number',
+          {
+            results: [
+              { index: 0, score: null },
+              { index: 1, score: 0.9 },
+            ],
+          },
+        ],
+        [
+          'tied scores out of input order',
+          {
+            results: [
+              { index: 1, score: 1 },
+              { index: 0, score: 1 },
+            ],
+          },
+        ],
+        [
+          'a non-boolean kept',
+          {
+            results: [
+              { index: 1, score: 1, kept: 'yes' },
+              { index: 0, score: 0, kept: false },
+            ],
+          },
+        ],
+        [
+          'an attempt without usage',
+          {
+            attempts: [
+              {
+                provider: 'cross-encoder',
+                model: 'm',
+                status: 'ok',
+                reason: null,
+                durationMs: 1,
+              },
+            ],
+          },
+        ],
+        ['an unknown provider', { provider: 'bogus' }],
+        ['a non-string reason', { reason: 7 }],
+        ['a non-numeric threshold', { threshold: 'x' }],
+        ['a non-boolean pinVerified', { pinVerified: 'yes' }],
+      ] as const
+    ).map(([label, broken]): [string, Record<string, unknown>] => [
+      label,
+      {
+        results: [
+          { index: 1, score: 1 },
+          { index: 0, score: 0 },
+        ],
+        provider: 'cross-encoder',
+        model: 'm',
+        status: 'ok',
+        reason: null,
+        attempts: [],
+        durationMs: 0,
+        usage: { ...emptyUsage },
+        ...broken,
+      },
+    ]),
   ])(
     'treats a step returning %s as invalid_results and moves on',
     async (_label, garbage) => {
@@ -1020,8 +1244,139 @@ describe('withFallback', () => {
     ).toEqual([
       ['skipped', 'backoff'],
       ['failed', 'error'],
+      ['skipped', 'no_api_key'],
     ]);
+    expect(outcome.attempts[2]).toMatchObject({
+      provider: 'none',
+      usage: emptyUsage,
+    });
     expect(order(outcome)).toEqual([0, 1]);
+  });
+
+  it('records a step that ran but reported no attempt, so the history keeps every step', async () => {
+    expect(
+      (
+        await noneReranker({ reason: 'no_api_key' }).rank({
+          query: 'q',
+          documents: ['a'],
+        })
+      ).attempts
+    ).toEqual([
+      {
+        provider: 'none',
+        model: '',
+        status: 'skipped',
+        reason: 'no_api_key',
+        durationMs: expect.any(Number),
+        usage: emptyUsage,
+      },
+    ]);
+    const silent = scripted('bm25', () => ({
+      results: [
+        { index: 1, score: 3 },
+        { index: 0, score: 1 },
+      ],
+      provider: 'bm25',
+      model: 'okapi',
+      status: 'ok',
+      reason: null,
+      attempts: [],
+      durationMs: 2,
+      usage: { ...emptyUsage },
+    }));
+    const outcome = await withFallback([
+      {
+        reranker: scripted('cross-encoder', () => Promise.reject(new Error())),
+      },
+      { reranker: silent },
+    ]).rank({ query: 'q', documents: ['a', 'b'] });
+    expect(
+      outcome.attempts.map((attempt) => [
+        attempt.provider,
+        attempt.status,
+        attempt.reason,
+      ])
+    ).toEqual([
+      ['cross-encoder', 'failed', 'error'],
+      ['bm25', 'ok', null],
+    ]);
+  });
+
+  it('abandons a gate at the chain deadline and starts no step after it', async () => {
+    const step = scripted('cross-encoder', (request) =>
+      noneReranker().rank(request)
+    );
+    const hung = withFallback([{ reranker: step }], {
+      gate: () => new Promise<null>(() => {}),
+    });
+    let startedAt = performance.now();
+    const never = await Promise.race([
+      hung.rank({ query: 'q', documents: ['a'], deadlineMs: 50 }),
+      new Promise<'hung'>((resolve) =>
+        setTimeout(() => resolve('hung'), 1_000)
+      ),
+    ]);
+    expect(never).toMatchObject({ status: 'skipped', reason: 'timeout' });
+    expect(performance.now() - startedAt).toBeLessThan(500);
+
+    const slow = withFallback([{ reranker: step }], {
+      gate: () =>
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 200)),
+    });
+    startedAt = performance.now();
+    expect(
+      await slow.rank({ query: 'q', documents: ['a'], deadlineMs: 50 })
+    ).toMatchObject({ status: 'skipped', reason: 'timeout' });
+    expect(performance.now() - startedAt).toBeLessThan(180);
+
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 20);
+    startedAt = performance.now();
+    expect(
+      await slow.rank({
+        query: 'q',
+        documents: ['a'],
+        signal: controller.signal,
+      })
+    ).toMatchObject({ status: 'skipped', reason: 'aborted' });
+    expect(performance.now() - startedAt).toBeLessThan(180);
+    expect(step.requests).toHaveLength(0);
+  });
+
+  it('accepts a full answer that arrives within the step grace after its deadline', async () => {
+    const late = scripted(
+      'cross-encoder',
+      () =>
+        new Promise<RerankOutcome>((resolve) =>
+          setTimeout(
+            () =>
+              resolve({
+                results: [
+                  { index: 1, score: 0.9 },
+                  { index: 0, score: 0.1 },
+                ],
+                provider: 'cross-encoder',
+                model: 'm',
+                status: 'ok',
+                reason: null,
+                attempts: [],
+                durationMs: 120,
+                usage: { ...emptyUsage, calls: 1 },
+              }),
+            120
+          )
+        )
+    );
+    const backup = scripted('bm25', () => {
+      throw new Error('unreachable');
+    });
+    const outcome = await withFallback([
+      { reranker: late, deadlineMs: 100 },
+      { reranker: backup },
+    ]).rank({ query: 'q', documents: ['a', 'b'] });
+    expect(outcome).toMatchObject({ status: 'ok', provider: 'cross-encoder' });
+    expect(order(outcome)).toEqual([1, 0]);
+    expect(backup.requests).toHaveLength(0);
   });
 
   it('reports empty input and a cancelled caller without calling a step', async () => {
@@ -1196,16 +1551,6 @@ describe('probePin', () => {
     ).toEqual({ verified: false, reason: 'error' });
   });
 });
-
-const emptyUsage = {
-  calls: 0,
-  inputTokens: 0,
-  outputTokens: 0,
-  searchUnits: 0,
-  cached: 0,
-  estimatedTokens: 0,
-  estimatedSearchUnits: 0,
-};
 
 describe('toOutcomeReranker and rerankCost', () => {
   it('turns a rejecting Reranker into reasons and validates its order', async () => {

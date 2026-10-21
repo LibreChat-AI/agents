@@ -245,7 +245,7 @@ export function createCrossEncoderReranker(
             estimatedUsage(kind, documents, options.estimatedTokensPerDocument)
           );
         }
-        return stepOutcome({ ...base, reason, usage });
+        return stepOutcome({ ...base, reason, usage, called: usage.calls > 0 });
       }
     },
   };

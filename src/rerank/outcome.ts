@@ -78,12 +78,12 @@ export function estimatedUsage(
   tokensPerDocument: number = ESTIMATED_TOKENS_PER_DOCUMENT[kind]
 ): Pick<RerankUsage, 'estimatedTokens' | 'estimatedSearchUnits'> {
   const n = Math.max(0, Math.floor(count(documents)));
-  const per = count(tokensPerDocument);
-  if (n === 0 || per === 0 || kind === 'bm25' || kind === 'none') {
+  if (n === 0 || kind === 'bm25' || kind === 'none') {
     return { estimatedTokens: 0, estimatedSearchUnits: 0 };
   }
+  // Search units follow the document count alone, so a zero token estimate never hides them.
   return {
-    estimatedTokens: n * per,
+    estimatedTokens: n * count(tokensPerDocument),
     estimatedSearchUnits: kind === 'cross-encoder' ? Math.ceil(n / 100) : 0,
   };
 }
@@ -193,6 +193,33 @@ export function rankedEntries(
           : { index, score, kept: score !== null && score >= threshold }
     )
     .sort(byScore);
+}
+
+const KINDS: ReadonlySet<string> = new Set<RerankKind>([
+  'systemone',
+  'cross-encoder',
+  'bm25',
+  'none',
+]);
+
+export const isRerankKind = (value: unknown): value is RerankKind =>
+  typeof value === 'string' && KINDS.has(value);
+
+/**
+ * Whether a permutation is in the order `rankedEntries` produces: score
+ * descending, ties in input order, `null` last, with `kept` a boolean when set.
+ */
+export function isRankedOrder(results: readonly RerankEntry[]): boolean {
+  for (let index = 0; index < results.length; index++) {
+    const entry = results[index];
+    if (entry.kept !== undefined && typeof entry.kept !== 'boolean') {
+      return false;
+    }
+    if (index > 0 && byScore(results[index - 1], entry) >= 0) {
+      return false;
+    }
+  }
+  return true;
 }
 
 /** Whether `results` is a full permutation of `count` documents with finite or `null` scores. */
@@ -389,7 +416,8 @@ export function rankRequestProblem(request: unknown): RerankReason | undefined {
  * The never-throwing layer over a rejecting `Reranker`: its full ranking
  * becomes an `ok` outcome, a rejection becomes a reason, and a ranking that
  * is not a full permutation in descending score order is `invalid_results`.
- * Usage counts one call with whatever tokens the reranker reported.
+ * Usage counts one call with whatever tokens the reranker reported, or none
+ * when an open breaker (`circuitOpen`) refused it before dispatch.
  */
 export function toOutcomeReranker(
   reranker: Reranker,
@@ -477,6 +505,11 @@ export function toOutcomeReranker(
           usage,
         });
       } catch (error) {
+        // An open breaker refuses before dispatch: nothing was sent, so nothing is charged.
+        const sent = !(error instanceof DecisionError && error.circuitOpen);
+        if (!sent) {
+          usage.calls = 0;
+        }
         const reason = isAborted(request.signal)
           ? 'aborted'
           : rerankReasonOf(error);
@@ -486,8 +519,9 @@ export function toOutcomeReranker(
           startedAt,
           model,
           reason,
+          called: sent,
           usage:
-            reason === 'timeout' || reason === 'aborted'
+            sent && (reason === 'timeout' || reason === 'aborted')
               ? { ...usage, ...estimatedUsage(kind, documents) }
               : usage,
         });

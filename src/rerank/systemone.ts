@@ -167,6 +167,12 @@ export function createSystemOneReranker(
     throw fail('bad_request', 'invalid reranker configuration');
   }
   const rubric = [...options.rubric];
+  /** A score the rubric can produce: provider answers and cache hits alike. */
+  const inRubric = (score: unknown): score is number =>
+    typeof score === 'number' &&
+    Number.isFinite(score) &&
+    score >= 0 &&
+    score <= rubric.length - 1;
 
   async function rerankBatch(request: RerankRequest): Promise<RerankResult> {
     return withDecisionDeadline(
@@ -231,12 +237,7 @@ export function createSystemOneReranker(
         const results: RankedDocument[] = [];
         for (let index = 0; index < documents.length; index++) {
           const answer = response.answers[`d${index}`];
-          if (
-            answer?.type !== 'score' ||
-            !Number.isFinite(answer.score) ||
-            answer.score < 0 ||
-            answer.score > rubric.length - 1
-          ) {
+          if (answer?.type !== 'score' || !inRubric(answer.score)) {
             throw fail(
               'malformed_response',
               'reranker requires a valid score for every candidate'
@@ -376,18 +377,46 @@ export function createSystemOneReranker(
       outputReports: 0,
       settled: false,
     };
-    const keyFor = (document: string): RerankCacheKey => ({
-      query,
-      document,
-      model: configured,
-      rubric: rubricKey,
-    });
-    const keys = cache && configured !== '' ? documents.map(keyFor) : null;
+    /** Built once per document, so the cache key and every request share the state a score was measured in. */
+    const states: Array<DecisionState | undefined> = new Array(n);
+    const stateFor = (index: number): DecisionState =>
+      (states[index] ??= stateOf(query, documents[index]));
+    /** `null` when a custom state cannot be built or serialized: that document is scored, never cached. */
+    const keyFor = (index: number): RerankCacheKey | null => {
+      let state = '';
+      if (options.state !== undefined) {
+        try {
+          const serialized: unknown = JSON.stringify(stateFor(index));
+          if (typeof serialized !== 'string') {
+            return null;
+          }
+          state = serialized;
+        } catch {
+          return null;
+        }
+      }
+      return {
+        query,
+        document: documents[index],
+        model: configured,
+        rubric: rubricKey,
+        state,
+      };
+    };
+    const keys =
+      cache && configured !== ''
+        ? documents.map((_, index) => keyFor(index))
+        : null;
     if (cache && keys) {
       for (let index = 0; index < n; index++) {
+        const key = keys[index];
+        if (key === null) {
+          continue;
+        }
         try {
-          const hit = cache.get(keys[index]);
-          if (typeof hit === 'number' && Number.isFinite(hit)) {
+          const hit = cache.get(key);
+          // An out-of-rubric value from a host store is a miss, never a score.
+          if (inRubric(hit)) {
             run.scores[index] = hit;
             run.usage.cached += 1;
           }
@@ -435,18 +464,16 @@ export function createSystemOneReranker(
       if (
         !isDecisionObject(answer) ||
         answer.type !== 'score' ||
-        typeof answer.score !== 'number' ||
-        !Number.isFinite(answer.score) ||
-        answer.score < 0 ||
-        answer.score > rubric.length - 1
+        !inRubric(answer.score)
       ) {
         run.failure ??= 'bad_response';
         return;
       }
       run.scores[index] = answer.score;
-      if (cache && keys && said === configured) {
+      const key = keys?.[index] ?? null;
+      if (cache && key !== null && said === configured) {
         try {
-          cache.set(keys[index], answer.score);
+          cache.set(key, answer.score);
         } catch {
           // The score stands; only reuse is lost.
         }
@@ -465,7 +492,10 @@ export function createSystemOneReranker(
         run.failureError ??= decisionError;
         return;
       }
-      run.replied += 1;
+      // An open breaker refused before dispatch: `ask` took back the call, so it is no reply either.
+      if (reason !== 'circuit_open') {
+        run.replied += 1;
+      }
       if (STEP_FATAL.has(reason)) {
         run.stop ??= reason;
         run.stopError ??= decisionError;
@@ -494,7 +524,7 @@ export function createSystemOneReranker(
                   response = await waitFor(
                     Promise.resolve().then(() =>
                       model.decide({
-                        state: stateOf(query, documents[index]),
+                        state: stateFor(index),
                         questions: { [QUESTION_ID]: question },
                         signal,
                         timeoutMs: Math.max(
@@ -506,6 +536,10 @@ export function createSystemOneReranker(
                     )
                   );
                 } catch (error) {
+                  if (error instanceof DecisionError && error.circuitOpen) {
+                    // Refused before dispatch: no request left, so none is counted or charged.
+                    run.usage.calls -= 1;
+                  }
                   if (live(signal)) {
                     refused(error);
                   }
@@ -604,6 +638,8 @@ export function createSystemOneReranker(
           model: said,
           reason: failed.reason,
           usage,
+          // Nothing sent (an open breaker, a deadline before the first request) is skipped, not failed.
+          called: run.usage.calls > 0,
           ...pinned,
         }),
         error: failed.error,

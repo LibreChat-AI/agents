@@ -9,18 +9,25 @@ import type {
 import {
   elapsedMs,
   isAborted,
+  stepOutcome,
+  isRerankKind,
   documentCount,
   validDeadline,
   addRerankUsage,
   estimatedUsage,
   identityOutcome,
+  isRankedOrder,
   emptyRerankUsage,
   rankRequestProblem,
   isRerankPermutation,
 } from './outcome';
 import { DecisionError, isDecisionObject } from '../decisions/types';
 
-/** Identity order, never a request: the last step of a chain, or the whole chain when nothing is configured. */
+/**
+ * Identity order, never a request: the last step of a chain, or the whole
+ * chain when nothing is configured. Its one attempt is `skipped` with
+ * `reason` and no usage, so a chain's history shows it ran.
+ */
 export function noneReranker(
   options: { reason?: string } = {}
 ): OutcomeReranker {
@@ -30,7 +37,14 @@ export function noneReranker(
     kind: 'none',
     model: '',
     async rank(request: RankRequest): Promise<RerankOutcome> {
-      return identityOutcome(documentCount(request), { reason });
+      return stepOutcome({
+        kind: 'none',
+        documents: documentCount(request),
+        startedAt: performance.now(),
+        model: '',
+        reason,
+        called: false,
+      });
     },
   };
 }
@@ -45,7 +59,10 @@ export interface FallbackOptions {
   /**
    * Returns a reason to skip a step without a request (a backoff, a budget,
    * an unverified pin), or nothing to run it. Not consulted for `none` steps.
-   * A gate that throws skips its step with `error`.
+   * A gate that throws skips its step with `error`. The wait for it is
+   * bounded like a step: a gate still pending when the request's deadline
+   * passes or its signal aborts is abandoned and the chain stops with
+   * `timeout` or `aborted`.
    */
   gate?: (
     reranker: OutcomeReranker
@@ -59,8 +76,17 @@ export interface FallbackReranker extends OutcomeReranker {
 }
 
 const STATUSES: ReadonlySet<string> = new Set(['ok', 'degraded', 'skipped']);
+const ATTEMPT_STATUSES: ReadonlySet<string> = new Set([
+  'ok',
+  'failed',
+  'skipped',
+]);
 
-/** Grace after a step's deadline for a reranker that honors its abort to report its own timeout and spend. */
+/**
+ * Grace after a step's deadline for a reranker that honors its abort to
+ * report its own timeout and spend. A full answer that arrives within it is
+ * accepted: waiting for it costs nothing the timeout would not.
+ */
 export const STEP_GRACE_MS = 50;
 
 function usageOf(value: unknown): RerankUsage {
@@ -97,10 +123,10 @@ function failedStep(
 
 /** What a step that never returned is charged: every document it was sent, at the estimate. */
 function abandonedUsage(kind: RerankKind, documents: number): RerankUsage {
-  const estimate = estimatedUsage(kind, documents);
-  if (estimate.estimatedTokens === 0) {
+  if (kind === 'bm25' || kind === 'none' || documents === 0) {
     return emptyRerankUsage();
   }
+  const estimate = estimatedUsage(kind, documents);
   return {
     ...emptyRerankUsage(),
     calls: kind === 'systemone' ? documents : 1,
@@ -108,15 +134,112 @@ function abandonedUsage(kind: RerankKind, documents: number): RerankUsage {
   };
 }
 
+const isReason = (value: unknown): value is string | null =>
+  value === null || typeof value === 'string';
+
+const isFiniteNumber = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isFinite(value);
+
+function isAttempt(value: unknown): value is RerankAttempt {
+  return (
+    isDecisionObject(value) &&
+    isRerankKind(value.provider) &&
+    typeof value.model === 'string' &&
+    typeof value.status === 'string' &&
+    ATTEMPT_STATUSES.has(value.status) &&
+    isReason(value.reason) &&
+    isFiniteNumber(value.durationMs) &&
+    isDecisionObject(value.usage)
+  );
+}
+
+/** The whole `RerankOutcome` contract, since a step's results and attempts are passed through as they are. */
 function isOutcome(value: unknown, documents: number): value is RerankOutcome {
   return (
     isDecisionObject(value) &&
     typeof value.status === 'string' &&
     STATUSES.has(value.status) &&
+    isRerankKind(value.provider) &&
+    typeof value.model === 'string' &&
+    isReason(value.reason) &&
     isRerankPermutation(value.results, documents) &&
+    isRankedOrder(value.results) &&
     Array.isArray(value.attempts) &&
-    value.attempts.every(isDecisionObject)
+    value.attempts.every(isAttempt) &&
+    (value.threshold === undefined || isFiniteNumber(value.threshold)) &&
+    (value.pinVerified === undefined || typeof value.pinVerified === 'boolean')
   );
+}
+
+/** The attempt a step that ran but reported none stands for, so the chain's history keeps every step. */
+function ownAttempt(outcome: RerankOutcome): RerankAttempt {
+  const usage = usageOf(outcome.usage);
+  let status: RerankAttempt['status'] = 'ok';
+  if (outcome.status === 'skipped') {
+    status = usage.calls > 0 ? 'failed' : 'skipped';
+  }
+  return {
+    provider: outcome.provider,
+    model: outcome.model,
+    status,
+    reason: outcome.reason,
+    durationMs: isFiniteNumber(outcome.durationMs)
+      ? Math.max(0, outcome.durationMs)
+      : 0,
+    usage,
+  };
+}
+
+type GateVerdict = { why: string | null } | { stop: 'aborted' | 'timeout' };
+
+/**
+ * The gate's verdict, or why the chain stopped first: a gate that is slow or
+ * never settles is abandoned at the chain's deadline or the caller's abort.
+ */
+async function consult(
+  gate: NonNullable<FallbackOptions['gate']>,
+  reranker: OutcomeReranker,
+  signal: AbortSignal | undefined,
+  expiresAt: number
+): Promise<GateVerdict> {
+  const cleanup: Array<() => void> = [];
+  const contenders: Array<Promise<GateVerdict>> = [
+    Promise.resolve()
+      .then(() => gate(reranker))
+      .then(
+        (why): GateVerdict => ({
+          why: typeof why === 'string' && why !== '' ? why : null,
+        }),
+        (): GateVerdict => ({ why: 'error' })
+      ),
+  ];
+  if (expiresAt !== Infinity) {
+    contenders.push(
+      new Promise<GateVerdict>((resolve) => {
+        const timer = setTimeout(
+          () => resolve({ stop: 'timeout' }),
+          Math.max(0, expiresAt - performance.now())
+        );
+        cleanup.push(() => clearTimeout(timer));
+      })
+    );
+  }
+  if (signal !== undefined) {
+    contenders.push(
+      new Promise<GateVerdict>((resolve) => {
+        const onAbort = (): void => resolve({ stop: 'aborted' });
+        signal.addEventListener('abort', onAbort, { once: true });
+        cleanup.push(() => signal.removeEventListener('abort', onAbort));
+      })
+    );
+  }
+  try {
+    return await Promise.race(contenders);
+  } finally {
+    for (const release of cleanup) {
+      release();
+    }
+  }
 }
 
 /** The step's deadline reached it as an abort; to the chain's caller it is the step's timeout. */
@@ -236,14 +359,16 @@ function stepDeadline(
  * reason; none answering is `skipped` in identity order with that reason. A
  * `none` step never answers. `kept`, `threshold`, and `pinVerified` come from
  * the answering step only, so falling back to a cross-encoder never carries a
- * System One threshold. A step that throws, rejects, returns something other
- * than a full permutation, or outlives its deadline plus `STEP_GRACE_MS` is a
- * failed step. A request's `deadlineMs` bounds the whole chain: each step
- * gets the lesser of its own deadline and what is left, a step without one
- * gets what is left, and once nothing is left the chain stops with
- * `timeout`. Usage sums every attempt: spend counts what was sent, not what
- * answered. An invalid request is identity order over every document. Never
- * throws.
+ * System One threshold. A step that throws, rejects, returns something that
+ * breaks the `RerankOutcome` contract (a full permutation in score order,
+ * well-formed attempts and fields), or outlives its deadline plus
+ * `STEP_GRACE_MS` is a failed step; a step that ran but reported no attempt
+ * is recorded as one. A request's `deadlineMs` bounds the whole chain, gates
+ * included: each step gets the lesser of its own deadline and what is left, a
+ * step without one gets what is left, and once nothing is left the chain
+ * stops with `timeout`. Usage sums every attempt: spend counts what was sent,
+ * not what answered. An invalid request is identity order over every
+ * document. Never throws.
  */
 export function withFallback(
   steps: readonly FallbackStep[],
@@ -257,6 +382,8 @@ export function withFallback(
         step === null ||
         typeof step !== 'object' ||
         typeof step.reranker?.rank !== 'function' ||
+        !isRerankKind(step.reranker.kind) ||
+        typeof step.reranker.model !== 'string' ||
         (step.deadlineMs !== undefined &&
           (!Number.isSafeInteger(step.deadlineMs) ||
             validDeadline(step.deadlineMs) === undefined))
@@ -294,36 +421,44 @@ export function withFallback(
       const usage = emptyRerankUsage();
       const budget = validDeadline(request.deadlineMs);
       const expiresAt = budget === undefined ? Infinity : startedAt + budget;
+      /** Read before every step and after every gate: either may have run out the clock. */
+      const stopped = (): 'aborted' | 'timeout' | null => {
+        if (isAborted(request.signal)) {
+          return 'aborted';
+        }
+        return performance.now() >= expiresAt ? 'timeout' : null;
+      };
       let first: string | null = null;
       for (let index = 0; index < chain.length; index++) {
         const { reranker } = chain[index];
-        if (isAborted(request.signal)) {
-          first ??= 'aborted';
-          break;
-        }
-        if (performance.now() >= expiresAt) {
-          first ??= 'timeout';
-          break;
-        }
-        if (gate && reranker.kind !== 'none') {
-          let why: string | null | undefined;
-          try {
-            why = await gate(reranker);
-          } catch {
-            why = 'error';
-          }
-          if (typeof why === 'string' && why !== '') {
+        let stop = stopped();
+        if (stop === null && gate && reranker.kind !== 'none') {
+          const verdict = await consult(
+            gate,
+            reranker,
+            request.signal,
+            expiresAt
+          );
+          if ('stop' in verdict) {
+            stop = verdict.stop;
+          } else if (verdict.why !== null) {
             attempts.push({
               provider: reranker.kind,
               model: reranker.model,
               status: 'skipped',
-              reason: why,
+              reason: verdict.why,
               durationMs: 0,
               usage: emptyRerankUsage(),
             });
-            first ??= why;
+            first ??= verdict.why;
             continue;
+          } else {
+            stop = stopped();
           }
+        }
+        if (stop !== null) {
+          first ??= stop;
+          break;
         }
         const outcome = await runStep(
           reranker,
@@ -337,7 +472,11 @@ export function withFallback(
         } catch {
           // Bookkeeping must not break a ranking.
         }
-        attempts.push(...outcome.attempts);
+        attempts.push(
+          ...(outcome.attempts.length > 0
+            ? outcome.attempts
+            : [ownAttempt(outcome)])
+        );
         addRerankUsage(usage, usageOf(outcome.usage));
         if (reranker.kind !== 'none' && outcome.status !== 'skipped') {
           const ok = index === 0 && outcome.status === 'ok';

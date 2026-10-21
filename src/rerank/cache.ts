@@ -1,3 +1,5 @@
+import { DecisionError } from '../decisions/types';
+
 /** What a cached score is keyed on: the document text, not an identity that survives edits. */
 export interface RerankCacheKey {
   query: string;
@@ -6,6 +8,11 @@ export interface RerankCacheKey {
   model: string;
   /** Identifies the rubric and instructions the score answers. */
   rubric: string;
+  /**
+   * The serialized decision state the score was measured in when a custom
+   * `state` built it; empty for the default `{ query, document }`.
+   */
+  state: string;
 }
 
 /** Per-document scores; a host can supply its own (for example, hashed keys or a shared store). */
@@ -20,23 +27,41 @@ export interface MemoryScoreCache extends RerankScoreCache {
 }
 
 export interface ScoreCacheOptions {
-  /** Entries kept, least recently used evicted first. Defaults to 20,000. */
+  /** Entries kept, a positive integer, least recently used evicted first. Defaults to 20,000. */
   max?: number;
-  /** Defaults to one day. */
+  /** A positive finite lifetime. Defaults to one day. */
   ttlMs?: number;
   now?: () => number;
 }
 
-/** A bounded in-memory LRU whose entries expire after `ttlMs`; keys hold the full document text. */
+/**
+ * A bounded in-memory LRU whose entries expire after `ttlMs`; keys hold the
+ * full document text. Throws on a `max` or `ttlMs` that would unbound it.
+ */
 export function createScoreCache(
   options: ScoreCacheOptions = {}
 ): MemoryScoreCache {
-  const max = Math.max(1, Math.floor(options.max ?? 20_000));
+  const max = options.max ?? 20_000;
   const ttlMs = options.ttlMs ?? 86_400_000;
+  if (
+    !Number.isSafeInteger(max) ||
+    max < 1 ||
+    typeof ttlMs !== 'number' ||
+    !Number.isFinite(ttlMs) ||
+    ttlMs <= 0
+  ) {
+    throw new DecisionError(
+      'bad_request',
+      'invalid score cache configuration',
+      {
+        provider: 'score-cache',
+      }
+    );
+  }
   const now = options.now ?? Date.now;
   const entries = new Map<string, { score: number; at: number }>();
   const keyOf = (key: RerankCacheKey): string =>
-    JSON.stringify([key.query, key.document, key.model, key.rubric]);
+    JSON.stringify([key.query, key.document, key.model, key.rubric, key.state]);
   return {
     get(key: RerankCacheKey): number | undefined {
       const id = keyOf(key);
