@@ -1,9 +1,11 @@
 import path from 'node:path';
 import { tmpdir } from 'node:os';
+import { execFile } from 'node:child_process';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import type { DecisionFetch } from './core';
 import {
   withBreaker,
+  createBreaker,
   DecisionError,
   booleanQuestion,
   createHttpDecisionModel,
@@ -69,6 +71,48 @@ async function exited(pid: number): Promise<boolean> {
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
   return false;
+}
+
+/** Kills `pid` if it is still running; cleanup for a process a test leaves behind. */
+function sweep(pid: number): void {
+  try {
+    process.kill(pid, 'SIGKILL');
+  } catch {
+    // Already gone.
+  }
+}
+
+async function pidFrom(file: string): Promise<number> {
+  while (!(await readFile(file, 'utf8').catch(() => ''))) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  return Number(await readFile(file, 'utf8'));
+}
+
+function activeTimeouts(): number {
+  return process
+    .getActiveResourcesInfo()
+    .filter((resource) => resource === 'Timeout').length;
+}
+
+/** Runs `body` in a separate Node host with `commandToken` in scope and resolves its stdout once that host exits. */
+async function host(body: string): Promise<string> {
+  const file = path.join(dir, 'host.ts');
+  await writeFile(
+    file,
+    [
+      `import { commandToken } from ${JSON.stringify(path.join(__dirname, 'node'))};`,
+      body,
+    ].join('\n')
+  );
+  return new Promise<string>((resolve, reject) => {
+    execFile(
+      process.execPath,
+      [require.resolve('tsx/cli'), file],
+      { timeout: 20_000 },
+      (error, stdout) => (error ? reject(error) : resolve(stdout))
+    );
+  });
 }
 
 async function rejection(promise: Promise<unknown>): Promise<DecisionError> {
@@ -642,6 +686,187 @@ describe('commandToken', () => {
     const refused = await rejection(model.decide(request));
     expect(refused.circuitOpen).toBe(true);
     expect(auth).toHaveLength(4);
+    expect(await runs()).toBe(3);
+  });
+
+  it('drops the SIGKILL escalation once the killed group is gone, so it never holds the host open', async () => {
+    const command = await script('setTimeout(() => {}, 30_000);');
+    const out = await host(
+      [
+        'let rejectedAt = Date.now();',
+        `commandToken(${JSON.stringify(command)}, { timeoutMs: 200, killGraceMs: 5_000 })({ refresh: false }).catch(() => { rejectedAt = Date.now(); });`,
+        'process.on("exit", () => process.stdout.write(String(Date.now() - rejectedAt)));',
+      ].join('\n')
+    );
+    expect(Number(out)).toBeLessThan(1_000);
+  });
+
+  it('clears the escalation timer of a killed run inside a vm context once its group is gone', async () => {
+    const pidFile = path.join(dir, 'pid');
+    const mint = commandToken(
+      await script(
+        [
+          `fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));`,
+          'setTimeout(() => {}, 30_000);',
+        ].join('\n')
+      ),
+      { timeoutMs: 300, killGraceMs: 10_000 }
+    );
+    const baseline = activeTimeouts();
+    expect(await rejection(mint({ refresh: false }))).toMatchObject({
+      failure: 'timeout',
+    });
+    expect(await exited(await pidFrom(pidFile))).toBe(true);
+    let left = activeTimeouts();
+    for (let i = 0; i < 25 && left > baseline; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      left = activeTimeouts();
+    }
+    expect(left).toBeLessThanOrEqual(baseline);
+  });
+
+  it('kills a run still going when its host exits', async () => {
+    const pidFile = path.join(dir, 'pid');
+    const command = await script(
+      [
+        `fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));`,
+        'setTimeout(() => process.stdout.write("token-1\\n"), 30_000);',
+      ].join('\n')
+    );
+    await host(
+      [
+        'import { existsSync } from "node:fs";',
+        `commandToken(${JSON.stringify(command)}, { timeoutMs: 60_000 })({ refresh: false }).catch(() => {});`,
+        `const wait = (): void => { if (existsSync(${JSON.stringify(pidFile)})) process.exit(0); else setTimeout(wait, 20); };`,
+        'wait();',
+      ].join('\n')
+    );
+    const pid = await pidFrom(pidFile);
+    try {
+      expect(await exited(pid)).toBe(true);
+    } finally {
+      sweep(pid);
+    }
+  });
+
+  it('settles when the shell exits, though a process it left behind still holds stdout', async () => {
+    const pidFile = path.join(dir, 'left');
+    const started = Date.now();
+    const pids: number[] = [];
+    try {
+      const minted = commandToken(
+        `sleep 3 & echo $! > "${pidFile}"; echo tok-1`,
+        { timeoutMs: 1_500 }
+      )({ refresh: false });
+      await expect(minted).resolves.toBe('tok-1');
+      expect(Date.now() - started).toBeLessThan(1_000);
+      pids.push(await pidFrom(pidFile));
+      /** The run ended on its own, so what it left behind is not killed. */
+      expect(() => process.kill(pids[0], 0)).not.toThrow();
+
+      await rm(pidFile);
+      const refused = await rejection(
+        commandToken(`sleep 3 & echo $! > "${pidFile}"; exit 3`, {
+          timeoutMs: 1_500,
+        })({ refresh: false })
+      );
+      pids.push(await pidFrom(pidFile));
+      expect(refused).toMatchObject({
+        failure: 'unauthorized',
+        message: 'token command exited with code 3',
+      });
+    } finally {
+      pids.forEach(sweep);
+    }
+  });
+
+  it('reads an exit status outside refusalExitCodes as network, leaving a breaker closed', async () => {
+    let requests = 0;
+    const fetch: DecisionFetch = async () => {
+      requests += 1;
+      return new Response(answered, { status: 200 });
+    };
+    const model = withBreaker(
+      createHttpDecisionModel({
+        endpoint: 'https://decisions.example/v1/systemone',
+        apiKey: commandToken(
+          await script(
+            'if (n === 1) process.exit(7); process.stdout.write("token-" + n + "\\n");'
+          ),
+          { refusalExitCodes: [1, 2] }
+        ),
+        dialect: 'systemone',
+        fetch,
+        maxRetries: 0,
+        timeoutMs: 10_000,
+      })
+    );
+
+    const error = await rejection(model.decide(request));
+    expect(error).toMatchObject({
+      failure: 'network',
+      message: 'token command exited with code 7',
+    });
+    expect(model.breaker.open).toBe(false);
+    await expect(model.decide(request)).resolves.toMatchObject({
+      model: 'jev-1.13.0',
+    });
+    expect(requests).toBe(1);
+
+    const listed = await rejection(
+      commandToken('exit 2', { refusalExitCodes: [1, 2] })({ refresh: false })
+    );
+    expect(listed.failure).toBe('unauthorized');
+    for (const codes of [[0], [256], [1.5]]) {
+      expect(() => commandToken('true', { refusalExitCodes: codes })).toThrow(
+        'invalid token command refusal exit codes'
+      );
+    }
+  });
+
+  it('starts a fresh run for a call made after a breaker reset instead of joining one from before it', async () => {
+    const flag = path.join(dir, 'logged-in');
+    const breaker = createBreaker();
+    const fetch: DecisionFetch = async () =>
+      new Response(answered, { status: 200 });
+    const model = withBreaker(
+      createHttpDecisionModel({
+        endpoint: 'https://decisions.example/v1/systemone',
+        apiKey: commandToken(
+          await script(
+            [
+              `if (fs.existsSync(${JSON.stringify(flag)})) process.stdout.write("token-" + n + "\\n");`,
+              'else setTimeout(() => process.exit(1), 600);',
+            ].join('\n')
+          ),
+          { breaker }
+        ),
+        dialect: 'systemone',
+        fetch,
+        timeoutMs: 10_000,
+      }),
+      breaker
+    );
+
+    expect(await rejection(model.decide(request))).toMatchObject({
+      failure: 'unauthorized',
+    });
+    expect(breaker.open).toBe(true);
+    breaker.reset();
+    const inFlight = model.decide(request);
+    while ((await runs()) < 2) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    /** The operator logs in while the run from before this reset is still failing. */
+    await writeFile(flag, '');
+    breaker.reset();
+    const after = model.decide(request);
+
+    expect(await rejection(inFlight)).toMatchObject({
+      failure: 'unauthorized',
+    });
+    await expect(after).resolves.toMatchObject({ model: 'jev-1.13.0' });
+    expect(breaker.open).toBe(false);
     expect(await runs()).toBe(3);
   });
 });

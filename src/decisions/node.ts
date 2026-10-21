@@ -6,6 +6,7 @@ import { spawn } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
 import type { Readable } from 'node:stream';
 import type { DecisionFailure, DecisionTokenMinter } from './types';
+import type { DecisionBreaker } from './breaker';
 import { DecisionError } from './types';
 import { redact } from './redact';
 
@@ -18,6 +19,11 @@ const STDERR_LIMIT = 200;
 /** Off Windows a shell reports a command killed by signal N as exit status 128 + N; Linux numbers signals up to 64. */
 const SIGNAL_EXIT_MIN = 129;
 const SIGNAL_EXIT_MAX = 128 + 64;
+/** How long a run whose shell has exited waits for a process it left holding stdout or stderr to let go. */
+const DRAIN_MS = 100;
+/** How often a killed run checks whether its process group has emptied, so the `SIGKILL` escalation stops waiting. */
+const REAP_POLL_MS = 25;
+const MAX_EXIT_CODE = 255;
 const KILL_SIGNAL = 'SIGTERM';
 const FORCE_SIGNAL = 'SIGKILL';
 const GROUP_KILL = process.platform !== 'win32';
@@ -39,6 +45,22 @@ export interface CommandTokenOptions {
    * its run; `0` escalates at once. Defaults to two seconds.
    */
   killGraceMs?: number;
+  /**
+   * The exit statuses that mean the credential was refused. A run that exits
+   * with any other non-zero status is a `network` failure, which the
+   * transport retries and which never trips a breaker, so a token CLI that
+   * exits 7 when its auth server is unreachable cannot open the breaker until
+   * a manual reset. By default every non-zero status outside 129–192 is a
+   * refusal.
+   */
+  refusalExitCodes?: ReadonlyArray<number>;
+  /**
+   * The breaker this credential's model is fused with. A run that started
+   * before `breaker.reset()` no longer serves callers that arrive after it, so
+   * the operator's fix is tested by a fresh run instead of failing on stale
+   * evidence and reopening the breaker.
+   */
+  breaker?: Pick<DecisionBreaker, 'generation'>;
 }
 
 interface SharedRun {
@@ -46,6 +68,35 @@ interface SharedRun {
   /** Callers still awaiting `token`; the run is killed when the last one aborts. */
   waiters: number;
   abandon: AbortController;
+  /** The breaker generation the run started under; `undefined` without a breaker. */
+  generation: number | undefined;
+  /** Set once a breaker reset stops the run serving new callers; its token is then not cached. */
+  detached: boolean;
+}
+
+/** Runs that may still have a live process group; the host's `exit` kills each, since the command's own process group does not receive the host's signals. */
+const live = new Set<ChildProcess>();
+
+function killLive(): void {
+  for (const child of live) {
+    killRun(child, FORCE_SIGNAL);
+  }
+}
+
+function track(child: ChildProcess): void {
+  if (child.pid === undefined) {
+    return;
+  }
+  if (live.size === 0) {
+    process.on('exit', killLive);
+  }
+  live.add(child);
+}
+
+function untrack(child: ChildProcess): void {
+  if (live.delete(child) && live.size === 0) {
+    process.off('exit', killLive);
+  }
 }
 
 function abandonedError(): DecisionError {
@@ -78,16 +129,23 @@ type RunEnd =
   | { kind: 'timeout' | 'overflow' | 'spawn' | 'abandoned' };
 
 /**
- * Only a run that finished and exited non-zero is a refusal. A run killed at
+ * Only a run that finished and exited non-zero, with a status in `refusals`
+ * when that list is given, is a refusal. A run killed at
  * `timeoutMs` is a `timeout`; a spawn error, an output overflow, or a signal
  * from outside is `network`, including one that killed a command the shell
  * forked, which the surviving shell reports as exit status 129–192. None of
  * these says anything about the credential, so none may trip a breaker.
  */
-function classify(end: RunEnd): { failure: DecisionFailure; reason: string } {
+function classify(
+  end: RunEnd,
+  refusals: ReadonlySet<number> | undefined
+): { failure: DecisionFailure; reason: string } {
   if (end.kind === 'exit') {
     return {
-      failure: 'unauthorized',
+      failure:
+        refusals === undefined || refusals.has(end.code)
+          ? 'unauthorized'
+          : 'network',
       reason: `token command exited with code ${end.code}`,
     };
   }
@@ -147,8 +205,10 @@ function runAlive(child: ChildProcess): boolean {
     process.kill(-child.pid, 0);
     return true;
   } catch (error) {
+    /** Not `instanceof Error`: a host that runs this module in a `vm` context (Jest does) gets the error from another realm. */
     return !(
-      error instanceof Error &&
+      typeof error === 'object' &&
+      error !== null &&
       'code' in error &&
       error.code === 'ESRCH'
     );
@@ -208,6 +268,17 @@ function describeFailure(
   return detail === '' ? reason : `${reason}: ${detail.slice(0, STDERR_LIMIT)}`;
 }
 
+function validExitCodes(codes: ReadonlyArray<number> | undefined): boolean {
+  return (
+    codes === undefined ||
+    (Array.isArray(codes) &&
+      codes.every(
+        (code) =>
+          Number.isSafeInteger(code) && code > 0 && code <= MAX_EXIT_CODE
+      ))
+  );
+}
+
 /**
  * A credential minted by a shell command that prints a short-lived bearer
  * token (for example `dataplanectl chai auth token`); the last non-empty line
@@ -216,23 +287,36 @@ function describeFailure(
  * concurrent calls share one run of the command, and a `refresh` (the
  * transport asks after a 401) runs it again unless the token it `refused` has
  * already been replaced, in which case the newer token (or the run minting
- * it) is shared instead.
+ * it) is shared instead. Given the model's `breaker`, a call made after
+ * `breaker.reset()` never joins a run that started before it.
+ *
+ * A run ends when its shell exits: a process the command leaves behind
+ * holding stdout or stderr gets 100 ms to let go, then the run settles from
+ * what it printed and that process is left running, unkilled.
  *
  * A caller whose `signal` aborts rejects at once with `aborted`; the run is
  * killed when every caller sharing it has aborted, and the next call starts a
  * fresh one. A run that exits non-zero or prints nothing rejects with an
- * `unauthorized` `DecisionError`; a run killed at `timeoutMs` rejects with
- * `timeout`, and a spawn failure, output overflow, or kill from outside with
- * `network`, so a slow command or one that cannot start never trips a
- * breaker. Off Windows an exit status of 129–192 is how a shell reports a
- * command it forked being killed by a signal (137 for `SIGKILL`), so it is a
- * kill, not a refusal; a pipeline such as `cmd | tail -1` hides a killed
- * `cmd` behind a clean exit with no output, which reads as `unauthorized`,
- * so keep the token command last in a pipeline. A kill sends
+ * `unauthorized` `DecisionError`, unless `refusalExitCodes` is given and does
+ * not list its status, which makes it `network`; a run killed at `timeoutMs`
+ * rejects with `timeout`, and a spawn failure, output overflow, or kill from
+ * outside with `network`, so a slow command or one that cannot start never
+ * trips a breaker. Off Windows an exit status of 129–192 is how a shell
+ * reports a command it forked being killed by a signal (137 for `SIGKILL`),
+ * so it is a kill, not a refusal; a pipeline such as `cmd | tail -1` hides a
+ * killed `cmd` behind a clean exit with no output, which reads as
+ * `unauthorized`, so keep the token command last in a pipeline. A kill sends
  * `SIGTERM`, then `SIGKILL` once `killGraceMs` passes with the run still
- * alive, so a killed run overlaps the next one for at most that grace. Off
+ * alive, so a killed run overlaps the next one for at most that grace; the
+ * escalation is dropped as soon as nothing it would reach is left. Off
  * Windows a kill reaches the command's whole process group; on Windows it
  * ends only the shell, not the command the shell launched.
+ *
+ * Off Windows the command runs in its own session, with no controlling
+ * terminal, so a signal sent to the host's process group (a terminal's
+ * Ctrl-C) does not reach it. When the host process exits, each run still
+ * going is sent `SIGKILL`; a host killed by a signal it does not handle never
+ * reaches its `exit` event, so it leaves such a run going.
  *
  * The message carries the exit status and a redacted stderr excerpt, never
  * a line of stdout, the command or any word of it (split at whitespace,
@@ -246,6 +330,7 @@ export function commandToken(
   const ttlMs = options.ttlMs ?? DEFAULT_TTL_MS;
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const killGraceMs = options.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
+  const { breaker } = options;
   if (typeof command !== 'string' || command.trim() === '') {
     throw new DecisionError('bad_request', 'token command is empty', {
       provider: COMMAND_TOKEN_PROVIDER,
@@ -260,6 +345,17 @@ export function commandToken(
       provider: COMMAND_TOKEN_PROVIDER,
     });
   }
+  if (!validExitCodes(options.refusalExitCodes)) {
+    throw new DecisionError(
+      'bad_request',
+      'invalid token command refusal exit codes',
+      { provider: COMMAND_TOKEN_PROVIDER }
+    );
+  }
+  const refusals =
+    options.refusalExitCodes === undefined
+      ? undefined
+      : new Set(options.refusalExitCodes);
 
   /** The last minted token; kept after a refusal so a failed refresh still redacts it. */
   let cached: string | null = null;
@@ -267,7 +363,11 @@ export function commandToken(
   let pending: SharedRun | null = null;
   const echoed = commandSecrets(command);
 
-  const run = (abandoned: AbortSignal): Promise<string> =>
+  /** `feedsCache` says whether a token this run mints may still be cached when it lands. */
+  const run = (
+    abandoned: AbortSignal,
+    feedsCache: () => boolean
+  ): Promise<string> =>
     new Promise<string>((resolve, reject) => {
       let child: ChildProcess;
       try {
@@ -286,16 +386,35 @@ export function commandToken(
         );
         return;
       }
+      track(child);
       let settled = false;
+      let killed = false;
       /** Armed by the first kill; outlives the shell, since a forked command may ignore the `SIGTERM` that ended it. */
       let escalation: NodeJS.Timeout | undefined;
+      /** Polls the killed group, so the escalation holds the host only while something it would reach is alive. */
+      let reaping: NodeJS.Timeout | undefined;
+      /** After the shell exits, bounds the wait for a process it left holding stdout or stderr. */
+      let draining: NodeJS.Timeout | undefined;
+      const release = (): void => {
+        clearTimeout(escalation);
+        clearInterval(reaping);
+        untrack(child);
+      };
+      const reap = (): void => {
+        if (!runAlive(child)) {
+          release();
+        }
+      };
       const stop = (end: RunEnd): void => {
-        if (escalation === undefined) {
+        if (!killed) {
+          killed = true;
           killRun(child, KILL_SIGNAL);
-          escalation = setTimeout(
-            () => killRun(child, FORCE_SIGNAL),
-            killGraceMs
-          );
+          escalation = setTimeout(() => {
+            killRun(child, FORCE_SIGNAL);
+            release();
+          }, killGraceMs);
+          reaping = setInterval(reap, REAP_POLL_MS);
+          reaping.unref();
         }
         child.stdout?.destroy();
         child.stderr?.destroy();
@@ -313,6 +432,7 @@ export function commandToken(
         }
         settled = true;
         clearTimeout(timer);
+        clearTimeout(draining);
         abandoned.removeEventListener('abort', onAbandon);
         return true;
       };
@@ -326,7 +446,7 @@ export function commandToken(
          * are listed whatever their length, at the cost of a garbled excerpt.
          */
         const secrets = [...echoed, ...stdout().split(/\r?\n/), cached];
-        const { failure, reason } = classify(end);
+        const { failure, reason } = classify(end, refusals);
         reject(
           new DecisionError(
             failure,
@@ -335,14 +455,11 @@ export function commandToken(
           )
         );
       }
-
-      child.once('error', () => fail({ kind: 'spawn' }));
-      child.once('exit', () => {
-        if (escalation !== undefined && !runAlive(child)) {
-          clearTimeout(escalation);
+      /** Settles a run that ended on its own, from what it printed. */
+      const ended = (code: number | null, signal: string | null): void => {
+        if (!killed) {
+          untrack(child);
         }
-      });
-      child.once('close', (code: number | null, signal: string | null) => {
         if (code !== 0) {
           fail(closedEnd(code, signal));
           return;
@@ -363,21 +480,43 @@ export function commandToken(
           );
           return;
         }
-        if (!abandoned.aborted) {
+        if (!abandoned.aborted && feedsCache()) {
           cached = token;
           /** From completion, so a slow command cannot hand out a token that is already expired. */
           expiresAt = Date.now() + ttlMs;
         }
         resolve(token);
+      };
+
+      child.once('error', () => fail({ kind: 'spawn' }));
+      child.once('exit', (code: number | null, signal: string | null) => {
+        if (killed) {
+          reap();
+          return;
+        }
+        draining = setTimeout(() => {
+          child.stdout?.destroy();
+          child.stderr?.destroy();
+          ended(code, signal);
+        }, DRAIN_MS);
+      });
+      child.once('close', (code: number | null, signal: string | null) => {
+        if (killed) {
+          reap();
+          return;
+        }
+        ended(code, signal);
       });
     });
 
   const start = (): SharedRun => {
     const abandon = new AbortController();
     const shared: SharedRun = {
-      token: run(abandon.signal),
+      token: run(abandon.signal, () => !shared.detached),
       waiters: 0,
       abandon,
+      generation: breaker?.generation,
+      detached: false,
     };
     const settle = (): void => {
       if (pending === shared) {
@@ -418,6 +557,11 @@ export function commandToken(
   return ({ refresh, refused, signal }): Promise<string> => {
     if (signal?.aborted === true) {
       return Promise.reject(abandonedError());
+    }
+    /** A run from before a breaker reset carries the credential state the reset was meant to clear; its callers keep it, new ones start fresh. */
+    if (pending !== null && pending.generation !== breaker?.generation) {
+      pending.detached = true;
+      pending = null;
     }
     /** A refusal of an older token says nothing about the one cached since. */
     if (refresh && (refused === undefined || refused === cached)) {

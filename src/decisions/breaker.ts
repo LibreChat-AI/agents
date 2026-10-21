@@ -68,7 +68,9 @@ export function createBreaker(): DecisionBreaker {
  * `circuitOpen: true`, until `breaker.reset()`. Rate limits, server errors,
  * timeouts, and network failures never trip it; the transport retries those.
  * A fatal failure from a call that started before a `reset()` does not reopen
- * it. Share one breaker between models that share a credential.
+ * it; a minter that shares one run between calls must not let a call made
+ * after a reset join a run from before it (`commandToken` takes the breaker
+ * for this). Share one breaker between models that share a credential.
  */
 export function withBreaker(
   model: DecisionModel,
