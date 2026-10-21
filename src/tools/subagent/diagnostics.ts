@@ -54,6 +54,10 @@ const SUBAGENT_RESOLUTION_MESSAGES = {
     'Subagent error: Workspace unavailable. Retry later or choose another workspace.',
   agent_unavailable: 'Subagent error: Agent not found or not accessible.',
   model_unavailable: 'Subagent error: Model or provider unavailable.',
+  authentication_required:
+    'Subagent error: Required tool authentication is incomplete. Complete the sign-in prompt before retrying.',
+  tools_unavailable:
+    'Subagent error: Required tools are unavailable. Retry later.',
   configuration_changed:
     'Subagent error: Subagent configuration changed. Start a new execution.',
   host_argument_rejected:
@@ -93,16 +97,10 @@ export type SubagentResolutionFailureHandler = (
 function normalizeResolutionCause(
   cause: SubagentResolutionCause | void
 ): SubagentResolutionCause {
-  switch (cause) {
-  case 'workspace_unavailable':
-  case 'agent_unavailable':
-  case 'model_unavailable':
-  case 'configuration_changed':
-  case 'host_argument_rejected':
-    return cause;
-  default:
-    return 'unknown';
-  }
+  return typeof cause === 'string' &&
+    Object.hasOwn(SUBAGENT_RESOLUTION_MESSAGES, cause)
+    ? cause
+    : 'unknown';
 }
 
 export function getSubagentResolutionFailureMessage(

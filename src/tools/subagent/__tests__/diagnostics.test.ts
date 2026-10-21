@@ -28,6 +28,8 @@ describe('subagent resolution diagnostics', () => {
     ['agent_unavailable', 'Agent not found or not accessible'],
     ['model_unavailable', 'Model or provider unavailable'],
     ['configuration_changed', 'Subagent configuration changed'],
+    ['authentication_required', 'Complete the sign-in prompt before retrying'],
+    ['tools_unavailable', 'Required tools are unavailable'],
     ['unknown', 'Unable to initialize the selected subagent'],
   ] as const)('accepts only safe public text for %s', (cause, message) => {
     const warn = silenceConsole();
