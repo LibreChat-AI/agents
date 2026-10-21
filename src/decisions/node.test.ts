@@ -322,6 +322,35 @@ describe('commandToken', () => {
     );
   });
 
+  it('reports a forked command the shell saw killed by a signal as network, leaving a breaker closed', async () => {
+    let requests = 0;
+    const fetch: DecisionFetch = async () => {
+      requests += 1;
+      return new Response(answered, { status: 200 });
+    };
+    const model = withBreaker(
+      createHttpDecisionModel({
+        endpoint: 'https://decisions.example/v1/systemone',
+        apiKey: commandToken('sh -c "kill -KILL \\$\\$" && echo token-1'),
+        dialect: 'systemone',
+        fetch,
+        maxRetries: 0,
+        timeoutMs: 10_000,
+      })
+    );
+
+    const error = await rejection(model.decide(request));
+    expect(error).toMatchObject({ failure: 'network', provider: 'command' });
+    expect(error.message).toMatch(
+      /^token command exited with code 137 \(killed by signal 9\)/
+    );
+    expect(model.breaker.open).toBe(false);
+    expect(requests).toBe(0);
+
+    const plain = await rejection(commandToken('exit 3')({ refresh: false }));
+    expect(plain.failure).toBe('unauthorized');
+  });
+
   it('does not cache a failed run', async () => {
     const mint = commandToken(
       await script(

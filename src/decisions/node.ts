@@ -15,6 +15,9 @@ const DEFAULT_TIMEOUT_MS = 60_000;
 const DEFAULT_KILL_GRACE_MS = 2_000;
 const MAX_OUTPUT_BYTES = 1024 * 1024;
 const STDERR_LIMIT = 200;
+/** Off Windows a shell reports a command killed by signal N as exit status 128 + N; Linux numbers signals up to 64. */
+const SIGNAL_EXIT_MIN = 129;
+const SIGNAL_EXIT_MAX = 128 + 64;
 const KILL_SIGNAL = 'SIGTERM';
 const FORCE_SIGNAL = 'SIGKILL';
 const GROUP_KILL = process.platform !== 'win32';
@@ -71,13 +74,15 @@ function lastLine(text: string): string {
 type RunEnd =
   | { kind: 'exit'; code: number }
   | { kind: 'signal'; signal: string }
+  | { kind: 'shellSignal'; code: number }
   | { kind: 'timeout' | 'overflow' | 'spawn' | 'abandoned' };
 
 /**
  * Only a run that finished and exited non-zero is a refusal. A run killed at
  * `timeoutMs` is a `timeout`; a spawn error, an output overflow, or a signal
- * from outside is `network`. None of these says anything about the
- * credential, so none may trip a breaker.
+ * from outside is `network`, including one that killed a command the shell
+ * forked, which the surviving shell reports as exit status 129–192. None of
+ * these says anything about the credential, so none may trip a breaker.
  */
 function classify(end: RunEnd): { failure: DecisionFailure; reason: string } {
   if (end.kind === 'exit') {
@@ -90,6 +95,12 @@ function classify(end: RunEnd): { failure: DecisionFailure; reason: string } {
     return {
       failure: 'timeout',
       reason: `token command timed out (${KILL_SIGNAL})`,
+    };
+  }
+  if (end.kind === 'shellSignal') {
+    return {
+      failure: 'network',
+      reason: `token command exited with code ${end.code} (killed by signal ${end.code - 128})`,
     };
   }
   if (end.kind === 'signal') {
@@ -176,6 +187,17 @@ function commandSecrets(command: string): string[] {
   );
 }
 
+/** How a run that closed with `code` and `signal` ended; off Windows, an exit status in the shell's signal range is a kill, not a refusal. */
+function closedEnd(code: number | null, signal: string | null): RunEnd {
+  if (code === null) {
+    return { kind: 'signal', signal: signal ?? 'unknown' };
+  }
+  if (GROUP_KILL && code >= SIGNAL_EXIT_MIN && code <= SIGNAL_EXIT_MAX) {
+    return { kind: 'shellSignal', code };
+  }
+  return { kind: 'exit', code };
+}
+
 /** Names how the command failed; never its text, stdout, or `error.message`, which echoes both. */
 function describeFailure(
   reason: string,
@@ -200,8 +222,13 @@ function describeFailure(
  * killed when every caller sharing it has aborted, and the next call starts a
  * fresh one. A run that exits non-zero or prints nothing rejects with an
  * `unauthorized` `DecisionError`; a run killed at `timeoutMs` rejects with
- * `timeout`, and a spawn failure or output overflow with `network`, so a slow
- * command or one that cannot start never trips a breaker. A kill sends
+ * `timeout`, and a spawn failure, output overflow, or kill from outside with
+ * `network`, so a slow command or one that cannot start never trips a
+ * breaker. Off Windows an exit status of 129–192 is how a shell reports a
+ * command it forked being killed by a signal (137 for `SIGKILL`), so it is a
+ * kill, not a refusal; a pipeline such as `cmd | tail -1` hides a killed
+ * `cmd` behind a clean exit with no output, which reads as `unauthorized`,
+ * so keep the token command last in a pipeline. A kill sends
  * `SIGTERM`, then `SIGKILL` once `killGraceMs` passes with the run still
  * alive, so a killed run overlaps the next one for at most that grace. Off
  * Windows a kill reaches the command's whole process group; on Windows it
@@ -317,11 +344,7 @@ export function commandToken(
       });
       child.once('close', (code: number | null, signal: string | null) => {
         if (code !== 0) {
-          fail(
-            code !== null
-              ? { kind: 'exit', code }
-              : { kind: 'signal', signal: signal ?? 'unknown' }
-          );
+          fail(closedEnd(code, signal));
           return;
         }
         if (!finish()) {
