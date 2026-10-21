@@ -58,6 +58,19 @@ async function runs(): Promise<number> {
   }
 }
 
+/** Whether a process is gone within two seconds; the command forked by the shell must not outlive a kill. */
+async function exited(pid: number): Promise<boolean> {
+  for (let i = 0; i < 100; i++) {
+    try {
+      process.kill(pid, 0);
+    } catch {
+      return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  return false;
+}
+
 async function rejection(promise: Promise<unknown>): Promise<DecisionError> {
   const error = await promise.then(
     () => undefined,
@@ -119,6 +132,104 @@ describe('commandToken', () => {
     }
   });
 
+  it('counts the ttl from when the command finished, not when it started', async () => {
+    let now = 1_000_000;
+    const clock = jest.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      const mint = commandToken(
+        await script('process.stdout.write("token-" + n + "\\n");'),
+        { ttlMs: 5_000 }
+      );
+      const first = mint({ refresh: false });
+      /** The command takes longer than the ttl. */
+      now += 10_000;
+      await expect(first).resolves.toBe('token-1');
+      now += 4_000;
+      await expect(mint({ refresh: false })).resolves.toBe('token-1');
+      expect(await runs()).toBe(1);
+      now += 1_001;
+      await expect(mint({ refresh: false })).resolves.toBe('token-2');
+      expect(await runs()).toBe(2);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it('redacts a refused token when the refresh that replaces it fails', async () => {
+    const refused = 'tok-medium-secret-1234';
+    const mint = commandToken(
+      await script(
+        [
+          `if (n === 1) { process.stdout.write(${JSON.stringify(`${refused}\n`)}); process.exit(0); }`,
+          `process.stderr.write(${JSON.stringify(`refresh failed for ${refused}\n`)});`,
+          'process.exit(1);',
+        ].join('\n')
+      )
+    );
+    await expect(mint({ refresh: false })).resolves.toBe(refused);
+    const error = await rejection(mint({ refresh: true }));
+    expect(error.message).toBe(
+      'token command exited with code 1: refresh failed for [REDACTED]'
+    );
+    expect(error.message).not.toContain(refused);
+  });
+
+  it('kills a run once its only caller aborts and starts fresh for the next call', async () => {
+    const pidFile = path.join(dir, 'pid');
+    const mint = commandToken(
+      await script(
+        [
+          `if (n === 1) { fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setTimeout(() => process.stdout.write("token-1\\n"), 30_000); }`,
+          'else process.stdout.write("token-" + n + "\\n");',
+        ].join('\n')
+      ),
+      { timeoutMs: 60_000 }
+    );
+    const caller = new AbortController();
+    const first = mint({ refresh: false, signal: caller.signal });
+    while (!(await readFile(pidFile, 'utf8').catch(() => ''))) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    const pid = Number(await readFile(pidFile, 'utf8'));
+    caller.abort();
+    const error = await rejection(first);
+    expect(error).toMatchObject({ failure: 'aborted', provider: 'command' });
+
+    await expect(mint({ refresh: false })).resolves.toBe('token-2');
+    expect(await runs()).toBe(2);
+    expect(await exited(pid)).toBe(true);
+  });
+
+  it('keeps a shared run alive while another caller still waits on it', async () => {
+    const mint = commandToken(
+      await script(
+        'setTimeout(() => process.stdout.write("token-" + n + "\\n"), 300);'
+      )
+    );
+    const leaving = new AbortController();
+    const left = mint({ refresh: false, signal: leaving.signal });
+    const staying = mint({
+      refresh: false,
+      signal: new AbortController().signal,
+    });
+    leaving.abort();
+    expect(await rejection(left)).toMatchObject({ failure: 'aborted' });
+    await expect(staying).resolves.toBe('token-1');
+    await expect(mint({ refresh: false })).resolves.toBe('token-1');
+    expect(await runs()).toBe(1);
+  });
+
+  it('rejects an already-aborted caller without running the command', async () => {
+    const mint = commandToken(
+      await script('process.stdout.write("token-" + n + "\\n");')
+    );
+    const error = await rejection(
+      mint({ refresh: false, signal: AbortSignal.abort() })
+    );
+    expect(error).toMatchObject({ failure: 'aborted' });
+    expect(await runs()).toBe(0);
+  });
+
   it('fails as unauthorized with a redacted stderr excerpt and never the token', async () => {
     const leaked = 'tok_live_0123456789';
     const mint = commandToken(
@@ -173,7 +284,10 @@ describe('commandToken', () => {
         endpoint: 'https://decisions.example/v1/systemone',
         apiKey: commandToken(
           await script(
-            'setTimeout(() => process.stdout.write("token-" + n + "\\n"), 3_000);'
+            [
+              `fs.writeFileSync(${JSON.stringify(path.join(dir, 'pid'))}, String(process.pid));`,
+              'setTimeout(() => process.stdout.write("token-" + n + "\\n"), 30_000);',
+            ].join('\n')
           ),
           { timeoutMs: 300 }
         ),
@@ -188,6 +302,9 @@ describe('commandToken', () => {
     expect(error.message).toMatch(/^token command timed out \(SIG[A-Z]+\)/);
     expect(model.breaker.open).toBe(false);
     expect(requests).toBe(0);
+    expect(
+      await exited(Number(await readFile(path.join(dir, 'pid'), 'utf8')))
+    ).toBe(true);
   });
 
   it('reports output past the buffer limit as a network failure', async () => {
@@ -218,6 +335,16 @@ describe('commandToken', () => {
     );
     expect(error.message).not.toContain('sk_short123');
     expect(error.message).not.toContain('mint.js');
+  });
+
+  it('drops the message of a spawn that throws, which quotes the command', async () => {
+    const error = await rejection(
+      commandToken('mint --key=sk_short123\0')({ refresh: false })
+    );
+    expect(error).toMatchObject({
+      failure: 'network',
+      message: 'token command failed',
+    });
   });
 
   it('rejects an empty command and invalid timing at construction', () => {
