@@ -238,6 +238,9 @@ export function createSystemOneReranker(
               signal,
               timeoutMs: request.timeoutMs ?? timeoutMs,
               label: 'rerank',
+              ...(request.onRequest !== undefined
+                ? { onRequest: request.onRequest }
+                : {}),
             })
           );
         } catch (error) {
@@ -570,12 +573,21 @@ export function createSystemOneReranker(
                       }
                       dispatch.sent = true;
                       run.usage.calls += 1;
+                      let requests = 0;
                       return model.decide({
                         state,
                         questions: { [QUESTION_ID]: question },
                         signal,
                         timeoutMs: left,
                         label: 'rerank',
+                        onRequest: () => {
+                          requests += 1;
+                          // The first request was counted at dispatch; a later one is a retry, so the one before it ended.
+                          if (requests > 1 && !run.settled) {
+                            run.usage.calls += 1;
+                            run.replied += 1;
+                          }
+                        },
                       });
                     })
                   );

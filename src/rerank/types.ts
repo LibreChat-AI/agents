@@ -6,6 +6,11 @@ export interface RerankRequest {
   topK?: number;
   signal?: AbortSignal;
   timeoutMs?: number;
+  /**
+   * Called once per request a reranker sends, retries included, for one that
+   * reports them (see `DecisionRequest.onRequest`). Not awaited; a throw is ignored.
+   */
+  onRequest?: () => void;
 }
 
 export interface RankedDocument {
@@ -67,7 +72,11 @@ export type RerankReason =
  * abandoned (see `estimatedUsage`). Never a price.
  */
 export interface RerankUsage {
-  /** Requests sent, including re-issues and retries. */
+  /**
+   * Requests sent, including re-issues and retries. Retries inside an injected
+   * decision model are counted when it reports them through `onRequest`, as
+   * the SDK's HTTP decision model does; otherwise one per `decide()`.
+   */
   calls: number;
   inputTokens: number;
   outputTokens: number;

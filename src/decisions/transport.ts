@@ -38,11 +38,17 @@ export interface TransportOptions {
   onAnswered?: (label: string, ms: number) => void;
 }
 
+/**
+ * `onRequest` is called once per HTTP request, just before it is sent:
+ * retries and every re-send after a 401 included. Not awaited; a throw or a
+ * rejected promise is ignored.
+ */
 export type Transport = <T>(
   prepare: () => { payload: string; parse: (body: string) => T },
   signal: AbortSignal | undefined,
   label: string,
-  timeoutOverrideMs?: number
+  timeoutOverrideMs?: number,
+  onRequest?: () => void
 ) => Promise<T>;
 
 export function failureForStatus(
@@ -210,7 +216,13 @@ export function createTransport(options: TransportOptions): Transport {
     return token;
   }
 
-  return async function send(prepare, callerSignal, label, timeoutOverrideMs) {
+  return async function send(
+    prepare,
+    callerSignal,
+    label,
+    timeoutOverrideMs,
+    onRequest
+  ) {
     const started = performance.now();
     return withDecisionDeadline(
       providerId,
@@ -271,6 +283,9 @@ export function createTransport(options: TransportOptions): Transport {
                 /** The minter has nothing newer than a key this call had refused: that refusal stands. */
                 throw refusal;
               }
+            }
+            if (onRequest !== undefined) {
+              callHook(() => onRequest());
             }
             const response = await waitFor(
               fetchImpl(endpoint, {

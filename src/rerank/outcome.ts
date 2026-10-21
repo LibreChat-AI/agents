@@ -1,6 +1,7 @@
 import type {
   Reranker,
   RerankKind,
+  RerankResult,
   RerankEntry,
   RerankUsage,
   RankRequest,
@@ -11,6 +12,7 @@ import type {
 } from './types';
 import type { DecisionFailure } from '../decisions/types';
 import { DecisionError, isDecisionObject } from '../decisions/types';
+import { withDecisionDeadline } from '../decisions/deadline';
 
 /** Longest deadline a step may have; matches `withDecisionDeadline`. */
 export const MAX_RERANK_DEADLINE_MS = 3_600_000;
@@ -519,8 +521,10 @@ export function rankRequestProblem(request: unknown): RerankReason | undefined {
  * The never-throwing layer over a rejecting `Reranker`: its full ranking
  * becomes an `ok` outcome, a rejection becomes a reason, and a ranking that
  * is not a full permutation in descending score order is `invalid_results`.
- * Usage counts one call with whatever tokens the reranker reported, or none
- * when an open breaker (`circuitOpen`) refused it before dispatch.
+ * Usage counts one call, plus every retry the reranker reports through
+ * `onRequest`, with whatever tokens it reported, or none when an open breaker
+ * (`circuitOpen`) refused it before dispatch. The request's `deadlineMs` and
+ * `signal` bound the wait even for a reranker that ignores them.
  */
 export function toOutcomeReranker(
   reranker: Reranker,
@@ -558,14 +562,38 @@ export function toOutcomeReranker(
       }
       const usage = emptyRerankUsage();
       usage.calls = 1;
+      /** Requests the reranker reported sending; the first is the call counted above. */
+      let requests = 0;
+      let settled = false;
       try {
         const deadlineMs = validDeadline(request.deadlineMs);
-        const response = await reranker.rerank({
-          query: request.query,
-          documents: request.documents,
-          ...(request.signal !== undefined ? { signal: request.signal } : {}),
-          ...(deadlineMs !== undefined ? { timeoutMs: deadlineMs } : {}),
-        });
+        const call = (signal: AbortSignal | undefined): Promise<RerankResult> =>
+          reranker.rerank({
+            query: request.query,
+            documents: request.documents,
+            ...(signal !== undefined ? { signal } : {}),
+            ...(deadlineMs !== undefined ? { timeoutMs: deadlineMs } : {}),
+            onRequest: () => {
+              requests += 1;
+              if (requests > 1 && !settled) {
+                usage.calls += 1;
+              }
+            },
+          });
+        // Bounded here too, so a reranker that ignores its deadline and signal cannot hold the call.
+        let response: RerankResult;
+        if (deadlineMs === undefined && request.signal === undefined) {
+          response = await call(undefined);
+        } else {
+          response = await withDecisionDeadline(
+            reranker.id,
+            deadlineMs ?? MAX_RERANK_DEADLINE_MS,
+            request.signal,
+            (signal, waitFor) =>
+              waitFor(Promise.resolve().then(() => call(signal)))
+          );
+        }
+        settled = true;
         usage.inputTokens = count(response.usage?.inputTokens);
         usage.outputTokens = count(response.usage?.outputTokens);
         const echoed =
@@ -608,6 +636,7 @@ export function toOutcomeReranker(
           usage,
         });
       } catch (error) {
+        settled = true;
         // An open breaker refuses before dispatch: nothing was sent, so nothing is charged.
         const sent = !(error instanceof DecisionError && error.circuitOpen);
         if (!sent) {

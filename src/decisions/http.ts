@@ -168,7 +168,8 @@ export function createHttpDecisionModel(
         },
         request.signal,
         request.label ?? 'decide',
-        request.timeoutMs
+        request.timeoutMs,
+        request.onRequest
       );
     },
   };

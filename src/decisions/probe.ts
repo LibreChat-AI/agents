@@ -1,10 +1,13 @@
 import type { DecisionModel, DecisionFailure, DecisionRequest } from './types';
+import { withDecisionDeadline } from './deadline';
 import { booleanQuestion } from './questions';
 import { DecisionError } from './types';
 import { redactExcerpt } from './redact';
 
 const DETAIL_LIMIT = 200;
 const PROBE_FAILED = 'decision model probe failed';
+/** How long a probe without `timeoutMs` waits for a model that never settles. */
+export const PROBE_MAX_WAIT_MS = 60_000;
 
 export type DecisionProbe =
   | { ok: true; model: string }
@@ -18,7 +21,11 @@ export type DecisionProbe =
     };
 
 export interface DecisionProbeOptions {
-  /** Defaults to the model's own timeout; allow for a slow first token mint. */
+  /**
+   * Passed to the model and enforced around its call, so a model that ignores
+   * it still settles; allow for a slow first token mint. Without it the model
+   * keeps its own timeout and the wait is bounded at `PROBE_MAX_WAIT_MS`.
+   */
   timeoutMs?: number;
   signal?: AbortSignal;
   /** Credentials the failure detail must never contain. */
@@ -41,8 +48,9 @@ export function probeRequest(): DecisionProbeRequest {
 
 /**
  * Can this model answer right now? Asks one tiny boolean question and never
- * throws: any reply is `ok`, and any failure, including a non-SDK exception
- * (read as `network`), is returned with a redacted detail. Through
+ * throws, and settles by its deadline or the caller's abort even when the
+ * model ignores both: any reply is `ok`, and any failure, including a non-SDK
+ * exception (read as `network`), is returned with a redacted detail. Through
  * `withBreaker`, a fatal failure trips the breaker and an open breaker answers
  * without a request.
  */
@@ -51,13 +59,22 @@ export async function probe(
   options: DecisionProbeOptions = {}
 ): Promise<DecisionProbe> {
   try {
-    const result = await model.decide({
-      ...probeRequest(),
-      ...(options.timeoutMs !== undefined
-        ? { timeoutMs: options.timeoutMs }
-        : {}),
-      ...(options.signal !== undefined ? { signal: options.signal } : {}),
-    });
+    const { timeoutMs } = options;
+    const result = await withDecisionDeadline(
+      model.id,
+      timeoutMs ?? PROBE_MAX_WAIT_MS,
+      options.signal,
+      (signal, waitFor) =>
+        waitFor(
+          Promise.resolve().then(() =>
+            model.decide({
+              ...probeRequest(),
+              ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+              signal,
+            })
+          )
+        )
+    );
     return { ok: true, model: result.model };
   } catch (error) {
     if (!(error instanceof DecisionError)) {

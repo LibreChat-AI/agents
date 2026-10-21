@@ -1,5 +1,6 @@
 import type { DecisionModel } from '../decisions/types';
 import type { RerankReason } from './types';
+import { withDecisionDeadline } from '../decisions/deadline';
 import { DecisionError } from '../decisions/types';
 import { probeRequest } from '../decisions/probe';
 import { rerankReasonOf } from './outcome';
@@ -12,8 +13,12 @@ export interface PinProbeOptions {
   modelFor: (model: string) => DecisionModel;
   /** The checkpoint to verify, such as `jev-1.13.0`. */
   pin: string;
+  /** Defaults to `PIN_SENTINEL_MODEL`; a blank sentinel, or one that is the pin, is `invalid_request`. */
   sentinel?: string;
-  /** Per request; defaults to 15 seconds to allow a slow first token mint. */
+  /**
+   * Per request, enforced around the model call even when the model ignores
+   * it; defaults to 15 seconds to allow a slow first token mint.
+   */
   timeoutMs?: number;
   signal?: AbortSignal;
 }
@@ -43,24 +48,43 @@ const echoOf = (value: unknown): string | undefined =>
  * Does this host really serve the pinned model? Two answers are needed: a
  * sentinel model no host serves must be refused with HTTP 404 (a host that
  * answers it, as Laya does, echoes whatever it is asked, so its echo proves
- * nothing), and a probe with the pin must echo exactly the pin. Never throws.
+ * nothing), and a probe with the pin must echo exactly the pin. Each request
+ * is bounded by `timeoutMs` and the caller's signal even when the model ignores
+ * them. Never throws.
  */
 export async function probePin(options: PinProbeOptions): Promise<PinProbe> {
   const pin = typeof options.pin === 'string' ? options.pin.trim() : '';
-  const sentinel = options.sentinel ?? PIN_SENTINEL_MODEL;
+  let sentinel = PIN_SENTINEL_MODEL;
+  if (options.sentinel !== undefined) {
+    sentinel =
+      typeof options.sentinel === 'string' ? options.sentinel.trim() : '';
+  }
   if (
     pin === '' ||
+    sentinel === '' ||
     sentinel === pin ||
     typeof options.modelFor !== 'function'
   ) {
     return { verified: false, reason: 'invalid_request' };
   }
-  const ask = async (model: string): Promise<unknown> =>
-    options.modelFor(model).decide({
-      ...probeRequest(),
-      timeoutMs: options.timeoutMs ?? 15_000,
-      ...(options.signal !== undefined ? { signal: options.signal } : {}),
-    });
+  const timeoutMs = options.timeoutMs ?? 15_000;
+  /** Bounded here, so a model that ignores its deadline and signal cannot hold the probe. */
+  const ask = (model: string): Promise<unknown> =>
+    withDecisionDeadline(
+      'pin-probe',
+      timeoutMs,
+      options.signal,
+      (signal, waitFor) =>
+        waitFor(
+          Promise.resolve().then(() =>
+            options.modelFor(model).decide({
+              ...probeRequest(),
+              timeoutMs,
+              signal,
+            })
+          )
+        )
+    );
   try {
     const answer = await ask(sentinel);
     const echoed = echoOf(answer);

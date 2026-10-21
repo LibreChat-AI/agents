@@ -26,6 +26,7 @@ import {
   DecisionError,
   decisionPreset,
   createDecisionModel,
+  createHttpDecisionModel,
 } from '@/decisions';
 
 type Json = { [key: string]: unknown };
@@ -984,6 +985,107 @@ function relevance(
 
 const RELEVANCE = { alpha: 0.1, beta: 0.7, gamma: 0.3, delta: 0.9 };
 
+describe('System One usage counts transport retries', () => {
+  /** A Jev model with the transport's own retries and no backoff wait. */
+  function retrying(url: string, apiKey?: DecisionCredential): DecisionModel {
+    return createHttpDecisionModel({
+      providerId: 'jev',
+      endpoint: `${url}/v1/systemone`,
+      model: 'jev-1.13.0',
+      dialect: 'systemone',
+      requiresAuth: apiKey !== undefined,
+      apiKey,
+      maxRetries: 2,
+      sleep: () => Promise.resolve(),
+    });
+  }
+
+  /** Fails each document's first `failures` requests with `status`, then scores it. */
+  function flaky(failures: number, status = 503): (call: Call) => Reply {
+    const seen = new Map<string, number>();
+    return (call) => {
+      const document = documentOf(call);
+      const nth = seen.get(document) ?? 0;
+      seen.set(document, nth + 1);
+      return nth < failures ? { status } : scored(SCORES)(call);
+    };
+  }
+
+  it('document mode counts every retried request, not one per decide()', async () => {
+    const server = await stub(flaky(2));
+    const outcome = await createSystemOneReranker({
+      model: retrying(server.url),
+      rubric,
+    }).rank({ query: 'q', documents: ['alpha', 'beta'] });
+    expect(server.calls).toHaveLength(6);
+    expect(outcome).toMatchObject({ status: 'ok' });
+    expect(outcome.usage).toMatchObject({
+      calls: 6,
+      inputTokens: 20,
+      estimatedTokens: 0,
+    });
+    expect(outcome.attempts[0].usage.calls).toBe(6);
+  });
+
+  it('document mode counts the re-send after a 401 refresh', async () => {
+    const server = await stub((call) =>
+      call.authorization === 'Bearer stale'
+        ? { status: 401 }
+        : scored(SCORES)(call)
+    );
+    const outcome = await createSystemOneReranker({
+      model: retrying(server.url, async ({ refresh }) =>
+        refresh ? 'fresh' : 'stale'
+      ),
+      rubric,
+    }).rank({ query: 'q', documents: ['alpha'] });
+    expect(server.calls).toHaveLength(2);
+    expect(outcome).toMatchObject({ status: 'ok' });
+    expect(outcome.usage).toMatchObject({ calls: 2, estimatedTokens: 0 });
+  });
+
+  it('estimates only the retried request a deadline abandoned', async () => {
+    const seen = new Map<string, number>();
+    const server = await stub((call) => {
+      const nth = seen.get(documentOf(call)) ?? 0;
+      seen.set(documentOf(call), nth + 1);
+      return nth === 0 ? { status: 503 } : 'hang';
+    });
+    const outcome = await createSystemOneReranker({
+      model: retrying(server.url),
+      rubric,
+      timeoutMs: 300,
+    }).rank({ query: 'q', documents: ['alpha'] });
+    expect(server.calls).toHaveLength(2);
+    expect(outcome).toMatchObject({ status: 'skipped', reason: 'timeout' });
+    expect(outcome.usage).toMatchObject({ calls: 2, estimatedTokens: 600 });
+  });
+
+  it('batch mode counts every retried request', async () => {
+    const answer: Reply = {
+      body: {
+        model: 'jev-1.13.0',
+        answers: {
+          d0: { type: 'score', score: 2 },
+          d1: { type: 'score', score: 1 },
+        },
+        usage: { input_tokens: 30, output_tokens: 2 },
+      },
+    };
+    const server = await stub((_call, nth) =>
+      nth === 0 ? { status: 503 } : answer
+    );
+    const outcome = await createSystemOneReranker({
+      model: retrying(server.url),
+      rubric,
+      mode: 'batch',
+    }).rank({ query: 'q', documents: ['alpha', 'beta'] });
+    expect(server.calls).toHaveLength(2);
+    expect(outcome).toMatchObject({ status: 'ok' });
+    expect(outcome.usage).toMatchObject({ calls: 2, inputTokens: 30 });
+  });
+});
+
 describe('cross-encoder ranking', () => {
   it('posts { model, query, documents } once with the bearer key and ranks by relevance_score', async () => {
     const server = await stub(relevance(RELEVANCE));
@@ -1449,6 +1551,36 @@ describe('withFallback', () => {
             ],
           },
         ],
+        [
+          'kept flags contradicting their threshold',
+          {
+            threshold: 0.5,
+            results: [
+              { index: 1, score: 1, kept: false },
+              { index: 0, score: 0, kept: true },
+            ],
+          },
+        ],
+        [
+          'a threshold without kept flags',
+          {
+            threshold: 0.5,
+            results: [
+              { index: 1, score: 1 },
+              { index: 0, score: 0 },
+            ],
+          },
+        ],
+        [
+          'a threshold with kept on only some entries',
+          {
+            threshold: 0.5,
+            results: [
+              { index: 1, score: 1, kept: true },
+              { index: 0, score: 0 },
+            ],
+          },
+        ],
         ['an unknown provider', { provider: 'bogus' }],
         ['a non-string reason', { reason: 7 }],
         ['a non-numeric threshold', { threshold: 'x' }],
@@ -1554,6 +1686,78 @@ describe('withFallback', () => {
     });
     expect(order(outcome)).toEqual([0, 1]);
   });
+
+  it('passes through kept flags that match their threshold', async () => {
+    const outcome = await withFallback([
+      {
+        reranker: scripted('systemone', () => ({
+          results: [
+            { index: 1, score: 3, kept: true },
+            { index: 0, score: 0.5, kept: true },
+            { index: 2, score: 0.4, kept: false },
+          ],
+          provider: 'systemone',
+          model: 'jev-1.13.0',
+          status: 'ok',
+          reason: null,
+          attempts: [],
+          durationMs: 0,
+          usage: { ...emptyUsage },
+          threshold: 0.5,
+        })),
+      },
+    ]).rank({ query: 'q', documents: ['a', 'b', 'c'] });
+    expect(outcome).toMatchObject({ status: 'ok', threshold: 0.5 });
+    expect(outcome.results.map((entry) => entry.kept)).toEqual([
+      true,
+      true,
+      false,
+    ]);
+  });
+
+  it.each([
+    ['missing', undefined],
+    ['all zero', { ...emptyUsage }],
+    ['contradicting', { ...emptyUsage, calls: 7 }],
+  ])(
+    'sums the chain usage from the step attempts when its own total is %s',
+    async (_label, total) => {
+      const spent = { ...emptyUsage, calls: 1, inputTokens: 500 };
+      const outcome = await withFallback([
+        {
+          reranker: scripted(
+            'cross-encoder',
+            () =>
+              ({
+                results: [
+                  { index: 1, score: 1 },
+                  { index: 0, score: 0 },
+                ],
+                provider: 'cross-encoder',
+                model: 'm',
+                status: 'ok',
+                reason: null,
+                attempts: [
+                  {
+                    provider: 'cross-encoder',
+                    model: 'm',
+                    status: 'ok',
+                    reason: null,
+                    durationMs: 1,
+                    usage: spent,
+                  },
+                ],
+                durationMs: 1,
+                usage: total,
+              }) as unknown as RerankOutcome
+          ),
+        },
+      ]).rank({ query: 'q', documents: ['a', 'b'] });
+      expect(outcome.status).toBe('ok');
+      expect(outcome.attempts.map((attempt) => attempt.usage)).toEqual([spent]);
+      expect(outcome.usage).toEqual(spent);
+    }
+  );
 
   it('records a step that ran but reported no attempt, so the history keeps every step', async () => {
     expect(
@@ -2075,6 +2279,141 @@ describe('probePin', () => {
         pin: 'jev-1.13.0',
       })
     ).toEqual({ verified: false, reason: 'error' });
+  });
+});
+
+describe('probePin input and deadlines', () => {
+  /** A routing front that 404s a missing or blank model, in front of a backend that aliases every named one. */
+  async function aliasing(): Promise<Stub> {
+    return stub((call) => {
+      const model = call.body.model;
+      if (typeof model !== 'string' || model.trim() === '') {
+        return { status: 404 };
+      }
+      return {
+        body: { model, answers: { ok: { type: 'noul', noul: 0.9 } } },
+      };
+    });
+  }
+
+  it.each([[''], ['   ']])(
+    'refuses a blank sentinel %j without a request',
+    async (sentinel) => {
+      const server = await aliasing();
+      expect(
+        await probePin({
+          modelFor: (model) => jev(server.url, { model }),
+          pin: 'jev-1.13.0',
+          sentinel,
+        })
+      ).toEqual({ verified: false, reason: 'invalid_request' });
+      expect(server.calls).toHaveLength(0);
+    }
+  );
+
+  it('refuses a sentinel that is the pin once both are trimmed', async () => {
+    const server = await aliasing();
+    expect(
+      await probePin({
+        modelFor: (model) => jev(server.url, { model }),
+        pin: 'jev-1.13.0',
+        sentinel: ' jev-1.13.0 ',
+      })
+    ).toEqual({ verified: false, reason: 'invalid_request' });
+    expect(server.calls).toHaveLength(0);
+  });
+
+  it('still catches an aliasing host with a custom sentinel', async () => {
+    const server = await aliasing();
+    expect(
+      await probePin({
+        modelFor: (model) => jev(server.url, { model }),
+        pin: 'jev-1.13.0',
+        sentinel: ' jev-9.9.9-missing ',
+      })
+    ).toMatchObject({ verified: false, reason: 'sentinel_accepted' });
+    expect(server.calls.map((call) => call.body.model)).toEqual([
+      'jev-9.9.9-missing',
+    ]);
+  });
+
+  describe('a model that ignores its deadline and signal', () => {
+    const modelFor = (model: string): DecisionModel => ({
+      id: 'hanging',
+      model,
+      decide: () => new Promise(() => {}),
+    });
+    const within = (ms: number, task: Promise<unknown>): Promise<unknown> =>
+      Promise.race([
+        task,
+        new Promise((resolve) => setTimeout(() => resolve('pending'), ms)),
+      ]);
+
+    it('is bounded at timeoutMs', async () => {
+      await expect(
+        within(1_000, probePin({ modelFor, pin: 'jev-1.13.0', timeoutMs: 50 }))
+      ).resolves.toEqual({ verified: false, reason: 'timeout' });
+    });
+
+    it('is bounded by the caller abort mid-flight', async () => {
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(), 50);
+      await expect(
+        within(
+          1_000,
+          probePin({ modelFor, pin: 'jev-1.13.0', signal: controller.signal })
+        )
+      ).resolves.toEqual({ verified: false, reason: 'aborted' });
+    });
+
+    it('answers a signal that already aborted at once', async () => {
+      await expect(
+        within(
+          500,
+          probePin({ modelFor, pin: 'jev-1.13.0', signal: AbortSignal.abort() })
+        )
+      ).resolves.toEqual({ verified: false, reason: 'aborted' });
+    });
+  });
+});
+
+describe('toOutcomeReranker with a reranker that ignores its deadline and signal', () => {
+  const hanging = toOutcomeReranker(
+    { id: 'hanging', rerank: () => new Promise(() => {}) },
+    { kind: 'cross-encoder', model: 'm' }
+  );
+  const within = (ms: number, task: Promise<unknown>): Promise<unknown> =>
+    Promise.race([
+      task,
+      new Promise((resolve) => setTimeout(() => resolve('pending'), ms)),
+    ]);
+
+  it('settles at deadlineMs as a charged timeout', async () => {
+    await expect(
+      within(
+        1_000,
+        hanging.rank({ query: 'q', documents: ['a', 'b'], deadlineMs: 50 })
+      )
+    ).resolves.toMatchObject({
+      status: 'skipped',
+      reason: 'timeout',
+      usage: { calls: 1, estimatedTokens: 400, estimatedSearchUnits: 1 },
+    });
+  });
+
+  it('settles when the caller aborts mid-flight', async () => {
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 50);
+    await expect(
+      within(
+        1_000,
+        hanging.rank({
+          query: 'q',
+          documents: ['a'],
+          signal: controller.signal,
+        })
+      )
+    ).resolves.toMatchObject({ status: 'skipped', reason: 'aborted' });
   });
 });
 

@@ -1,5 +1,6 @@
 import type {
   RerankKind,
+  RerankEntry,
   RerankUsage,
   RankRequest,
   RerankAttempt,
@@ -161,10 +162,20 @@ function isAttempt(value: unknown): value is RerankAttempt {
   );
 }
 
+/** Every entry's `kept` is what `threshold` says of its score, as `rankedEntries` sets it. */
+const keptByThreshold = (
+  results: readonly RerankEntry[],
+  threshold: number
+): boolean =>
+  results.every(
+    (entry) => entry.kept === (entry.score !== null && entry.score >= threshold)
+  );
+
 /**
  * The whole `RerankOutcome` contract, since a step's results and attempts are
  * passed through as they are: an answer (`ok` or `degraded`) scores every
- * document, and `kept` comes only with the `threshold` behind it.
+ * document, and `kept` comes only with the `threshold` behind it, on every
+ * entry and matching it.
  */
 function isOutcome(value: unknown, documents: number): value is RerankOutcome {
   return (
@@ -178,11 +189,12 @@ function isOutcome(value: unknown, documents: number): value is RerankOutcome {
     isRankedOrder(value.results) &&
     (value.status === 'skipped' ||
       value.results.every((entry) => entry.score !== null)) &&
-    (value.threshold !== undefined ||
-      value.results.every((entry) => entry.kept === undefined)) &&
+    (value.threshold === undefined
+      ? value.results.every((entry) => entry.kept === undefined)
+      : isFiniteNumber(value.threshold) &&
+        keptByThreshold(value.results, value.threshold)) &&
     Array.isArray(value.attempts) &&
     everySlot(value.attempts as unknown[], isAttempt) &&
-    (value.threshold === undefined || isFiniteNumber(value.threshold)) &&
     (value.pinVerified === undefined || typeof value.pinVerified === 'boolean')
   );
 }
@@ -404,15 +416,17 @@ function stepDeadline(
  * the answering step only, so falling back to a cross-encoder never carries a
  * System One threshold. A step that throws, rejects, returns something that
  * breaks the `RerankOutcome` contract (a full permutation in score order,
- * every document scored when it answers, `kept` only with a `threshold`,
- * well-formed attempts whose usage counters and durations are finite counts
- * of at least zero, and well-formed fields), or outlives its deadline or the
+ * every document scored when it answers, `kept` only with a `threshold` and
+ * then on every entry, `true` exactly where the score reaches it, well-formed
+ * attempts whose usage counters and durations are finite counts of at least
+ * zero, and well-formed fields), or outlives its deadline or the
  * caller's abort by `STEP_GRACE_MS` is a failed step; a step that ran but
  * reported no attempt is recorded as one. A request's `deadlineMs` bounds the whole
  * chain, gates included: each step gets the lesser of its own deadline and
  * what is left, a step without one gets what is left, and once nothing is
- * left the chain stops with `timeout`. Usage sums every attempt: spend counts what was sent,
- * not what answered. An invalid request is identity order over every
+ * left the chain stops with `timeout`. Usage sums every attempt, from the
+ * attempts themselves rather than a step's own total: spend counts what was
+ * sent, not what answered. An invalid request is identity order over every
  * document. Never throws.
  */
 export function withFallback(
@@ -515,12 +529,15 @@ export function withFallback(
         );
         // Bookkeeping, sync or async, must not break a ranking.
         callHook(() => onAttempt?.(reranker, outcome));
-        attempts.push(
-          ...(outcome.attempts.length > 0
+        const ran =
+          outcome.attempts.length > 0
             ? outcome.attempts
-            : [ownAttempt(outcome)])
-        );
-        addRerankUsage(usage, usageOf(outcome.usage));
+            : [ownAttempt(outcome)];
+        attempts.push(...ran);
+        // From the validated attempts, never the step's own total, so `usage` always sums `attempts`.
+        for (const attempt of ran) {
+          addRerankUsage(usage, attempt.usage);
+        }
         if (reranker.kind !== 'none' && outcome.status !== 'skipped') {
           const ok = index === 0 && outcome.status === 'ok';
           return {

@@ -80,6 +80,13 @@ export interface DecisionRequest {
   label?: string;
   /** Overrides the provider's timeout for this request alone. */
   timeoutMs?: number;
+  /**
+   * Called once per request the model sends, just before it goes out, so a
+   * caller can count retries and every re-send after a 401. The HTTP
+   * decision model calls it; a model that does not report requests leaves the
+   * caller to count one per `decide()`. Not awaited; a throw is ignored.
+   */
+  onRequest?: () => void;
 }
 
 export interface DecisionResult {
