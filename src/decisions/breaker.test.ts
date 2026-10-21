@@ -102,24 +102,48 @@ describe('withBreaker', () => {
     }
   });
 
-  it('refreshes a credential function once, retries, then opens on the second 401', async () => {
+  it('refreshes a credential function once, rechecks once, then opens when every key is refused', async () => {
     const minted: boolean[] = [];
     const credential: DecisionCredential = async ({ refresh }) => {
       minted.push(refresh);
       return `token-${minted.length}`;
     };
-    const { model, auth } = fused([401, 401, 200], credential);
+    const { model, auth } = fused([401, 401, 401, 200], credential);
 
     const first = await failure(model);
     expect(first).toMatchObject({ failure: 'unauthorized', status: 401 });
-    expect(minted).toEqual([false, true]);
-    expect(auth).toEqual(['Bearer token-1', 'Bearer token-2']);
+    /** A minter that mints on every call has a newer key at the recheck; the call sends it once, then gives up. */
+    expect(minted).toEqual([false, true, false]);
+    expect(auth).toEqual([
+      'Bearer token-1',
+      'Bearer token-2',
+      'Bearer token-3',
+    ]);
     expect(model.breaker.open).toBe(true);
 
     const refused = await failure(model);
     expect(refused.circuitOpen).toBe(true);
-    expect(minted).toEqual([false, true]);
-    expect(auth).toHaveLength(2);
+    expect(minted).toEqual([false, true, false]);
+    expect(auth).toHaveLength(3);
+  });
+
+  it('opens without re-sending when the recheck after a second 401 has nothing newer', async () => {
+    const seen: Array<{ refresh: boolean; refused?: string }> = [];
+    const credential: DecisionCredential = async ({ refresh, refused }) => {
+      seen.push(refused === undefined ? { refresh } : { refresh, refused });
+      return seen.length === 1 ? 'token-1' : 'token-2';
+    };
+    const { model, auth } = fused([401, 401, 200], credential);
+
+    const first = await failure(model);
+    expect(first).toMatchObject({ failure: 'unauthorized', status: 401 });
+    expect(seen).toEqual([
+      { refresh: false },
+      { refresh: true, refused: 'token-1' },
+      { refresh: false },
+    ]);
+    expect(auth).toEqual(['Bearer token-1', 'Bearer token-2']);
+    expect(model.breaker.open).toBe(true);
   });
 
   it('opens on a 402 quota failure after exactly one request', async () => {

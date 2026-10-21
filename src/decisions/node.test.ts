@@ -549,6 +549,61 @@ describe('commandToken', () => {
     expect(model.breaker.open).toBe(false);
   });
 
+  it('rechecks a refreshed token refused late and sends the one another call minted since', async () => {
+    const auth: string[] = [];
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let holding!: () => void;
+    const inFlight = new Promise<void>((resolve) => {
+      holding = resolve;
+    });
+    let refreshedSent = 0;
+    const fetch: DecisionFetch = async (_url, init) => {
+      const header = init.headers.Authorization;
+      auth.push(header);
+      if (header === 'Bearer token-3') {
+        release();
+        return new Response(answered, { status: 200 });
+      }
+      /** The first call's request with its refreshed token-2 is answered only after the second call has replaced it. */
+      if (header === 'Bearer token-2' && ++refreshedSent === 1) {
+        holding();
+        await held;
+      }
+      return new Response('refused', { status: 401 });
+    };
+    const model = withBreaker(
+      createHttpDecisionModel({
+        endpoint: 'https://decisions.example/v1/systemone',
+        apiKey: commandToken(
+          await script('process.stdout.write("token-" + n + "\\n");')
+        ),
+        dialect: 'systemone',
+        fetch,
+        timeoutMs: 10_000,
+      })
+    );
+
+    const first = model.decide(request);
+    await inFlight;
+    const outcomes = await Promise.allSettled([model.decide(request), first]);
+    expect(outcomes.map((outcome) => outcome.status)).toEqual([
+      'fulfilled',
+      'fulfilled',
+    ]);
+    expect(model.breaker.open).toBe(false);
+    expect(auth).toEqual([
+      'Bearer token-1',
+      'Bearer token-2',
+      'Bearer token-2',
+      'Bearer token-3',
+      'Bearer token-3',
+    ]);
+    expect(await runs()).toBe(3);
+  });
+
   it('re-mints through the transport after a 401, then opens the breaker on a second', async () => {
     const auth: Array<string | undefined> = [];
     const statuses = [401, 200, 401, 401];

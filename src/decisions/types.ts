@@ -109,7 +109,7 @@ export type DecisionTokenMinter = (options: {
   signal?: AbortSignal;
 }) => Promise<string>;
 
-/** A bearer key, or a per-request token minter; a 401 requests one fresh token for that call. */
+/** A bearer key, or a per-request token minter; a 401 requests one fresh token for that call, and a second 401 one recheck (`refresh: false`) for a token minted since. */
 export type DecisionCredential = string | DecisionTokenMinter;
 
 export interface DecisionProviderSettings {

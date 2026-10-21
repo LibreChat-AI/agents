@@ -237,8 +237,14 @@ export function createTransport(options: TransportOptions): Transport {
             'decision model request interrupted',
             { provider: providerId }
           );
-        /** The key a 401 refused; set once, since a call refreshes at most once. */
-        let refused: string | undefined;
+        /**
+         * Keys 401s refused in this call. The first earns a refresh; a second
+         * earns one recheck with `refresh: false`, since another call may have
+         * replaced the key while this request was in flight, and the call
+         * re-sends only a key it has not had refused.
+         */
+        const refused: string[] = [];
+        let refusal: DecisionError | undefined;
         let key: string | null | undefined;
         let lastError: DecisionError | undefined;
         for (let attemptNo = 0; attemptNo <= maxRetries; attemptNo++) {
@@ -247,7 +253,20 @@ export function createTransport(options: TransportOptions): Transport {
           }
           try {
             if (key === undefined) {
-              key = await waitFor(resolveKey(refused, signal));
+              key = await waitFor(
+                resolveKey(
+                  refused.length === 1 ? refused[0] : undefined,
+                  signal
+                )
+              );
+              if (
+                refusal !== undefined &&
+                typeof key === 'string' &&
+                refused.includes(key)
+              ) {
+                /** The minter has nothing newer than a key this call had refused: that refusal stands. */
+                throw refusal;
+              }
             }
             const response = await waitFor(
               fetchImpl(endpoint, {
@@ -297,10 +316,12 @@ export function createTransport(options: TransportOptions): Transport {
             if (
               lastError.status === 401 &&
               typeof credential === 'function' &&
-              refused === undefined &&
-              typeof key === 'string'
+              typeof key === 'string' &&
+              refused.length < 2 &&
+              !refused.includes(key)
             ) {
-              refused = key;
+              refused.push(key);
+              refusal = lastError;
               key = undefined;
               attemptNo -= 1;
               continue;
