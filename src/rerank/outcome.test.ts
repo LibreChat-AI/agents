@@ -1044,6 +1044,33 @@ describe('System One usage counts transport retries', () => {
     expect(outcome.usage).toMatchObject({ calls: 2, estimatedTokens: 0 });
   });
 
+  it('document mode counts the re-send after a recheck that follows a second 401', async () => {
+    const server = await stub((call) =>
+      call.authorization === 'Bearer newer'
+        ? scored(SCORES)(call)
+        : { status: 401 }
+    );
+    let cached = 'stale';
+    const outcome = await createSystemOneReranker({
+      model: retrying(server.url, async ({ refresh }) => {
+        if (refresh) {
+          /** Another call has `fresh` refused and caches `newer` while this request is in flight. */
+          cached = 'newer';
+          return 'fresh';
+        }
+        return cached;
+      }),
+      rubric,
+    }).rank({ query: 'q', documents: ['alpha'] });
+    expect(server.calls.map((call) => call.authorization)).toEqual([
+      'Bearer stale',
+      'Bearer fresh',
+      'Bearer newer',
+    ]);
+    expect(outcome).toMatchObject({ status: 'ok' });
+    expect(outcome.usage).toMatchObject({ calls: 3, estimatedTokens: 0 });
+  });
+
   it('estimates only the retried request a deadline abandoned', async () => {
     const seen = new Map<string, number>();
     const server = await stub((call) => {
