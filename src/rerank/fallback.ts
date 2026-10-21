@@ -72,8 +72,9 @@ export interface FallbackOptions {
     reranker: OutcomeReranker
   ) => string | null | undefined | Promise<string | null | undefined>;
   /**
-   * Sees every step that ran, for backoff bookkeeping. Not awaited; a throw
-   * or a rejected promise is ignored.
+   * Sees every step that ran, for backoff bookkeeping, as a copy: changing
+   * it changes nothing the chain returns. Not awaited; a throw or a rejected
+   * promise is ignored.
    */
   onAttempt?: (reranker: OutcomeReranker, outcome: RerankOutcome) => void;
 }
@@ -197,6 +198,19 @@ function isOutcome(value: unknown, documents: number): value is RerankOutcome {
     everySlot(value.attempts as unknown[], isAttempt) &&
     (value.pinVerified === undefined || typeof value.pinVerified === 'boolean')
   );
+}
+
+/** A copy of a validated outcome for a hook, so nothing it does reaches the chain's results or history. */
+function hookCopy(outcome: RerankOutcome): RerankOutcome {
+  return {
+    ...outcome,
+    results: outcome.results.map((entry) => ({ ...entry })),
+    attempts: outcome.attempts.map((attempt) => ({
+      ...attempt,
+      usage: { ...attempt.usage },
+    })),
+    usage: usageOf(outcome.usage),
+  };
 }
 
 /** The attempt a step that ran but reported none stands for, so the chain's history keeps every step. */
@@ -424,7 +438,9 @@ function stepDeadline(
  * reported no attempt is recorded as one. A request's `deadlineMs` bounds the whole
  * chain, gates included: each step gets the lesser of its own deadline and
  * what is left, a step without one gets what is left, and once nothing is
- * left the chain stops with `timeout`. Usage sums every attempt, from the
+ * left the chain stops with `timeout`. A step's deadline reaches it as
+ * `RankRequest.deadlineMs`, which caps the reranker's own timeout and never
+ * extends it. Usage sums every attempt, from the
  * attempts themselves rather than a step's own total: spend counts what was
  * sent, not what answered. An invalid request is identity order over every
  * document. Never throws.
@@ -528,7 +544,10 @@ export function withFallback(
           request.signal
         );
         // Bookkeeping, sync or async, must not break a ranking.
-        callHook(() => onAttempt?.(reranker, outcome));
+        if (onAttempt !== undefined) {
+          const seen = hookCopy(outcome);
+          callHook(() => onAttempt(reranker, seen));
+        }
         const ran =
           outcome.attempts.length > 0
             ? outcome.attempts

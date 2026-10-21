@@ -6,6 +6,7 @@ import {
   stepOutcome,
   documentCount,
   validDeadline,
+  retriedReply,
   estimatedUsage,
   rerankReasonOf,
   isTokenEstimate,
@@ -32,7 +33,7 @@ export interface CrossEncoderRerankerOptions {
   apiKey?: DecisionCredential;
   /** Defaults to true; without a key every ranking is skipped with `no_api_key`. */
   requiresAuth?: boolean;
-  /** Defaults to 30 seconds; a request's `deadlineMs` overrides it. */
+  /** Defaults to 30 seconds; a request's `deadlineMs` can shorten it, never extend it. */
   timeoutMs?: number;
   /** Retries for rate limits, server errors, and network failures. Defaults to 0. */
   maxRetries?: number;
@@ -134,8 +135,9 @@ function parseResponse(body: string, documents: number): Parsed {
  * answered by `results[{ index, relevance_score }]`. Never throws. The
  * response must score every document exactly once; scores are the host's and
  * carry no calibrated threshold, so `kept` is never set. Requests do not
- * follow redirects, and a deadline that fires after the request was sent is
- * charged at `estimatedUsage`.
+ * follow redirects, and a deadline that fires while a request is in flight
+ * is charged at `estimatedUsage`; one that fires while a 429 or 5xx reply is
+ * being backed off from charges nothing and reports that reply's reason.
  */
 export function createCrossEncoderReranker(
   options: CrossEncoderRerankerOptions
@@ -196,10 +198,10 @@ export function createCrossEncoderReranker(
         return stepOutcome({ ...base, reason: 'aborted', called: false });
       }
       const usage = emptyRerankUsage();
-      const fetchImpl: DecisionFetch = options.fetch ?? globalThis.fetch;
-      const counting: DecisionFetch = (input, init) => {
-        usage.calls += 1;
-        return fetchImpl(input, init);
+      /** Requests that ended, with a reply or without one; the rest were in flight. */
+      const tally: { ended: number; backoff: DecisionError | null } = {
+        ended: 0,
+        backoff: null,
       };
       try {
         const send = createTransport({
@@ -207,9 +209,13 @@ export function createCrossEncoderReranker(
           apiKey,
           requiresAuth,
           endpoint: url,
-          timeoutMs: validDeadline(request.deadlineMs) ?? timeoutMs,
+          // The request's deadline caps the configured timeout; it never extends it.
+          timeoutMs: Math.min(
+            validDeadline(request.deadlineMs) ?? timeoutMs,
+            timeoutMs
+          ),
           maxRetries,
-          fetch: counting,
+          ...(options.fetch !== undefined ? { fetch: options.fetch } : {}),
         });
         const parsed = await send(
           () => ({
@@ -221,7 +227,15 @@ export function createCrossEncoderReranker(
             parse: (body: string): Parsed => parseResponse(body, documents),
           }),
           request.signal,
-          'rerank'
+          'rerank',
+          undefined,
+          () => {
+            usage.calls += 1;
+          },
+          (status) => {
+            tally.ended += 1;
+            tally.backoff ??= retriedReply(id, status);
+          }
         );
         usage.inputTokens = parsed.tokens;
         usage.searchUnits = parsed.units;
@@ -241,10 +255,18 @@ export function createCrossEncoderReranker(
           usage,
         });
       } catch (error) {
-        const reason = isAborted(request.signal)
+        let reason: string = isAborted(request.signal)
           ? 'aborted'
           : rerankReasonOf(error);
-        if (usage.calls > 0 && (reason === 'timeout' || reason === 'aborted')) {
+        const outstanding = usage.calls - tally.ended;
+        if (
+          reason === 'timeout' &&
+          outstanding === 0 &&
+          tally.backoff !== null
+        ) {
+          reason = rerankReasonOf(tally.backoff);
+        }
+        if (outstanding > 0 && (reason === 'timeout' || reason === 'aborted')) {
           Object.assign(
             usage,
             estimatedUsage(kind, documents, options.estimatedTokensPerDocument)

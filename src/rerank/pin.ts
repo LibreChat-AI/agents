@@ -1,9 +1,9 @@
 import type { DecisionModel } from '../decisions/types';
 import type { RerankReason } from './types';
 import { withDecisionDeadline } from '../decisions/deadline';
+import { rerankReasonOf, validDeadline } from './outcome';
 import { DecisionError } from '../decisions/types';
 import { probeRequest } from '../decisions/probe';
-import { rerankReasonOf } from './outcome';
 
 /** A model id no host serves: a host that answers it echoes whatever it is asked, so its echo proves nothing. */
 export const PIN_SENTINEL_MODEL = 'jev-0.0.0-pin-sentinel';
@@ -17,7 +17,8 @@ export interface PinProbeOptions {
   sentinel?: string;
   /**
    * Per request, enforced around the model call even when the model ignores
-   * it; defaults to 15 seconds to allow a slow first token mint.
+   * it; defaults to 15 seconds to allow a slow first token mint. Anything but
+   * an integer from 1 to 3,600,000 is `invalid_request`, with no request sent.
    */
   timeoutMs?: number;
   signal?: AbortSignal;
@@ -68,6 +69,12 @@ export async function probePin(options: PinProbeOptions): Promise<PinProbe> {
     return { verified: false, reason: 'invalid_request' };
   }
   const timeoutMs = options.timeoutMs ?? 15_000;
+  if (
+    !Number.isSafeInteger(timeoutMs) ||
+    validDeadline(timeoutMs) === undefined
+  ) {
+    return { verified: false, reason: 'invalid_request' };
+  }
   /** Bounded here, so a model that ignores its deadline and signal cannot hold the probe. */
   const ask = (model: string): Promise<unknown> =>
     withDecisionDeadline(

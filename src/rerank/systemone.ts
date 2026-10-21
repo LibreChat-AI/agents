@@ -26,6 +26,7 @@ import {
   estimatedUsage,
   rerankReasonOf,
   validDeadline,
+  retriedReply,
   isTokenEstimate,
   emptyRerankUsage,
   toOutcomeReranker,
@@ -95,10 +96,15 @@ const DEFAULT_INSTRUCTIONS =
 const QUESTION_ID = 'relevance';
 const MODES: readonly string[] = ['document', 'batch'];
 
-/** Failures that belong to the host, credential, or model, not to one document: stop sending the rest. */
+/**
+ * Failures that belong to the host, credential, or model, not to one
+ * document: stop sending the rest, and re-issue nothing. A 429 is the host
+ * asking for less traffic, so it is one of them.
+ */
 const STEP_FATAL: ReadonlySet<RerankReason> = new Set<RerankReason>([
   'unauthorized',
   'quota',
+  'rate_limited',
   'circuit_open',
   'unsupported',
   'pin_mismatch',
@@ -118,8 +124,13 @@ interface DocumentState {
   failure: RerankReason | null;
   failureError: DecisionError | null;
   echoed: string | null;
-  /** Requests the host answered, with a ranking or with an error. */
+  /**
+   * Requests that ended, with a ranking or with an error. For a model that
+   * reports its requests, every one that ended with or without a reply.
+   */
   replied: number;
+  /** A 429 or 5xx reply a request was backing off from, for a model that reports its requests. */
+  backoff: DecisionError | null;
   /** Requests the host answered with a ranking. */
   answered: number;
   inputReports: number;
@@ -241,6 +252,9 @@ export function createSystemOneReranker(
               ...(request.onRequest !== undefined
                 ? { onRequest: request.onRequest }
                 : {}),
+              ...(request.onResponse !== undefined
+                ? { onResponse: request.onResponse }
+                : {}),
             })
           );
         } catch (error) {
@@ -277,9 +291,16 @@ export function createSystemOneReranker(
     );
   }
 
+  /** A model that reports its requests is counted from those reports; see `RerankUsage.calls`. */
+  const reports = model.reportsRequests === true;
+
   if (mode === 'batch') {
     const batch = toOutcomeReranker(
-      { id: model.id, rerank: rerankBatch },
+      {
+        id: model.id,
+        rerank: rerankBatch,
+        ...(reports ? { reportsRequests: true } : {}),
+      },
       { kind: 'systemone', model: model.model }
     );
     return {
@@ -287,13 +308,12 @@ export function createSystemOneReranker(
       kind: 'systemone',
       model: model.model,
       mode,
+      ...(reports ? { reportsRequests: true } : {}),
       rerank: rerankBatch,
       async rank(request: RankRequest): Promise<RerankOutcome> {
         const documents = documentCount(request);
-        if (
-          rankRequestProblem(request) === undefined &&
-          documents > maxDocuments
-        ) {
+        const problem = rankRequestProblem(request);
+        if (problem === undefined && documents > maxDocuments) {
           // The caller's size problem, as document mode and the cross-encoder report it, not the model's `unsupported`.
           return stepOutcome({
             kind: 'systemone',
@@ -304,7 +324,19 @@ export function createSystemOneReranker(
             called: false,
           });
         }
-        return batch.rank(request);
+        if (problem !== undefined) {
+          return batch.rank(request);
+        }
+        // The request's deadline caps this reranker's own timeout; it never extends it.
+        return batch.rank({
+          query: request.query,
+          documents: request.documents,
+          ...(request.signal !== undefined ? { signal: request.signal } : {}),
+          deadlineMs: Math.min(
+            validDeadline(request.deadlineMs) ?? timeoutMs,
+            timeoutMs
+          ),
+        });
       },
     };
   }
@@ -335,7 +367,14 @@ export function createSystemOneReranker(
   const configured = model.model;
   const perDocument = options.estimatedTokensPerDocument;
 
-  async function rankDocuments(request: RankRequest): Promise<DocumentRun> {
+  /**
+   * `override` is the rejecting `rerank` contract, whose `timeoutMs` replaces
+   * the configured timeout; an outcome's `deadlineMs` only caps it.
+   */
+  async function rankDocuments(
+    request: RankRequest,
+    override = false
+  ): Promise<DocumentRun> {
     const startedAt = performance.now();
     const n = documentCount(request);
     const base = { kind: 'systemone' as const, documents: n, startedAt };
@@ -366,13 +405,14 @@ export function createSystemOneReranker(
         fail('unsupported_question', 'rerank candidate batch too large')
       );
     }
-    const deadlineMs = validDeadline(request.deadlineMs ?? timeoutMs);
-    if (deadlineMs === undefined) {
+    const asked = validDeadline(request.deadlineMs ?? timeoutMs);
+    if (asked === undefined) {
       return refuse(
         'invalid_request',
         fail('bad_request', 'invalid decision model timeout')
       );
     }
+    const deadlineMs = override ? asked : Math.min(asked, timeoutMs);
     if (isAborted(request.signal)) {
       return refuse(
         'aborted',
@@ -399,6 +439,7 @@ export function createSystemOneReranker(
       failureError: null,
       echoed: null,
       replied: 0,
+      backoff: null,
       answered: 0,
       inputReports: 0,
       outputReports: 0,
@@ -470,7 +511,9 @@ export function createSystemOneReranker(
       });
     }
     const record = (index: number, response: unknown): void => {
-      run.replied += 1;
+      if (!reports) {
+        run.replied += 1;
+      }
       run.answered += 1;
       const answered = isDecisionObject(response) ? response : {};
       const usage = isDecisionObject(answered.usage) ? answered.usage : {};
@@ -517,7 +560,8 @@ export function createSystemOneReranker(
     /**
      * Called only while the step's signal is live, so a timeout here is the
      * model's own, not the step's. `sent` is false for a failure before
-     * dispatch, which is neither a call nor a reply.
+     * dispatch, which is neither a call nor a reply. A model that reports its
+     * requests counted its replies already.
      */
     const refused = (error: unknown, sent: boolean): void => {
       const reason = rerankReasonOf(error);
@@ -531,7 +575,7 @@ export function createSystemOneReranker(
         run.failureError ??= decisionError;
         return;
       }
-      if (sent) {
+      if (sent && !reports) {
         run.replied += 1;
       }
       if (STEP_FATAL.has(reason)) {
@@ -540,6 +584,14 @@ export function createSystemOneReranker(
       } else {
         run.failure ??= reason;
         run.failureError ??= decisionError;
+      }
+    };
+
+    /** A reported request's end, for a model that reports them. */
+    const ended = (status: number | null): void => {
+      if (!run.settled) {
+        run.replied += 1;
+        run.backoff ??= retriedReply(model.id, status);
       }
     };
 
@@ -556,24 +608,29 @@ export function createSystemOneReranker(
                 if (run.stop !== null || !live(signal)) {
                   return;
                 }
-                /** Set at dispatch: a failure before it (a throwing `state`, a spent deadline) sent nothing. */
-                const dispatch = { sent: false };
+                /**
+                 * `sent` is set at dispatch, so a failure before it (a throwing
+                 * `state`, a spent deadline) sent nothing; for a model that
+                 * reports its requests, only a reported request is sent.
+                 */
+                const dispatch = { sent: false, requests: 0 };
                 let response: DecisionResult;
                 try {
                   response = await waitFor(
                     Promise.resolve().then(() => {
                       const state = stateFor(index);
                       const left = Math.ceil(expiresAt - performance.now());
-                      if (left <= 0) {
-                        // Building the state spent the deadline: nothing is sent, so none is counted or charged.
+                      if (left <= 0 || signal.aborted) {
+                        // The state spent the deadline, or the step ended meanwhile: nothing is sent, counted, or charged.
                         throw fail(
                           'timeout',
                           'decision model deadline exceeded'
                         );
                       }
-                      dispatch.sent = true;
-                      run.usage.calls += 1;
-                      let requests = 0;
+                      if (!reports) {
+                        dispatch.sent = true;
+                        run.usage.calls += 1;
+                      }
                       return model.decide({
                         state,
                         questions: { [QUESTION_ID]: question },
@@ -581,18 +638,26 @@ export function createSystemOneReranker(
                         timeoutMs: left,
                         label: 'rerank',
                         onRequest: () => {
-                          requests += 1;
-                          // The first request was counted at dispatch; a later one is a retry, so the one before it ended.
-                          if (requests > 1 && !run.settled) {
+                          if (run.settled) {
+                            return;
+                          }
+                          dispatch.requests += 1;
+                          if (reports) {
+                            dispatch.sent = true;
+                            run.usage.calls += 1;
+                          } else if (dispatch.requests > 1) {
+                            // The first request was counted at dispatch; a later one is a retry, so the one before it ended.
                             run.usage.calls += 1;
                             run.replied += 1;
                           }
                         },
+                        ...(reports ? { onResponse: ended } : {}),
                       });
                     })
                   );
                 } catch (error) {
                   if (
+                    !reports &&
                     dispatch.sent &&
                     error instanceof DecisionError &&
                     error.circuitOpen
@@ -686,6 +751,14 @@ export function createSystemOneReranker(
     } else if (left > 0) {
       failed = { reason: 'partial', error: incomplete() };
     }
+    if (
+      failed?.reason === 'timeout' &&
+      run.usage.calls === run.replied &&
+      run.backoff !== null
+    ) {
+      // The deadline fired while nothing was in flight and a request was backing off: the host said why.
+      failed = { reason: rerankReasonOf(run.backoff), error: run.backoff };
+    }
     const pinned: { pinVerified?: boolean } = {};
     if (pin !== undefined) {
       pinned.pinVerified =
@@ -761,14 +834,17 @@ export function createSystemOneReranker(
       if (problem === 'empty' || (problem === undefined && topK === 0)) {
         return { results: [], model: configured, usage: null };
       }
-      const run = await rankDocuments({
-        query: request.query,
-        documents: request.documents,
-        ...(request.signal !== undefined ? { signal: request.signal } : {}),
-        ...(request.timeoutMs !== undefined
-          ? { deadlineMs: request.timeoutMs }
-          : {}),
-      });
+      const run = await rankDocuments(
+        {
+          query: request.query,
+          documents: request.documents,
+          ...(request.signal !== undefined ? { signal: request.signal } : {}),
+          ...(request.timeoutMs !== undefined
+            ? { deadlineMs: request.timeoutMs }
+            : {}),
+        },
+        true
+      );
       if (run.outcome.status !== 'ok') {
         throw run.error ?? fail('network', 'reranker request failed');
       }

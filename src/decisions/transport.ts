@@ -40,15 +40,19 @@ export interface TransportOptions {
 
 /**
  * `onRequest` is called once per HTTP request, just before it is sent:
- * retries and every re-send after a 401 included. Not awaited; a throw or a
- * rejected promise is ignored.
+ * retries and every re-send after a 401 included. `onResponse` is called once
+ * per such request that ended before the deadline or the caller's abort, with
+ * its HTTP status (after a successful body is read in full) or `null` when the
+ * fetch failed; a request interrupted in flight gets none. Neither is awaited;
+ * a throw or a rejected promise is ignored.
  */
 export type Transport = <T>(
   prepare: () => { payload: string; parse: (body: string) => T },
   signal: AbortSignal | undefined,
   label: string,
   timeoutOverrideMs?: number,
-  onRequest?: () => void
+  onRequest?: () => void,
+  onResponse?: (status: number | null) => void
 ) => Promise<T>;
 
 export function failureForStatus(
@@ -221,7 +225,8 @@ export function createTransport(options: TransportOptions): Transport {
     callerSignal,
     label,
     timeoutOverrideMs,
-    onRequest
+    onRequest,
+    onResponse
   ) {
     const started = performance.now();
     return withDecisionDeadline(
@@ -287,19 +292,34 @@ export function createTransport(options: TransportOptions): Transport {
             if (onRequest !== undefined) {
               callHook(() => onRequest());
             }
-            const response = await waitFor(
-              fetchImpl(endpoint, {
-                method: 'POST',
-                headers: {
-                  ...(key !== null ? { Authorization: `Bearer ${key}` } : {}),
-                  'Content-Type': 'application/json',
-                },
-                body: payload,
-                signal,
-                redirect: 'error',
-              })
-            );
+            /** Reports the request's end once, unless the deadline or the caller's abort interrupted it. */
+            let open = true;
+            const ended = (status: number | null): void => {
+              if (open && !wasAborted() && onResponse !== undefined) {
+                callHook(() => onResponse(status));
+              }
+              open = false;
+            };
+            let response: Awaited<ReturnType<DecisionFetch>>;
+            try {
+              response = await waitFor(
+                fetchImpl(endpoint, {
+                  method: 'POST',
+                  headers: {
+                    ...(key !== null ? { Authorization: `Bearer ${key}` } : {}),
+                    'Content-Type': 'application/json',
+                  },
+                  body: payload,
+                  signal,
+                  redirect: 'error',
+                })
+              );
+            } catch (error) {
+              ended(null);
+              throw error;
+            }
             if (!response.ok) {
+              ended(response.status);
               void response.body?.cancel().catch(() => {});
               const error = new DecisionError(
                 failureForStatus(response.status),
@@ -311,7 +331,12 @@ export function createTransport(options: TransportOptions): Transport {
               );
               throw error;
             }
-            const body = await readResponse(response.body, waitFor, providerId);
+            let body: string;
+            try {
+              body = await readResponse(response.body, waitFor, providerId);
+            } finally {
+              ended(response.status);
+            }
             const result = await waitFor(Promise.resolve(parse(body)));
             // Observability, sync or async, must not turn a valid answer into a retried request.
             callHook(() => onAnswered?.(label, performance.now() - started));

@@ -13,6 +13,7 @@ import type {
 import type { DecisionFailure } from '../decisions/types';
 import { DecisionError, isDecisionObject } from '../decisions/types';
 import { withDecisionDeadline } from '../decisions/deadline';
+import { failureForStatus } from '../decisions/transport';
 
 /** Longest deadline a step may have; matches `withDecisionDeadline`. */
 export const MAX_RERANK_DEADLINE_MS = 3_600_000;
@@ -465,6 +466,26 @@ export function rerankReasonOf(error: unknown): RerankReason {
   return REASON_FOR_FAILURE[error.failure] ?? 'error';
 }
 
+/**
+ * A reply the transport backs off from and retries (HTTP 429 or 5xx), as the
+ * error it stands for; `null` for any other reply or none. A deadline that
+ * fires during that backoff, with no request in flight, reports this rather
+ * than `timeout`: the host answered, and said why.
+ */
+export function retriedReply(
+  provider: string,
+  status: number | null
+): DecisionError | null {
+  if (status === null || (status !== 429 && status < 500)) {
+    return null;
+  }
+  return new DecisionError(
+    failureForStatus(status),
+    `decision model returned HTTP ${status}`,
+    { provider, status }
+  );
+}
+
 /** A positive integer deadline no longer than an hour, or `undefined` when it is not one. */
 export function validDeadline(value: unknown): number | undefined {
   if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
@@ -521,10 +542,15 @@ export function rankRequestProblem(request: unknown): RerankReason | undefined {
  * The never-throwing layer over a rejecting `Reranker`: its full ranking
  * becomes an `ok` outcome, a rejection becomes a reason, and a ranking that
  * is not a full permutation in descending score order is `invalid_results`.
- * Usage counts one call, plus every retry the reranker reports through
- * `onRequest`, with whatever tokens it reported, or none when an open breaker
- * (`circuitOpen`) refused it before dispatch. The request's `deadlineMs` and
- * `signal` bound the wait even for a reranker that ignores them.
+ * For a reranker with `reportsRequests`, usage counts each request it
+ * reported through `onRequest`, so a call that failed before sending counts
+ * none and is `skipped`, and a deadline charges an estimate only while a
+ * request was in flight. Any other reranker counts one call, plus every retry
+ * it reports through `onRequest`, or none when an open breaker
+ * (`circuitOpen`) refused it before dispatch. Tokens are whatever it
+ * reported. The request's `deadlineMs` and `signal` bound the wait even for
+ * a reranker that ignores them, and it is passed on as the reranker's
+ * `timeoutMs`.
  */
 export function toOutcomeReranker(
   reranker: Reranker,
@@ -561,25 +587,51 @@ export function toOutcomeReranker(
         });
       }
       const usage = emptyRerankUsage();
-      usage.calls = 1;
-      /** Requests the reranker reported sending; the first is the call counted above. */
-      let requests = 0;
+      const reports = reranker.reportsRequests === true;
+      const tally: {
+        /** Requests the reranker reported sending. */
+        requests: number;
+        /** Reported requests that ended, with a reply or without one. */
+        ended: number;
+        /** A 429 or 5xx reply the reranker was backing off from. */
+        backoff: DecisionError | null;
+        /** Set when `rerank` is called; a deadline or abort before it sent nothing. */
+        dispatched: boolean;
+      } = { requests: 0, ended: 0, backoff: null, dispatched: false };
       let settled = false;
       try {
         const deadlineMs = validDeadline(request.deadlineMs);
-        const call = (signal: AbortSignal | undefined): Promise<RerankResult> =>
-          reranker.rerank({
+        const onResponse = (status: number | null): void => {
+          if (!settled) {
+            tally.ended += 1;
+            tally.backoff ??= retriedReply(reranker.id, status);
+          }
+        };
+        const call = (
+          signal: AbortSignal | undefined
+        ): Promise<RerankResult> => {
+          tally.dispatched = true;
+          if (!reports) {
+            usage.calls = 1;
+          }
+          return reranker.rerank({
             query: request.query,
             documents: request.documents,
             ...(signal !== undefined ? { signal } : {}),
             ...(deadlineMs !== undefined ? { timeoutMs: deadlineMs } : {}),
             onRequest: () => {
-              requests += 1;
-              if (requests > 1 && !settled) {
+              if (settled) {
+                return;
+              }
+              tally.requests += 1;
+              // Without reports, the first request is the call counted at dispatch.
+              if (reports || tally.requests > 1) {
                 usage.calls += 1;
               }
             },
+            ...(reports ? { onResponse } : {}),
           });
+        };
         // Bounded here too, so a reranker that ignores its deadline and signal cannot hold the call.
         let response: RerankResult;
         if (deadlineMs === undefined && request.signal === undefined) {
@@ -590,7 +642,19 @@ export function toOutcomeReranker(
             deadlineMs ?? MAX_RERANK_DEADLINE_MS,
             request.signal,
             (signal, waitFor) =>
-              waitFor(Promise.resolve().then(() => call(signal)))
+              waitFor(
+                Promise.resolve().then(() => {
+                  // An abort that landed after the call was scheduled: nothing is sent, counted, or charged.
+                  if (signal.aborted) {
+                    throw new DecisionError(
+                      'aborted',
+                      'caller aborted the request',
+                      { provider: reranker.id }
+                    );
+                  }
+                  return call(signal);
+                })
+              )
           );
         }
         settled = true;
@@ -638,13 +702,28 @@ export function toOutcomeReranker(
       } catch (error) {
         settled = true;
         // An open breaker refuses before dispatch: nothing was sent, so nothing is charged.
-        const sent = !(error instanceof DecisionError && error.circuitOpen);
+        const sent = reports
+          ? usage.calls > 0
+          : tally.dispatched &&
+            !(error instanceof DecisionError && error.circuitOpen);
         if (!sent) {
           usage.calls = 0;
         }
-        const reason = isAborted(request.signal)
+        /** Requests the host may still be working on: only those are estimated. */
+        let outstanding = 0;
+        if (sent) {
+          outstanding = reports ? usage.calls - tally.ended : 1;
+        }
+        let reason: string = isAborted(request.signal)
           ? 'aborted'
           : rerankReasonOf(error);
+        if (
+          reason === 'timeout' &&
+          outstanding === 0 &&
+          tally.backoff !== null
+        ) {
+          reason = rerankReasonOf(tally.backoff);
+        }
         return stepOutcome({
           kind,
           documents,
@@ -653,7 +732,7 @@ export function toOutcomeReranker(
           reason,
           called: sent,
           usage:
-            sent && (reason === 'timeout' || reason === 'aborted')
+            outstanding > 0 && (reason === 'timeout' || reason === 'aborted')
               ? { ...usage, ...estimatedUsage(kind, documents) }
               : usage,
         });

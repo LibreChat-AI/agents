@@ -16,6 +16,7 @@ import {
   estimatedUsage,
   createScoreCache,
   toOutcomeReranker,
+  corpusStats,
   createBm25Reranker,
   createSystemOneReranker,
   createCrossEncoderReranker,
@@ -39,7 +40,13 @@ interface Call {
 
 type Reply =
   | 'hang'
-  | { status?: number; body?: unknown; raw?: string; delayMs?: number };
+  | {
+      status?: number;
+      body?: unknown;
+      raw?: string;
+      delayMs?: number;
+      headers?: Record<string, string>;
+    };
 
 interface Stub {
   url: string;
@@ -49,6 +56,21 @@ interface Stub {
 }
 
 const servers: Stub[] = [];
+
+/** `task`'s result, or `pending` when it has not settled after `ms`; the timer never outlives the race. */
+async function within<T>(ms: number, task: Promise<T>): Promise<T | 'pending'> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      task,
+      new Promise<'pending'>((resolve) => {
+        timer = setTimeout(() => resolve('pending'), ms);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 /** A real HTTP server: requests leave the process's fetch and come back over a socket. */
 async function stub(reply: (call: Call, nth: number) => Reply): Promise<Stub> {
@@ -80,6 +102,7 @@ async function stub(reply: (call: Call, nth: number) => Reply): Promise<Stub> {
         }
         res.writeHead(answer.status ?? 200, {
           'content-type': 'application/json',
+          ...answer.headers,
         });
         res.end(answer.raw ?? JSON.stringify(answer.body ?? {}));
       }, answer.delayMs ?? 0);
@@ -383,7 +406,8 @@ describe('System One per-document ranking', () => {
       status: 'skipped',
       reason: 'rate_limited',
     });
-    expect(server.calls).toHaveLength(4);
+    // A 429 is the host's, not one document's: nothing is re-issued into it.
+    expect(server.calls).toHaveLength(2);
   });
 
   it('returns at its deadline as timeout and charges the abandoned request at the estimate', async () => {
@@ -1843,12 +1867,10 @@ describe('withFallback', () => {
       gate: () => new Promise<null>(() => {}),
     });
     let startedAt = performance.now();
-    const never = await Promise.race([
-      hung.rank({ query: 'q', documents: ['a'], deadlineMs: 50 }),
-      new Promise<'hung'>((resolve) =>
-        setTimeout(() => resolve('hung'), 1_000)
-      ),
-    ]);
+    const never = await within(
+      1_000,
+      hung.rank({ query: 'q', documents: ['a'], deadlineMs: 50 })
+    );
     expect(never).toMatchObject({ status: 'skipped', reason: 'timeout' });
     expect(performance.now() - startedAt).toBeLessThan(500);
 
@@ -1885,7 +1907,8 @@ describe('withFallback', () => {
       const controller = new AbortController();
       setTimeout(() => controller.abort(), 20);
       const startedAt = performance.now();
-      const outcome = await Promise.race([
+      const outcome = await within(
+        1_000,
         withFallback([
           {
             reranker: hung,
@@ -1896,11 +1919,8 @@ describe('withFallback', () => {
           query: 'q',
           documents: ['a', 'b'],
           signal: controller.signal,
-        }),
-        new Promise<'hung'>((resolve) =>
-          setTimeout(() => resolve('hung'), 1_000)
-        ),
-      ]);
+        })
+      );
       expect(outcome).toMatchObject({ status: 'skipped', reason: 'aborted' });
       expect(performance.now() - startedAt).toBeLessThan(500);
       expect((outcome as RerankOutcome).attempts[0]).toMatchObject({
@@ -2370,11 +2390,6 @@ describe('probePin input and deadlines', () => {
       model,
       decide: () => new Promise(() => {}),
     });
-    const within = (ms: number, task: Promise<unknown>): Promise<unknown> =>
-      Promise.race([
-        task,
-        new Promise((resolve) => setTimeout(() => resolve('pending'), ms)),
-      ]);
 
     it('is bounded at timeoutMs', async () => {
       await expect(
@@ -2409,11 +2424,6 @@ describe('toOutcomeReranker with a reranker that ignores its deadline and signal
     { id: 'hanging', rerank: () => new Promise(() => {}) },
     { kind: 'cross-encoder', model: 'm' }
   );
-  const within = (ms: number, task: Promise<unknown>): Promise<unknown> =>
-    Promise.race([
-      task,
-      new Promise((resolve) => setTimeout(() => resolve('pending'), ms)),
-    ]);
 
   it('settles at deadlineMs as a charged timeout', async () => {
     await expect(
@@ -2617,5 +2627,423 @@ describe('rerankCost rates', () => {
       usd: 0,
       unpriced: [{ provider: 'cross-encoder', model: 'm' }],
     });
+  });
+});
+
+describe('a request deadline caps a reranker’s own timeout', () => {
+  /** A Jev model whose requests hang until their abort. */
+  const hungJev = (): DecisionModel => ({
+    id: 'hung-jev',
+    model: 'jev-1.13.0',
+    decide: (request) =>
+      new Promise((_, reject) => {
+        request.signal?.addEventListener('abort', () =>
+          reject(new DecisionError('aborted', 'aborted', { provider: 'x' }))
+        );
+      }),
+  });
+  const bm25 = (): OutcomeReranker =>
+    createBm25Reranker({ idf: new Map([['alpha', 1]]), avgdl: 1 });
+
+  it.each(['document', 'batch'] as const)(
+    'a %s-mode System One step with a 200 ms timeout falls back to BM25 at 200 ms under a 1500 ms request deadline',
+    async (mode) => {
+      const chain = withFallback([
+        {
+          reranker: createSystemOneReranker({
+            model: hungJev(),
+            rubric,
+            timeoutMs: 200,
+            mode,
+          }),
+        },
+        { reranker: bm25() },
+      ]);
+      const startedAt = performance.now();
+      const outcome = await chain.rank({
+        query: 'alpha',
+        documents: ['beta', 'alpha'],
+        deadlineMs: 1_500,
+      });
+      expect(performance.now() - startedAt).toBeLessThan(900);
+      expect(outcome).toMatchObject({
+        status: 'degraded',
+        provider: 'bm25',
+        reason: 'timeout',
+      });
+      expect(outcome.attempts.map((attempt) => attempt.provider)).toEqual([
+        'systemone',
+        'bm25',
+      ]);
+    }
+  );
+
+  it('a cross-encoder with a 200 ms timeout gives up at 200 ms under a 1500 ms request deadline', async () => {
+    const server = await stub(() => 'hang');
+    const startedAt = performance.now();
+    const outcome = await createCrossEncoderReranker({
+      url: `${server.url}/rerank`,
+      model: 'ce',
+      requiresAuth: false,
+      timeoutMs: 200,
+    }).rank({ query: 'q', documents: ['a'], deadlineMs: 1_500 });
+    expect(performance.now() - startedAt).toBeLessThan(900);
+    expect(outcome).toMatchObject({ status: 'skipped', reason: 'timeout' });
+  });
+
+  it('a shorter request deadline still shortens the reranker’s timeout', async () => {
+    const startedAt = performance.now();
+    const outcome = await createSystemOneReranker({
+      model: hungJev(),
+      rubric,
+      timeoutMs: 5_000,
+    }).rank({ query: 'q', documents: ['a'], deadlineMs: 100 });
+    expect(performance.now() - startedAt).toBeLessThan(900);
+    expect(outcome).toMatchObject({ status: 'skipped', reason: 'timeout' });
+  });
+});
+
+describe('a model that reports its requests is counted at the transport', () => {
+  /** An HTTP Jev model whose credential is `apiKey`, against a server that counts what reached it. */
+  const httpJev = (
+    url: string,
+    apiKey: DecisionCredential | undefined,
+    maxRetries = 0
+  ): DecisionModel =>
+    createHttpDecisionModel({
+      providerId: 'jev',
+      endpoint: `${url}/v1/systemone`,
+      model: 'jev-1.13.0',
+      dialect: 'systemone',
+      requiresAuth: apiKey !== undefined,
+      apiKey,
+      maxRetries,
+    });
+  const docs = ['alpha', 'beta', 'gamma'];
+
+  it('the HTTP model reports its requests, and a breaker passes that on', () => {
+    const model = httpJev('http://127.0.0.1:1', undefined);
+    expect(model.reportsRequests).toBe(true);
+    expect(withBreaker(model).reportsRequests).toBe(true);
+    expect(
+      withBreaker({ ...fakeJev(() => 1).model }).reportsRequests
+    ).toBeUndefined();
+  });
+
+  it('a minter that returns no token sends nothing: no call, a skipped attempt', async () => {
+    const server = await stub(scored(SCORES));
+    for (const model of [
+      httpJev(server.url, async () => ''),
+      withBreaker(httpJev(server.url, async () => '')),
+    ]) {
+      const outcome = await createSystemOneReranker({ model, rubric }).rank({
+        query: 'q',
+        documents: docs,
+      });
+      expect(outcome).toMatchObject({
+        status: 'skipped',
+        reason: 'unauthorized',
+      });
+      expect(outcome.usage).toEqual(emptyUsage);
+      expect(outcome.attempts[0].status).toBe('skipped');
+    }
+    expect(server.calls).toHaveLength(0);
+  });
+
+  it('a minter still pending at the deadline charges no call and no estimate', async () => {
+    const server = await stub(scored(SCORES));
+    const outcome = await createSystemOneReranker({
+      model: httpJev(server.url, () => new Promise<string>(() => {})),
+      rubric,
+    }).rank({ query: 'q', documents: docs, deadlineMs: 150 });
+    expect(server.calls).toHaveLength(0);
+    expect(outcome).toMatchObject({ status: 'skipped', reason: 'timeout' });
+    expect(outcome.usage).toEqual(emptyUsage);
+    expect(outcome.attempts[0].status).toBe('skipped');
+    expect(
+      rerankCost(outcome, { systemone: { '*': { inputPerMTok: 1 } } }).usd
+    ).toBe(0);
+  });
+
+  it('a state that cannot be serialized sends nothing, on the first pass or the re-issue', async () => {
+    const server = await stub(scored(SCORES));
+    const outcome = await createSystemOneReranker({
+      model: httpJev(server.url, undefined),
+      rubric,
+      state: (query, document) =>
+        ({ query, document, n: BigInt(1) }) as unknown as Record<
+          string,
+          string
+        >,
+    }).rank({ query: 'q', documents: docs });
+    expect(server.calls).toHaveLength(0);
+    expect(outcome.usage).toEqual(emptyUsage);
+    expect(outcome.attempts[0].status).toBe('skipped');
+  });
+
+  it('batch mode with a minter still pending at the deadline charges no call and no estimate', async () => {
+    const server = await stub(scored(SCORES));
+    const outcome = await createSystemOneReranker({
+      model: httpJev(server.url, () => new Promise<string>(() => {})),
+      rubric,
+      mode: 'batch',
+    }).rank({ query: 'q', documents: docs, deadlineMs: 150 });
+    expect(server.calls).toHaveLength(0);
+    expect(outcome).toMatchObject({ status: 'skipped', reason: 'timeout' });
+    expect(outcome.usage).toEqual(emptyUsage);
+    expect(outcome.attempts[0].status).toBe('skipped');
+  });
+
+  it.each(['document', 'batch'] as const)(
+    'a caller abort that lands as a %s-mode request is scheduled sends, counts, and charges nothing',
+    async (mode) => {
+      const server = await stub(scored(SCORES));
+      const controller = new AbortController();
+      const pending = createSystemOneReranker({
+        model: httpJev(server.url, undefined),
+        rubric,
+        mode,
+      }).rank({
+        query: 'q',
+        documents: docs,
+        signal: controller.signal,
+        deadlineMs: 1_000,
+      });
+      queueMicrotask(() => controller.abort());
+      const outcome = await pending;
+      expect(server.calls).toHaveLength(0);
+      expect(outcome).toMatchObject({ status: 'skipped', reason: 'aborted' });
+      expect(outcome.usage).toEqual(emptyUsage);
+    }
+  );
+
+  it('a model that does not report requests is not dispatched once an abort lands before dispatch', async () => {
+    const { model, sent } = fakeJev(() => 1);
+    const controller = new AbortController();
+    const pending = createSystemOneReranker({ model, rubric }).rank({
+      query: 'q',
+      documents: docs,
+      signal: controller.signal,
+      deadlineMs: 1_000,
+    });
+    queueMicrotask(() => controller.abort());
+    const outcome = await pending;
+    expect(sent).toHaveLength(0);
+    expect(outcome).toMatchObject({ status: 'skipped', reason: 'aborted' });
+    expect(outcome.usage).toEqual(emptyUsage);
+    expect(outcome.attempts[0].status).toBe('skipped');
+  });
+});
+
+describe('a deadline during backoff charges no estimate and reports the reply', () => {
+  const throttled = (): Reply => ({
+    status: 429,
+    headers: { 'retry-after': '5' },
+  });
+
+  it('cross-encoder: a 429 with Retry-After is rate_limited, not an abandoned request', async () => {
+    const server = await stub(throttled);
+    const outcome = await createCrossEncoderReranker({
+      url: `${server.url}/rerank`,
+      model: 'ce',
+      requiresAuth: false,
+      maxRetries: 2,
+    }).rank({ query: 'q', documents: ['a', 'b', 'c'], deadlineMs: 300 });
+    expect(server.calls).toHaveLength(1);
+    expect(outcome).toMatchObject({
+      status: 'skipped',
+      reason: 'rate_limited',
+    });
+    expect(outcome.usage).toMatchObject({
+      calls: 1,
+      estimatedTokens: 0,
+      estimatedSearchUnits: 0,
+    });
+    expect(
+      rerankCost(outcome, {
+        'cross-encoder': { '*': { perSearchUnit: 0.002 } },
+      }).usd
+    ).toBe(0);
+  });
+
+  it('cross-encoder: a 500 answered before the deadline is not estimated', async () => {
+    const server = await stub(() => ({ status: 500 }));
+    const outcome = await createCrossEncoderReranker({
+      url: `${server.url}/rerank`,
+      model: 'ce',
+      requiresAuth: false,
+      maxRetries: 1,
+    }).rank({ query: 'q', documents: ['a', 'b', 'c'], deadlineMs: 150 });
+    expect(server.calls).toHaveLength(1);
+    expect(outcome).toMatchObject({ status: 'skipped', reason: 'error' });
+    expect(outcome.usage).toMatchObject({
+      calls: 1,
+      estimatedTokens: 0,
+      estimatedSearchUnits: 0,
+    });
+  });
+
+  it.each(['document', 'batch'] as const)(
+    'System One %s mode: a 429 with Retry-After is rate_limited and charges no estimate',
+    async (mode) => {
+      const server = await stub(throttled);
+      const documents = ['alpha', 'beta', 'gamma'];
+      const outcome = await createSystemOneReranker({
+        model: jev(server.url, { maxRetries: 2 }),
+        rubric,
+        mode,
+      }).rank({ query: 'q', documents, deadlineMs: 300 });
+      const requests = mode === 'document' ? documents.length : 1;
+      expect(server.calls).toHaveLength(requests);
+      expect(outcome).toMatchObject({
+        status: 'skipped',
+        reason: 'rate_limited',
+      });
+      expect(outcome.usage).toMatchObject({
+        calls: requests,
+        estimatedTokens: 0,
+      });
+    }
+  );
+
+  it('System One: a request still in flight at the deadline is estimated', async () => {
+    const server = await stub(() => 'hang');
+    const outcome = await createSystemOneReranker({
+      model: jev(server.url),
+      rubric,
+    }).rank({ query: 'q', documents: ['alpha', 'beta'], deadlineMs: 150 });
+    expect(outcome).toMatchObject({ status: 'skipped', reason: 'timeout' });
+    expect(outcome.usage).toMatchObject({ calls: 2, estimatedTokens: 1_200 });
+  });
+
+  it('System One: an always-429 host gets one request per document, with nothing re-issued', async () => {
+    const server = await stub(() => ({ status: 429 }));
+    const outcome = await createSystemOneReranker({
+      model: jev(server.url),
+      rubric,
+    }).rank({ query: 'q', documents: ['alpha', 'beta', 'gamma'] });
+    expect(server.calls).toHaveLength(3);
+    expect(outcome).toMatchObject({
+      status: 'skipped',
+      reason: 'rate_limited',
+    });
+    expect(outcome.usage.calls).toBe(3);
+  });
+});
+
+describe('BM25 with a query it reads no terms in', () => {
+  const stats = corpusStats(['café au lait', 'カフェ ラテ', 'coffee bean']);
+
+  it.each(['カフェ', 'été', 'the and of'])(
+    'skips %p as unsupported instead of an all-zero ranking',
+    async (query) => {
+      const outcome = await createBm25Reranker(stats).rank({
+        query,
+        documents: ['café au lait', 'カフェ ラテ'],
+      });
+      expect(outcome).toMatchObject({
+        status: 'skipped',
+        reason: 'unsupported',
+      });
+      expect(outcome.attempts[0].status).toBe('skipped');
+    }
+  );
+
+  it('lets a chain move on to its next step', async () => {
+    const failing = scripted('systemone', (request) =>
+      noneReranker({ reason: 'timeout' }).rank(request)
+    );
+    const next = scripted('cross-encoder', (request) => ({
+      results: request.documents.map((_, index) => ({
+        index,
+        score: request.documents.length - index,
+      })),
+      provider: 'cross-encoder',
+      model: 'ce',
+      status: 'ok',
+      reason: null,
+      attempts: [],
+      durationMs: 0,
+      usage: emptyUsage,
+    }));
+    const outcome = await withFallback([
+      { reranker: failing },
+      { reranker: createBm25Reranker(stats) },
+      { reranker: next },
+    ]).rank({ query: 'カフェ', documents: ['café au lait', 'カフェ ラテ'] });
+    expect(outcome).toMatchObject({
+      status: 'degraded',
+      provider: 'cross-encoder',
+    });
+    expect(outcome.attempts.map((attempt) => attempt.provider)).toEqual([
+      'none',
+      'bm25',
+      'cross-encoder',
+    ]);
+  });
+});
+
+describe('probePin timeoutMs', () => {
+  it.each([0, -1, NaN, 1.5, Infinity, 3_600_001])(
+    '%p is invalid_request, with no request sent',
+    async (timeoutMs) => {
+      const modelFor = jest.fn();
+      await expect(
+        probePin({ modelFor, pin: 'jev-1.13.0', timeoutMs })
+      ).resolves.toEqual({ verified: false, reason: 'invalid_request' });
+      expect(modelFor).not.toHaveBeenCalled();
+    }
+  );
+});
+
+describe('withFallback onAttempt', () => {
+  const ranked = scripted('cross-encoder', () => ({
+    results: [
+      { index: 2, score: 3 },
+      { index: 1, score: 2 },
+      { index: 0, score: 1 },
+    ],
+    provider: 'cross-encoder',
+    model: 'ce',
+    status: 'ok',
+    reason: null,
+    attempts: [
+      {
+        provider: 'cross-encoder',
+        model: 'ce',
+        status: 'ok',
+        reason: null,
+        durationMs: 1,
+        usage: { ...emptyUsage, calls: 1 },
+      },
+    ],
+    durationMs: 1,
+    usage: { ...emptyUsage, calls: 1 },
+  }));
+
+  it('sees a copy: a hook that mutates it changes nothing the chain returns', async () => {
+    const later: Array<() => void> = [];
+    const chain = withFallback([{ reranker: ranked }], {
+      onAttempt: (_reranker, outcome) => {
+        outcome.results.sort((a, b) => a.index - b.index);
+        outcome.attempts[0].usage.calls = 99;
+        later.push(() => {
+          outcome.results.reverse();
+          outcome.attempts.length = 0;
+        });
+      },
+    });
+    const outcome = await chain.rank({
+      query: 'q',
+      documents: ['a', 'b', 'c'],
+    });
+    for (const mutate of later) {
+      mutate();
+    }
+    expect(outcome.status).toBe('ok');
+    expect(outcome.results.map((entry) => entry.index)).toEqual([2, 1, 0]);
+    expect(outcome.attempts).toHaveLength(1);
+    expect(outcome.attempts[0].usage.calls).toBe(1);
+    expect(outcome.usage.calls).toBe(1);
   });
 });

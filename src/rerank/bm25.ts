@@ -18,7 +18,9 @@ const STOP_WORDS: ReadonlySet<string> = new Set(
  * Codegraph's measured BM25 tokenizer for code and its prose: camelCase,
  * snake_case, kebab-case, dotted names, and paths split into words, which
  * are lower-cased; words of two letters or fewer and English stop words are
- * dropped.
+ * dropped. It keeps only ASCII letters and digits, so CJK text yields no
+ * words and accented words split into fragments; pass a `tokenize` of your
+ * own for other scripts.
  */
 export function tokenizeCode(text: string): string[] {
   return text
@@ -94,7 +96,10 @@ function isIdfMap(value: unknown): value is ReadonlyMap<string, number> {
  * shortlist alone is close to degenerate. A term the corpus never saw counts
  * as rare as its rarest term. Never throws once built, and costs nothing.
  * Scoring is synchronous: an already-aborted `signal` is `aborted` before any
- * work, and neither an abort nor `deadlineMs` stops a pass once it starts.
+ * work, and neither an abort nor `deadlineMs` stops a pass once it starts. A
+ * query the tokenizer leaves no terms in (only stop words, or a script it
+ * does not read) is `unsupported`, not an all-zero ranking, so a chain moves
+ * on.
  */
 export function createBm25Reranker(
   options: Bm25RerankerOptions
@@ -153,6 +158,10 @@ export function createBm25Reranker(
       }
       try {
         const terms = tokenize(request.query);
+        if (terms.length === 0) {
+          // Every score would be zero: identity order dressed as a ranking.
+          return stepOutcome({ ...base, reason: 'unsupported', called: false });
+        }
         const scores = request.documents.map((document) => {
           const tokens = tokenize(document);
           const frequency = new Map<string, number>();

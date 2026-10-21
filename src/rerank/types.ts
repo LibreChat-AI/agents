@@ -11,6 +11,12 @@ export interface RerankRequest {
    * reports them (see `DecisionRequest.onRequest`). Not awaited; a throw is ignored.
    */
   onRequest?: () => void;
+  /**
+   * Called once per reported request that ended with a reply (its HTTP
+   * status) or a failure without one (`null`), for one that reports them
+   * (see `DecisionRequest.onResponse`). Not awaited; a throw is ignored.
+   */
+  onResponse?: (status: number | null) => void;
 }
 
 export interface RankedDocument {
@@ -29,6 +35,13 @@ export interface RerankResult {
 /** Rankings retain candidate identity; failures reject rather than fabricate scores. */
 export interface Reranker {
   readonly id: string;
+  /**
+   * True when `rerank` reports every request it sends through `onRequest` and
+   * every one that ends through `onResponse` (see
+   * `DecisionModel.reportsRequests`), so `toOutcomeReranker` counts only what
+   * was really sent.
+   */
+  readonly reportsRequests?: boolean;
   rerank(request: RerankRequest): Promise<RerankResult>;
 }
 
@@ -69,13 +82,17 @@ export type RerankReason =
 /**
  * What a ranking was charged. Reported counts are summed as the host sent
  * them; `estimated*` counts charge requests a host received but a deadline
- * abandoned (see `estimatedUsage`). Never a price.
+ * abandoned (see `estimatedUsage`): for a reranker whose requests are
+ * reported, only those still in flight when it fired, never one the host had
+ * already answered. Never a price.
  */
 export interface RerankUsage {
   /**
-   * Requests sent, including re-issues and retries. Retries inside an injected
-   * decision model are counted when it reports them through `onRequest`, as
-   * the SDK's HTTP decision model does; otherwise one per `decide()`.
+   * Requests sent, including re-issues and retries. A decision model that
+   * reports its requests (`reportsRequests`, as the SDK's HTTP decision model
+   * does) is counted from those reports, so a `decide()` that failed before
+   * sending (a credential minter that failed or hung, a state that cannot be
+   * serialized) counts nothing; any other model counts one per `decide()`.
    */
   calls: number;
   inputTokens: number;
@@ -135,7 +152,11 @@ export interface RankRequest {
   query: string;
   documents: readonly string[];
   signal?: AbortSignal;
-  /** This call's deadline; overrides the reranker's own timeout. */
+  /**
+   * This call's deadline. It caps the reranker's own timeout rather than
+   * replacing it: a reranker configured with a shorter timeout still gives up
+   * at that timeout, so a chain's later steps keep their time.
+   */
   deadlineMs?: number;
 }
 

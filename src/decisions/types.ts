@@ -87,6 +87,15 @@ export interface DecisionRequest {
    * caller to count one per `decide()`. Not awaited; a throw is ignored.
    */
   onRequest?: () => void;
+  /**
+   * Called once per request `onRequest` announced that ended before the
+   * deadline or the caller's abort: with the HTTP status once the host
+   * replied (a successful reply's body read in full), or `null` when the
+   * request failed without a reply. A request still in flight when the call
+   * is interrupted gets none, so the announced requests without one are the
+   * ones the host may still be working on. Not awaited; a throw is ignored.
+   */
+  onResponse?: (status: number | null) => void;
 }
 
 export interface DecisionResult {
@@ -99,6 +108,13 @@ export interface DecisionResult {
 export interface DecisionModel {
   readonly id: string;
   readonly model: string;
+  /**
+   * True when `decide` reports every request it sends through `onRequest`
+   * and every one that ends through `onResponse`, as the HTTP decision model
+   * does, so a caller can count what was really sent: a `decide` that fails
+   * before its first `onRequest` sent nothing.
+   */
+  readonly reportsRequests?: boolean;
   decide(request: DecisionRequest): Promise<DecisionResult>;
 }
 

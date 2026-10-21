@@ -366,11 +366,22 @@ describe('probe', () => {
       decide: () => new Promise(() => {}),
     };
     /** The probe's result, or `pending` when it has not settled after `ms`. */
-    const within = (ms: number, task: Promise<unknown>): Promise<unknown> =>
-      Promise.race([
-        task,
-        new Promise((resolve) => setTimeout(() => resolve('pending'), ms)),
-      ]);
+    const within = async (
+      ms: number,
+      task: Promise<unknown>
+    ): Promise<unknown> => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return await Promise.race([
+          task,
+          new Promise((resolve) => {
+            timer = setTimeout(() => resolve('pending'), ms);
+          }),
+        ]);
+      } finally {
+        clearTimeout(timer);
+      }
+    };
 
     it('at timeoutMs', async () => {
       await expect(
