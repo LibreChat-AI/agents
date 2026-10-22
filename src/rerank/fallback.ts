@@ -497,7 +497,9 @@ export function withFallback(
     });
   }
   const chain = steps.map((step) => ({ ...step }));
-  const head = chain[0].reranker;
+  const head =
+    chain.find(({ reranker }) => reranker.kind !== 'none')?.reranker ??
+    chain[0].reranker;
   const { gate, onAttempt } = options;
 
   return {
@@ -585,7 +587,7 @@ export function withFallback(
           for (const attempt of ran) {
             addRerankUsage(usage, attempt.usage);
           }
-          if (reranker.kind !== 'none' && outcome.status !== 'skipped') {
+          if (outcome.provider !== 'none' && outcome.status !== 'skipped') {
             const ok = index === 0 && outcome.status === 'ok';
             return {
               results: outcome.results,

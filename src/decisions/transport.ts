@@ -306,20 +306,22 @@ export function createTransport(options: TransportOptions): Transport {
               open = false;
             };
             let response: Awaited<ReturnType<DecisionFetch>>;
+            let pending: ReturnType<DecisionFetch> | undefined;
             try {
-              response = await waitFor(
-                fetchImpl(endpoint, {
-                  method: 'POST',
-                  headers: {
-                    ...(key !== null ? { Authorization: `Bearer ${key}` } : {}),
-                    'Content-Type': 'application/json',
-                  },
-                  body: payload,
-                  signal,
-                  redirect: 'error',
-                })
-              );
+              pending = fetchImpl(endpoint, {
+                method: 'POST',
+                headers: {
+                  ...(key !== null ? { Authorization: `Bearer ${key}` } : {}),
+                  'Content-Type': 'application/json',
+                },
+                body: payload,
+                signal,
+                redirect: 'error',
+              });
+              response = await waitFor(pending);
             } catch (error) {
+              // A fetch that ignores abort still owns a body when it eventually resolves.
+              void pending?.then((late) => late.body?.cancel()).catch(() => {});
               ended(null);
               throw error;
             }

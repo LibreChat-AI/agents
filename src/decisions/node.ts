@@ -7,8 +7,8 @@ import type { ChildProcess } from 'node:child_process';
 import type { Readable } from 'node:stream';
 import type { DecisionFailure, DecisionTokenMinter } from './types';
 import type { DecisionBreaker } from './breaker';
-import { DecisionError } from './types';
 import { redactExcerpt } from './redact';
+import { DecisionError } from './types';
 
 /** Fifty minutes: under the ClickHouse gateway's hourly token. */
 const DEFAULT_TTL_MS = 50 * 60_000;
@@ -573,6 +573,7 @@ export function commandToken(
 
       child.once('error', () => fail({ kind: 'spawn' }));
       child.once('exit', (code: number | null, signal: string | null) => {
+        clearTimeout(timer);
         if (killed) {
           reap();
           return;

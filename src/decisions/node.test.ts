@@ -1,8 +1,10 @@
 import path from 'node:path';
-import { tmpdir, homedir } from 'node:os';
+import { once } from 'node:events';
 import { existsSync } from 'node:fs';
-import { execFile } from 'node:child_process';
+import { tmpdir, homedir } from 'node:os';
+import childProcess, { execFile } from 'node:child_process';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import type { ChildProcess } from 'node:child_process';
 import type { DecisionFetch } from './core';
 import {
   withBreaker,
@@ -932,6 +934,48 @@ describe('commandToken', () => {
       pids.forEach(sweep);
     }
   });
+
+  it.each([0, 3])(
+    'preserves shell exit %s when pipe draining crosses the command timeout',
+    async (exitCode) => {
+      jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate'] });
+      const spawned = jest.spyOn(childProcess, 'spawn');
+      let descendant: number | undefined;
+      try {
+        const pidFile = path.join(dir, 'drain-child');
+        const pending = commandToken(
+          `sleep 3 & echo $! > "${pidFile}"; echo tok-1; exit ${exitCode}`,
+          { timeoutMs: 50, killGraceMs: 0 }
+        )({ refresh: false }).then(
+          (token) => token,
+          (error: unknown) => error
+        );
+        const child = spawned.mock.results[0].value as ChildProcess;
+        await once(child, 'exit');
+        const pid = await pidFrom(pidFile);
+        descendant = pid;
+        expect(child.exitCode).toBe(exitCode);
+        await jest.advanceTimersByTimeAsync(100);
+        const result = await pending;
+        if (exitCode === 0) {
+          expect(result).toBe('tok-1');
+        } else {
+          expect(result).toMatchObject({
+            failure: 'unauthorized',
+            message: 'token command exited with code 3',
+          });
+        }
+        expect(() => process.kill(pid, 0)).not.toThrow();
+      } finally {
+        spawned.mockRestore();
+        jest.clearAllTimers();
+        jest.useRealTimers();
+        if (descendant !== undefined) {
+          sweep(descendant);
+        }
+      }
+    }
+  );
 
   it('reads an exit status outside refusalExitCodes as network, leaving a breaker closed', async () => {
     let requests = 0;

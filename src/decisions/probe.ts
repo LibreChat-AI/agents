@@ -1,8 +1,8 @@
 import type { DecisionModel, DecisionFailure, DecisionRequest } from './types';
 import { withDecisionDeadline } from './deadline';
 import { booleanQuestion } from './questions';
-import { DecisionError } from './types';
 import { redactExcerpt } from './redact';
+import { DecisionError } from './types';
 
 const DETAIL_LIMIT = 200;
 const PROBE_FAILED = 'decision model probe failed';
@@ -90,7 +90,7 @@ export async function probe(
       failure: error.failure,
       ...(error.status !== undefined ? { status: error.status } : {}),
       circuitOpen: error.circuitOpen,
-      detail: safeDetail(error.message, options.secrets),
+      detail: safeDetail(error.message, options),
     };
   }
 }
@@ -100,11 +100,9 @@ export async function probe(
  * be read: never the raw message, never a throw. Only the start is read, so a
  * host model's oversized error message cannot make the probe slow or large.
  */
-function safeDetail(
-  message: string,
-  secrets: DecisionProbeOptions['secrets']
-): string {
+function safeDetail(message: string, options: DecisionProbeOptions): string {
   try {
+    const { secrets } = options;
     return redactExcerpt(
       message,
       secrets === undefined ? [] : secrets,

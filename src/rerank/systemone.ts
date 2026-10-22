@@ -377,8 +377,9 @@ export function createSystemOneReranker(
     throw fail('bad_request', 'invalid reranker configuration');
   }
   const question = scoreQuestion(instructions, rubric);
+  const customState = options.state;
   const stateOf =
-    options.state ??
+    customState ??
     ((query: string, document: string): DecisionState => ({
       query,
       document,
@@ -475,7 +476,7 @@ export function createSystemOneReranker(
     /** `null` when a custom state cannot be built or serialized: that document is scored, never cached. */
     const keyFor = (index: number): RerankCacheKey | null => {
       let state = '';
-      if (options.state !== undefined) {
+      if (customState !== undefined) {
         try {
           const serialized: unknown = JSON.stringify(stateFor(index));
           if (typeof serialized !== 'string') {

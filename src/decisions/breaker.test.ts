@@ -437,6 +437,32 @@ describe('probe', () => {
     });
   });
 
+  it('keeps typed probe failures sanitized when a secrets getter throws', async () => {
+    const leaky: DecisionModel = {
+      id: 'leaky',
+      model: 'leaky',
+      decide: async () => {
+        throw new DecisionError('unauthorized', 'private token detail', {
+          status: 401,
+          circuitOpen: true,
+        });
+      },
+    };
+    await expect(
+      probe(leaky, {
+        get secrets(): readonly string[] {
+          throw new Error('private secret configuration');
+        },
+      })
+    ).resolves.toEqual({
+      ok: false,
+      failure: 'unauthorized',
+      status: 401,
+      circuitOpen: true,
+      detail: 'decision model probe failed',
+    });
+  });
+
   it('still resolves, without the message, when the secrets it was handed cannot be read', async () => {
     const leaky: DecisionModel = {
       id: 'leaky',
