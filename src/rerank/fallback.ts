@@ -180,12 +180,23 @@ const keptByThreshold = (
     (entry) => entry.kept === (entry.score !== null && entry.score >= threshold)
   );
 
+/** A step that did not answer has no `ok` attempt, and an answer that reports attempts has one. */
+const attemptsFit = (
+  status: string,
+  attempts: readonly RerankAttempt[]
+): boolean =>
+  status === 'skipped'
+    ? attempts.every((attempt) => attempt.status !== 'ok')
+    : attempts.length === 0 ||
+      attempts.some((attempt) => attempt.status === 'ok');
+
 /**
  * The whole `RerankOutcome` contract, since a step's results and attempts are
  * passed through as they are: `reason` is `null` exactly when the status
  * (the outcome's and each attempt's) is `ok`, an answer (`ok` or
- * `degraded`) scores every document, and `kept` comes only with the `threshold` behind it, on every
- * entry and matching it.
+ * `degraded`) scores every document while a `skipped` outcome scores none
+ * (so it is identity order), the attempts agree with the status, and `kept`
+ * comes only with the `threshold` behind it, on every entry and matching it.
  */
 function isOutcome(value: unknown, documents: number): value is RerankOutcome {
   return (
@@ -197,14 +208,17 @@ function isOutcome(value: unknown, documents: number): value is RerankOutcome {
     reasonFits(value.status, value.reason) &&
     isRerankPermutation(value.results, documents) &&
     isRankedOrder(value.results) &&
-    (value.status === 'skipped' ||
-      value.results.every((entry) => entry.score !== null)) &&
+    // A skipped step scored nothing, so ranked order is then identity order.
+    value.results.every(
+      (entry) => (value.status === 'skipped') === (entry.score === null)
+    ) &&
     (value.threshold === undefined
       ? value.results.every((entry) => entry.kept === undefined)
       : isFiniteNumber(value.threshold) &&
         keptByThreshold(value.results, value.threshold)) &&
     Array.isArray(value.attempts) &&
     everySlot(value.attempts as unknown[], isAttempt) &&
+    attemptsFit(value.status, value.attempts as RerankAttempt[]) &&
     (value.pinVerified === undefined || typeof value.pinVerified === 'boolean')
   );
 }

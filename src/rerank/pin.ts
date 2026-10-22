@@ -35,9 +35,19 @@ export type PinProbe =
        */
       reason: 'sentinel_accepted' | 'echo_mismatch' | RerankReason;
       echoed?: string;
-      /** The HTTP status the sentinel request got, when it got a reply. */
+      /**
+       * The HTTP status the sentinel request got, when it got a reply: for an
+       * accepted sentinel, the success status the model reported through
+       * `onResponse` (the SDK's HTTP model does), else none.
+       */
       sentinelStatus?: number;
     };
+
+const isHttpStatus = (value: unknown): value is number =>
+  typeof value === 'number' &&
+  Number.isInteger(value) &&
+  value >= 100 &&
+  value <= 599;
 
 const echoOf = (value: unknown): string | undefined =>
   value !== null &&
@@ -77,8 +87,13 @@ export async function probePin(options: PinProbeOptions): Promise<PinProbe> {
   ) {
     return { verified: false, reason: 'invalid_request' };
   }
+  /** The status of the sentinel's last reply, as the model reported it through `onResponse`. */
+  let replied: number | undefined;
   /** Bounded here, so a model that ignores its deadline and signal cannot hold the probe. */
-  const ask = (model: string): Promise<unknown> =>
+  const ask = (
+    model: string,
+    onResponse?: (status: number | null) => void
+  ): Promise<unknown> =>
     withDecisionDeadline(
       'pin-probe',
       timeoutMs,
@@ -90,18 +105,22 @@ export async function probePin(options: PinProbeOptions): Promise<PinProbe> {
               ...probeRequest(),
               timeoutMs,
               signal,
+              ...(onResponse !== undefined ? { onResponse } : {}),
             })
           )
         )
     );
   try {
-    const answer = await ask(sentinel);
+    const answer = await ask(sentinel, (status) => {
+      replied = isHttpStatus(status) ? status : undefined;
+    });
     const echoed = echoOf(answer);
+    // Only a status the sentinel's reply carried; a model that reports none gives none.
     return {
       verified: false,
       reason: 'sentinel_accepted',
       ...(echoed !== undefined ? { echoed } : {}),
-      sentinelStatus: 200,
+      ...(replied !== undefined ? { sentinelStatus: replied } : {}),
     };
   } catch (error) {
     if (!(error instanceof DecisionError) || error.status !== 404) {

@@ -1745,6 +1745,46 @@ describe('withFallback', () => {
             ],
           },
         ],
+        [
+          'a skipped outcome with scores',
+          { status: 'skipped', reason: 'no_api_key' },
+        ],
+        [
+          'a skipped outcome with an ok attempt',
+          {
+            status: 'skipped',
+            reason: 'no_api_key',
+            results: [
+              { index: 0, score: null },
+              { index: 1, score: null },
+            ],
+            attempts: [
+              {
+                provider: 'cross-encoder',
+                model: 'm',
+                status: 'ok',
+                reason: null,
+                durationMs: 1,
+                usage: { ...emptyUsage },
+              },
+            ],
+          },
+        ],
+        [
+          'an answer with no ok attempt',
+          {
+            attempts: [
+              {
+                provider: 'cross-encoder',
+                model: 'm',
+                status: 'failed',
+                reason: 'timeout',
+                durationMs: 1,
+                usage: { ...emptyUsage },
+              },
+            ],
+          },
+        ],
         ['a non-numeric threshold', { threshold: 'x' }],
         ['a non-boolean pinVerified', { pinVerified: 'yes' }],
       ] as const
@@ -2600,6 +2640,37 @@ describe('probePin', () => {
       sentinelStatus: 200,
     });
     expect(server.calls).toHaveLength(1);
+  });
+
+  it('reports the success status the sentinel really got, and none from a model that reports no status', async () => {
+    const server = await stub((call) => ({
+      status: 201,
+      body: {
+        model: call.body.model,
+        answers: { ok: { type: 'noul', noul: 0.9 } },
+      },
+    }));
+    expect(
+      await probePin({
+        modelFor: (model) => jev(server.url, { model }),
+        pin: 'jev-1.13.0',
+      })
+    ).toEqual({
+      verified: false,
+      reason: 'sentinel_accepted',
+      echoed: 'jev-0.0.0-pin-sentinel',
+      sentinelStatus: 201,
+    });
+    const injected = (model: string): DecisionModel => ({
+      id: 'injected',
+      model,
+      decide: async () => ({ model, answers: {}, usage: null }),
+    });
+    expect(await probePin({ modelFor: injected, pin: 'jev-1.13.0' })).toEqual({
+      verified: false,
+      reason: 'sentinel_accepted',
+      echoed: 'jev-0.0.0-pin-sentinel',
+    });
   });
 
   it('a pin answered as another model is echo_mismatch', async () => {
