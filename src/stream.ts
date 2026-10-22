@@ -185,6 +185,19 @@ function isEagerExecutionExcludedTool(
   if (excluded != null && excluded.includes(name)) {
     return true;
   }
+  // ToolNode unwraps dispatched calls and refuses disabled tools; a prestart
+  // would run them before that happens.
+  const toolDef =
+    agentContext?.toolRegistry?.get(name) ??
+    agentContext?.toolDefinitions?.find((def) => def.name === name);
+  const dispatcher = agentContext?.toolDispatch?.name;
+  if (
+    name === dispatcher ||
+    toolDef?.disabled != null ||
+    (dispatcher != null && toolDef?.defer_loading === true)
+  ) {
+    return true;
+  }
   // Run-scoped circuit breaker: once a prestart for this tool diverged from
   // the final request ("changed after eager execution started"), stop
   // prestarting it so the model's retry executes normally instead of
@@ -2608,12 +2621,14 @@ export function createContentAggregator(): t.ContentAggregatorResult {
         toolCallContentIndexMap.delete(existingToolCallId);
       }
 
-      const newToolCall: ToolCall & t.PartMetadata & { outcome?: string } = {
-        id,
-        name,
-        args,
-        type: ToolCallTypes.TOOL_CALL,
-      };
+      const newToolCall: ToolCall &
+        t.PartMetadata &
+        Pick<t.ToolCallPart, 'outcome' | 'dispatched'> = {
+          id,
+          name,
+          args,
+          type: ToolCallTypes.TOOL_CALL,
+        };
 
       const auth =
         contentPart.tool_call.auth ?? existingContent?.tool_call?.auth;
@@ -2631,6 +2646,10 @@ export function createContentAggregator(): t.ContentAggregatorResult {
         const outcome = (contentPart.tool_call as t.ToolCallPart).outcome;
         if (outcome != null) {
           newToolCall.outcome = outcome;
+        }
+        const dispatched = (contentPart.tool_call as t.ToolCallPart).dispatched;
+        if (dispatched != null) {
+          newToolCall.dispatched = dispatched;
         }
       }
 

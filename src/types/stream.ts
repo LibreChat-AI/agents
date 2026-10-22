@@ -253,6 +253,18 @@ export type ProcessedToolCall = {
    * which is language-neutral and always consistent.
    */
   outcome?: string;
+  /**
+   * The tool that actually ran when `name` is the dispatcher tool. The call
+   * keeps the model's form (`name`/`args` of the dispatcher call) so stored
+   * history stays valid; renderers should key on this field when present.
+   */
+  dispatched?: DispatchedToolCall;
+};
+
+/** Target of a dispatcher call, as executed. */
+export type DispatchedToolCall = {
+  name: string;
+  args: string | Record<string, unknown>;
 };
 
 export type ProcessedContent = {
@@ -495,6 +507,8 @@ export type ToolCallPart = {
    * preserved through aggregation so it survives persistence/reload.
    */
   outcome?: string;
+  /** Tool that ran when `name` is the dispatcher tool (see `ProcessedToolCall.dispatched`). */
+  dispatched?: DispatchedToolCall;
   /** Auth URL */
   auth?: string;
   /** Expiration time */

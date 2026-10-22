@@ -158,6 +158,32 @@ code-execution configurations require the manifest so caller policy can reject
 direct-only dependencies before starting an execution runtime without parsing
 the submitted programming language.
 
+## Tool Dispatcher
+
+A **Tool Dispatcher** is an opt-in fixed tool (`AgentInputs.toolDispatch`,
+`call_tool` by default) bound from the first turn so a host can make tools
+available mid-conversation without changing the provider's `tools`, which
+providers serialize ahead of the system prompt. Dispatchable targets are
+deferred registry entries; they are never bound, even after discovery, and
+their schemas reach the model as history text written by the host.
+
+The **Canonical Call** of a dispatcher call is its target with the target's
+arguments under the dispatcher call's id. ToolNode computes it once, before
+hooks, approval, HITL, permission layers, and execution, with
+`resolveDispatchedToolCall`; layers outside ToolNode call the same function.
+Results and completion events leave in the model form (dispatcher name and
+arguments, real tool in `dispatched`), so history names only declared tools.
+A direct call to a dispatchable tool (for example after `tool_search`, whose
+results then carry schemas and point to the dispatcher) runs the same way and
+is rewritten into a dispatcher call in the assistant message, because the
+model's own message would otherwise put an undeclared name into the history.
+A `disabled` definition stays bound and is refused at the same point.
+A host narrows the targets with `toolDispatch.canDispatch`: a deferred tool it
+rejects is refused whether called directly or through the dispatcher. A tool
+whose schema the validator cannot apply (an unresolved `$ref`, a pattern that
+is not an ECMAScript regular expression) is answered with a tool error and
+never fails the run.
+
 ## Context Pressure Measurement
 
 A **Context Pressure Meter** is the request-scoped projection of retained
