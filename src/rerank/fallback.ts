@@ -30,7 +30,9 @@ import { callHook } from '../decisions/hook';
 /**
  * Identity order, never a request: the last step of a chain, or the whole
  * chain when nothing is configured. Its one attempt is `skipped` with
- * `reason` and no usage, so a chain's history shows it ran.
+ * `reason` and no usage, so a chain's history shows it ran. A malformed
+ * request is `invalid_request` and an empty one `empty`, as for every other
+ * reranker, so a bad call is never mistaken for a disabled one.
  */
 export function noneReranker(
   options: { reason?: string } = {}
@@ -49,7 +51,7 @@ export function noneReranker(
         documents: documentCount(request),
         startedAt: performance.now(),
         model: '',
-        reason,
+        reason: rankRequestProblem(request) ?? reason,
         called: false,
       });
     },
@@ -329,6 +331,9 @@ async function runStep(
       : deadline.signal;
   }
   const timers: Array<ReturnType<typeof setTimeout>> = [];
+  /** A step that gave up without an answer after its signal fired was stopped, not broken: `asTimeout` then names a deadline. */
+  const failure = (): 'aborted' | 'error' =>
+    isAborted(signal) ? 'aborted' : 'error';
   const work = Promise.resolve()
     .then(() =>
       reranker.rank({
@@ -343,7 +348,7 @@ async function runStep(
         if (isOutcome(outcome, n)) {
           return outcome;
         }
-        const reason = outcome == null ? 'error' : 'invalid_results';
+        const reason = outcome == null ? failure() : 'invalid_results';
         const reported = isDecisionObject(outcome) ? outcome.usage : null;
         return failedStep(
           reranker,
@@ -353,7 +358,7 @@ async function runStep(
           usageOf(reported)
         );
       },
-      () => failedStep(reranker, n, 'error', elapsedMs(startedAt))
+      () => failedStep(reranker, n, failure(), elapsedMs(startedAt))
     );
   if (deadlineMs === undefined && outer === undefined) {
     return work;

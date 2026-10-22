@@ -570,8 +570,9 @@ export function rankRequestProblem(request: unknown): RerankReason | undefined {
  * it reports through `onRequest`, or none when an open breaker
  * (`circuitOpen`) refused it before dispatch. Tokens are whatever it
  * reported. The request's `deadlineMs` and `signal` bound the wait even for
- * a reranker that ignores them, and it is passed on as the reranker's
- * `timeoutMs`.
+ * a reranker that ignores them. The deadline reaches the reranker only as
+ * its abort signal, never as `timeoutMs`, which would replace its configured
+ * timeout: a deadline caps that timeout and never extends it.
  */
 export function toOutcomeReranker(
   reranker: Reranker,
@@ -642,7 +643,6 @@ export function toOutcomeReranker(
             query: request.query,
             documents: request.documents,
             ...(signal !== undefined ? { signal } : {}),
-            ...(deadlineMs !== undefined ? { timeoutMs: deadlineMs } : {}),
             onRequest: () => {
               if (settled) {
                 return;

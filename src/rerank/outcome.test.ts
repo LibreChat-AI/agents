@@ -2378,6 +2378,7 @@ describe('sparse document arrays', () => {
         { reranker: createBm25Reranker({ idf: () => 1, avgdl: 2 }) },
         { reranker: noneReranker() },
       ]),
+      noneReranker(),
     ];
     for (const reranker of rerankers) {
       const outcome = await reranker.rank({ query: 'q', documents: sparse() });
@@ -2472,6 +2473,7 @@ describe('malformed request signals', () => {
           { id: 'rejecting', rerank: rejecting },
           { kind: 'cross-encoder', model: 'm' }
         ),
+        noneReranker(),
       ];
       for (const reranker of rerankers) {
         const outcome = await reranker.rank({
@@ -2763,6 +2765,189 @@ describe('toOutcomeReranker with a reranker that ignores its deadline and signal
         })
       )
     ).resolves.toMatchObject({ status: 'skipped', reason: 'aborted' });
+  });
+});
+
+describe('toOutcomeReranker deadline', () => {
+  /** A reranker that gives up at its own `timeoutMs` (200 ms unless overridden) on a host that answers after 1 s. */
+  const configured = (): {
+    reranker: OutcomeReranker;
+    seen: Array<number | undefined>;
+  } => {
+    const seen: Array<number | undefined> = [];
+    const reranker = toOutcomeReranker(
+      {
+        id: 'configured',
+        rerank: (request) => {
+          seen.push(request.timeoutMs);
+          return new Promise((resolve, reject) => {
+            const answer = setTimeout(
+              () =>
+                resolve({
+                  results: [
+                    { index: 1, score: 2 },
+                    { index: 0, score: 1 },
+                  ],
+                  model: 'm',
+                  usage: null,
+                }),
+              1_000
+            );
+            setTimeout(() => {
+              clearTimeout(answer);
+              reject(new DecisionError('timeout', 'gave up'));
+            }, request.timeoutMs ?? 200);
+          });
+        },
+      },
+      { kind: 'cross-encoder', model: 'm' }
+    );
+    return { reranker, seen };
+  };
+
+  it('caps the wrapped reranker at its own shorter timeout instead of extending it to the deadline', async () => {
+    const { reranker, seen } = configured();
+    const startedAt = performance.now();
+    const outcome = await reranker.rank({
+      query: 'q',
+      documents: ['a', 'b'],
+      deadlineMs: 1_500,
+    });
+    expect(performance.now() - startedAt).toBeLessThan(800);
+    expect(outcome).toMatchObject({ status: 'skipped', reason: 'timeout' });
+    expect(seen).toEqual([undefined]);
+  });
+
+  it('lets a chain fall back when the wrapped step times out on its own', async () => {
+    const { reranker } = configured();
+    const startedAt = performance.now();
+    const outcome = await withFallback([
+      { reranker },
+      { reranker: createBm25Reranker({ idf: () => 1, avgdl: 2 }) },
+    ]).rank({ query: 'beta', documents: ['alpha', 'beta'], deadlineMs: 1_500 });
+    expect(performance.now() - startedAt).toBeLessThan(800);
+    expect(outcome).toMatchObject({
+      status: 'degraded',
+      reason: 'timeout',
+      provider: 'bm25',
+    });
+  });
+});
+
+describe('noneReranker requests', () => {
+  const malformed: Array<[string, unknown]> = [
+    ['a blank query', { query: ' ', documents: ['a'] }],
+    ['sparse documents', { query: 'q', documents: new Array<string>(2) }],
+    ['a non-string document', { query: 'q', documents: ['a', 1] }],
+    ['a negative deadline', { query: 'q', documents: ['a'], deadlineMs: -5 }],
+    ['an endless deadline', { query: 'q', documents: ['a'], deadlineMs: 1e12 }],
+    [
+      'a duck-typed signal',
+      { query: 'q', documents: ['a'], signal: { aborted: false } },
+    ],
+    ['no request', null],
+  ];
+
+  it.each(malformed)('is invalid_request for %s', async (_label, request) => {
+    const outcome = await noneReranker({ reason: 'budget' }).rank(
+      request as RankRequest
+    );
+    expect(outcome).toMatchObject({
+      status: 'skipped',
+      reason: 'invalid_request',
+      usage: emptyUsage,
+    });
+    expect(outcome.attempts).toEqual([
+      expect.objectContaining({ status: 'skipped', reason: 'invalid_request' }),
+    ]);
+  });
+
+  it('is empty without documents, and its own reason otherwise', async () => {
+    await expect(
+      noneReranker().rank({ query: 'q', documents: [] })
+    ).resolves.toMatchObject({ status: 'skipped', reason: 'empty' });
+    await expect(
+      noneReranker().rank({ query: 'q', documents: ['a'] })
+    ).resolves.toMatchObject({ status: 'skipped', reason: 'disabled' });
+    await expect(
+      noneReranker({ reason: 'budget' }).rank({ query: 'q', documents: ['a'] })
+    ).resolves.toMatchObject({ status: 'skipped', reason: 'budget' });
+  });
+});
+
+describe('withFallback steps that reject once stopped', () => {
+  /** Honors its signal by rejecting, as a reranker that breaks the never-rejects contract might. */
+  const rejectsOnAbort = (): OutcomeReranker =>
+    scripted(
+      'cross-encoder',
+      (request) =>
+        new Promise<RerankOutcome>((_resolve, reject) => {
+          request.signal?.addEventListener('abort', () =>
+            reject(new Error('stopped'))
+          );
+        })
+    );
+  /** Honors its signal by resolving nothing. */
+  const resolvesNothingOnAbort = (): OutcomeReranker =>
+    scripted(
+      'cross-encoder',
+      (request) =>
+        new Promise<RerankOutcome>((resolve) => {
+          request.signal?.addEventListener('abort', () =>
+            resolve(undefined as unknown as RerankOutcome)
+          );
+        })
+    );
+  const bm25 = (): OutcomeReranker =>
+    createBm25Reranker({ idf: () => 1, avgdl: 2 });
+
+  it.each([
+    ['rejects', rejectsOnAbort],
+    ['resolves nothing', resolvesNothingOnAbort],
+  ])('is a timeout when a step %s at its deadline', async (_label, step) => {
+    const outcome = await withFallback([
+      { reranker: step(), deadlineMs: 30 },
+      { reranker: bm25() },
+    ]).rank({ query: 'beta', documents: ['alpha', 'beta'] });
+    expect(outcome).toMatchObject({ status: 'degraded', reason: 'timeout' });
+    expect(outcome.attempts[0]).toMatchObject({
+      status: 'failed',
+      reason: 'timeout',
+    });
+  });
+
+  it.each([
+    ['rejects', rejectsOnAbort],
+    ['resolves nothing', resolvesNothingOnAbort],
+  ])('is aborted when a step %s on the caller abort', async (_label, step) => {
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 30);
+    const outcome = await withFallback([
+      { reranker: step() },
+      { reranker: bm25() },
+    ]).rank({
+      query: 'beta',
+      documents: ['alpha', 'beta'],
+      signal: controller.signal,
+    });
+    expect(outcome).toMatchObject({ status: 'skipped', reason: 'aborted' });
+    expect(outcome.attempts[0]).toMatchObject({
+      status: 'failed',
+      reason: 'aborted',
+    });
+  });
+
+  it('is still an error when a step rejects on its own', async () => {
+    const outcome = await withFallback([
+      {
+        reranker: scripted('cross-encoder', () =>
+          Promise.reject(new Error('boom'))
+        ),
+        deadlineMs: 500,
+      },
+      { reranker: bm25() },
+    ]).rank({ query: 'beta', documents: ['alpha', 'beta'] });
+    expect(outcome).toMatchObject({ status: 'degraded', reason: 'error' });
   });
 });
 
