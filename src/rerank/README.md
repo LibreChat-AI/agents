@@ -2,6 +2,10 @@
 
 `Reranker.rerank({ query, documents, topK?, signal?, timeoutMs? })` returns ranked input indices and provider-specific scores. Indices preserve candidate identity even when two documents have identical text. A successful ranking is ordered by descending score. Scores are not portable confidence thresholds. Missing usage is `null`.
 
+## Light entry point
+
+`@librechat/agents/rerank` exports the `Reranker` types and `createSystemOneReranker` without loading LangChain or any other third-party package; pair it with `@librechat/agents/decisions` to build the decision model. `createWebSearchReranker` extends the search tool's reranker, so it is exported only from the root entry.
+
 ## Host-owned web-search ranking
 
 `createSearchTool({ reranker })` now honors an injected `SearchReranker` before constructing its configured built-in reranker. Hosts can supply a plain `{ provider, rerank(query, documents, topK?, metrics?) }` object. Extending `BaseReranker` is not required. Existing Jina, Cohere, rag_api, Infinity, and `none` selection stays unchanged when there is no injection.

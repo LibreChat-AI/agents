@@ -2,6 +2,8 @@ export const packageEntries = Object.freeze({
   main: 'src/index.ts',
   'provider-registration': 'src/provider-registration.ts',
   'openai/index': 'src/openai/index.ts',
+  'decisions/core': 'src/decisions/core.ts',
+  'rerank/core': 'src/rerank/core.ts',
   'llm/providers.eager': 'src/llm/providers.eager.ts',
   'llm/openai/index': 'src/llm/openai/index.ts',
   'llm/mistral/index': 'src/llm/mistral/index.ts',

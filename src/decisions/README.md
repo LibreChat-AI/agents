@@ -35,6 +35,10 @@ Use the request's `signal` and `timeoutMs` to bound a call. HTTP timeouts cover 
 
 The structured-chat adapter sends the original state to the provider. Its prompt carries a marker so Langfuse can drop the **entire state and question text** from generation inputs when any tool-output redaction policy is active. Selectively removing identifiable tool fields would still leak a private result quoted in free-form state or instructions. With no active redaction policy, prompts remain visible. Configure provider-side logging separately. No defaults should change until quality, calibration, latency, and cost have been evaluated for each backend and use case.
 
+## Light Entry Point
+
+`@librechat/agents/decisions` exports the System One HTTP stack (types, question builders, presets, `createHttpDecisionModel`, the dialect parser, `createTransport`, `failureForStatus`, `retryAfterMs`, and `withDecisionDeadline`) without loading LangChain or any other third-party package. `createStructuredChatDecisionModel` binds a LangChain chat model, so it is exported only from the root entry. The root `@librechat/agents` entry still exports everything. `npm run test:light-entries` loads the built subpath and fails if it reaches a non-built-in package.
+
 ## Structured Output Capabilities
 
 The private `structuredOutput.ts` binding boundary owns adapter/method options. The caller explicitly chooses the method; there is no automatic mode fallback, public capability registry, provider-profile override, or extra provider SDK import at runtime.

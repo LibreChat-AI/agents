@@ -1,16 +1,17 @@
 import type {
+  DecisionModel,
+  DecisionQuestion,
+  DecisionResult,
+} from '../decisions/types';
+import type {
   Reranker,
   RerankRequest,
   RerankResult,
   RankedDocument,
 } from './types';
-import type {
-  DecisionModel,
-  DecisionQuestion,
-  DecisionResult,
-} from '@/decisions';
-import { DecisionError, scoreQuestion, isDecisionObject } from '@/decisions';
-import { withDecisionDeadline } from '@/decisions/deadline';
+import { DecisionError, isDecisionObject } from '../decisions/types';
+import { withDecisionDeadline } from '../decisions/deadline';
+import { scoreQuestion } from '../decisions/questions';
 
 export interface SystemOneRerankerOptions {
   /** Inject a configured Jev/Laya HTTP decision model; chat cannot produce expected scores. */

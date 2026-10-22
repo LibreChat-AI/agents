@@ -1,4 +1,2 @@
-export type * from './types';
-export { createSystemOneReranker } from './systemone';
-export type { SystemOneRerankerOptions } from './systemone';
+export * from './core';
 export { createWebSearchReranker } from './search';

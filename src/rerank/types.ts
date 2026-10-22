@@ -1,4 +1,4 @@
-import type { DecisionUsage } from '@/decisions';
+import type { DecisionUsage } from '../decisions/types';
 
 export interface RerankRequest {
   query: string;
