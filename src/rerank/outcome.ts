@@ -482,8 +482,8 @@ export function rerankReasonOf(error: unknown): RerankReason {
 /**
  * A reply the transport backs off from and retries (HTTP 429 or 5xx), as the
  * error it stands for; `null` for any other reply or none. A deadline that
- * fires during that backoff, with no request in flight, reports this rather
- * than `timeout`: the host answered, and said why.
+ * fires after it, with no request in flight and no later request ended,
+ * reports this rather than `timeout`: the host answered, and said why.
  */
 export function retriedReply(
   provider: string,
@@ -615,7 +615,7 @@ export function toOutcomeReranker(
         requests: number;
         /** Reported requests that ended, with a reply or without one. */
         ended: number;
-        /** A 429 or 5xx reply the reranker was backing off from. */
+        /** The latest ended request's reply, when it is a 429 or 5xx the reranker backs off from. */
         backoff: DecisionError | null;
         /** Set when `rerank` is called; a deadline or abort before it sent nothing. */
         dispatched: boolean;
@@ -629,7 +629,8 @@ export function toOutcomeReranker(
         ): void => {
           if (!settled) {
             tally.ended += 1;
-            tally.backoff ??= retriedReply(reranker.id, status, retryAfterMs);
+            // The latest reply only: an earlier one's backoff is over once another request ended.
+            tally.backoff = retriedReply(reranker.id, status, retryAfterMs);
           }
         };
         const call = (

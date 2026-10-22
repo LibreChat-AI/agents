@@ -91,7 +91,8 @@ export interface DecisionRequest {
    * Called once per request `onRequest` announced that ended before the
    * deadline or the caller's abort: with the HTTP status once the host
    * replied (a successful reply's body read in full), or `null` when the
-   * request failed without a reply, and for a reply that was not OK its
+   * request failed without a reply or a successful reply's body could not be
+   * read, and for a reply that was not OK its
    * `Retry-After` in milliseconds when it sent one. A request still in
    * flight when the call is interrupted gets none, so the announced requests
    * without one are the ones the host may still be working on. Not awaited;

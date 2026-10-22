@@ -43,9 +43,10 @@ export interface TransportOptions {
  * retries and every re-send after a 401 included. `onResponse` is called once
  * per such request that ended before the deadline or the caller's abort, with
  * its HTTP status (after a successful body is read in full) or `null` when the
- * fetch failed, and a reply's `Retry-After` in milliseconds when it was not OK
- * and sent one; a request interrupted in flight gets none. Neither is awaited;
- * a throw or a rejected promise is ignored.
+ * fetch failed or a successful body could not be read, and a reply's
+ * `Retry-After` in milliseconds when it was not OK and sent one; a request
+ * interrupted in flight gets none. Neither is awaited; a throw or a rejected
+ * promise is ignored.
  */
 export type Transport = <T>(
   prepare: () => { payload: string; parse: (body: string) => T },
@@ -339,9 +340,12 @@ export function createTransport(options: TransportOptions): Transport {
             let body: string;
             try {
               body = await readResponse(response.body, waitFor, providerId);
-            } finally {
-              ended(response.status);
+            } catch (error) {
+              // A body that broke off or overflowed is no reply: the request may be retried.
+              ended(null);
+              throw error;
             }
+            ended(response.status);
             const result = await waitFor(Promise.resolve(parse(body)));
             // Observability, sync or async, must not turn a valid answer into a retried request.
             callHook(() => onAnswered?.(label, performance.now() - started));

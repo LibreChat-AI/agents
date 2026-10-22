@@ -46,6 +46,8 @@ type Reply =
       raw?: string;
       delayMs?: number;
       headers?: Record<string, string>;
+      /** Sends the headers and part of the body, then drops the connection. */
+      truncate?: boolean;
     };
 
 interface Stub {
@@ -98,6 +100,15 @@ async function stub(reply: (call: Call, nth: number) => Reply): Promise<Stub> {
       }
       setTimeout(() => {
         if (res.destroyed) {
+          return;
+        }
+        if (answer.truncate === true) {
+          res.writeHead(answer.status ?? 200, {
+            'content-type': 'application/json',
+            'content-length': '1000',
+          });
+          res.write('{"model":');
+          setTimeout(() => res.destroy(), 5);
           return;
         }
         res.writeHead(answer.status ?? 200, {
@@ -3428,6 +3439,153 @@ describe('a deadline during backoff charges no estimate and reports the reply', 
   });
 });
 
+describe('a deadline reports the backoff it interrupted, not an earlier one', () => {
+  /** Answers each request with the next of `replies`, then hangs. */
+  function sequence(replies: Reply[]): (call: Call, nth: number) => Reply {
+    return (_, nth) => replies[nth] ?? 'hang';
+  }
+
+  it('cross-encoder: a 500 then a 429 whose Retry-After outlasts the deadline is rate_limited', async () => {
+    const server = await stub(
+      sequence([
+        { status: 500 },
+        { status: 429, headers: { 'retry-after': '5' } },
+      ])
+    );
+    const outcome = await createCrossEncoderReranker({
+      url: `${server.url}/rerank`,
+      model: 'ce',
+      requiresAuth: false,
+      maxRetries: 2,
+    }).rank({ query: 'q', documents: ['a', 'b'], deadlineMs: 600 });
+    expect(server.calls).toHaveLength(2);
+    expect(outcome).toMatchObject({
+      status: 'skipped',
+      reason: 'rate_limited',
+    });
+    expect(outcome.usage).toMatchObject({ calls: 2, estimatedTokens: 0 });
+  });
+
+  it('cross-encoder: a 500 then a 401 whose refresh outlasts the deadline is a timeout', async () => {
+    const server = await stub(sequence([{ status: 500 }, { status: 401 }]));
+    const outcome = await createCrossEncoderReranker({
+      url: `${server.url}/rerank`,
+      model: 'ce',
+      maxRetries: 2,
+      apiKey: ({ refresh }) =>
+        refresh ? new Promise<string>(() => {}) : Promise.resolve('k1'),
+    }).rank({ query: 'q', documents: ['a', 'b'], deadlineMs: 600 });
+    expect(server.calls).toHaveLength(2);
+    expect(outcome).toMatchObject({ status: 'skipped', reason: 'timeout' });
+    expect(outcome.usage).toMatchObject({ calls: 2, estimatedTokens: 0 });
+  });
+
+  it('toOutcomeReranker: a 500 then a 429 backed off past the deadline is rate_limited', async () => {
+    const outcome = await toOutcomeReranker(
+      {
+        id: 'reporting',
+        reportsRequests: true,
+        rerank: async (request) => {
+          request.onRequest?.();
+          request.onResponse?.(500);
+          request.onRequest?.();
+          request.onResponse?.(429, 5_000);
+          return new Promise(() => {});
+        },
+      },
+      { kind: 'cross-encoder', model: 'ce' }
+    ).rank({ query: 'q', documents: ['a', 'b'], deadlineMs: 100 });
+    expect(outcome).toMatchObject({
+      status: 'skipped',
+      reason: 'rate_limited',
+    });
+    expect(outcome.usage).toMatchObject({ calls: 2, estimatedTokens: 0 });
+  });
+
+  /** A reporting model: `alpha` follows `alpha`'s script, every other document hangs before sending. */
+  function reporting(
+    alpha: (request: DecisionRequest) => Promise<void>
+  ): DecisionModel {
+    const score = {
+      model: 'jev-1.13.0',
+      answers: {
+        relevance: {
+          type: 'score' as const,
+          score: 2,
+          confidence: null,
+          probabilities: null,
+        },
+      },
+      usage: null,
+    };
+    return {
+      id: 'reporting',
+      model: 'jev-1.13.0',
+      reportsRequests: true,
+      decide: async (request) => {
+        if ((request.state as { document: string }).document !== 'alpha') {
+          return new Promise(() => {});
+        }
+        await alpha(request);
+        return score;
+      },
+    };
+  }
+
+  it('System One: a backoff that ended in a score is not what the deadline interrupted', async () => {
+    const model = reporting(async (request) => {
+      request.onRequest?.();
+      request.onResponse?.(500);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      request.onRequest?.();
+      request.onResponse?.(200);
+    });
+    const outcome = await createSystemOneReranker({
+      model,
+      rubric,
+      concurrency: 1,
+    }).rank({ query: 'q', documents: ['alpha', 'beta'], deadlineMs: 150 });
+    expect(outcome).toMatchObject({ status: 'skipped', reason: 'timeout' });
+    expect(outcome.usage).toMatchObject({ calls: 2, estimatedTokens: 0 });
+  });
+
+  it('System One: a score on another document does not hide a backoff the deadline interrupted', async () => {
+    const backingOff: DecisionModel = {
+      id: 'reporting',
+      model: 'jev-1.13.0',
+      reportsRequests: true,
+      decide: async (request) => {
+        const document = (request.state as { document: string }).document;
+        request.onRequest?.();
+        if (document === 'alpha') {
+          request.onResponse?.(503);
+          return new Promise(() => {});
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        request.onResponse?.(200);
+        return {
+          model: 'jev-1.13.0',
+          answers: {
+            relevance: {
+              type: 'score',
+              score: 2,
+              confidence: null,
+              probabilities: null,
+            },
+          },
+          usage: null,
+        };
+      },
+    };
+    const outcome = await createSystemOneReranker({
+      model: backingOff,
+      rubric,
+    }).rank({ query: 'q', documents: ['alpha', 'beta'], deadlineMs: 150 });
+    expect(outcome).toMatchObject({ status: 'skipped', reason: 'error' });
+    expect(outcome.usage).toMatchObject({ calls: 2, estimatedTokens: 0 });
+  });
+});
+
 describe('a stopped System One step sends nothing more', () => {
   it('a 429 stops the step at once: the transport does not retry it, though the model allows retries', async () => {
     const server = await stub(() => ({ status: 429 }));
@@ -3486,6 +3644,73 @@ describe('a stopped System One step sends nothing more', () => {
     // The 503 would be retried 250 ms later; the 402 stopped the step first.
     await new Promise((resolve) => setTimeout(resolve, 400));
     expect(server.calls.map(documentOf).sort()).toEqual(['alpha', 'beta']);
+    expect(outcome.usage).toMatchObject({ calls: 2, estimatedTokens: 0 });
+  });
+
+  it.each([
+    ['after', 5, 50],
+    ['before', 40, 5],
+  ])(
+    'halts a document whose 2xx body broke off when another document stops the step %s it',
+    async (_, alphaMs, betaMs) => {
+      const server = await stub((call) =>
+        documentOf(call) === 'alpha'
+          ? { truncate: true, delayMs: alphaMs }
+          : { status: 402, delayMs: betaMs }
+      );
+      const started = performance.now();
+      const outcome = await createSystemOneReranker({
+        model: jev(server.url, { maxRetries: 2 }),
+        rubric,
+      }).rank({ query: 'q', documents: ['alpha', 'beta'] });
+      expect(outcome).toMatchObject({ status: 'skipped', reason: 'quota' });
+      // The broken body would be retried 250 ms later; the 402 stops the step.
+      expect(performance.now() - started).toBeLessThan(250);
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      expect(server.calls.map(documentOf).sort()).toEqual(['alpha', 'beta']);
+      expect(outcome.usage).toMatchObject({ calls: 2, estimatedTokens: 0 });
+    }
+  );
+
+  it('does not send a retry the model starts after a 2xx once the step has stopped', async () => {
+    const sent: string[] = [];
+    const model: DecisionModel = {
+      id: 'retries-after-2xx',
+      model: 'jev-1.13.0',
+      reportsRequests: true,
+      decide: async (request) => {
+        const document = (request.state as { document: string }).document;
+        const send = (): boolean => {
+          request.onRequest?.();
+          if (request.signal?.aborted === true) {
+            return false;
+          }
+          sent.push(document);
+          return true;
+        };
+        if (document === 'beta') {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          send();
+          request.onResponse?.(402);
+          throw new DecisionError('quota', 'quota', { status: 402 });
+        }
+        // A 2xx whose answer then fails, retried as the transport retries a network failure.
+        send();
+        request.onResponse?.(200);
+        await new Promise((resolve) => setTimeout(resolve, 60));
+        if (!send()) {
+          throw new DecisionError('aborted', 'halted');
+        }
+        request.onResponse?.(200);
+        throw new DecisionError('network', 'failed again');
+      },
+    };
+    const outcome = await createSystemOneReranker({ model, rubric }).rank({
+      query: 'q',
+      documents: ['alpha', 'beta'],
+    });
+    expect(outcome).toMatchObject({ status: 'skipped', reason: 'quota' });
+    expect(sent.sort()).toEqual(['alpha', 'beta']);
     expect(outcome.usage).toMatchObject({ calls: 2, estimatedTokens: 0 });
   });
 

@@ -132,8 +132,13 @@ interface DocumentState {
    * reports its requests, every one that ended with or without a reply.
    */
   replied: number;
-  /** A 429 or 5xx reply a request was backing off from, for a model that reports its requests. */
-  backoff: DecisionError | null;
+  /**
+   * For a model that reports its requests, each dispatch whose latest request
+   * ended with a 429 or 5xx reply it backs off from, with that reply. A
+   * dispatch leaves it when a later request of its own ends, or when it fails
+   * while the step is live; the step's deadline leaves it in.
+   */
+  backoffs: Map<Dispatch, DecisionError>;
   /** Requests the host answered with a ranking. */
   answered: number;
   inputReports: number;
@@ -457,7 +462,7 @@ export function createSystemOneReranker(
       failureError: null,
       echoed: null,
       replied: 0,
-      backoff: null,
+      backoffs: new Map(),
       answered: 0,
       inputReports: 0,
       outputReports: 0,
@@ -649,7 +654,11 @@ export function createSystemOneReranker(
       dispatch.onWire = false;
       dispatch.answered = status !== null && status >= 200 && status < 300;
       const reply = retriedReply(model.id, status, retryAfterMs);
-      run.backoff ??= reply;
+      if (reply === null) {
+        run.backoffs.delete(dispatch);
+      } else {
+        run.backoffs.set(dispatch, reply);
+      }
       if (status === 429 && reply !== null) {
         stopStep('rate_limited', reply);
       } else if (run.stop !== null && !dispatch.answered) {
@@ -711,6 +720,11 @@ export function createSystemOneReranker(
                       if (run.settled) {
                         return;
                       }
+                      if (reports && run.stop !== null) {
+                        // A retry the transport starts after the step stopped is halted before it leaves, uncounted.
+                        dispatch.halt.abort();
+                        return;
+                      }
                       dispatch.requests += 1;
                       if (reports) {
                         dispatch.onWire = true;
@@ -728,6 +742,10 @@ export function createSystemOneReranker(
               );
             } catch (error) {
               dispatches.delete(dispatch);
+              if (live(signal)) {
+                // It failed for good; past the step's deadline, its last backoff still says why.
+                run.backoffs.delete(dispatch);
+              }
               if (dispatch.halt.signal.aborted) {
                 // Halted between requests by the step's stop: every request it sent was reported and ended.
                 return;
@@ -748,6 +766,7 @@ export function createSystemOneReranker(
               return;
             }
             dispatches.delete(dispatch);
+            run.backoffs.delete(dispatch);
             if (live(signal)) {
               record(index, response);
             }
@@ -828,13 +847,14 @@ export function createSystemOneReranker(
     } else if (left > 0) {
       failed = { reason: 'partial', error: incomplete() };
     }
+    const backoff = run.backoffs.values().next().value;
     if (
       failed?.reason === 'timeout' &&
       run.usage.calls === run.replied &&
-      run.backoff !== null
+      backoff !== undefined
     ) {
       // The deadline fired while nothing was in flight and a request was backing off: the host said why.
-      failed = { reason: rerankReasonOf(run.backoff), error: run.backoff };
+      failed = { reason: rerankReasonOf(backoff), error: backoff };
     }
     const pinned: { pinVerified?: boolean } = {};
     if (pin !== undefined) {

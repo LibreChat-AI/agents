@@ -360,6 +360,38 @@ describe('decision dialect', () => {
 });
 
 describe('HTTP decisionModel', () => {
+  it('reports a 2xx whose body broke off as no reply, so its retry is not read as answered', async () => {
+    let sent = 0;
+    const fetch: DecisionFetch = async () => {
+      sent += 1;
+      if (sent > 1) {
+        return new Response(measured, { status: 200 });
+      }
+      const body = new ReadableStream<Uint8Array>({
+        start(controller): void {
+          controller.enqueue(new TextEncoder().encode('{"model":'));
+          controller.error(new TypeError('terminated'));
+        },
+      });
+      return new Response(body, { status: 200 });
+    };
+    const ended: Array<number | null> = [];
+    await createHttpDecisionModel({
+      endpoint: 'https://s1.example/v1/systemone',
+      apiKey: 'k',
+      model: 'jev-1.13.0',
+      dialect: 'systemone',
+      maxRetries: 1,
+      sleep: () => Promise.resolve(),
+      fetch,
+    }).decide({
+      state: {},
+      questions: { q: booleanQuestion('q?') },
+      onResponse: (status) => ended.push(status),
+    });
+    expect(ended).toEqual([null, 200]);
+  });
+
   it('posts Jev-shaped questions and keeps only measured answer probabilities', async () => {
     const { fetch, calls } = fakeFetch([
       {

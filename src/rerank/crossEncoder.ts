@@ -140,8 +140,9 @@ function parseResponse(body: string, documents: number): Parsed {
  * response must score every document exactly once; scores are the host's and
  * carry no calibrated threshold, so `kept` is never set. Requests do not
  * follow redirects, and a deadline that fires while a request is in flight
- * is charged at `estimatedUsage`; one that fires while a 429 or 5xx reply is
- * being backed off from charges nothing and reports that reply's reason.
+ * is charged at `estimatedUsage`; one that fires after the latest request
+ * ended with a 429 or 5xx reply, before its retry is sent, charges nothing and
+ * reports that reply's reason.
  */
 export function createCrossEncoderReranker(
   options: CrossEncoderRerankerOptions
@@ -203,7 +204,10 @@ export function createCrossEncoderReranker(
         return stepOutcome({ ...base, reason: 'aborted', called: false });
       }
       const usage = emptyRerankUsage();
-      /** Requests that ended, with a reply or without one; the rest were in flight. */
+      /**
+       * Requests that ended, with a reply or without one; the rest were in
+       * flight. `backoff` is the latest one's reply when it is retried.
+       */
       const tally: { ended: number; backoff: DecisionError | null } = {
         ended: 0,
         backoff: null,
@@ -239,7 +243,8 @@ export function createCrossEncoderReranker(
           },
           (status, retryAfterMs) => {
             tally.ended += 1;
-            tally.backoff ??= retriedReply(id, status, retryAfterMs);
+            // The latest reply only: an earlier one's backoff is over once another request ended.
+            tally.backoff = retriedReply(id, status, retryAfterMs);
           }
         );
         usage.inputTokens = parsed.tokens;
