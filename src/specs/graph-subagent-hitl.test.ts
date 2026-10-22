@@ -119,19 +119,22 @@ function harness(
   question = false,
   programmatic = false,
   sessionTools = false,
-  completedEffects = false
+  completedEffects = false,
+  mixedQuestion?: 'left' | 'right'
 ) {
   const checkpointer = new MemorySaver();
   const calls: string[] = [];
   const leftExecute = jest.fn(
     async ({ value }: { value: string }, _config?: ToolRunnableConfig) =>
-      question
+      question || mixedQuestion === 'left'
         ? `left ${askUserQuestion({ question: 'Clarify the review' }, { toolCallId: 'shared-member-call' }).answer}`
         : `left ${value}`
   );
   const rightExecute = jest.fn(
     async ({ value }: { value: string }, _config?: ToolRunnableConfig) =>
-      `right ${value}`
+      mixedQuestion === 'right'
+        ? `right ${askUserQuestion({ question: 'Clarify the review' }, { toolCallId: 'shared-member-call' }).answer}`
+        : `right ${value}`
   );
   const tools = { left: leftExecute, right: rightExecute };
   const leftEffect = jest.fn(async () => 'left effect');
@@ -201,6 +204,21 @@ function harness(
     entryAgentId: 'entry',
     resultAgentId: 'result',
   };
+  if (mixedQuestion != null) {
+    const member = graph.agents.find(
+      (agent) => agent.agentId === mixedQuestion
+    );
+    if (member == null) throw new Error('Missing question member');
+    member.graphTools = [
+      tool(tools[mixedQuestion], {
+        name: `${mixedQuestion}_tool`,
+        description: 'Ask a question',
+        schema: z.object({ value: z.string() }),
+      }),
+    ];
+    member.tools = [];
+    member.toolDefinitions = undefined;
+  }
   if (programmatic) {
     const target = graph.agents[1].tools?.[0];
     if (target == null) throw new Error('Missing target tool');
@@ -230,6 +248,7 @@ function harness(
   ) => {
     const hookRegistry = new HookRegistry();
     for (const id of ['left', 'right']) {
+      if (id === mixedQuestion) continue;
       const memberTool =
         programmatic && id === 'left'
           ? Constants.PROGRAMMATIC_TOOL_CALLING
@@ -1306,6 +1325,214 @@ describe('graph subagent foreground HITL', () => {
       expect(h.rightExecute.mock.calls[0][0]).toEqual({ value: 'original' });
       expect(h.leftExecute).toHaveBeenCalledTimes(1);
       expect(h.rightExecute).toHaveBeenCalledTimes(1);
+    }
+  );
+
+  test.each([
+    { label: 'temperature', options: { temperature: 0.8 } },
+    {
+      label: 'thinking',
+      options: {
+        modelKwargs: { thinking: { type: 'enabled', budget_tokens: 2048 } },
+      },
+    },
+    {
+      label: 'fallback',
+      options: {
+        fallbacks: [
+          {
+            provider: Providers.OPENAI,
+            clientOptions: { modelName: 'other', apiKey: 'unused' },
+          },
+        ],
+      },
+    },
+    {
+      label: 'endpoint',
+      options: { configuration: { baseURL: 'https://changed.invalid/v1' } },
+    },
+    {
+      label: 'request headers',
+      options: { configuration: { defaultHeaders: { 'x-route': 'changed' } } },
+    },
+  ])(
+    'rejects changed model runtime options before resumed effects: $label',
+    async ({ options }) => {
+      const h = harness();
+      const run = await h.build();
+      await start(run);
+      const definition = {
+        ...h.graph,
+        agents: h.graph.agents.map((agent) => ({ ...agent })),
+      };
+      definition.agents[1].clientOptions = {
+        ...definition.agents[1].clientOptions,
+        ...options,
+      };
+      const rebuilt = await h.build(definition);
+      await rebuilt.resume([{ type: 'approve' }], config);
+      expect(h.leftExecute).not.toHaveBeenCalled();
+      expect(h.rightExecute).not.toHaveBeenCalled();
+      expect(h.calls.filter((id) => id === 'result')).toHaveLength(0);
+    }
+  );
+
+  test('runtime option key order and omitted undefined values remain compatible', async () => {
+    const h = harness();
+    h.graph.agents[1].clientOptions = {
+      modelName: 'left-model',
+      apiKey: 'test-key',
+      temperature: 0.4,
+      configuration: {
+        baseURL: 'https://stable.invalid/v1',
+        defaultHeaders: { 'x-route': 'stable' },
+      },
+    };
+    const run = await h.build();
+    await start(run);
+    const definition = {
+      ...h.graph,
+      agents: h.graph.agents.map((agent) => ({ ...agent })),
+    };
+    definition.agents[1].clientOptions = {
+      configuration: {
+        defaultHeaders: { 'x-route': 'stable' },
+        baseURL: 'https://stable.invalid/v1',
+      },
+      temperature: 0.4,
+      apiKey: 'test-key',
+      modelName: 'left-model',
+      maxRetries: undefined,
+    };
+    const rebuilt = await h.build(definition);
+    await rebuilt.resume([{ type: 'approve' }], config);
+    await rebuilt.resume([{ type: 'approve' }], config);
+    expect(rebuilt.getInterrupt()).toBeUndefined();
+    expect(h.leftExecute).toHaveBeenCalledTimes(1);
+    expect(h.rightExecute).toHaveBeenCalledTimes(1);
+  });
+
+  test('executable runtime options require a host revision before any member starts', async () => {
+    const h = harness();
+    h.graph.agents[1].clientOptions = {
+      ...h.graph.agents[1].clientOptions,
+      configuration: { fetch: globalThis.fetch },
+    };
+    const run = await h.build();
+    await start(run);
+    expect(h.calls).toHaveLength(0);
+    expect(
+      run
+        .getRunMessages()
+        ?.some((message) => String(message.content).includes('configId'))
+    ).toBe(true);
+  });
+
+  test.each([false, true])(
+    'versioned executable runtime options resume with explicit host authority, changed=%s',
+    async (changed) => {
+      const h = harness();
+      h.graph.configId = 'runtime-v1';
+      h.graph.agents[1].clientOptions = {
+        ...h.graph.agents[1].clientOptions,
+        configuration: { fetch: globalThis.fetch },
+      };
+      const run = await h.build();
+      await start(run);
+      const definition = {
+        ...h.graph,
+        configId: changed ? 'runtime-v2' : 'runtime-v1',
+      };
+      const rebuilt = await h.build(definition);
+      await rebuilt.resume([{ type: 'approve' }], config);
+      if (changed) {
+        expect(h.leftExecute).not.toHaveBeenCalled();
+        expect(h.rightExecute).not.toHaveBeenCalled();
+        return;
+      }
+      await rebuilt.resume([{ type: 'approve' }], config);
+      expect(rebuilt.getInterrupt()).toBeUndefined();
+      expect(h.leftExecute).toHaveBeenCalledTimes(1);
+      expect(h.rightExecute).toHaveBeenCalledTimes(1);
+    }
+  );
+
+  test.each(
+    [false, true].flatMap((eventDriven) =>
+      [false, true].flatMap((rebuilt) =>
+        ['left', 'right'].map((questionMember) => ({
+          eventDriven,
+          rebuilt,
+          questionMember: questionMember as 'left' | 'right',
+        }))
+      )
+    )
+  )(
+    'mixed question and approval decisions remain task-local: %j',
+    async ({ eventDriven, rebuilt, questionMember }) => {
+      const h = harness(
+        eventDriven,
+        false,
+        false,
+        false,
+        false,
+        questionMember
+      );
+      const run = await h.build();
+      await start(run);
+      const pending = run.getInterrupt()?.pendingInterrupts;
+      expect(pending).toHaveLength(2);
+      const decisions = Object.fromEntries(
+        (pending ?? []).map((entry) => [
+          entry.interruptId,
+          isToolApprovalInterrupt(entry.payload)
+            ? [{ type: 'approve' }]
+            : { answer: 'clarified' },
+        ])
+      );
+      const resumed = rebuilt ? await h.build() : run;
+      await resumed.resume(decisions, config);
+      expect(resumed.getInterrupt()).toBeUndefined();
+      expect(h.calls.filter((id) => id === 'entry')).toHaveLength(1);
+      expect(h.calls.filter((id) => id === 'result')).toHaveLength(1);
+      const approved =
+        questionMember === 'left' ? h.rightExecute : h.leftExecute;
+      const questioned =
+        questionMember === 'left' ? h.leftExecute : h.rightExecute;
+      expect(approved).toHaveBeenCalledTimes(1);
+      expect(await questioned.mock.results.at(-1)?.value).toBe(
+        `${questionMember} clarified`
+      );
+    }
+  );
+
+  test.each(['cycle', 'getter', 'array-getter', 'opaque-instance'] as const)(
+    'opaque model options fail before execution without inspecting hidden values: %s',
+    async (kind) => {
+      const h = harness();
+      const getter = jest.fn(() => 'hidden');
+      const metadata = {};
+      if (kind === 'cycle') Object.defineProperty(metadata, 'self', { value: metadata, enumerable: true });
+      if (kind === 'getter') Object.defineProperty(metadata, 'hidden', { enumerable: true, get: getter });
+      if (kind === 'array-getter') {
+        const values: string[] = [];
+        Object.defineProperty(values, 0, { enumerable: true, get: getter });
+        Object.defineProperty(metadata, 'values', { enumerable: true, value: values });
+      }
+      if (kind === 'opaque-instance') Object.setPrototypeOf(metadata, Date.prototype);
+      h.graph.agents[1].clientOptions = {
+        ...h.graph.agents[1].clientOptions,
+        metadata,
+      };
+      const run = await h.build();
+      await start(run);
+      expect(h.calls).toHaveLength(0);
+      expect(getter).not.toHaveBeenCalled();
+      expect(
+        run
+          .getRunMessages()
+          ?.some((message) => String(message.content).includes('configId'))
+      ).toBe(true);
     }
   );
 });

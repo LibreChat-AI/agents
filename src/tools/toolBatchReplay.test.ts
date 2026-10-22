@@ -92,6 +92,22 @@ describe('checkpoint-owned tool batch replay', () => {
     expect(getToolBatchReplayState(pending[0].value)?.approvalOwner).toBe(question ? undefined : JSON.stringify(['source', '', 'left', 'user', 'source-thread']));
   });
 
+  it.each([false, true].flatMap(questionFirst => ['approval', 'question', 'both'].map(resumed => ({ questionFirst, resumed }))))('isolates ownerless question evidence without leaking decisions: %j', async ({ questionFirst, resumed }) => {
+    const approve = { id: 'approval', value: await attachToolBatchReplayState(approval, JSON.stringify(['source', '', 'left', 'user', 'source-thread']), new Map()) };
+    const question = { id: 'question', value: { type: 'ask_user_question', question: { question: 'Explain?' } } };
+    const config: RunnableConfig = { configurable: { user_id: 'user', thread_id: 'child-thread', __librechat_tool_approval_execution_scope: 'fork' } };
+    restoreToolReplayConfigs(config.configurable!, questionFirst ? [question, approve] : [approve, question], 'source', 'fork', 'child-thread', new Set(resumed === 'both' ? ['approval', 'question'] : [resumed]));
+    const selectedApproval = getToolReplayConfig(config, getToolBatchReplayOwner(config, 'left'));
+    const selectedQuestion = getToolReplayConfig(config, getToolBatchReplayOwner(config, 'right'));
+    expect(getToolApprovalReviewEvidence(selectedApproval)?.interruptId).toBe(resumed === 'question' ? undefined : 'approval');
+    expect(getToolApprovalReviewEvidence(selectedQuestion)).toBeUndefined();
+    expect(getToolBatchReplayState(selectedQuestion.configurable)).toBeUndefined();
+    const foreign = { configurable: { ...config.configurable, user_id: 'different-user' } };
+    expect(() => getToolReplayConfig(foreign, getToolBatchReplayOwner(foreign, 'left'))).toThrow('execution identity changed');
+    const foreignThread = { configurable: { ...config.configurable, thread_id: 'other-thread' } };
+    expect(() => getToolReplayConfig(foreignThread, getToolBatchReplayOwner(foreignThread, 'right'))).toThrow('execution identity changed');
+  });
+
   it('rejects ambiguous member evidence rather than accepting the last checkpoint', async () => {
     const payload = await attachToolBatchReplayState(approval, JSON.stringify(['source', '', 'member']), new Map());
     expect(() => restoreToolReplayConfigs({}, [{ id: 'first', value: payload }, { id: 'second', value: payload }], 'source', 'fork', 'child-thread', new Set(['first', 'second']))).toThrow('Ambiguous tool replay checkpoint owner');

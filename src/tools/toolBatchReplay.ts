@@ -178,6 +178,10 @@ export function restoreToolReplayConfigs(
     };
     if (resumed) first ??= evidence;
     const owner = review?.owner ?? replay?.approvalOwner;
+    if (owner == null && (replay?.records.length ?? 0) === 0) configs.set('', {
+      [TOOL_BATCH_REPLAY_KEY]: undefined,
+      [TOOL_APPROVAL_REVIEW_CONFIG_KEY]: undefined,
+    });
     const owners = owner == null
       ? new Set(replay?.records.map(record => record.owner))
       : new Set([owner]);
@@ -201,7 +205,23 @@ export function getToolReplayConfig(
 ): RunnableConfig {
   const candidate = config.configurable?.[TOOL_REPLAY_CONFIGS_KEY];
   if (!(candidate instanceof Map)) return config;
-  const evidence = (candidate as ReadonlyMap<string, ToolReplayConfig>).get(owner);
+  const configs = candidate as ReadonlyMap<string, ToolReplayConfig>;
+  let evidence = configs.get(owner);
+  if (evidence == null && configs.has('')) {
+    const identity: unknown = JSON.parse(owner);
+    if (Array.isArray(identity)) {
+      const execution = JSON.stringify(identity.map((part, index) => index === 2 ? '' : part));
+      for (const key of configs.keys()) {
+        if (key === '') continue;
+        const sibling: unknown = JSON.parse(key);
+        if (Array.isArray(sibling) && execution === JSON.stringify(sibling.map((part, index) => index === 2 ? '' : part))) {
+          evidence = configs.get('');
+          break;
+        }
+      }
+    }
+    if (evidence == null) throw new Error('Tool replay execution identity changed before resume');
+  }
   if (evidence == null) return config;
   const configurable: NonNullable<RunnableConfig['configurable']> = {
     ...config.configurable,

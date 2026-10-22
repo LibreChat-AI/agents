@@ -432,6 +432,71 @@ type SubagentCheckpointMarker = {
   settledOutput?: PersistedToolOutput;
 };
 
+/** Hash serializable options; executable or opaque inputs require a host revision. */
+function getRuntimeOptionsIdentity(
+  options: AgentInputs['clientOptions']
+): { digest: string; requiresRevision: boolean } {
+  const hash = createHash('sha256');
+  const ancestors = new Set<object>();
+  let requiresRevision = false;
+  const opaque = (): void => {
+    requiresRevision = true;
+    hash.update('host-revision');
+  };
+  const visit = (value: unknown, depth: number): void => {
+    if (value == null) {
+      hash.update(value === null ? 'null' : 'undefined');
+      return;
+    }
+    const kind = typeof value;
+    if (kind === 'string' || kind === 'boolean' || (kind === 'number' && Number.isFinite(value))) {
+      hash.update(`${kind}:${JSON.stringify(value)};`);
+      return;
+    }
+    if (kind !== 'object') {
+      opaque();
+      return;
+    }
+    const object = value as object;
+    if (depth >= 64 || ancestors.has(object)) {
+      opaque();
+      return;
+    }
+    const prototype = Object.getPrototypeOf(object);
+    if (prototype !== Object.prototype && prototype !== null &&
+      !(Array.isArray(value) && prototype === Array.prototype)) {
+      opaque();
+      return;
+    }
+    ancestors.add(object);
+    if (Object.getOwnPropertySymbols(object).length > 0) opaque();
+    if (Array.isArray(value)) {
+      hash.update('[');
+      for (let index = 0; index < value.length; index++) {
+        const property = Object.getOwnPropertyDescriptor(value, String(index));
+        if (property?.get != null || property?.set != null) opaque();
+        else visit(property?.value, depth + 1);
+      }
+      hash.update(']');
+    } else {
+      hash.update('{');
+      const descriptors = Object.getOwnPropertyDescriptors(object);
+      for (const key of Object.keys(descriptors).sort()) {
+        const property = descriptors[key];
+        if (property.enumerable !== true) continue;
+        if ('value' in property && property.value === undefined) continue;
+        hash.update(`${JSON.stringify(key)}:`);
+        if (property.get != null || property.set != null) opaque();
+        else visit(property.value, depth + 1);
+      }
+      hash.update('}');
+    }
+    ancestors.delete(object);
+  };
+  visit(options, 0);
+  return { digest: hash.digest('hex'), requiresRevision };
+}
+
 /** Declarative graph identity plus the host's revision for executable implementations. */
 function getSubagentDefinitionId(
   config: ExecutableSubagentConfigEntry | undefined
@@ -456,6 +521,7 @@ function getSubagentDefinitionId(
       toolEnd: agent.toolEnd ?? false,
       summarizeOnly: agent.summarizeOnly ?? false,
       model: resolveClientOptionsModel(agent.clientOptions),
+      runtimeOptions: getRuntimeOptionsIdentity(agent.clientOptions).digest,
       instructions: agent.instructions,
       additionalInstructions: agent.additional_instructions,
       maxContextTokens: agent.maxContextTokens,
@@ -2674,6 +2740,20 @@ export class SubagentExecutor {
       return Promise.resolve(
         createSubagentFailure(
           'Error: Resumable graph subagents with functional prompts require a configId revision.'
+        )
+      );
+    }
+    if (
+      this.humanInTheLoop?.enabled === true &&
+      isGraphSubagentConfig(executableConfig) &&
+      executableConfig.configId == null &&
+      executableConfig.agents.some(
+        (agent) => getRuntimeOptionsIdentity(agent.clientOptions).requiresRevision
+      )
+    ) {
+      return Promise.resolve(
+        createSubagentFailure(
+          'Error: Resumable graph subagents with executable model options require a configId revision.'
         )
       );
     }
