@@ -502,10 +502,10 @@ const MEMBER_IDENTITY_EXCLUSIONS = new Set([
   'tools', 'toolMap', 'graphTools', 'toolRegistry', 'toolDefinitions',
   'codeSessionKey', 'toolEnd', 'summarizeOnly', 'discoveredTools',
   'initialSessions', 'initialSummary', 'subagentConfigs', 'maxSubagentDepth',
-  'langfuse', 'toolSchemaTokens',
+  'langfuse',
 ]);
 
-/** Sessions refresh on resume; scrubbed parent state and tracing/cache data are non-authoritative. */
+/** Sessions refresh on resume; scrubbed parent state and tracing are non-authoritative. */
 function getMemberExecutionIdentity(
   agent: AgentInputs
 ): ReturnType<typeof getRuntimeOptionsIdentity> {

@@ -1554,6 +1554,7 @@ describe('graph subagent foreground HITL', () => {
 
   test.each([
     { setting: 'result truncation', change: { maxToolResultChars: 400 } },
+    { setting: 'cached tool schema budget', change: { toolSchemaTokens: 120 } },
     {
       setting: 'summarization enablement',
       change: { summarizationEnabled: true },
