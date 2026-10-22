@@ -8,7 +8,7 @@ import type { Readable } from 'node:stream';
 import type { DecisionFailure, DecisionTokenMinter } from './types';
 import type { DecisionBreaker } from './breaker';
 import { DecisionError } from './types';
-import { redact } from './redact';
+import { redactExcerpt } from './redact';
 
 /** Fifty minutes: under the ClickHouse gateway's hourly token. */
 const DEFAULT_TTL_MS = 50 * 60_000;
@@ -242,12 +242,37 @@ function collect(
 /**
  * The command text and every word of it whatever its length, so neither a
  * shell that echoes the line nor a program that quotes an argument back can
- * leak an inline secret; a short word may garble the excerpt instead.
+ * leak an inline secret; a short word may garble the excerpt instead. Words
+ * split at quotes, which the shell removes, and at braces and commas, which
+ * bash's brace expansion splits a word at.
  */
 function commandSecrets(command: string): string[] {
-  return [command, ...command.split(/[\s'"`=]+/)].filter(
+  return [command, ...command.split(/[\s'"`=,{}]+/)].filter(
     (word) => word.trim() !== ''
   );
+}
+
+/** A double-quoted, single-quoted, or unquoted stretch of a POSIX command; a stray quote reads as unquoted. */
+const SHELL_SEGMENT = /"[^"]*"|'[^']*'|[^"']+|["']/g;
+const SINGLE_QUOTED = /^'[^']*'$/;
+
+/**
+ * Whether the shell may hand the program an argument the command text does
+ * not contain, which no word of the text can redact: off Windows, a backslash
+ * escape or a `$` or backtick expansion outside single quotes; on Windows,
+ * cmd.exe's `%` expansion and `^` escape, or a `\"` a program's argument
+ * parser decodes.
+ */
+function rewritesWords(command: string): boolean {
+  if (!GROUP_KILL) {
+    return /[%^]|\\"/.test(command);
+  }
+  for (const [segment] of command.matchAll(SHELL_SEGMENT)) {
+    if (!SINGLE_QUOTED.test(segment) && /[\\$`]/.test(segment)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /** How a run that closed with `code` and `signal` ended; off Windows, an exit status in the shell's signal range is a kill, not a refusal. */
@@ -261,14 +286,24 @@ function closedEnd(code: number | null, signal: string | null): RunEnd {
   return { kind: 'exit', code };
 }
 
-/** Names how the command failed; never its text, stdout, or `error.message`, which echoes both. */
+/**
+ * Names how the command failed; never its text, stdout, or `error.message`,
+ * which echoes both. Stderr that is not `scrubbable` is withheld.
+ */
 function describeFailure(
   reason: string,
   stderr: string,
-  secrets: ReadonlyArray<string | null>
+  secrets: ReadonlyArray<string | null>,
+  scrubbable: boolean
 ): string {
-  const detail = redact(stderr, secrets).replace(/\s+/g, ' ').trim();
-  return detail === '' ? reason : `${reason}: ${detail.slice(0, STDERR_LIMIT)}`;
+  if (stderr.trim() === '') {
+    return reason;
+  }
+  if (!scrubbable) {
+    return `${reason} (stderr withheld: the command uses shell escapes or expansion)`;
+  }
+  const detail = redactExcerpt(stderr, secrets, STDERR_LIMIT);
+  return detail === '' ? reason : `${reason}: ${detail}`;
 }
 
 function validExitCodes(codes: ReadonlyArray<number> | undefined): boolean {
@@ -323,9 +358,13 @@ function validExitCodes(codes: ReadonlyArray<number> | undefined): boolean {
  *
  * The message carries the exit status and a redacted stderr excerpt, never
  * a line of stdout, the command or any word of it (split at whitespace,
- * quotes, and `=`), or any of the last eight tokens it minted or was told
- * were refused, cached or not, whatever their length, including a refused
- * token whose refresh failed.
+ * quotes, `=`, braces, and commas), or any of the last eight tokens it minted
+ * or was told were refused, cached or not, whatever their length, including a
+ * refused token whose refresh failed. The excerpt reads only the start of
+ * stderr, so formatting it stays cheap whatever the command printed. When the
+ * shell may pass the program an argument the command text does not contain
+ * (off Windows, a backslash escape or a `$` or backtick expansion outside
+ * single quotes; on Windows, `%`, `^`, or `\"`), stderr is withheld instead.
  */
 export function commandToken(
   command: string,
@@ -368,6 +407,8 @@ export function commandToken(
   let cachedGeneration: number | undefined;
   let pending: SharedRun | null = null;
   const echoed = commandSecrets(command);
+  /** Stderr may quote an argument the shell decoded or expanded, which no word of the text matches. */
+  const scrubbable = !rewritesWords(command);
   /**
    * The last tokens minted or refused, cached or not: a run detached by a
    * breaker reset hands out a token it never caches, and the command's own
@@ -481,7 +522,7 @@ export function commandToken(
         reject(
           new DecisionError(
             failure,
-            describeFailure(reason, stderr(), secrets),
+            describeFailure(reason, stderr(), secrets, scrubbable),
             { provider: COMMAND_TOKEN_PROVIDER }
           )
         );

@@ -1,5 +1,6 @@
 import path from 'node:path';
-import { tmpdir } from 'node:os';
+import { tmpdir, homedir } from 'node:os';
+import { existsSync } from 'node:fs';
 import { execFile } from 'node:child_process';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import type { DecisionFetch } from './core';
@@ -392,6 +393,92 @@ describe('commandToken', () => {
     expect(error.message).toBe(
       'token command exited with code 2: bad password [REDACTED]'
     );
+  });
+
+  describe('when the shell rewrites an argument the command text does not contain', () => {
+    const echo = [
+      'process.stderr.write("bad password " + process.argv[2].split("=")[1] + "\\n");',
+      'process.exit(2);',
+    ].join('\n');
+
+    it.each([
+      ['a backslash escape', '--pw=abc\\$def', 'abc$def'],
+      ['an escaped space', '--pw=abc\\ def', 'abc'],
+      ['an escape inside double quotes', '"--pw=abc\\$def"', 'abc$def'],
+      ['a parameter expansion', '"--pw=$HOME"', homedir()],
+      ['a command substitution', '--pw=$(printf ab)cd', 'abcd'],
+      ['a backtick substitution', '--pw=`printf ab`cd', 'abcd'],
+    ])('withholds stderr after %s', async (_case, argument, decoded) => {
+      if (process.platform === 'win32') {
+        return;
+      }
+      const base = await script(echo);
+      const error = await rejection(
+        commandToken(`${base} ${argument}`)({ refresh: false })
+      );
+      expect(error.message).toBe(
+        'token command exited with code 2 (stderr withheld: the command uses shell escapes or expansion)'
+      );
+      expect(error.message).not.toContain(decoded);
+    });
+
+    it('keeps the excerpt when `$` and `\\` appear only inside single quotes', async () => {
+      if (process.platform === 'win32') {
+        return;
+      }
+      const base = await script(echo);
+      const error = await rejection(
+        commandToken(`${base} '--pw=a$b\\c'`)({ refresh: false })
+      );
+      expect(error.message).toBe(
+        'token command exited with code 2: bad password [REDACTED]'
+      );
+    });
+
+    it('redacts each piece of a word that brace expansion splits', async () => {
+      if (process.platform === 'win32' || !existsSync('/bin/bash')) {
+        return;
+      }
+      const base = await script(echo);
+      const error = await rejection(
+        commandToken(`/bin/bash -c '${base} --pw={ab12,cd}'`)({
+          refresh: false,
+        })
+      );
+      expect(error.message).toBe(
+        'token command exited with code 2: bad password [REDACTED]'
+      );
+      expect(error.message).not.toContain('ab12');
+    });
+  });
+
+  it('formats the failure promptly when stdout repeats short lines that stderr is full of', async () => {
+    const base = await script(
+      [
+        'process.stdout.write("  }\\n".repeat(20000));',
+        'process.stderr.write((JSON.stringify({ level: "debug", msg: "retrying" }) + "\\n").repeat(3000));',
+        'process.exitCode = 1;',
+      ].join('\n')
+    );
+    const error = await rejection(commandToken(base)({ refresh: false }));
+    expect(error.failure).toBe('unauthorized');
+    expect(error.message).toMatch(/^token command exited with code 1: /);
+    expect(error.message).not.toContain('}');
+  });
+
+  it('formats the failure promptly against many distinct stdout lines that stderr matches everywhere', async () => {
+    const base = await script(
+      [
+        'for (let i = 1; i <= 600; i++) process.stdout.write("a".repeat(i) + "\\n");',
+        'process.stderr.write("a".repeat(900000));',
+        'process.exitCode = 1;',
+      ].join('\n')
+    );
+    const started = performance.now();
+    const error = await rejection(commandToken(base)({ refresh: false }));
+    const elapsed = performance.now() - started;
+    expect(error.message).toBe('token command exited with code 1: [REDACTED]');
+    expect(elapsed).toBeLessThan(5000);
   });
 
   it('reports a forked command the shell saw killed by a signal as network, leaving a breaker closed', async () => {
