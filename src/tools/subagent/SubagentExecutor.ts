@@ -1,8 +1,8 @@
 import { nanoid } from 'nanoid';
 import { createHash } from 'crypto';
-import { convertToOpenAITool, isLangChainTool } from '@langchain/core/utils/function_calling';
 import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
 import { AsyncLocalStorageProviderSingleton } from '@langchain/core/singletons';
+import { convertToOpenAITool, isLangChainTool } from '@langchain/core/utils/function_calling';
 import {
   AIMessage,
   BaseMessage,
@@ -124,17 +124,17 @@ import {
   getSubagentHostArgumentFailureMessage,
 } from './diagnostics';
 import {
-  getSubagentHostArgSpecs,
-  resolveSubagentHostArgs,
-  pickSubagentHostArgInput,
-  getSubagentHostArgsDigest,
-} from './hostArgs';
-import {
   TOOL_REPLAY_CONFIGS_KEY,
   rebindToolBatchReplayPayload,
   restoreToolReplayConfigs,
   getPublicToolInterruptPayload,
 } from '@/tools/toolBatchReplay';
+import {
+  getSubagentHostArgSpecs,
+  resolveSubagentHostArgs,
+  pickSubagentHostArgInput,
+  getSubagentHostArgsDigest,
+} from './hostArgs';
 import {
   executeHooks,
   HookRegistry,
@@ -159,6 +159,7 @@ import {
   createChildGraphPlan,
   isGraphSubagentConfig,
 } from './childGraphConfig';
+import { cloneToolApprovalInterruptPayload } from '@/hitl/approvalReview';
 import { ProviderTextProtectionError } from '@/protection/providerText';
 import { stripRunStepResumeState } from '@/tools/runStepResume';
 import { seedAgentInitialSessions } from '@/utils/toolSessions';
@@ -434,7 +435,7 @@ type SubagentCheckpointMarker = {
 
 /** Hash serializable options; executable or opaque inputs require a host revision. */
 function getRuntimeOptionsIdentity(
-  options: AgentInputs['clientOptions']
+  options: unknown
 ): { digest: string; requiresRevision: boolean } {
   const hash = createHash('sha256');
   const ancestors = new Set<object>();
@@ -497,6 +498,31 @@ function getRuntimeOptionsIdentity(
   return { digest: hash.digest('hex'), requiresRevision };
 }
 
+const MEMBER_IDENTITY_EXCLUSIONS = new Set([
+  'tools', 'toolMap', 'graphTools', 'toolRegistry', 'toolDefinitions',
+  'codeSessionKey', 'toolEnd', 'summarizeOnly', 'discoveredTools',
+  'initialSessions', 'initialSummary', 'subagentConfigs', 'maxSubagentDepth',
+  'langfuse', 'toolSchemaTokens',
+]);
+
+/** Sessions refresh on resume; scrubbed parent state and tracing/cache data are non-authoritative. */
+function getMemberExecutionIdentity(
+  agent: AgentInputs
+): ReturnType<typeof getRuntimeOptionsIdentity> {
+  const descriptors = Object.fromEntries(
+    Object.entries(Object.getOwnPropertyDescriptors(agent)).filter(
+      ([key]) => !MEMBER_IDENTITY_EXCLUSIONS.has(key)
+    )
+  );
+  return getRuntimeOptionsIdentity(Object.defineProperties({}, descriptors));
+}
+
+function hasExecutableMemberTools(agent: AgentInputs): boolean {
+  return (agent.toolMap?.size ?? 0) > 0 ||
+    (agent.graphTools?.length ?? 0) > 0 ||
+    agent.tools?.some(isLangChainTool) === true;
+}
+
 /** Declarative graph identity plus the host's revision for executable implementations. */
 function getSubagentDefinitionId(
   config: ExecutableSubagentConfigEntry | undefined
@@ -521,7 +547,7 @@ function getSubagentDefinitionId(
       toolEnd: agent.toolEnd ?? false,
       summarizeOnly: agent.summarizeOnly ?? false,
       model: resolveClientOptionsModel(agent.clientOptions),
-      runtimeOptions: getRuntimeOptionsIdentity(agent.clientOptions).digest,
+      executionOptions: getMemberExecutionIdentity(agent).digest,
       instructions: agent.instructions,
       additionalInstructions: agent.additional_instructions,
       maxContextTokens: agent.maxContextTokens,
@@ -2183,7 +2209,7 @@ export class SubagentExecutor {
             pendingInterrupts: activeRun.pendingInterrupts.flatMap((pending) =>
               pending.id == null ? [] : [{
                 interruptId: pending.id,
-                payload: structuredClone(getPublicToolInterruptPayload(pending.value)),
+                payload: cloneToolApprovalInterruptPayload(getPublicToolInterruptPayload(pending.value)),
               }]
             ),
           }),
@@ -2748,12 +2774,24 @@ export class SubagentExecutor {
       isGraphSubagentConfig(executableConfig) &&
       executableConfig.configId == null &&
       executableConfig.agents.some(
-        (agent) => getRuntimeOptionsIdentity(agent.clientOptions).requiresRevision
+        (agent) => getMemberExecutionIdentity(agent).requiresRevision
       )
     ) {
       return Promise.resolve(
         createSubagentFailure(
-          'Error: Resumable graph subagents with executable model options require a configId revision.'
+          'Error: Resumable graph subagents with executable member options require a configId revision.'
+        )
+      );
+    }
+    if (
+      this.humanInTheLoop?.enabled === true &&
+      isGraphSubagentConfig(executableConfig) &&
+      executableConfig.configId == null &&
+      executableConfig.agents.some(hasExecutableMemberTools)
+    ) {
+      return Promise.resolve(
+        createSubagentFailure(
+          'Error: Resumable graph subagents with executable member tools require a configId revision.'
         )
       );
     }

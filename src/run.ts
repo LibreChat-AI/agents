@@ -55,6 +55,13 @@ import {
   normalizeActivityPhaseLabel,
 } from '@/prompts/activityLabel';
 import {
+  TOOL_BATCH_REPLAY_KEY,
+  TOOL_REPLAY_CONFIGS_KEY,
+  restoreToolReplayConfig,
+  stripToolBatchReplayState,
+  getPublicToolInterruptPayload,
+} from '@/tools/toolBatchReplay';
+import {
   requireValidSubagentResumeManifest,
   SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY,
   SUBAGENT_RESUME_MANIFEST_CONFIG_KEY,
@@ -65,13 +72,6 @@ import {
   buildReasoningLabelPrompt,
   normalizeReasoningLabel,
 } from '@/prompts/reasoningLabel';
-import {
-  TOOL_BATCH_REPLAY_KEY,
-  TOOL_REPLAY_CONFIGS_KEY,
-  restoreToolReplayConfig,
-  stripToolBatchReplayState,
-  getPublicToolInterruptPayload,
-} from '@/tools/toolBatchReplay';
 import {
   hasToolOutputTracingConfig,
   resolveLangfuseConfig,
@@ -2003,7 +2003,7 @@ export class Run<_T extends t.BaseGraphState> {
       ),
       pendingInterrupts: [...pendingInterrupts.values()].map((pending) => ({
         interruptId: pending.interruptId,
-        payload: structuredClone(getPublicToolInterruptPayload(pending.payload)),
+        payload: cloneToolApprovalInterruptPayload(getPublicToolInterruptPayload(pending.payload)),
       })),
     } as t.RunInterruptResult<TPayload>;
   }

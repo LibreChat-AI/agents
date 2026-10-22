@@ -1,23 +1,23 @@
 import { z } from 'zod';
 import { tool } from '@langchain/core/tools';
 import { MemorySaver } from '@langchain/langgraph';
+import { ChatGenerationChunk } from '@langchain/core/outputs';
+import { FakeListChatModel } from '@langchain/core/utils/testing';
 import {
   AIMessageChunk,
   HumanMessage,
   ToolMessage,
 } from '@langchain/core/messages';
-import { ChatGenerationChunk } from '@langchain/core/outputs';
-import { FakeListChatModel } from '@langchain/core/utils/testing';
 import type { ToolRunnableConfig } from '@langchain/core/tools';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type { Interrupt } from '@langchain/langgraph';
 import type * as t from '@/types';
 import { getPublicToolInterruptPayload } from '@/tools/toolBatchReplay';
+import { Constants, GraphEvents, Providers } from '@/common';
 import { isToolApprovalInterrupt } from '@/types/hitl';
 import { createFakeStreamingLLM } from '@/llm/fake';
 import { askUserQuestion } from '@/hitl';
 import { HookRegistry } from '@/hooks';
-import { Constants, GraphEvents, Providers } from '@/common';
 import { Run } from '@/run';
 
 const member = (agentId: string): t.AgentInputs => ({
@@ -154,6 +154,7 @@ function harness(
   );
   const graph: t.GraphSubagentConfig = {
     kind: 'graph',
+    configId: 'team-v1',
     type: 'team',
     name: 'Team',
     description: 'Review in parallel',
@@ -1152,6 +1153,7 @@ describe('graph subagent foreground HITL', () => {
 
   test('functional prompts require a host revision before resumable graph work starts', async () => {
     const h = harness();
+    delete h.graph.configId;
     h.graph.edges[1].prompt = () => 'Unversioned transition';
     const run = await h.build();
     await start(run);
@@ -1414,6 +1416,7 @@ describe('graph subagent foreground HITL', () => {
 
   test('executable runtime options require a host revision before any member starts', async () => {
     const h = harness();
+    delete h.graph.configId;
     h.graph.agents[1].clientOptions = {
       ...h.graph.agents[1].clientOptions,
       configuration: { fetch: globalThis.fetch },
@@ -1510,16 +1513,29 @@ describe('graph subagent foreground HITL', () => {
     'opaque model options fail before execution without inspecting hidden values: %s',
     async (kind) => {
       const h = harness();
+      delete h.graph.configId;
       const getter = jest.fn(() => 'hidden');
       const metadata = {};
-      if (kind === 'cycle') Object.defineProperty(metadata, 'self', { value: metadata, enumerable: true });
-      if (kind === 'getter') Object.defineProperty(metadata, 'hidden', { enumerable: true, get: getter });
+      if (kind === 'cycle')
+        Object.defineProperty(metadata, 'self', {
+          value: metadata,
+          enumerable: true,
+        });
+      if (kind === 'getter')
+        Object.defineProperty(metadata, 'hidden', {
+          enumerable: true,
+          get: getter,
+        });
       if (kind === 'array-getter') {
         const values: string[] = [];
         Object.defineProperty(values, 0, { enumerable: true, get: getter });
-        Object.defineProperty(metadata, 'values', { enumerable: true, value: values });
+        Object.defineProperty(metadata, 'values', {
+          enumerable: true,
+          value: values,
+        });
       }
-      if (kind === 'opaque-instance') Object.setPrototypeOf(metadata, Date.prototype);
+      if (kind === 'opaque-instance')
+        Object.setPrototypeOf(metadata, Date.prototype);
       h.graph.agents[1].clientOptions = {
         ...h.graph.agents[1].clientOptions,
         metadata,
@@ -1535,4 +1551,126 @@ describe('graph subagent foreground HITL', () => {
       ).toBe(true);
     }
   );
+
+  test.each([
+    { setting: 'result truncation', change: { maxToolResultChars: 400 } },
+    {
+      setting: 'summarization enablement',
+      change: { summarizationEnabled: true },
+    },
+    {
+      setting: 'summarization configuration',
+      change: { summarizationConfig: { reserveRatio: 0.4 } },
+    },
+    {
+      setting: 'context pruning',
+      change: {
+        contextPruningConfig: { enabled: true, keepLastAssistants: 1 },
+      },
+    },
+    { setting: 'legacy content format', change: { useLegacyContent: true } },
+    {
+      setting: 'reasoning format',
+      change: { reasoningKey: 'reasoning_content' as const },
+    },
+    { setting: 'stream buffer', change: { streamBuffer: 16 } },
+    { setting: 'member identity', change: { name: 'Different identity' } },
+  ])(
+    'rejects execution-affecting member setting changes: $setting',
+    async ({ change }) => {
+      const h = harness();
+      const run = await h.build();
+      await start(run);
+      const definition = {
+        ...h.graph,
+        agents: h.graph.agents.map((agent, index) =>
+          index === 1 ? { ...agent, ...change } : agent
+        ),
+      };
+      const rebuilt = await h.build(definition);
+      await rebuilt.resume([{ type: 'approve' }], config);
+      expect(h.leftExecute).not.toHaveBeenCalled();
+      expect(h.rightExecute).not.toHaveBeenCalled();
+      expect(h.calls.filter((id) => id === 'result')).toHaveLength(0);
+    }
+  );
+
+  test.each(['tools', 'toolMap', 'graphTools'] as const)(
+    'executable %s requires a host revision before effects',
+    async (source) => {
+      const h = harness();
+      delete h.graph.configId;
+      const executable = tool(h.leftExecute, {
+        name: 'left_tool',
+        description: 'Requires review',
+        schema: z.object({ value: z.string() }),
+      });
+      h.graph.agents[1].tools = [];
+      if (source === 'toolMap')
+        h.graph.agents[1].toolMap = new Map([['left_tool', executable]]);
+      else h.graph.agents[1][source] = [executable];
+      const run = await h.build();
+      await start(run);
+      expect(h.calls).toHaveLength(0);
+      expect(h.leftExecute).not.toHaveBeenCalled();
+      expect(h.rightExecute).not.toHaveBeenCalled();
+      expect(
+        run
+          .getRunMessages()
+          ?.some((message) => String(message.content).includes('configId'))
+      ).toBe(true);
+    }
+  );
+
+  test.each(['toolMap', 'graphTools'] as const)(
+    'changed %s implementation revision rejects old approval',
+    async (source) => {
+      const h = harness();
+      const original = tool(h.leftExecute, {
+        name: 'left_tool',
+        description: 'Requires review',
+        schema: z.object({ value: z.string() }),
+      });
+      h.graph.agents[1].tools = [];
+      if (source === 'toolMap')
+        h.graph.agents[1].toolMap = new Map([['left_tool', original]]);
+      else h.graph.agents[1].graphTools = [original];
+      const run = await h.build();
+      await start(run);
+      const replacement = jest.fn(async () => 'replacement effect');
+      const executable = tool(replacement, {
+        name: 'left_tool',
+        description: 'Requires review',
+        schema: z.object({ value: z.string() }),
+      });
+      const definition = {
+        ...h.graph,
+        configId: 'implementation-v2',
+        agents: h.graph.agents.map((agent) => ({ ...agent })),
+      };
+      if (source === 'toolMap')
+        definition.agents[1].toolMap = new Map([['left_tool', executable]]);
+      else definition.agents[1].graphTools = [executable];
+      const rebuilt = await h.build(definition);
+      await rebuilt.resume([{ type: 'approve' }], config);
+      expect(replacement).not.toHaveBeenCalled();
+      expect(h.leftExecute).not.toHaveBeenCalled();
+      expect(h.rightExecute).not.toHaveBeenCalled();
+    }
+  );
+
+  test('schema-only graph members do not require an implementation revision', async () => {
+    const h = harness(true);
+    delete h.graph.configId;
+    h.graph.agents = h.graph.agents.map((agent) => ({ ...agent, tools: [] }));
+    const run = await h.build();
+    await start(run);
+    expect(run.getInterrupt()?.pendingInterrupts).toHaveLength(2);
+    await run.resume([{ type: 'approve' }], config);
+    const rebuilt = await h.build();
+    await rebuilt.resume([{ type: 'approve' }], config);
+    expect(rebuilt.getInterrupt()).toBeUndefined();
+    expect(h.leftExecute).toHaveBeenCalledTimes(1);
+    expect(h.rightExecute).toHaveBeenCalledTimes(1);
+  });
 });

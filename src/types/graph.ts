@@ -677,7 +677,7 @@ export interface SingleAgentSubagentConfig extends SubagentConfig {
 
 export interface GraphSubagentConfig extends SubagentConfigBase {
   kind: 'graph';
-  /** Host revision for executable implementations. Required for HITL functional prompts and opaque model options. */
+  /** Host revision for executable implementations. Required for HITL executable tools, functional prompts, and opaque member options. */
   configId?: string;
   resolveAgentInputs?: never;
   hostArgs?: never;
