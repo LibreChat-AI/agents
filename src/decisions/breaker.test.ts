@@ -374,6 +374,24 @@ describe('probe', () => {
     });
   });
 
+  it('reads only the start of an oversized failure message', async () => {
+    const message = `token short-1 was refused ${'eyJ-'.repeat(200_000)}`;
+    const huge: DecisionModel = {
+      id: 'huge',
+      model: 'huge',
+      decide: async () => {
+        throw new DecisionError('unauthorized', message);
+      },
+    };
+    const started = performance.now();
+    const result = await probe(huge, { secrets: ['short-1'] });
+    expect(performance.now() - started).toBeLessThan(500);
+    expect(result).toMatchObject({ ok: false, failure: 'unauthorized' });
+    expect(result).toMatchObject({
+      detail: 'token [REDACTED] was refused [REDACTED]',
+    });
+  });
+
   it('still resolves, without the message, when the secrets it was handed cannot be read', async () => {
     const leaky: DecisionModel = {
       id: 'leaky',

@@ -1,7 +1,7 @@
 import type { DecisionModel, DecisionFailure, DecisionRequest } from './types';
 import { booleanQuestion } from './questions';
 import { DecisionError } from './types';
-import { redact } from './redact';
+import { redactExcerpt } from './redact';
 
 const DETAIL_LIMIT = 200;
 const PROBE_FAILED = 'decision model probe failed';
@@ -13,7 +13,7 @@ export type DecisionProbe =
       failure: DecisionFailure;
       status?: number;
       circuitOpen: boolean;
-      /** Redacted and truncated; safe for a log line or a status row. */
+      /** Redacted, whitespace-collapsed, and truncated; safe for a log line or a status row. */
       detail: string;
     };
 
@@ -78,13 +78,21 @@ export async function probe(
   }
 }
 
-/** The redacted message, or a fixed detail when `secrets` cannot be read: never the raw message, never a throw. */
+/**
+ * The redacted start of the message, or a fixed detail when `secrets` cannot
+ * be read: never the raw message, never a throw. Only the start is read, so a
+ * host model's oversized error message cannot make the probe slow or large.
+ */
 function safeDetail(
   message: string,
   secrets: DecisionProbeOptions['secrets']
 ): string {
   try {
-    return redact(message, secrets).slice(0, DETAIL_LIMIT);
+    return redactExcerpt(
+      message,
+      secrets === undefined ? [] : secrets,
+      DETAIL_LIMIT
+    );
   } catch {
     return PROBE_FAILED;
   }

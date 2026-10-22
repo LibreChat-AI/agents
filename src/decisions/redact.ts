@@ -1,12 +1,19 @@
 const REDACTED = '[REDACTED]';
 const BEARER = /\b(bearer\s+)([^\s"',;]+)/gi;
-const JWT = /\beyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]{8,}/g;
+/** Where a JWT can start; its three segments are measured by `jwtSpans`. */
+const JWT_START = /\beyJ/g;
+/** A character of one JWT segment. */
+const SEGMENT_CHAR = /[\w-]/;
+/** The shortest segment a JWT is recognized with. */
+const SEGMENT_MIN = 8;
 /** Long opaque runs (API keys, session tokens); also catches 40-hex digests, which is acceptable in a log line. */
 const OPAQUE = /[A-Za-z0-9_-]{40,}/g;
 /** A character of a token-shaped run (opaque, JWT, dotted) a cut at the end of an excerpt window may split. */
 const TOKEN_CHAR = /[\w.-]/;
 /** How much of the text an excerpt reads, so its cost does not grow with the text. */
 const EXCERPT_WINDOW = 4096;
+/** How much raw text an excerpt collapses to fill its window; whitespace past it is never scanned. */
+const RAW_WINDOW = EXCERPT_WINDOW * 4;
 
 /**
  * Coverage of `source` as a difference array: `depth[i]` adds one where a
@@ -59,6 +66,51 @@ function patternSpans(
   }
 }
 
+/** Where the run of segment characters starting at `from` ends. */
+function segmentEnd(source: string, from: number): number {
+  let at = from;
+  while (at < source.length && SEGMENT_CHAR.test(source[at])) {
+    at += 1;
+  }
+  return at;
+}
+
+/**
+ * Every JWT shape (`eyJ` and three dot-separated segments of at least
+ * `SEGMENT_MIN` characters each) in one pass. A segment cannot contain the
+ * dot that ends it, so each segment's end is fixed by where its run of
+ * segment characters stops, and a start that fails fails for every later
+ * start inside its first segment too: the scan resumes past that segment
+ * instead of rescanning the run from each word boundary, which a
+ * backtracking pattern does in quadratic time.
+ */
+function jwtSpans(source: string, coverage: Coverage): void {
+  JWT_START.lastIndex = 0;
+  for (
+    let match = JWT_START.exec(source);
+    match !== null;
+    match = JWT_START.exec(source)
+  ) {
+    const start = match.index;
+    const firstEnd = segmentEnd(source, start + 3);
+    let from = start + 3;
+    let stop = firstEnd;
+    let segments = 0;
+    while (
+      stop - from >= SEGMENT_MIN &&
+      ++segments < 3 &&
+      source[stop] === '.'
+    ) {
+      from = stop + 1;
+      stop = segmentEnd(source, from);
+    }
+    if (segments === 3) {
+      mark(coverage, start, stop);
+    }
+    JWT_START.lastIndex = Math.max(segments === 3 ? stop : firstEnd, start + 1);
+  }
+}
+
 /**
  * The distinct listed secrets, each normalized by `normalize`; iterates
  * `secrets` with `for...of`, so an unreadable list throws instead of
@@ -88,7 +140,7 @@ function cover(source: string, secrets: Set<string>, cutAt?: number): string {
     literalSpans(source, secret, coverage);
   }
   patternSpans(source, BEARER, coverage, 1);
-  patternSpans(source, JWT, coverage);
+  jwtSpans(source, coverage);
   patternSpans(source, OPAQUE, coverage);
   if (cutAt !== undefined && cutAt < source.length) {
     mark(coverage, cutAt, source.length);
@@ -137,9 +189,9 @@ const collapse = (text: string): string => text.replace(/\s+/g, ' ').trim();
 
 /**
  * The first `limit` characters of `text` redacted, with whitespace
- * collapsed. Only the first 4096 characters (after collapsing) are read, so
- * the cost stays bounded however long the text and however many secrets
- * there are. When the text runs past that window, its tail is redacted as far
+ * collapsed. Only the first 4096 characters after collapsing, drawn from at
+ * most the first 16384 of the text, are read, so the cost stays bounded
+ * however long the text and however many secrets there are. When the text runs past that window, its tail is redacted as far
  * back as the longest listed secret could reach and through any token-shaped
  * run the cut splits, so a credential the window cuts off cannot show its
  * first characters.
@@ -149,11 +201,13 @@ export function redactExcerpt(
   secrets: ReadonlyArray<string | null | undefined>,
   limit: number
 ): string {
-  const whole = collapse(String(text));
+  const raw = String(text);
+  const head = raw.slice(0, RAW_WINDOW);
+  const whole = collapse(head);
   const source = whole.slice(0, EXCERPT_WINDOW);
   const distinct = listed(secrets, collapse);
   let cutAt: number | undefined;
-  if (whole.length > source.length) {
+  if (raw.length > head.length || whole.length > source.length) {
     let longest = 0;
     for (const secret of distinct) {
       longest = Math.max(longest, secret.length);

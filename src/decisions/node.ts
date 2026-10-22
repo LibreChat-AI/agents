@@ -260,11 +260,13 @@ const SHELL_SEGMENT = /"[^"]*"|'[^']*'|[^"']+|["']/g;
 const SINGLE_QUOTED = /^'[^']*'$/;
 
 /**
- * Whether the shell may hand the program an argument the command text does
- * not contain, which no word of the text can redact: off Windows, a backslash
- * escape or a `$` or backtick expansion outside single quotes; on Windows,
- * cmd.exe's `%` expansion and `^` escape, or a `\"` a program's argument
- * parser decodes.
+ * Whether the shell may hand the program an argument built from text the
+ * command does not show (a variable, command output, or a decoded escape),
+ * which no word of the text can redact: off Windows, a backslash escape or a
+ * `$` or backtick expansion outside single quotes; on Windows, cmd.exe's `%`
+ * expansion and `^` escape, or a `\"` a program's argument parser decodes.
+ * Pathname and tilde expansion are left alone: they substitute paths that
+ * already exist on disk, not text the command carried.
  */
 function rewritesWords(command: string): boolean {
   if (!GROUP_KILL) {
@@ -366,9 +368,12 @@ function validExitCodes(codes: ReadonlyArray<number> | undefined): boolean {
  * or was told were refused, cached or not, whatever their length, including a
  * refused token whose refresh failed. The excerpt reads only the start of
  * stderr, so formatting it stays cheap whatever the command printed. When the
- * shell may pass the program an argument the command text does not contain
- * (off Windows, a backslash escape or a `$` or backtick expansion outside
- * single quotes; on Windows, `%`, `^`, or `\"`), stderr is withheld instead.
+ * shell may pass the program an argument built from text the command does
+ * not show, such as a variable, command output, or a decoded escape (off
+ * Windows, a backslash escape or a `$` or backtick expansion outside single
+ * quotes; on Windows, `%`, `^`, or `\"`), stderr is withheld instead.
+ * Pathname (`*`, `?`, `[`) and tilde expansion do not withhold it: they
+ * substitute existing paths, which can reach the excerpt.
  */
 export function commandToken(
   command: string,
