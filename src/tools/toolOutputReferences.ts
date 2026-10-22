@@ -31,6 +31,7 @@ import {
 } from '@/utils/truncation';
 import { isComputerCallOutputMessage } from '@/utils/toolContent';
 import { INTENT_ARG } from '@/tools/intentArg';
+import type { ToolMessageRefMetadata } from '@/types/messages';
 
 /** Parses a stringified JSON object arg; undefined for anything else. */
 function parseStringifiedArgsObject(
@@ -81,6 +82,40 @@ export function buildReferencePrefix(key: string): string {
 /** Stable registry key for a tool output. */
 export function buildReferenceKey(toolIndex: number, turn: number): string {
   return `tool${toolIndex}turn${turn}`;
+}
+
+const REFERENCE_KEY_TURN_PATTERN = /^tool\d+turn(\d+)$/;
+
+/**
+ * Fields that persist a tool result's reference labels on the completed
+ * `tool_call` part, so a restored history re-creates the same `[ref: …]`
+ * and `[unresolved refs: …]` markers the live run showed the model.
+ */
+export function buildCompletionRefFields(
+  meta: ToolMessageRefMetadata | undefined
+): { ref?: string; unresolved_refs?: string[] } {
+  const ref = readRefKey(meta as Record<string, unknown> | undefined);
+  const unresolved = readUnresolvedRefs(meta as Record<string, unknown> | undefined);
+  return {
+    ...(ref != null && { ref }),
+    ...(unresolved.length > 0 && { unresolved_refs: unresolved }),
+  };
+}
+
+/**
+ * First turn number not used by any `_refKey` in `messages`. Seeds the
+ * registry so keys stay unique across the conversation instead of
+ * restarting at `turn0` on every run.
+ */
+export function nextReferenceTurn(messages: BaseMessage[]): number {
+  let next = 0;
+  for (const m of messages) {
+    if (m._getType() !== 'tool') continue;
+    const key = readRefKey(m.additional_kwargs);
+    const match = key != null ? REFERENCE_KEY_TURN_PATTERN.exec(key) : null;
+    if (match != null) next = Math.max(next, Number(match[1]) + 1);
+  }
+  return next;
 }
 
 export type ToolOutputReferenceRegistryOptions = {
@@ -288,9 +323,7 @@ export class ToolOutputReferenceRegistry {
 
   /**
    * Returns `true` when `key` is currently stored in `runId`'s bucket.
-   * Used by {@link annotateMessagesForLLM} to gate transient annotation
-   * on whether the registry still owns the referenced output (a stale
-   * `_refKey` from a prior run silently no-ops here).
+   * Placeholder resolution depends on this; labelling does not.
    */
   has(runId: string | undefined, key: string): boolean {
     return this.runStates.get(this.keyFor(runId))?.entries.has(key) ?? false;
@@ -347,6 +380,12 @@ export class ToolOutputReferenceRegistry {
     }
     const bucket = this.getOrCreate(runId);
     return bucket.turnCounter++;
+  }
+
+  /** Raises `runId`'s turn counter to at least `turn`; never lowers it. */
+  seedTurn(runId: string | undefined, turn: number): void {
+    const bucket = this.getOrCreate(runId);
+    bucket.turnCounter = Math.max(bucket.turnCounter, turn);
   }
 
   /**
@@ -728,18 +767,16 @@ function arraysShallowEqual(a: unknown, b: readonly string[]): boolean {
 /**
  * Lazy projection that, given a registry and a runId, returns a new
  * `messages` array where each `ToolMessage` carrying ref metadata is
- * projected into a transient copy with annotated content (when the ref
- * is live in the registry) and with the framework-owned `additional_
- * kwargs` keys (`_refKey`, `_refScope`, `_unresolvedRefs`) stripped
- * regardless of whether annotation applied. The original input array
- * and its messages are never mutated.
+ * projected into a transient copy with annotated content and with the
+ * framework-owned `additional_kwargs` keys (`_refKey`, `_refScope`,
+ * `_unresolvedRefs`) stripped. The original input array and its
+ * messages are never mutated.
  *
- * Annotation is gated on registry presence: a stale `_refKey` from a
- * prior run (e.g. one that survived in persisted history) silently
- * no-ops on the *content* side. The strip-metadata side still runs so
- * stale framework keys never leak onto the wire under any custom or
- * future provider serializer that might transmit `additional_kwargs`.
- * `_unresolvedRefs` is always meaningful and is not gated.
+ * The label is the output's name, not a registry lookup: `_refKey` is
+ * persisted with the tool result and restored with the history, so a
+ * message is labelled identically in the run that produced it and in
+ * every later run, whether or not the registry still holds the output.
+ * Resolving a placeholder is what depends on the registry.
  *
  * **Feature-disabled fast path:** when the host hasn't enabled the
  * tool-output-reference feature, the registry is `undefined` and this
@@ -750,7 +787,7 @@ function arraysShallowEqual(a: unknown, b: readonly string[]): boolean {
 export function annotateMessagesForLLM(
   messages: BaseMessage[],
   registry: ToolOutputReferenceRegistry | undefined,
-  runId: string | undefined
+  _runId?: string
 ): BaseMessage[] {
   if (registry == null) return messages;
 
@@ -789,18 +826,7 @@ export function annotateMessagesForLLM(
     const refKey = readRefKey(meta);
     const unresolved = readUnresolvedRefs(meta);
 
-    /**
-     * Prefer the message-stamped `_refScope` for the registry lookup.
-     * For named runs it equals the current `runId`; for anonymous
-     * invocations it carries the per-batch synthetic scope minted by
-     * ToolNode (`\0anon-<n>`), which `runId` from config cannot
-     * recover. Falling back to `runId` keeps backward compatibility
-     * with messages stamped before this field existed.
-     */
-    const lookupScope = readRefScope(meta) ?? runId;
-    const liveRef =
-      refKey != null && registry.has(lookupScope, refKey) ? refKey : undefined;
-    const annotates = liveRef != null || unresolved.length > 0;
+    const annotates = refKey != null || unresolved.length > 0;
 
     const tm = m as ToolMessage;
     let nextContent: ToolMessage['content'] = tm.content;
@@ -808,7 +834,7 @@ export function annotateMessagesForLLM(
     if (annotates && typeof tm.content === 'string') {
       nextContent = annotateToolOutputWithReference(
         tm.content,
-        liveRef,
+        refKey,
         unresolved
       );
     } else if (annotates && Array.isArray(tm.content)) {
@@ -829,10 +855,10 @@ export function annotateMessagesForLLM(
        * prepended.
        */
       const prefixBlocks: Array<{ type: 'text'; text: string }> = [];
-      if (liveRef != null) {
+      if (refKey != null) {
         prefixBlocks.push({
           type: 'text',
-          text: buildReferencePrefix(liveRef),
+          text: buildReferencePrefix(refKey),
         });
       }
       if (unresolved.length > 0) {
@@ -850,8 +876,8 @@ export function annotateMessagesForLLM(
     }
 
     /**
-     * Project unconditionally: even when no annotation applies (stale
-     * `_refKey` or non-annotatable content), `cloneToolMessageWithContent`
+     * Project unconditionally: even when no annotation applies
+     * (non-annotatable content), `cloneToolMessageWithContent`
      * runs `stripFrameworkRefMetadata` on `additional_kwargs` so the
      * framework-owned keys never reach the wire.
      */
@@ -871,19 +897,6 @@ function readRefKey(
   meta: Record<string, unknown> | undefined
 ): string | undefined {
   const v = meta?._refKey;
-  return typeof v === 'string' ? v : undefined;
-}
-
-/**
- * Reads `_refScope` defensively from untyped `additional_kwargs`.
- * Mirrors {@link readRefKey} — non-string scopes are dropped (the
- * caller falls back to the run-derived scope) rather than passed into
- * the registry as a malformed key.
- */
-function readRefScope(
-  meta: Record<string, unknown> | undefined
-): string | undefined {
-  const v = meta?._refScope;
   return typeof v === 'string' ? v : undefined;
 }
 

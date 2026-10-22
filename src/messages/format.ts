@@ -1867,6 +1867,8 @@ function formatAssistantMessage(
         const {
           output,
           args: _args,
+          ref,
+          unresolved_refs,
           ..._tool_call
         } = part.tool_call as ToolCallPart;
 
@@ -1990,6 +1992,14 @@ function formatAssistantMessage(
               tool_call_id: tool_call.id ?? '',
               name: tool_call.name,
               content: formatToolCallOutput(output),
+              ...((ref != null || unresolved_refs != null) && {
+                additional_kwargs: {
+                  ...(ref != null && { _refKey: ref }),
+                  ...(unresolved_refs != null && {
+                    _unresolvedRefs: unresolved_refs,
+                  }),
+                },
+              }),
             }),
             'tool'
           ),

@@ -2608,12 +2608,14 @@ export function createContentAggregator(): t.ContentAggregatorResult {
         toolCallContentIndexMap.delete(existingToolCallId);
       }
 
-      const newToolCall: ToolCall & t.PartMetadata & { outcome?: string } = {
-        id,
-        name,
-        args,
-        type: ToolCallTypes.TOOL_CALL,
-      };
+      const newToolCall: ToolCall &
+        t.PartMetadata &
+        Pick<t.ToolCallPart, 'outcome' | 'ref' | 'unresolved_refs'> = {
+          id,
+          name,
+          args,
+          type: ToolCallTypes.TOOL_CALL,
+        };
 
       const auth =
         contentPart.tool_call.auth ?? existingContent?.tool_call?.auth;
@@ -2631,6 +2633,14 @@ export function createContentAggregator(): t.ContentAggregatorResult {
         const outcome = (contentPart.tool_call as t.ToolCallPart).outcome;
         if (outcome != null) {
           newToolCall.outcome = outcome;
+        }
+        const { ref, unresolved_refs } =
+          contentPart.tool_call as t.ToolCallPart;
+        if (ref != null) {
+          newToolCall.ref = ref;
+        }
+        if (unresolved_refs != null) {
+          newToolCall.unresolved_refs = unresolved_refs;
         }
       }
 

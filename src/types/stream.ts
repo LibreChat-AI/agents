@@ -253,6 +253,10 @@ export type ProcessedToolCall = {
    * which is language-neutral and always consistent.
    */
   outcome?: string;
+  /** Output reference key (`tool<i>turn<n>`), see `ToolMessageRefMetadata._refKey`. */
+  ref?: string;
+  /** Placeholder keys that did not resolve for this call. */
+  unresolved_refs?: string[];
 };
 
 export type ProcessedContent = {
@@ -495,6 +499,13 @@ export type ToolCallPart = {
    * preserved through aggregation so it survives persistence/reload.
    */
   outcome?: string;
+  /**
+   * Output reference key and unresolved placeholders (see
+   * `ProcessedToolCall.ref`), persisted so a restored history re-creates
+   * the same `[ref: …]` labels the live run showed the model.
+   */
+  ref?: string;
+  unresolved_refs?: string[];
   /** Auth URL */
   auth?: string;
   /** Expiration time */
