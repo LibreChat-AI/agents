@@ -43,9 +43,12 @@ export type Transport = <T>(
 
 export function failureForStatus(
   status: number
-): 'unauthorized' | 'rate_limited' | 'server_error' | 'bad_request' {
+): 'unauthorized' | 'quota' | 'rate_limited' | 'server_error' | 'bad_request' {
   if (status === 401 || status === 403) {
     return 'unauthorized';
+  }
+  if (status === 402) {
+    return 'quota';
   }
   if (status === 429) {
     return 'rate_limited';
