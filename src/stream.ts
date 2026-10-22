@@ -33,6 +33,7 @@ import {
   CODE_EXECUTION_TOOLS,
   LOCAL_CODING_BUNDLE_NAMES,
 } from '@/common';
+import { resolveClientOptionsModel } from '@/llm/request';
 import {
   getMessageCreationContentMetadata,
   splitAssistantTextContentByPhase,
@@ -456,6 +457,17 @@ function isGoogleServerSideToolContentPart(
   return contentPart.type === 'toolCall' || contentPart.type === 'toolResponse';
 }
 
+function isReasoningContentPart(
+  contentPart: t.MessageContentComplex
+): boolean {
+  return (
+    (contentPart.type?.startsWith(ContentTypes.THINKING) ?? false) ||
+    (contentPart.type?.startsWith(ContentTypes.REASONING) ?? false) ||
+    (contentPart.type?.startsWith(ContentTypes.REASONING_CONTENT) ?? false) ||
+    contentPart.type === 'redacted_thinking'
+  );
+}
+
 function isTextContentPart(contentPart: t.MessageContentComplex): boolean {
   return contentPart.type?.startsWith(ContentTypes.TEXT) ?? false;
 }
@@ -470,6 +482,148 @@ function getReasoningTextFromContentPart(
       ?.text ??
     ''
   );
+}
+
+interface ServingIdentity {
+  provider?: string;
+  model?: string;
+}
+
+const asNonEmpty = (value: unknown): string | undefined =>
+  typeof value === 'string' && value !== '' ? value : undefined;
+
+/**
+ * Identity of the model that actually served this call: the attempt stamp
+ * (primary or fallback), then what the graph resolved for the call (override
+ * model, `modelName` alias), then the configured client options.
+ */
+function resolveServingIdentity(
+  agentContext: AgentContext,
+  metadata?: Record<string, unknown>
+): ServingIdentity {
+  return {
+    provider:
+      asNonEmpty(metadata?.[Constants.INVOKED_PROVIDER]) ??
+      agentContext.reasoningReplaySource?.provider ??
+      agentContext.provider,
+    model:
+      asNonEmpty(metadata?.[Constants.INVOKED_MODEL]) ??
+      agentContext.reasoningReplaySource?.model ??
+      resolveClientOptionsModel(agentContext.clientOptions),
+  };
+}
+
+function getBedrockReasoningReplay(
+  contentPart: t.MessageContentComplex,
+  serving: ServingIdentity
+): t.ProviderReasoningReplay | undefined {
+  const model = serving.model;
+  if (
+    typeof model !== 'string' ||
+    model === '' ||
+    contentPart.type !== ContentTypes.REASONING_CONTENT
+  ) {
+    return undefined;
+  }
+  const block = contentPart as Partial<t.BedrockReasoningReplayBlock>;
+  const reasoningText = block.reasoningText;
+  if (
+    reasoningText != null &&
+    (typeof reasoningText.text === 'string' ||
+      typeof reasoningText.signature === 'string')
+  ) {
+    return {
+      bedrock: {
+        model,
+        blocks: [
+          {
+            type: ContentTypes.REASONING_CONTENT,
+            reasoningText: {
+              ...(typeof reasoningText.text === 'string' && {
+                text: reasoningText.text,
+              }),
+              ...(typeof reasoningText.signature === 'string' && {
+                signature: reasoningText.signature,
+              }),
+            },
+          },
+        ],
+      },
+    };
+  }
+  if (
+    typeof block.redactedContent === 'string' &&
+    block.redactedContent !== ''
+  ) {
+    return {
+      bedrock: {
+        model,
+        blocks: [
+          {
+            type: ContentTypes.REASONING_CONTENT,
+            redactedContent: block.redactedContent,
+          },
+        ],
+      },
+    };
+  }
+  return undefined;
+}
+
+function getAnthropicReasoningReplay(
+  contentPart: t.MessageContentComplex,
+  serving: ServingIdentity
+): t.ProviderReasoningReplay | undefined {
+  const model = serving.model;
+  if (typeof model !== 'string' || model === '') {
+    return undefined;
+  }
+  if (
+    contentPart.type === ContentTypes.THINKING ||
+    contentPart.type === ContentTypes.REASONING
+  ) {
+    const block = contentPart as Partial<t.AnthropicReasoningReplayBlock> & {
+      thinking?: string;
+      reasoning?: string;
+      signature?: string;
+    };
+    const thinking =
+      contentPart.type === ContentTypes.THINKING
+        ? block.thinking
+        : block.reasoning;
+    if (typeof thinking !== 'string' && typeof block.signature !== 'string') {
+      return undefined;
+    }
+    return {
+      anthropic: {
+        model,
+        blocks: [
+          {
+            type: ContentTypes.THINKING,
+            ...(typeof thinking === 'string' && {
+              thinking,
+            }),
+            ...(typeof block.signature === 'string' && {
+              signature: block.signature,
+            }),
+          },
+        ],
+      },
+    };
+  }
+  if (contentPart.type === 'redacted_thinking') {
+    const data = (contentPart as { data?: unknown }).data;
+    if (typeof data !== 'string' || data === '') {
+      return undefined;
+    }
+    return {
+      anthropic: {
+        model,
+        blocks: [{ type: 'redacted_thinking', data }],
+      },
+    };
+  }
+  return undefined;
 }
 
 function getReasoningTextFromChunk(
@@ -1439,6 +1593,15 @@ export function getChunkContent({
   }
 
   if (
+    provider === Providers.BEDROCK &&
+    Array.isArray(chunk?.content) &&
+    chunk.content.length > 0 &&
+    chunk.content.every((contentPart) => isReasoningContentPart(contentPart))
+  ) {
+    return chunk.content;
+  }
+
+  if (
     (provider === Providers.OPENAI || provider === Providers.AZURE) &&
     (
       chunk?.additional_kwargs?.reasoning as
@@ -2173,15 +2336,32 @@ hasToolCallChunks: ${hasToolCallChunks}
       await graph.dispatchReasoningDelta(
         stepId,
         {
-          content: content.map((c) => ({
-            type: ContentTypes.THINK,
-            think:
-              (c as t.ThinkingContentText).thinking ??
-              (c as Partial<t.GoogleReasoningContentText>).reasoning ??
-              (c as Partial<t.BedrockReasoningContentText>).reasoningText
-                ?.text ??
-              '',
-          })),
+          content: content.map((c) => {
+            const serving = resolveServingIdentity(agentContext, metadata);
+            const isAnthropicReplayShape =
+              c.type === ContentTypes.THINKING ||
+              c.type === 'redacted_thinking' ||
+              (c.type === ContentTypes.REASONING &&
+                typeof (c as { signature?: unknown }).signature === 'string');
+            let providerReplay: t.ProviderReasoningReplay | undefined;
+            if (agentContext.providerReasoningReplay) {
+              providerReplay = isAnthropicReplayShape
+                ? getAnthropicReasoningReplay(c, serving)
+                : getBedrockReasoningReplay(c, serving);
+            }
+            return {
+              type: ContentTypes.THINK,
+              think:
+                (c as t.ThinkingContentText).thinking ??
+                (c as Partial<t.GoogleReasoningContentText>).reasoning ??
+                (c as Partial<t.BedrockReasoningContentText>).reasoningText
+                  ?.text ??
+                '',
+              ...(providerReplay != null && {
+                provider_replay: providerReplay,
+              }),
+            };
+          }),
         },
         metadata
       );
@@ -2275,6 +2455,103 @@ hasToolCallChunks: ${hasToolCallChunks}
   }
 }
 
+function mergeProviderReasoningReplay(
+  existing: t.ProviderReasoningReplay | undefined,
+  incoming: t.ProviderReasoningReplay | undefined
+): t.ProviderReasoningReplay | undefined {
+  if (incoming == null) {
+    return existing;
+  }
+  if (incoming.invalidated === true) {
+    return { invalidated: true };
+  }
+  const anthropicModelChanged =
+    incoming.anthropic != null &&
+    existing?.anthropic?.model !== incoming.anthropic.model;
+  const anthropic = anthropicModelChanged
+    ? structuredClone(incoming.anthropic)
+    : structuredClone(existing?.anthropic);
+  if (
+    !anthropicModelChanged &&
+    anthropic != null &&
+    incoming.anthropic != null
+  ) {
+    for (const incomingBlock of incoming.anthropic.blocks) {
+      const lastBlock = anthropic.blocks[anthropic.blocks.length - 1];
+      /**
+       * A signature closes its block and arrives whole, so a later block starts at its thinking
+       * text or at its own signature; with omitted thinking display only the signature is sent.
+       */
+      const startsNewSignedBlock =
+        incomingBlock.type === ContentTypes.THINKING &&
+        (typeof incomingBlock.thinking === 'string' ||
+          (typeof incomingBlock.signature === 'string' &&
+            incomingBlock.signature !== '')) &&
+        anthropic.blocks.length > 0 &&
+        lastBlock.type === ContentTypes.THINKING &&
+        typeof lastBlock.signature === 'string' &&
+        lastBlock.signature !== '';
+      if (
+        incomingBlock.type === ContentTypes.THINKING &&
+        anthropic.blocks.length > 0 &&
+        lastBlock.type === ContentTypes.THINKING &&
+        !startsNewSignedBlock
+      ) {
+        if (typeof incomingBlock.thinking === 'string') {
+          lastBlock.thinking =
+            (lastBlock.thinking ?? '') + incomingBlock.thinking;
+        }
+        if (typeof incomingBlock.signature === 'string') {
+          lastBlock.signature =
+            (lastBlock.signature ?? '') + incomingBlock.signature;
+        }
+        continue;
+      }
+      anthropic.blocks.push(structuredClone(incomingBlock));
+    }
+  }
+  const bedrockModelChanged =
+    incoming.bedrock != null &&
+    existing?.bedrock?.model !== incoming.bedrock.model;
+  const bedrock = bedrockModelChanged
+    ? structuredClone(incoming.bedrock)
+    : structuredClone(existing?.bedrock);
+  if (!bedrockModelChanged && bedrock != null && incoming.bedrock != null) {
+    for (const incomingBlock of incoming.bedrock.blocks) {
+      const incomingReasoningText = incomingBlock.reasoningText;
+      const lastBlock = bedrock.blocks[bedrock.blocks.length - 1];
+      const lastReasoningText =
+        bedrock.blocks.length > 0 ? lastBlock.reasoningText : undefined;
+      const startsNewSignedBlock =
+        (typeof incomingReasoningText?.text === 'string' ||
+          (typeof incomingReasoningText?.signature === 'string' &&
+            incomingReasoningText.signature !== '')) &&
+        lastReasoningText?.signature != null;
+      if (
+        incomingReasoningText != null &&
+        lastReasoningText != null &&
+        !startsNewSignedBlock
+      ) {
+        if (typeof incomingReasoningText.text === 'string') {
+          lastReasoningText.text =
+            (lastReasoningText.text ?? '') + incomingReasoningText.text;
+        }
+        if (typeof incomingReasoningText.signature === 'string') {
+          lastReasoningText.signature =
+            (lastReasoningText.signature ?? '') +
+            incomingReasoningText.signature;
+        }
+        continue;
+      }
+      bedrock.blocks.push(structuredClone(incomingBlock));
+    }
+  }
+  return {
+    ...(anthropic != null && anthropic.blocks.length > 0 && { anthropic }),
+    ...(bedrock != null && bedrock.blocks.length > 0 && { bedrock }),
+  };
+}
+
 export function createContentAggregator(): t.ContentAggregatorResult {
   type ToolStepContentState = {
     indices: Set<number>;
@@ -2287,6 +2564,7 @@ export function createContentAggregator(): t.ContentAggregatorResult {
   const contentParts: Array<t.MessageContentComplex | undefined> = [];
   const stepMap = new Map<string, t.RunStep>();
   const toolCallContentIndexMap = new Map<string, number>();
+  const providerItemsByToolCallId = new Map<string, t.ProviderOutputItems>();
   const sourceContentIndexMap = new Map<number, number>();
   const toolStepContentMap = new Map<string, ToolStepContentState>();
   let indexedContentLength = 0;
@@ -2513,6 +2791,10 @@ export function createContentAggregator(): t.ContentAggregatorResult {
       const update: t.ReasoningDeltaUpdate = {
         type: ContentTypes.THINK,
         think: (currentContent.think || '') + contentPart.think,
+        provider_replay: mergeProviderReasoningReplay(
+          currentContent.provider_replay,
+          (contentPart as t.ReasoningContentText).provider_replay
+        ),
       };
       contentParts[index] = update;
     } else if (
@@ -2608,12 +2890,20 @@ export function createContentAggregator(): t.ContentAggregatorResult {
         toolCallContentIndexMap.delete(existingToolCallId);
       }
 
-      const newToolCall: ToolCall & t.PartMetadata & { outcome?: string } = {
-        id,
-        name,
-        args,
-        type: ToolCallTypes.TOOL_CALL,
-      };
+      const newToolCall: ToolCall &
+        t.PartMetadata &
+        Pick<
+          t.ToolCallPart,
+          | 'outcome'
+          | 'roundId'
+          | 'providerItems'
+          | 'outputFormat'
+        > = {
+          id,
+          name,
+          args,
+          type: ToolCallTypes.TOOL_CALL,
+        };
 
       const auth =
         contentPart.tool_call.auth ?? existingContent?.tool_call?.auth;
@@ -2624,6 +2914,18 @@ export function createContentAggregator(): t.ContentAggregatorResult {
         newToolCall.auth = auth;
         newToolCall.expires_at = expiresAt;
       }
+      const roundId =
+        (contentPart.tool_call as t.ToolCallPart).roundId ??
+        existingContent?.tool_call?.roundId;
+      if (roundId != null) {
+        newToolCall.roundId = roundId;
+      }
+      const providerItems =
+        existingContent?.tool_call?.providerItems ??
+        providerItemsByToolCallId.get(id);
+      if (providerItems != null) {
+        newToolCall.providerItems = providerItems;
+      }
 
       if (finalUpdate) {
         newToolCall.progress = 1;
@@ -2631,6 +2933,10 @@ export function createContentAggregator(): t.ContentAggregatorResult {
         const outcome = (contentPart.tool_call as t.ToolCallPart).outcome;
         if (outcome != null) {
           newToolCall.outcome = outcome;
+        }
+        const { outputFormat } = contentPart.tool_call as t.ToolCallPart;
+        if (outputFormat != null) {
+          newToolCall.outputFormat = outputFormat;
         }
       }
 
@@ -2659,10 +2965,24 @@ export function createContentAggregator(): t.ContentAggregatorResult {
       | t.MessageDeltaEvent
       | t.ReasoningDeltaEvent
       | t.RunStepDeltaEvent
+      | t.ProviderOutputItemsEvent
       | t.SummarizeDeltaData
       | t.SummarizeCompleteEvent
       | { result: t.ToolEndEvent };
   }): void => {
+    if (event === GraphEvents.ON_PROVIDER_OUTPUT_ITEMS) {
+      for (const { id, providerItems } of (data as t.ProviderOutputItemsEvent)
+        .tool_calls) {
+        providerItemsByToolCallId.set(id, providerItems);
+        const index = toolCallContentIndexMap.get(id);
+        const part = index != null ? contentParts[index] : undefined;
+        if (part?.type === ContentTypes.TOOL_CALL && part.tool_call != null) {
+          part.tool_call = { ...part.tool_call, providerItems };
+        }
+      }
+      return;
+    }
+
     if (event === GraphEvents.ON_SUMMARIZE_DELTA) {
       const deltaData = data as t.SummarizeDeltaData;
       const runStep = stepMap.get(deltaData.id);
@@ -2749,6 +3069,7 @@ export function createContentAggregator(): t.ContentAggregatorResult {
                 args: toolCall.args,
                 name: toolCall.name,
                 id: toolCallId,
+                ...(runStep.roundId != null && { roundId: runStep.roundId }),
               },
             };
 

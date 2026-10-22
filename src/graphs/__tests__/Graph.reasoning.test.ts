@@ -332,6 +332,114 @@ describe('StandardGraph final response reasoning fallback', () => {
     ).toEqual(['commentary', 'final_answer']);
   });
 
+  it('logs what the provider changed in the request history', async () => {
+    const logs: t.AgentLogEvent[] = [];
+    const run = await Run.create<t.IState>({
+      runId: 'input-transformations-log',
+      graphConfig: { type: 'standard', llmConfig },
+      returnContent: true,
+      skipCleanup: true,
+      customHandlers: {
+        [GraphEvents.ON_AGENT_LOG]: {
+          handle: (_event: string, data: t.StreamEventData): void => {
+            logs.push(data as t.AgentLogEvent);
+          },
+        },
+      },
+    });
+
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+
+    const transformation = {
+      type: 'thinking_dropped',
+      path: 'messages.1.content.0',
+      reason: 'prefix_binding_mismatch',
+    };
+    run.Graph.overrideModel = new InvokeOnlyMessageModel(
+      new AIMessageChunk({
+        content: 'Done.',
+        response_metadata: { input_transformations: [transformation] },
+      })
+    );
+    await run.processStream({ messages: [new HumanMessage('Hi')] }, config);
+
+    expect(logs).toContainEqual(
+      expect.objectContaining({
+        level: 'warn',
+        message: 'The provider changed the request history',
+        data: { count: 1, inputTransformations: [transformation] },
+      })
+    );
+  });
+
+  it('records replay compatibility from the actual override model', async () => {
+    const run = await Run.create<t.IState>({
+      runId: 'reasoning-replay-override-model',
+      graphConfig: {
+        type: 'standard',
+        llmConfig,
+        providerReasoningReplay: true,
+      },
+      returnContent: true,
+      skipCleanup: true,
+    });
+
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+
+    const overrideModel = new InvokeOnlyMessageModel(
+      new AIMessageChunk({ content: 'Done.' })
+    ) as InvokeOnlyMessageModel & { model: string };
+    overrideModel.model = 'gpt-override';
+    run.Graph.overrideModel = overrideModel;
+
+    await run.processStream(
+      { messages: [new HumanMessage('Use the override')] },
+      config
+    );
+
+    expect(
+      run.Graph.agentContexts.get('default')?.reasoningReplaySource
+    ).toEqual({
+      provider: Providers.OPENAI,
+      model: 'gpt-override',
+    });
+  });
+
+  it('records no replay source without the replay opt-in', async () => {
+    const run = await Run.create<t.IState>({
+      runId: 'reasoning-replay-opt-out',
+      graphConfig: {
+        type: 'standard',
+        llmConfig,
+      },
+      returnContent: true,
+      skipCleanup: true,
+    });
+
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+
+    const overrideModel = new InvokeOnlyMessageModel(
+      new AIMessageChunk({ content: 'Done.' })
+    ) as InvokeOnlyMessageModel & { model: string };
+    overrideModel.model = 'gpt-override';
+    run.Graph.overrideModel = overrideModel;
+
+    await run.processStream(
+      { messages: [new HumanMessage('Use the override')] },
+      config
+    );
+
+    expect(
+      run.Graph.agentContexts.get('default')?.reasoningReplaySource
+    ).toBeUndefined();
+  });
+
   it('emits reasoning_content from invoke-only final responses', async () => {
     const reasoningText = 'Need to inspect the Home Assistant tool state.';
     const reasoningDeltas: t.ReasoningDeltaEvent[] = [];
