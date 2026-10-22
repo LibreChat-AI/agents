@@ -57,10 +57,11 @@ export interface CommandTokenOptions {
    */
   refusalExitCodes?: ReadonlyArray<number>;
   /**
-   * The breaker this credential's model is fused with. A run that started
-   * before `breaker.reset()` no longer serves callers that arrive after it, so
-   * the operator's fix is tested by a fresh run instead of failing on stale
-   * evidence and reopening the breaker.
+   * The breaker this credential's model is fused with. Neither a run that
+   * started before `breaker.reset()` nor a token it minted, cached or still in
+   * flight, serves callers that arrive after it, so the operator's fix is
+   * tested by a fresh run instead of failing on stale evidence and reopening
+   * the breaker.
    */
   breaker?: Pick<DecisionBreaker, 'generation'>;
 }
@@ -363,6 +364,8 @@ export function commandToken(
   /** The last minted token; kept after a refusal so a failed refresh still redacts it. */
   let cached: string | null = null;
   let expiresAt = 0;
+  /** The breaker generation the run that minted `cached` started under; a reset since then bypasses it. */
+  let cachedGeneration: number | undefined;
   let pending: SharedRun | null = null;
   const echoed = commandSecrets(command);
   /**
@@ -381,9 +384,13 @@ export function commandToken(
     }
   };
 
-  /** `feedsCache` says whether a token this run mints may still be cached when it lands. */
+  /**
+   * `feedsCache` says whether a token this run mints may still be cached when
+   * it lands; `generation` is the breaker generation the run started under.
+   */
   const run = (
     abandoned: AbortSignal,
+    generation: number | undefined,
     feedsCache: () => boolean
   ): Promise<string> =>
     new Promise<string>((resolve, reject) => {
@@ -507,6 +514,7 @@ export function commandToken(
         remember(token);
         if (!abandoned.aborted && feedsCache()) {
           cached = token;
+          cachedGeneration = generation;
           /** From completion, so a slow command cannot hand out a token that is already expired. */
           expiresAt = Date.now() + ttlMs;
         }
@@ -536,11 +544,12 @@ export function commandToken(
 
   const start = (): SharedRun => {
     const abandon = new AbortController();
+    const generation = breaker?.generation;
     const shared: SharedRun = {
-      token: run(abandon.signal, () => !shared.detached),
+      token: run(abandon.signal, generation, () => !shared.detached),
       waiters: 0,
       abandon,
-      generation: breaker?.generation,
+      generation,
       detached: false,
     };
     const settle = (): void => {
@@ -596,7 +605,13 @@ export function commandToken(
       /** The cached token was refused; never hand it out again. */
       expiresAt = 0;
     }
-    if (pending === null && cached !== null && Date.now() < expiresAt) {
+    /** A token minted before a reset is stale evidence too, even when its run settled before anyone arrived to detach it. */
+    if (
+      pending === null &&
+      cached !== null &&
+      cachedGeneration === breaker?.generation &&
+      Date.now() < expiresAt
+    ) {
       return Promise.resolve(cached);
     }
     pending ??= start();

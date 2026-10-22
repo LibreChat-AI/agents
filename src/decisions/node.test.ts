@@ -897,4 +897,67 @@ describe('commandToken', () => {
     expect(breaker.open).toBe(false);
     expect(await runs()).toBe(3);
   });
+  it('mints afresh after a reset instead of reusing a token cached before it, even one a 403 refused', async () => {
+    const flag = path.join(dir, 'right-account');
+    const breaker = createBreaker();
+    const auth: Array<string | undefined> = [];
+    const fetch: DecisionFetch = async (_url, init) => {
+      auth.push(init.headers.Authorization);
+      return init.headers.Authorization.startsWith('Bearer good-')
+        ? new Response(answered, { status: 200 })
+        : new Response('forbidden', { status: 403 });
+    };
+    const model = withBreaker(
+      createHttpDecisionModel({
+        endpoint: 'https://decisions.example/v1/systemone',
+        apiKey: commandToken(
+          await script(
+            `process.stdout.write((fs.existsSync(${JSON.stringify(flag)}) ? "good-" : "bad-") + n + "\\n");`
+          ),
+          { breaker }
+        ),
+        dialect: 'systemone',
+        fetch,
+        timeoutMs: 10_000,
+      }),
+      breaker
+    );
+
+    expect(await rejection(model.decide(request))).toMatchObject({
+      failure: 'unauthorized',
+      status: 403,
+    });
+    expect(breaker.open).toBe(true);
+    /** The operator logs in as the right account; a 403 never refreshes, so only the reset can retire `bad-1`. */
+    await writeFile(flag, '');
+    breaker.reset();
+
+    await expect(model.decide(request)).resolves.toMatchObject({
+      model: 'jev-1.13.0',
+    });
+    expect(auth).toEqual(['Bearer bad-1', 'Bearer good-2']);
+    expect(breaker.open).toBe(false);
+    expect(await runs()).toBe(2);
+  });
+
+  it('mints afresh after a reset that a run from before it outlived with no caller arriving meanwhile', async () => {
+    const breaker = createBreaker();
+    const mint = commandToken(
+      await script(
+        'setTimeout(() => process.stdout.write("token-" + n + "\\n"), 300);'
+      ),
+      { breaker }
+    );
+
+    const before = mint({ refresh: false });
+    while ((await runs()) < 1) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    breaker.reset();
+    await expect(before).resolves.toBe('token-1');
+
+    await expect(mint({ refresh: false })).resolves.toBe('token-2');
+    await expect(mint({ refresh: false })).resolves.toBe('token-2');
+    expect(await runs()).toBe(2);
+  });
 });

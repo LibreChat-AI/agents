@@ -69,8 +69,8 @@ export function createBreaker(): DecisionBreaker {
  * timeouts, and network failures never trip it; the transport retries those.
  * A fatal failure from a call that started before a `reset()` does not reopen
  * it; a minter that shares one run between calls must not let a call made
- * after a reset join a run from before it (`commandToken` takes the breaker
- * for this). Share one breaker between models that share a credential.
+ * after a reset join a run from before it or reuse a token such a run minted
+ * (`commandToken` takes the breaker for this). Share one breaker between models that share a credential.
  */
 export function withBreaker(
   model: DecisionModel,
