@@ -13,6 +13,7 @@ import { failureForStatus, retryAfterMs } from './transport';
 import { validateDecisionQuestions } from './questions';
 import { DECISION_PROMPT_PREFIX } from './traceMarker';
 import { withDecisionDeadline } from './deadline';
+import { callHook } from './hook';
 
 const MAX_QUESTIONS = 32;
 const MAX_CHOICE_OPTIONS = 128;
@@ -92,6 +93,7 @@ export interface StructuredChatDecisionModelOptions {
   method: DecisionOutputMethod;
   timeoutMs?: number;
   maxQuestions?: number;
+  /** Called after a valid decision. Not awaited; a throw or a rejected promise is ignored. */
   onAnswered?: (label: string, ms: number) => void;
 }
 
@@ -342,14 +344,10 @@ export function createStructuredChatDecisionModel(
             usage: readChatUsage(output.raw),
           };
           await waitFor(Promise.resolve());
-          try {
-            onAnswered?.(
-              request.label ?? 'decide',
-              performance.now() - started
-            );
-          } catch {
-            // A callback error must not make a valid decision fail.
-          }
+          // A callback error, sync or async, must not make a valid decision fail.
+          callHook(() =>
+            onAnswered?.(request.label ?? 'decide', performance.now() - started)
+          );
           return result;
         }
       );

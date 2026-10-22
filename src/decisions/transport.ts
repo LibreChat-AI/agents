@@ -2,6 +2,7 @@ import type { AwaitWithinDeadline } from './deadline';
 import type { DecisionCredential } from './types';
 import { withDecisionDeadline } from './deadline';
 import { DecisionError } from './types';
+import { callHook } from './hook';
 
 const DEFAULT_TIMEOUT_MS = 4_000;
 const DEFAULT_MAX_RETRIES = 2;
@@ -30,15 +31,30 @@ export interface TransportOptions {
   maxRetries?: number;
   fetch?: DecisionFetch;
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
-  /** Called only after the response parses, with no state, answers, or credentials. */
+  /**
+   * Called only after the response parses, with no state, answers, or
+   * credentials. Not awaited; a throw or a rejected promise is ignored.
+   */
   onAnswered?: (label: string, ms: number) => void;
 }
 
+/**
+ * `onRequest` is called once per HTTP request, just before it is sent:
+ * retries and every re-send after a 401 included. `onResponse` is called once
+ * per such request that ended before the deadline or the caller's abort, with
+ * its HTTP status (after a successful body is read in full) or `null` when the
+ * fetch failed or a successful body could not be read, and a reply's
+ * `Retry-After` in milliseconds when it was not OK and sent one; a request
+ * interrupted in flight gets none. Neither is awaited; a throw or a rejected
+ * promise is ignored.
+ */
 export type Transport = <T>(
   prepare: () => { payload: string; parse: (body: string) => T },
   signal: AbortSignal | undefined,
   label: string,
-  timeoutOverrideMs?: number
+  timeoutOverrideMs?: number,
+  onRequest?: () => void,
+  onResponse?: (status: number | null, retryAfterMs?: number) => void
 ) => Promise<T>;
 
 export function failureForStatus(
@@ -206,7 +222,14 @@ export function createTransport(options: TransportOptions): Transport {
     return token;
   }
 
-  return async function send(prepare, callerSignal, label, timeoutOverrideMs) {
+  return async function send(
+    prepare,
+    callerSignal,
+    label,
+    timeoutOverrideMs,
+    onRequest,
+    onResponse
+  ) {
     const started = performance.now();
     return withDecisionDeadline(
       providerId,
@@ -268,37 +291,64 @@ export function createTransport(options: TransportOptions): Transport {
                 throw refusal;
               }
             }
-            const response = await waitFor(
-              fetchImpl(endpoint, {
-                method: 'POST',
-                headers: {
-                  ...(key !== null ? { Authorization: `Bearer ${key}` } : {}),
-                  'Content-Type': 'application/json',
-                },
-                body: payload,
-                signal,
-                redirect: 'error',
-              })
-            );
+            if (onRequest !== undefined) {
+              callHook(() => onRequest());
+            }
+            /** Reports the request's end once, unless the deadline or the caller's abort interrupted it. */
+            let open = true;
+            const ended = (
+              status: number | null,
+              retryAfter?: number
+            ): void => {
+              if (open && !wasAborted() && onResponse !== undefined) {
+                callHook(() => onResponse(status, retryAfter));
+              }
+              open = false;
+            };
+            let response: Awaited<ReturnType<DecisionFetch>>;
+            try {
+              response = await waitFor(
+                fetchImpl(endpoint, {
+                  method: 'POST',
+                  headers: {
+                    ...(key !== null ? { Authorization: `Bearer ${key}` } : {}),
+                    'Content-Type': 'application/json',
+                  },
+                  body: payload,
+                  signal,
+                  redirect: 'error',
+                })
+              );
+            } catch (error) {
+              ended(null);
+              throw error;
+            }
             if (!response.ok) {
+              const retryAfter = retryAfterMs(
+                response.headers.get('retry-after')
+              );
+              ended(response.status, retryAfter);
               void response.body?.cancel().catch(() => {});
               const error = new DecisionError(
                 failureForStatus(response.status),
                 `decision model returned HTTP ${response.status}`,
                 { provider: providerId, status: response.status }
               );
-              error.retryAfterMs = retryAfterMs(
-                response.headers.get('retry-after')
-              );
+              error.retryAfterMs = retryAfter;
               throw error;
             }
-            const body = await readResponse(response.body, waitFor, providerId);
-            const result = await waitFor(Promise.resolve(parse(body)));
+            let body: string;
             try {
-              onAnswered?.(label, performance.now() - started);
-            } catch {
-              // Observability must not turn a valid answer into a retried request.
+              body = await readResponse(response.body, waitFor, providerId);
+            } catch (error) {
+              // A body that broke off or overflowed is no reply: the request may be retried.
+              ended(null);
+              throw error;
             }
+            ended(response.status);
+            const result = await waitFor(Promise.resolve(parse(body)));
+            // Observability, sync or async, must not turn a valid answer into a retried request.
+            callHook(() => onAnswered?.(label, performance.now() - started));
             return result;
           } catch (error) {
             if (wasAborted()) {

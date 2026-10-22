@@ -70,7 +70,9 @@ export function createBreaker(): DecisionBreaker {
  * A fatal failure from a call that started before a `reset()` does not reopen
  * it; a minter that shares one run between calls must not let a call made
  * after a reset join a run from before it or reuse a token such a run minted
- * (`commandToken` takes the breaker for this). Share one breaker between models that share a credential.
+ * (`commandToken` takes the breaker for this). Share one breaker between
+ * models that share a credential. A refusal sends nothing and reports no
+ * request; `reportsRequests` is kept.
  */
 export function withBreaker(
   model: DecisionModel,
@@ -79,6 +81,7 @@ export function withBreaker(
   return {
     id: model.id,
     model: model.model,
+    ...(model.reportsRequests === true ? { reportsRequests: true } : {}),
     breaker,
     async decide(request: DecisionRequest): Promise<DecisionResult> {
       const tripped = breaker.error;

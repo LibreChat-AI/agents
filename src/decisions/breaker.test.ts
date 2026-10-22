@@ -359,6 +359,51 @@ describe('probe', () => {
     });
   });
 
+  describe('bounds a model that ignores its deadline and signal', () => {
+    const hanging: DecisionModel = {
+      id: 'hanging',
+      model: 'hanging',
+      decide: () => new Promise(() => {}),
+    };
+    /** The probe's result, or `pending` when it has not settled after `ms`. */
+    const within = async (
+      ms: number,
+      task: Promise<unknown>
+    ): Promise<unknown> => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return await Promise.race([
+          task,
+          new Promise((resolve) => {
+            timer = setTimeout(() => resolve('pending'), ms);
+          }),
+        ]);
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+
+    it('at timeoutMs', async () => {
+      await expect(
+        within(1_000, probe(hanging, { timeoutMs: 50 }))
+      ).resolves.toMatchObject({ ok: false, failure: 'timeout' });
+    });
+
+    it('when the caller aborts mid-flight', async () => {
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(), 50);
+      await expect(
+        within(1_000, probe(hanging, { signal: controller.signal }))
+      ).resolves.toMatchObject({ ok: false, failure: 'aborted' });
+    });
+
+    it('when the caller already aborted', async () => {
+      await expect(
+        within(500, probe(hanging, { signal: AbortSignal.abort() }))
+      ).resolves.toMatchObject({ ok: false, failure: 'aborted' });
+    });
+  });
+
   it('redacts listed secrets from the failure detail', async () => {
     const leaky: DecisionModel = {
       id: 'leaky',

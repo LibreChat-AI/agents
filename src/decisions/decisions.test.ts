@@ -360,6 +360,38 @@ describe('decision dialect', () => {
 });
 
 describe('HTTP decisionModel', () => {
+  it('reports a 2xx whose body broke off as no reply, so its retry is not read as answered', async () => {
+    let sent = 0;
+    const fetch: DecisionFetch = async () => {
+      sent += 1;
+      if (sent > 1) {
+        return new Response(measured, { status: 200 });
+      }
+      const body = new ReadableStream<Uint8Array>({
+        start(controller): void {
+          controller.enqueue(new TextEncoder().encode('{"model":'));
+          controller.error(new TypeError('terminated'));
+        },
+      });
+      return new Response(body, { status: 200 });
+    };
+    const ended: Array<number | null> = [];
+    await createHttpDecisionModel({
+      endpoint: 'https://s1.example/v1/systemone',
+      apiKey: 'k',
+      model: 'jev-1.13.0',
+      dialect: 'systemone',
+      maxRetries: 1,
+      sleep: () => Promise.resolve(),
+      fetch,
+    }).decide({
+      state: {},
+      questions: { q: booleanQuestion('q?') },
+      onResponse: (status) => ended.push(status),
+    });
+    expect(ended).toEqual([null, 200]);
+  });
+
   it('posts Jev-shaped questions and keeps only measured answer probabilities', async () => {
     const { fetch, calls } = fakeFetch([
       {
@@ -1102,6 +1134,31 @@ describe('HTTP decisionModel', () => {
     });
     expect(onAnswered).toHaveBeenCalledTimes(1);
     expect(onAnswered).toHaveBeenCalledWith('gate', expect.any(Number));
+  });
+
+  it('ignores an async onAnswered that rejects, without an unhandled rejection', async () => {
+    const seen: unknown[] = [];
+    const listener = (reason: unknown): void => {
+      seen.push(reason);
+    };
+    process.on('unhandledRejection', listener);
+    try {
+      const ok = fakeFetch([{ status: 200, body: measured }]);
+      const result = await createHttpDecisionModel({
+        endpoint: 'https://s1.example',
+        apiKey: 'k',
+        dialect: 'systemone',
+        fetch: ok.fetch,
+        onAnswered: async () => {
+          throw new Error('observability');
+        },
+      }).decide({ state: {}, questions: { q: booleanQuestion('?') } });
+      expect(result.answers.q).toMatchObject({ type: 'boolean' });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    } finally {
+      process.off('unhandledRejection', listener);
+    }
+    expect(seen).toEqual([]);
   });
 
   it('keeps concurrent credential refreshes and request signals independent', async () => {
