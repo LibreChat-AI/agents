@@ -1015,12 +1015,71 @@ describe('HTTP decisionModel', () => {
     ).rejects.toMatchObject({ failure: 'timeout' });
   });
 
+  it.each(['timeout', 'aborted'] as const)(
+    'cancels a non-cooperative fetch body delivered after %s without late hooks or retries',
+    async (failure) => {
+      let reply: ((response: Response) => void) | undefined;
+      let sent: (() => void) | undefined;
+      const started = new Promise<void>((resolve) => {
+        sent = resolve;
+      });
+      let signal: AbortSignal | undefined;
+      const fetch: DecisionFetch = jest.fn(async (_url, init) => {
+        signal = init.signal;
+        sent?.();
+        return new Promise<Response>((resolve) => {
+          reply = resolve;
+        });
+      });
+      const onRequest = jest.fn();
+      const onResponse = jest.fn();
+      const onAnswered = jest.fn();
+      const caller = new AbortController();
+      const model = createHttpDecisionModel({
+        endpoint: 'https://s1.example',
+        requiresAuth: false,
+        fetch,
+        timeoutMs: failure === 'timeout' ? 25 : 1000,
+        onAnswered,
+      });
+      const pending = model.decide({
+        state: {},
+        questions: { q: booleanQuestion('?') },
+        signal: caller.signal,
+        onRequest,
+        onResponse,
+      });
+      const rejected = expect(pending).rejects.toMatchObject({ failure });
+      await started;
+      if (failure === 'aborted') {
+        caller.abort();
+      }
+      await rejected;
+      const cancel = jest.fn();
+      reply?.(
+        new Response(new ReadableStream<Uint8Array>({ cancel }), {
+          status: 200,
+        })
+      );
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(signal?.aborted).toBe(true);
+      expect(cancel).toHaveBeenCalledTimes(1);
+      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(onRequest).toHaveBeenCalledTimes(1);
+      expect(onResponse).not.toHaveBeenCalled();
+      expect(onAnswered).not.toHaveBeenCalled();
+    }
+  );
+
   it('aborts the fetch signal when the monotonic deadline expires before the timer runs', async () => {
     let seenSignal: AbortSignal | undefined;
+    const cancel = jest.fn();
     const fetch: DecisionFetch = async (_url, init) => {
       seenSignal = init.signal;
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 15);
-      return new Response(measured, { status: 200 });
+      return new Response(new ReadableStream<Uint8Array>({ cancel }), {
+        status: 200,
+      });
     };
     const decisionModel = createHttpDecisionModel({
       endpoint: 'https://s1.example',
@@ -1035,6 +1094,8 @@ describe('HTTP decisionModel', () => {
       })
     ).rejects.toMatchObject({ failure: 'timeout' });
     expect(seenSignal?.aborted).toBe(true);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(cancel).toHaveBeenCalledTimes(1);
   });
 
   it('bounds synchronous request preparation even when a state getter throws', async () => {

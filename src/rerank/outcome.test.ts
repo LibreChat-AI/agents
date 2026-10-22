@@ -7,7 +7,7 @@ import type {
   DecisionProviderSettings,
 } from '@/decisions';
 import type { RankRequest, RerankOutcome, OutcomeReranker } from './types';
-import type { FallbackStep } from './core';
+import type { FallbackStep, SystemOneRerankerOptions } from './core';
 import {
   probePin,
   rerankCost,
@@ -674,6 +674,46 @@ describe('System One per-document ranking', () => {
       state: tenant('b'),
     }).rank({ query: 'q', documents: ['d'] });
     expect(again.usage).toMatchObject({ calls: 0, cached: 1 });
+  });
+
+  it('captures custom-state presence with its factory when constructor options are reused', async () => {
+    const server = await stub((call) => ({
+      body: {
+        model: call.body.model,
+        answers: {
+          relevance: {
+            type: 'score',
+            score: (call.body.state as Json).tenant === 'a' ? 2 : 0,
+          },
+        },
+      },
+    }));
+    const options: SystemOneRerankerOptions = {
+      model: jev(server.url),
+      rubric,
+      cache: createScoreCache(),
+      pin: { model: 'jev-1.13.0', threshold: 1 },
+      state: (query, document) => ({ query, document, tenant: 'a' }),
+    };
+    const custom = createSystemOneReranker(options);
+    delete options.state;
+    const ordinary = createSystemOneReranker(options);
+    const request = { query: 'q', documents: ['d'] };
+    expect((await custom.rank(request)).results).toEqual([
+      { index: 0, score: 2, kept: true },
+    ]);
+    const outcome = await ordinary.rank(request);
+    expect(outcome.results).toEqual([{ index: 0, score: 0, kept: false }]);
+    expect(outcome.usage).toMatchObject({ calls: 1, cached: 0 });
+    expect(server.calls).toHaveLength(2);
+    expect((await custom.rank(request)).usage).toMatchObject({
+      calls: 0,
+      cached: 1,
+    });
+    expect((await ordinary.rank(request)).usage).toMatchObject({
+      calls: 0,
+      cached: 1,
+    });
   });
 
   it('refuses a score cache bound that would unbound it', () => {
@@ -1420,6 +1460,66 @@ function scripted(
 }
 
 describe('withFallback', () => {
+  it('preserves the answered outcome of a nested chain that starts with none', async () => {
+    const documents = ['alpha', 'beta'];
+    const bm25 = createBm25Reranker(corpusStats(documents));
+    const inner = withFallback([
+      { reranker: noneReranker() },
+      { reranker: bm25 },
+    ]);
+    const request = { query: 'beta', documents };
+    const nested = withFallback([{ reranker: inner }]);
+    for (const reranker of [
+      inner,
+      nested,
+      withFallback([{ reranker: nested }]),
+    ]) {
+      const outcome = await reranker.rank(request);
+      expect(order(outcome)).toEqual([1, 0]);
+      expect(outcome).toMatchObject({
+        provider: 'bm25',
+        status: 'degraded',
+        reason: 'disabled',
+      });
+      expect(
+        outcome.attempts.map(({ provider, status }) => [provider, status])
+      ).toEqual([
+        ['none', 'skipped'],
+        ['bm25', 'ok'],
+      ]);
+    }
+  });
+
+  it('consults the gate for a nested answering chain, while all-none chains stay request-free', async () => {
+    const documents = ['alpha', 'beta'];
+    const bm25 = createBm25Reranker(corpusStats(documents));
+    const rank = jest.spyOn(bm25, 'rank');
+    const inner = withFallback([
+      { reranker: noneReranker() },
+      { reranker: bm25 },
+    ]);
+    const gate = jest.fn(() => 'budget');
+    const request = { query: 'beta', documents };
+    const result = await withFallback([{ reranker: inner }], { gate }).rank(
+      request
+    );
+    expect(inner.kind).toBe('bm25');
+    expect(gate).toHaveBeenCalledTimes(1);
+    expect(gate).toHaveBeenCalledWith(inner);
+    expect(rank).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ status: 'skipped', reason: 'budget' });
+    expect(result.results).toEqual([
+      { index: 0, score: null },
+      { index: 1, score: null },
+    ]);
+    gate.mockClear();
+    const none = withFallback([{ reranker: noneReranker() }]);
+    expect(
+      (await withFallback([{ reranker: none }], { gate }).rank(request)).status
+    ).toBe('skipped');
+    expect(gate).not.toHaveBeenCalled();
+  });
+
   it('tries steps in order: a refused System One step degrades to the cross-encoder with the first reason', async () => {
     const server = await stub((call) =>
       call.path === '/v1/systemone'
