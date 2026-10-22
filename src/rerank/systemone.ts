@@ -63,7 +63,8 @@ export interface SystemOneRerankerOptions {
    * One deadline for the whole ranking, counted from the call: building
    * states, cache lookups, and re-issues included, and no request is sent
    * after it. A ranking the cache answers in full is served even when the
-   * lookups outran it. Defaults to 10 seconds.
+   * lookups outran it. Whole milliseconds from 1 to an hour; anything else
+   * throws at construction. Defaults to 10 seconds.
    */
   timeoutMs?: number;
   mode?: SystemOneMode;
@@ -196,6 +197,7 @@ export function createSystemOneReranker(
     ) ||
     !Number.isSafeInteger(maxDocuments) ||
     maxDocuments < 1 ||
+    !Number.isSafeInteger(timeoutMs) ||
     validDeadline(timeoutMs) === undefined ||
     (options.concurrency !== undefined &&
       (!Number.isSafeInteger(options.concurrency) ||
@@ -474,6 +476,8 @@ export function createSystemOneReranker(
           if (typeof serialized !== 'string') {
             return null;
           }
+          // The request sends this snapshot, not the caller's object: mutating it after `rank` cannot score one state under another's key.
+          states[index] = JSON.parse(serialized) as DecisionState;
           state = serialized;
         } catch {
           return null;

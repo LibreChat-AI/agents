@@ -33,7 +33,11 @@ export interface CrossEncoderRerankerOptions {
   apiKey?: DecisionCredential;
   /** Defaults to true; without a key every ranking is skipped with `no_api_key`. */
   requiresAuth?: boolean;
-  /** Defaults to 30 seconds; a request's `deadlineMs` can shorten it, never extend it. */
+  /**
+   * Whole milliseconds from 1 to an hour; anything else throws at
+   * construction. Defaults to 30 seconds; a request's `deadlineMs` can
+   * shorten it, never extend it.
+   */
   timeoutMs?: number;
   /** Retries for rate limits, server errors, and network failures. Defaults to 0. */
   maxRetries?: number;
@@ -151,6 +155,7 @@ export function createCrossEncoderReranker(
   const requiresAuth = options.requiresAuth !== false;
   if (
     model === '' ||
+    !Number.isSafeInteger(timeoutMs) ||
     validDeadline(timeoutMs) === undefined ||
     !Number.isSafeInteger(maxRetries) ||
     maxRetries < 0 ||

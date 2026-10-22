@@ -1,7 +1,7 @@
 import type { DecisionModel } from '../decisions/types';
 import type { RerankReason } from './types';
+import { rerankReasonOf, validDeadline, isRequestSignal } from './outcome';
 import { withDecisionDeadline } from '../decisions/deadline';
-import { rerankReasonOf, validDeadline } from './outcome';
 import { DecisionError } from '../decisions/types';
 import { probeRequest } from '../decisions/probe';
 
@@ -65,7 +65,8 @@ export async function probePin(options: PinProbeOptions): Promise<PinProbe> {
     pin === '' ||
     sentinel === '' ||
     sentinel === pin ||
-    typeof options.modelFor !== 'function'
+    typeof options.modelFor !== 'function' ||
+    !isRequestSignal(options.signal)
   ) {
     return { verified: false, reason: 'invalid_request' };
   }

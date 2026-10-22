@@ -35,7 +35,10 @@ import { callHook } from '../decisions/hook';
 export function noneReranker(
   options: { reason?: string } = {}
 ): OutcomeReranker {
-  const reason = options.reason ?? 'disabled';
+  const reason =
+    typeof options.reason === 'string' && options.reason !== ''
+      ? options.reason
+      : 'disabled';
   return {
     id: 'none',
     kind: 'none',
@@ -143,8 +146,11 @@ function abandonedUsage(kind: RerankKind, documents: number): RerankUsage {
   };
 }
 
-const isReason = (value: unknown): value is string | null =>
-  value === null || typeof value === 'string';
+/** `null` exactly when `status` is `ok`; otherwise the non-empty reason it failed or degraded. */
+const reasonFits = (status: string, reason: unknown): boolean =>
+  status === 'ok'
+    ? reason === null
+    : typeof reason === 'string' && reason !== '';
 
 const isFiniteNumber = (value: unknown): value is number =>
   typeof value === 'number' && Number.isFinite(value);
@@ -156,7 +162,7 @@ function isAttempt(value: unknown): value is RerankAttempt {
     typeof value.model === 'string' &&
     typeof value.status === 'string' &&
     ATTEMPT_STATUSES.has(value.status) &&
-    isReason(value.reason) &&
+    reasonFits(value.status, value.reason) &&
     isFiniteNumber(value.durationMs) &&
     value.durationMs >= 0 &&
     isRerankUsage(value.usage)
@@ -174,8 +180,9 @@ const keptByThreshold = (
 
 /**
  * The whole `RerankOutcome` contract, since a step's results and attempts are
- * passed through as they are: an answer (`ok` or `degraded`) scores every
- * document, and `kept` comes only with the `threshold` behind it, on every
+ * passed through as they are: `reason` is `null` exactly when the status
+ * (the outcome's and each attempt's) is `ok`, an answer (`ok` or
+ * `degraded`) scores every document, and `kept` comes only with the `threshold` behind it, on every
  * entry and matching it.
  */
 function isOutcome(value: unknown, documents: number): value is RerankOutcome {
@@ -185,7 +192,7 @@ function isOutcome(value: unknown, documents: number): value is RerankOutcome {
     STATUSES.has(value.status) &&
     isRerankKind(value.provider) &&
     typeof value.model === 'string' &&
-    isReason(value.reason) &&
+    reasonFits(value.status, value.reason) &&
     isRerankPermutation(value.results, documents) &&
     isRankedOrder(value.results) &&
     (value.status === 'skipped' ||
@@ -224,7 +231,8 @@ function ownAttempt(outcome: RerankOutcome): RerankAttempt {
     provider: outcome.provider,
     model: outcome.model,
     status,
-    reason: outcome.reason,
+    // A `degraded` step answered, so its own attempt is `ok` and carries no reason.
+    reason: status === 'ok' ? null : outcome.reason,
     durationMs: isFiniteNumber(outcome.durationMs)
       ? Math.max(0, outcome.durationMs)
       : 0,
@@ -505,78 +513,83 @@ export function withFallback(
         return performance.now() >= expiresAt ? 'timeout' : null;
       };
       let first: string | null = null;
-      for (let index = 0; index < chain.length; index++) {
-        const { reranker } = chain[index];
-        let stop = stopped();
-        if (stop === null && gate && reranker.kind !== 'none') {
-          const verdict = await consult(
-            gate,
-            reranker,
-            request.signal,
-            expiresAt
-          );
-          if ('stop' in verdict) {
-            stop = verdict.stop;
-          } else if (verdict.why !== null) {
-            attempts.push({
-              provider: reranker.kind,
-              model: reranker.model,
-              status: 'skipped',
-              reason: verdict.why,
-              durationMs: 0,
-              usage: emptyRerankUsage(),
-            });
-            first ??= verdict.why;
-            continue;
-          } else {
-            stop = stopped();
+      try {
+        for (let index = 0; index < chain.length; index++) {
+          const { reranker } = chain[index];
+          let stop = stopped();
+          if (stop === null && gate && reranker.kind !== 'none') {
+            const verdict = await consult(
+              gate,
+              reranker,
+              request.signal,
+              expiresAt
+            );
+            if ('stop' in verdict) {
+              stop = verdict.stop;
+            } else if (verdict.why !== null) {
+              attempts.push({
+                provider: reranker.kind,
+                model: reranker.model,
+                status: 'skipped',
+                reason: verdict.why,
+                durationMs: 0,
+                usage: emptyRerankUsage(),
+              });
+              first ??= verdict.why;
+              continue;
+            } else {
+              stop = stopped();
+            }
           }
+          if (stop !== null) {
+            first ??= stop;
+            break;
+          }
+          const outcome = await runStep(
+            reranker,
+            request.query,
+            request.documents,
+            stepDeadline(chain[index].deadlineMs, expiresAt),
+            request.signal
+          );
+          // Bookkeeping, sync or async, must not break a ranking.
+          if (onAttempt !== undefined) {
+            const seen = hookCopy(outcome);
+            callHook(() => onAttempt(reranker, seen));
+          }
+          const ran =
+            outcome.attempts.length > 0
+              ? outcome.attempts
+              : [ownAttempt(outcome)];
+          attempts.push(...ran);
+          // From the validated attempts, never the step's own total, so `usage` always sums `attempts`.
+          for (const attempt of ran) {
+            addRerankUsage(usage, attempt.usage);
+          }
+          if (reranker.kind !== 'none' && outcome.status !== 'skipped') {
+            const ok = index === 0 && outcome.status === 'ok';
+            return {
+              results: outcome.results,
+              provider: outcome.provider,
+              model: outcome.model,
+              status: ok ? 'ok' : 'degraded',
+              reason: ok ? null : (first ?? outcome.reason ?? 'error'),
+              attempts,
+              durationMs: elapsedMs(startedAt),
+              usage,
+              ...(outcome.pinVerified !== undefined
+                ? { pinVerified: outcome.pinVerified }
+                : {}),
+              ...(outcome.threshold !== undefined
+                ? { threshold: outcome.threshold }
+                : {}),
+            };
+          }
+          first ??= outcome.reason ?? 'error';
         }
-        if (stop !== null) {
-          first ??= stop;
-          break;
-        }
-        const outcome = await runStep(
-          reranker,
-          request.query,
-          request.documents,
-          stepDeadline(chain[index].deadlineMs, expiresAt),
-          request.signal
-        );
-        // Bookkeeping, sync or async, must not break a ranking.
-        if (onAttempt !== undefined) {
-          const seen = hookCopy(outcome);
-          callHook(() => onAttempt(reranker, seen));
-        }
-        const ran =
-          outcome.attempts.length > 0
-            ? outcome.attempts
-            : [ownAttempt(outcome)];
-        attempts.push(...ran);
-        // From the validated attempts, never the step's own total, so `usage` always sums `attempts`.
-        for (const attempt of ran) {
-          addRerankUsage(usage, attempt.usage);
-        }
-        if (reranker.kind !== 'none' && outcome.status !== 'skipped') {
-          const ok = index === 0 && outcome.status === 'ok';
-          return {
-            results: outcome.results,
-            provider: outcome.provider,
-            model: outcome.model,
-            status: ok ? 'ok' : 'degraded',
-            reason: ok ? null : (first ?? outcome.reason ?? null),
-            attempts,
-            durationMs: elapsedMs(startedAt),
-            usage,
-            ...(outcome.pinVerified !== undefined
-              ? { pinVerified: outcome.pinVerified }
-              : {}),
-            ...(outcome.threshold !== undefined
-              ? { threshold: outcome.threshold }
-              : {}),
-          };
-        }
-        first ??= outcome.reason ?? 'error';
+      } catch {
+        // Every helper above is meant never to throw; this keeps `rank` from rejecting if one does.
+        first ??= 'error';
       }
       return {
         ...identityOutcome(documents, {

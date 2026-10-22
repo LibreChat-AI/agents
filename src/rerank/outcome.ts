@@ -341,6 +341,14 @@ export function isRerankPermutation(
 export const isAborted = (signal: AbortSignal | undefined): boolean =>
   signal?.aborted === true;
 
+/**
+ * No signal, or a real `AbortSignal`: `AbortSignal.any` and `fetch` refuse
+ * anything else, duck-typed look-alikes included.
+ */
+export const isRequestSignal = (value: unknown): boolean =>
+  value === undefined ||
+  (typeof AbortSignal !== 'undefined' && value instanceof AbortSignal);
+
 /** How many documents a request carries, read defensively at the public boundary. */
 export const documentCount = (request: unknown): number =>
   isDecisionObject(request) && Array.isArray(request.documents)
@@ -406,7 +414,12 @@ export function stepOutcome(step: StepOutcome): RerankOutcome {
   const durationMs = elapsedMs(step.startedAt);
   const usage = step.usage ?? emptyRerankUsage();
   const ok = step.reason === undefined && step.scores !== undefined;
-  const reason = ok ? null : (step.reason ?? 'error');
+  let reason: string | null = null;
+  if (!ok) {
+    // An empty reason names nothing, so it is reported as the generic one.
+    reason =
+      step.reason === undefined || step.reason === '' ? 'error' : step.reason;
+  }
   const attempt: RerankAttempt = {
     provider: step.kind,
     model: step.model,
@@ -489,7 +502,11 @@ export function retriedReply(
   return error;
 }
 
-/** A positive integer deadline no longer than an hour, or `undefined` when it is not one. */
+/**
+ * A positive finite deadline rounded up to whole milliseconds, when that is no
+ * longer than an hour; otherwise `undefined`. It accepts fractions, so a
+ * configured timeout kept as given must also be checked as an integer.
+ */
 export function validDeadline(value: unknown): number | undefined {
   if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
     return undefined;
@@ -515,7 +532,7 @@ export function everySlot<T>(
   return true;
 }
 
-/** A non-empty query and string documents, or the reason the request cannot be ranked. */
+/** A non-empty query, string documents, and a real signal if any, or the reason the request cannot be ranked. */
 export function rankRequestProblem(request: unknown): RerankReason | undefined {
   if (
     !isDecisionObject(request) ||
@@ -525,7 +542,8 @@ export function rankRequestProblem(request: unknown): RerankReason | undefined {
     !everySlot(
       request.documents as unknown[],
       (document) => typeof document === 'string'
-    )
+    ) ||
+    !isRequestSignal(request.signal)
   ) {
     return 'invalid_request';
   }

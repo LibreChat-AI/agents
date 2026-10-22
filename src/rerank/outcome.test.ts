@@ -814,6 +814,10 @@ describe('System One per-document ranking', () => {
       { estimatedTokensPerDocument: Infinity },
       { timeoutMs: 0 },
       { timeoutMs: Number.NaN },
+      // Fractions are rejected, not kept: the deadline wrapper refuses them on every call.
+      { timeoutMs: 0.5 },
+      { timeoutMs: (0.1 + 0.2) * 1000 },
+      { mode: 'batch' as const, timeoutMs: 0.5 },
       { concurrency: 0 },
       { concurrency: 1.5 },
       { instructions: circular as never },
@@ -984,6 +988,30 @@ describe('System One per-document ranking', () => {
       sent.map((request) => request.questions.relevance.instructions)
     ).toEqual([{ strict: false }, { strict: false }]);
     expect(outcome.results[0].score).toBe(2);
+  });
+
+  it('snapshots a custom state with its cache key, so a caller mutating it after rank never caches one state under another', async () => {
+    const { model, sent } = fakeJev((request) =>
+      (request.state as { variant: string }).variant === 'A' ? 2 : 0
+    );
+    const shared = { variant: 'A' };
+    let fresh = false;
+    const reranker = createSystemOneReranker({
+      model,
+      rubric,
+      cache: createScoreCache(),
+      state: () => (fresh ? { variant: 'A' } : shared),
+    });
+    const pending = reranker.rank({ query: 'q', documents: ['d'] });
+    shared.variant = 'B';
+    const first = await pending;
+    expect(sent.map((request) => request.state)).toEqual([{ variant: 'A' }]);
+    expect(first.results[0].score).toBe(2);
+    fresh = true;
+    const second = await reranker.rank({ query: 'q', documents: ['d'] });
+    expect(sent).toHaveLength(1);
+    expect(second).toMatchObject({ usage: { calls: 0, cached: 1 } });
+    expect(second.results[0].score).toBe(2);
   });
 });
 
@@ -1285,6 +1313,22 @@ describe('cross-encoder ranking', () => {
     expect(outcome.status).toBe('ok');
     expect(minted).toEqual([false, true]);
     expect(outcome.usage.calls).toBe(2);
+  });
+
+  it('rejects a fractional timeout at construction instead of failing every ranking', async () => {
+    const server = await stub(relevance(RELEVANCE));
+    const base = { url: `${server.url}/rerank`, model: 'm', apiKey: 'k' };
+    for (const timeoutMs of [0.5, (0.1 + 0.2) * 1000]) {
+      expect(() => createCrossEncoderReranker({ ...base, timeoutMs })).toThrow(
+        'invalid reranker configuration'
+      );
+    }
+    const outcome = await createCrossEncoderReranker({
+      ...base,
+      timeoutMs: 1100,
+    }).rank({ query: 'q', documents: ['alpha', 'beta'] });
+    expect(outcome.status).toBe('ok');
+    expect(server.calls).toHaveLength(1);
   });
 
   it('rejects a token estimate that is not a finite count instead of charging nothing', () => {
@@ -1634,6 +1678,62 @@ describe('withFallback', () => {
         ],
         ['an unknown provider', { provider: 'bogus' }],
         ['a non-string reason', { reason: 7 }],
+        ['an answer with a reason', { reason: 'partial' }],
+        ['a degraded answer without a reason', { status: 'degraded' }],
+        [
+          'a degraded answer with an empty reason',
+          { status: 'degraded', reason: '' },
+        ],
+        ['a skipped outcome without a reason', { status: 'skipped' }],
+        [
+          'a skipped outcome with an empty reason',
+          { status: 'skipped', reason: '' },
+        ],
+        [
+          'an ok attempt with a reason',
+          {
+            attempts: [
+              {
+                provider: 'cross-encoder',
+                model: 'm',
+                status: 'ok',
+                reason: 'partial',
+                durationMs: 1,
+                usage: { ...emptyUsage },
+              },
+            ],
+          },
+        ],
+        [
+          'a failed attempt without a reason',
+          {
+            attempts: [
+              {
+                provider: 'cross-encoder',
+                model: 'm',
+                status: 'failed',
+                reason: null,
+                durationMs: 1,
+                usage: { ...emptyUsage },
+              },
+            ],
+          },
+        ],
+        [
+          'a skipped attempt with an empty reason',
+          {
+            attempts: [
+              {
+                provider: 'cross-encoder',
+                model: 'm',
+                status: 'skipped',
+                reason: '',
+                durationMs: 1,
+                usage: { ...emptyUsage },
+              },
+            ],
+          },
+        ],
         ['a non-numeric threshold', { threshold: 'x' }],
         ['a non-boolean pinVerified', { pinVerified: 'yes' }],
       ] as const
@@ -1691,6 +1791,66 @@ describe('withFallback', () => {
       expect(order(outcome)).toEqual([1, 0]);
     }
   );
+
+  it('never answers degraded without a reason, and an empty none reason is disabled', async () => {
+    const degraded = scripted('cross-encoder', () => ({
+      results: [
+        { index: 1, score: 1 },
+        { index: 0, score: 0 },
+      ],
+      provider: 'cross-encoder',
+      model: 'm',
+      status: 'degraded',
+      reason: null,
+      attempts: [],
+      durationMs: 0,
+      usage: { ...emptyUsage },
+    }));
+    const alone = await withFallback([{ reranker: degraded }]).rank({
+      query: 'q',
+      documents: ['a', 'b'],
+    });
+    expect(alone).toMatchObject({
+      status: 'skipped',
+      reason: 'invalid_results',
+    });
+    const nested = await withFallback([
+      { reranker: withFallback([{ reranker: degraded }]) },
+    ]).rank({ query: 'q', documents: ['a', 'b'] });
+    expect(nested).toMatchObject({
+      status: 'skipped',
+      reason: 'invalid_results',
+    });
+    const answered = await withFallback([
+      {
+        reranker: scripted('cross-encoder', () => ({
+          results: [
+            { index: 1, score: 1 },
+            { index: 0, score: 0 },
+          ],
+          provider: 'cross-encoder',
+          model: 'm',
+          status: 'degraded',
+          reason: 'partial',
+          attempts: [],
+          durationMs: 0,
+          usage: { ...emptyUsage },
+        })),
+      },
+    ]).rank({ query: 'q', documents: ['a', 'b'] });
+    expect(answered).toMatchObject({ status: 'degraded', reason: 'partial' });
+    // The step answered, so its own attempt is `ok`, and an `ok` attempt has no reason.
+    expect(answered.attempts).toEqual([
+      expect.objectContaining({ status: 'ok', reason: null }),
+    ]);
+    const none = await withFallback([
+      { reranker: noneReranker({ reason: '' }) },
+    ]).rank({ query: 'q', documents: ['a', 'b'] });
+    expect(none).toMatchObject({ status: 'skipped', reason: 'disabled' });
+    expect(none.attempts).toEqual([
+      expect.objectContaining({ status: 'skipped', reason: 'disabled' }),
+    ]);
+  });
 
   it('a gate skips a step without a request, none never answers, and nothing answering is skipped with the first reason', async () => {
     const server = await stub(scored(SCORES));
@@ -2240,6 +2400,140 @@ describe('sparse document arrays', () => {
     expect(() =>
       createSystemOneReranker({ model, rubric: new Array<string>(3) })
     ).toThrow('invalid reranker configuration');
+  });
+});
+
+describe('malformed request signals', () => {
+  const malformed: Array<[string, unknown]> = [
+    ['an empty object', {}],
+    ['null', null],
+    ['a string', 'nope'],
+    [
+      'a duck-typed signal',
+      {
+        aborted: false,
+        addEventListener: () => undefined,
+        removeEventListener: () => undefined,
+      },
+    ],
+  ];
+
+  it.each(malformed)(
+    'withFallback answers %s as invalid_request, with or without a deadline or gate, and never rejects',
+    async (_label, signal) => {
+      const step = scripted('cross-encoder', () => {
+        throw new Error('never reached');
+      });
+      const shapes: Array<[FallbackStep[], { deadlineMs?: number }, boolean]> =
+        [
+          [[{ reranker: step }], {}, false],
+          [[{ reranker: step }], { deadlineMs: 500 }, false],
+          [[{ reranker: step, deadlineMs: 500 }], {}, false],
+          [[{ reranker: step }], {}, true],
+        ];
+      for (const [steps, extra, gated] of shapes) {
+        const gate = jest.fn(() => null);
+        const outcome = await withFallback(steps, gated ? { gate } : {}).rank({
+          query: 'q',
+          documents: ['a', 'b'],
+          signal: signal as AbortSignal,
+          ...extra,
+        });
+        expect(outcome).toMatchObject({
+          status: 'skipped',
+          reason: 'invalid_request',
+          attempts: [],
+          usage: emptyUsage,
+        });
+        expect(gate).not.toHaveBeenCalled();
+      }
+      expect(step.requests).toHaveLength(0);
+    }
+  );
+
+  it.each(malformed)(
+    'every reranker and probePin answer %s as invalid_request before any request',
+    async (_label, signal) => {
+      const server = await stub(relevance(RELEVANCE));
+      const { model, sent } = fakeJev(() => 2);
+      const rejecting = jest.fn(() =>
+        Promise.resolve({ results: [], model: 'm', usage: null })
+      );
+      const rerankers: OutcomeReranker[] = [
+        createSystemOneReranker({ model, rubric }),
+        createSystemOneReranker({ model, rubric, mode: 'batch' }),
+        createCrossEncoderReranker({
+          url: `${server.url}/rerank`,
+          model: 'm',
+          apiKey: 'k',
+        }),
+        createBm25Reranker({ idf: () => 1, avgdl: 2 }),
+        toOutcomeReranker(
+          { id: 'rejecting', rerank: rejecting },
+          { kind: 'cross-encoder', model: 'm' }
+        ),
+      ];
+      for (const reranker of rerankers) {
+        const outcome = await reranker.rank({
+          query: 'q',
+          documents: ['a', 'b'],
+          signal: signal as AbortSignal,
+        });
+        expect(outcome).toMatchObject({
+          status: 'skipped',
+          reason: 'invalid_request',
+          usage: emptyUsage,
+        });
+      }
+      const modelFor = jest.fn(() => model);
+      await expect(
+        probePin({
+          modelFor,
+          pin: 'jev-1.13.0',
+          signal: signal as AbortSignal,
+        })
+      ).resolves.toEqual({ verified: false, reason: 'invalid_request' });
+      expect(modelFor).not.toHaveBeenCalled();
+      expect(rejecting).not.toHaveBeenCalled();
+      expect(sent).toHaveLength(0);
+      expect(server.calls).toHaveLength(0);
+    }
+  );
+
+  it('accepts a real signal', async () => {
+    const outcome = await withFallback([
+      { reranker: createBm25Reranker({ idf: () => 1, avgdl: 2 }) },
+    ]).rank({
+      query: 'alpha',
+      documents: ['gamma', 'alpha beta'],
+      signal: new AbortController().signal,
+      deadlineMs: 500,
+    });
+    expect(outcome).toMatchObject({ status: 'ok', reason: null });
+  });
+
+  it('withFallback resolves even when reading the request throws mid-chain', async () => {
+    let reads = 0;
+    const request = {
+      query: 'q',
+      documents: ['a', 'b'],
+      get signal(): AbortSignal | undefined {
+        reads += 1;
+        if (reads > 1) {
+          throw new Error('signal getter');
+        }
+        return undefined;
+      },
+    };
+    const outcome = await withFallback([{ reranker: noneReranker() }]).rank(
+      request
+    );
+    expect(outcome).toMatchObject({
+      status: 'skipped',
+      reason: 'error',
+      attempts: [],
+      usage: emptyUsage,
+    });
   });
 });
 
