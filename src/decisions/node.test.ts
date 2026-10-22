@@ -450,6 +450,44 @@ describe('commandToken', () => {
       );
       expect(error.message).not.toContain('ab12');
     });
+
+    it.each([
+      ['`;`', '--pw=abc12;exit 7', 7],
+      ['`&&`', '--pw=abc12&&true', 2],
+      ['`||`', '--pw=abc12||exit 3', 3],
+      ['`|`', '--pw=abc12|cat;exit 5', 5],
+      ['`>`', '--pw=abc12>/dev/null', 2],
+      ['`<`', '--pw=abc12</dev/null', 2],
+    ])(
+      'redacts an argument the shell ends at %s without whitespace',
+      async (_case, argument, code) => {
+        if (process.platform === 'win32') {
+          return;
+        }
+        const base = await script(echo);
+        const error = await rejection(
+          commandToken(`${base} ${argument}`)({ refresh: false })
+        );
+        expect(error.message).toBe(
+          `token command exited with code ${code}: bad password [REDACTED]`
+        );
+        expect(error.message).not.toContain('abc');
+      }
+    );
+
+    it('redacts an argument the shell ends at a closing parenthesis', async () => {
+      if (process.platform === 'win32') {
+        return;
+      }
+      const base = await script(echo);
+      const error = await rejection(
+        commandToken(`(${base} --pw=abc12)`)({ refresh: false })
+      );
+      expect(error.message).toBe(
+        'token command exited with code 2: bad password [REDACTED]'
+      );
+      expect(error.message).not.toContain('abc');
+    });
   });
 
   it('formats the failure promptly when stdout repeats short lines that stderr is full of', async () => {

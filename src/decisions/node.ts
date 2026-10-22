@@ -243,11 +243,14 @@ function collect(
  * The command text and every word of it whatever its length, so neither a
  * shell that echoes the line nor a program that quotes an argument back can
  * leak an inline secret; a short word may garble the excerpt instead. Words
- * split at quotes, which the shell removes, and at braces and commas, which
- * bash's brace expansion splits a word at.
+ * split at quotes, which the shell removes; at braces and commas, which
+ * bash's brace expansion splits a word at; and at `;`, `&`, `|`, `(`, `)`,
+ * `<`, and `>`, which end an unquoted word without whitespace in a POSIX
+ * shell and in cmd.exe alike. Splitting quoted text there too is harmless,
+ * since every piece is still redacted.
  */
 function commandSecrets(command: string): string[] {
-  return [command, ...command.split(/[\s'"`=,{}]+/)].filter(
+  return [command, ...command.split(/[\s'"`=,{};&|()<>]+/)].filter(
     (word) => word.trim() !== ''
   );
 }
@@ -358,7 +361,8 @@ function validExitCodes(codes: ReadonlyArray<number> | undefined): boolean {
  *
  * The message carries the exit status and a redacted stderr excerpt, never
  * a line of stdout, the command or any word of it (split at whitespace,
- * quotes, `=`, braces, and commas), or any of the last eight tokens it minted
+ * quotes, `=`, braces, commas, and the shell operators `;`, `&`, `|`, `(`,
+ * `)`, `<`, and `>`), or any of the last eight tokens it minted
  * or was told were refused, cached or not, whatever their length, including a
  * refused token whose refresh failed. The excerpt reads only the start of
  * stderr, so formatting it stays cheap whatever the command printed. When the
