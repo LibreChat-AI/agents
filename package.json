@@ -1,6 +1,6 @@
 {
   "name": "@librechat/agents",
-  "version": "4.0.5",
+  "version": "4.1.0",
   "reova": {
     "enabled": true,
     "endpoint": "https://telemetry.reo.dev/data"
@@ -18,6 +18,21 @@
       "types": "./dist/types/provider-registration.d.ts",
       "import": "./dist/esm/provider-registration.mjs",
       "require": "./dist/cjs/provider-registration.cjs"
+    },
+    "./decisions": {
+      "types": "./dist/types/decisions/core.d.ts",
+      "import": "./dist/esm/decisions/core.mjs",
+      "require": "./dist/cjs/decisions/core.cjs"
+    },
+    "./decisions/node": {
+      "types": "./dist/types/decisions/node.d.ts",
+      "import": "./dist/esm/decisions/node.mjs",
+      "require": "./dist/cjs/decisions/node.cjs"
+    },
+    "./rerank": {
+      "types": "./dist/types/rerank/core.d.ts",
+      "import": "./dist/esm/rerank/core.mjs",
+      "require": "./dist/cjs/rerank/core.cjs"
     },
     "./openai": {
       "types": "./dist/types/openai/index.d.ts",
@@ -120,6 +135,15 @@
       "provider-registration": [
         "dist/types/provider-registration.d.ts"
       ],
+      "decisions": [
+        "dist/types/decisions/core.d.ts"
+      ],
+      "decisions/node": [
+        "dist/types/decisions/node.d.ts"
+      ],
+      "rerank": [
+        "dist/types/rerank/core.d.ts"
+      ],
       "langchain": [
         "dist/types/langchain/index.d.ts"
       ],
@@ -193,6 +217,7 @@
     "build:dev": "tsdown",
     "check:circular-deps": "node config/circular-deps.mjs",
     "test:circular-deps": "node --test config/circular-deps.test.mjs",
+    "test:light-entries": "node --test config/light-entries.test.mjs",
     "sort-imports": "node scripts/sort-imports.ts",
     "sort-imports:check": "node scripts/sort-imports.ts --check",
     "start": "node dist/esm/main.js",

@@ -978,6 +978,22 @@ export type LocalExecutionConfig = {
    */
   includeCodingTools?: boolean;
   /**
+   * Allowlist of auto-bound local coding tool names (for example
+   * `['read_file', 'edit_file', 'grep_search', 'bash_tool']`). Omit to bind
+   * the whole suite. Fewer tool schemas means a smaller prompt on every
+   * request.
+   */
+  codingToolNames?: readonly string[];
+  /**
+   * Opt-in cap, in characters, on the results the model reads most:
+   * `read_file` keeps whole lines up to the cap (and its `limit`, when
+   * given) with an `offset` hint to continue, `grep_search` cuts long match lines and stops
+   * at the cap with a count of omitted lines, and `bash_tool` keeps the head
+   * and tail of long stdout and stderr with the status lines intact. Unset
+   * keeps the existing limits.
+   */
+  toolResultMaxChars?: number;
+  /**
    * Override the process launcher. When set, replaces
    * `child_process.spawn` for every local tool invocation, allowing
    * SSH/container delegation. Default: native spawn.

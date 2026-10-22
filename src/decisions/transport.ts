@@ -2,6 +2,7 @@ import type { AwaitWithinDeadline } from './deadline';
 import type { DecisionCredential } from './types';
 import { withDecisionDeadline } from './deadline';
 import { DecisionError } from './types';
+import { callHook } from './hook';
 
 const DEFAULT_TIMEOUT_MS = 4_000;
 const DEFAULT_MAX_RETRIES = 2;
@@ -30,22 +31,40 @@ export interface TransportOptions {
   maxRetries?: number;
   fetch?: DecisionFetch;
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
-  /** Called only after the response parses, with no state, answers, or credentials. */
+  /**
+   * Called only after the response parses, with no state, answers, or
+   * credentials. Not awaited; a throw or a rejected promise is ignored.
+   */
   onAnswered?: (label: string, ms: number) => void;
 }
 
+/**
+ * `onRequest` is called once per HTTP request, just before it is sent:
+ * retries and every re-send after a 401 included. `onResponse` is called once
+ * per such request that ended before the deadline or the caller's abort, with
+ * its HTTP status (after a successful body is read in full) or `null` when the
+ * fetch failed or a successful body could not be read, and a reply's
+ * `Retry-After` in milliseconds when it was not OK and sent one; a request
+ * interrupted in flight gets none. Neither is awaited; a throw or a rejected
+ * promise is ignored.
+ */
 export type Transport = <T>(
   prepare: () => { payload: string; parse: (body: string) => T },
   signal: AbortSignal | undefined,
   label: string,
-  timeoutOverrideMs?: number
+  timeoutOverrideMs?: number,
+  onRequest?: () => void,
+  onResponse?: (status: number | null, retryAfterMs?: number) => void
 ) => Promise<T>;
 
 export function failureForStatus(
   status: number
-): 'unauthorized' | 'rate_limited' | 'server_error' | 'bad_request' {
+): 'unauthorized' | 'quota' | 'rate_limited' | 'server_error' | 'bad_request' {
   if (status === 401 || status === 403) {
     return 'unauthorized';
+  }
+  if (status === 402) {
+    return 'quota';
   }
   if (status === 429) {
     return 'rate_limited';
@@ -176,7 +195,7 @@ export function createTransport(options: TransportOptions): Transport {
   }
 
   async function resolveKey(
-    refresh: boolean,
+    refused: string | undefined,
     signal: AbortSignal
   ): Promise<string | null> {
     if (typeof credential === 'string') {
@@ -185,7 +204,11 @@ export function createTransport(options: TransportOptions): Transport {
     if (!credential) {
       return null;
     }
-    const minted: string = await credential({ refresh, signal });
+    const minted: string = await credential(
+      refused === undefined
+        ? { refresh: false, signal }
+        : { refresh: true, refused, signal }
+    );
     const token = typeof minted === 'string' ? minted.trim() : '';
     if (!token) {
       throw new DecisionError(
@@ -199,7 +222,14 @@ export function createTransport(options: TransportOptions): Transport {
     return token;
   }
 
-  return async function send(prepare, callerSignal, label, timeoutOverrideMs) {
+  return async function send(
+    prepare,
+    callerSignal,
+    label,
+    timeoutOverrideMs,
+    onRequest,
+    onResponse
+  ) {
     const started = performance.now();
     return withDecisionDeadline(
       providerId,
@@ -230,7 +260,14 @@ export function createTransport(options: TransportOptions): Transport {
             'decision model request interrupted',
             { provider: providerId }
           );
-        let refreshed = false;
+        /**
+         * Keys 401s refused in this call. The first earns a refresh; a second
+         * earns one recheck with `refresh: false`, since another call may have
+         * replaced the key while this request was in flight, and the call
+         * re-sends only a key it has not had refused.
+         */
+        const refused: string[] = [];
+        let refusal: DecisionError | undefined;
         let key: string | null | undefined;
         let lastError: DecisionError | undefined;
         for (let attemptNo = 0; attemptNo <= maxRetries; attemptNo++) {
@@ -239,10 +276,39 @@ export function createTransport(options: TransportOptions): Transport {
           }
           try {
             if (key === undefined) {
-              key = await waitFor(resolveKey(refreshed, signal));
+              key = await waitFor(
+                resolveKey(
+                  refused.length === 1 ? refused[0] : undefined,
+                  signal
+                )
+              );
+              if (
+                refusal !== undefined &&
+                typeof key === 'string' &&
+                refused.includes(key)
+              ) {
+                /** The minter has nothing newer than a key this call had refused: that refusal stands. */
+                throw refusal;
+              }
             }
-            const response = await waitFor(
-              fetchImpl(endpoint, {
+            if (onRequest !== undefined) {
+              callHook(() => onRequest());
+            }
+            /** Reports the request's end once, unless the deadline or the caller's abort interrupted it. */
+            let open = true;
+            const ended = (
+              status: number | null,
+              retryAfter?: number
+            ): void => {
+              if (open && !wasAborted() && onResponse !== undefined) {
+                callHook(() => onResponse(status, retryAfter));
+              }
+              open = false;
+            };
+            let response: Awaited<ReturnType<DecisionFetch>>;
+            let pending: ReturnType<DecisionFetch> | undefined;
+            try {
+              pending = fetchImpl(endpoint, {
                 method: 'POST',
                 headers: {
                   ...(key !== null ? { Authorization: `Bearer ${key}` } : {}),
@@ -251,27 +317,40 @@ export function createTransport(options: TransportOptions): Transport {
                 body: payload,
                 signal,
                 redirect: 'error',
-              })
-            );
+              });
+              response = await waitFor(pending);
+            } catch (error) {
+              // A fetch that ignores abort still owns a body when it eventually resolves.
+              void pending?.then((late) => late.body?.cancel()).catch(() => {});
+              ended(null);
+              throw error;
+            }
             if (!response.ok) {
+              const retryAfter = retryAfterMs(
+                response.headers.get('retry-after')
+              );
+              ended(response.status, retryAfter);
               void response.body?.cancel().catch(() => {});
               const error = new DecisionError(
                 failureForStatus(response.status),
                 `decision model returned HTTP ${response.status}`,
                 { provider: providerId, status: response.status }
               );
-              error.retryAfterMs = retryAfterMs(
-                response.headers.get('retry-after')
-              );
+              error.retryAfterMs = retryAfter;
               throw error;
             }
-            const body = await readResponse(response.body, waitFor, providerId);
-            const result = await waitFor(Promise.resolve(parse(body)));
+            let body: string;
             try {
-              onAnswered?.(label, performance.now() - started);
-            } catch {
-              // Observability must not turn a valid answer into a retried request.
+              body = await readResponse(response.body, waitFor, providerId);
+            } catch (error) {
+              // A body that broke off or overflowed is no reply: the request may be retried.
+              ended(null);
+              throw error;
             }
+            ended(response.status);
+            const result = await waitFor(Promise.resolve(parse(body)));
+            // Observability, sync or async, must not turn a valid answer into a retried request.
+            callHook(() => onAnswered?.(label, performance.now() - started));
             return result;
           } catch (error) {
             if (wasAborted()) {
@@ -289,9 +368,12 @@ export function createTransport(options: TransportOptions): Transport {
             if (
               lastError.status === 401 &&
               typeof credential === 'function' &&
-              !refreshed
+              typeof key === 'string' &&
+              refused.length < 2 &&
+              !refused.includes(key)
             ) {
-              refreshed = true;
+              refused.push(key);
+              refusal = lastError;
               key = undefined;
               attemptNo -= 1;
               continue;
