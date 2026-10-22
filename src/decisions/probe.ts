@@ -1,0 +1,99 @@
+import type { DecisionModel, DecisionFailure, DecisionRequest } from './types';
+import { booleanQuestion } from './questions';
+import { DecisionError } from './types';
+import { redactExcerpt } from './redact';
+
+const DETAIL_LIMIT = 200;
+const PROBE_FAILED = 'decision model probe failed';
+
+export type DecisionProbe =
+  | { ok: true; model: string }
+  | {
+      ok: false;
+      failure: DecisionFailure;
+      status?: number;
+      circuitOpen: boolean;
+      /** Redacted, whitespace-collapsed, and truncated; safe for a log line or a status row. */
+      detail: string;
+    };
+
+export interface DecisionProbeOptions {
+  /** Defaults to the model's own timeout; allow for a slow first token mint. */
+  timeoutMs?: number;
+  signal?: AbortSignal;
+  /** Credentials the failure detail must never contain. */
+  secrets?: ReadonlyArray<string | null | undefined>;
+}
+
+export type DecisionProbeRequest = Pick<
+  DecisionRequest,
+  'state' | 'questions' | 'label'
+>;
+
+/** One yes/no question a host answers in a few tokens; the answer itself is irrelevant. */
+export function probeRequest(): DecisionProbeRequest {
+  return {
+    state: 'decision model readiness probe',
+    questions: { ok: booleanQuestion('Is this text a readiness probe?') },
+    label: 'probe',
+  };
+}
+
+/**
+ * Can this model answer right now? Asks one tiny boolean question and never
+ * throws: any reply is `ok`, and any failure, including a non-SDK exception
+ * (read as `network`), is returned with a redacted detail. Through
+ * `withBreaker`, a fatal failure trips the breaker and an open breaker answers
+ * without a request.
+ */
+export async function probe(
+  model: DecisionModel,
+  options: DecisionProbeOptions = {}
+): Promise<DecisionProbe> {
+  try {
+    const result = await model.decide({
+      ...probeRequest(),
+      ...(options.timeoutMs !== undefined
+        ? { timeoutMs: options.timeoutMs }
+        : {}),
+      ...(options.signal !== undefined ? { signal: options.signal } : {}),
+    });
+    return { ok: true, model: result.model };
+  } catch (error) {
+    if (!(error instanceof DecisionError)) {
+      return {
+        ok: false,
+        failure: 'network',
+        circuitOpen: false,
+        detail: PROBE_FAILED,
+      };
+    }
+    return {
+      ok: false,
+      failure: error.failure,
+      ...(error.status !== undefined ? { status: error.status } : {}),
+      circuitOpen: error.circuitOpen,
+      detail: safeDetail(error.message, options.secrets),
+    };
+  }
+}
+
+/**
+ * The redacted start of the message, or a fixed detail when `secrets` cannot
+ * be read: never the raw message, never a throw. Only the start is read, so a
+ * host model's oversized error message cannot make the probe slow or large.
+ */
+function safeDetail(
+  message: string,
+  secrets: DecisionProbeOptions['secrets']
+): string {
+  try {
+    return redactExcerpt(
+      message,
+      secrets === undefined ? [] : secrets,
+      DETAIL_LIMIT
+    );
+  } catch {
+    return PROBE_FAILED;
+  }
+}

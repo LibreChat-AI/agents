@@ -4,7 +4,12 @@ import { access } from 'node:fs/promises';
 import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
 
-import { lightSubpaths, probe, walkDeclarations } from './light-entries.mjs';
+import {
+  lightSubpaths,
+  neutralSubpaths,
+  probe,
+  walkDeclarations,
+} from './light-entries.mjs';
 import { packageEntries } from './package-entries.mjs';
 import manifest from '../package.json' with { type: 'json' };
 
@@ -48,6 +53,22 @@ for (const subpath of lightSubpaths) {
     assert.deepEqual(result.missing, []);
   });
 }
+
+for (const subpath of neutralSubpaths) {
+  for (const format of ['esm', 'cjs']) {
+    test(`${subpath} loads without Node built-ins (${format})`, async () => {
+      const result = await probe(subpath, format);
+      assert.deepEqual(result.builtins, []);
+    });
+  }
+}
+
+test('./decisions/node reaches only node:child_process', async () => {
+  for (const format of ['esm', 'cjs']) {
+    const result = await probe('./decisions/node', format);
+    assert.deepEqual(result.builtins, ['child_process']);
+  }
+});
 
 test('the probe reports third-party packages a subpath reaches', async () => {
   const result = await probe('./langchain/messages', 'esm');

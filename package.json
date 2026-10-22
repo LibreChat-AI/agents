@@ -24,6 +24,11 @@
       "import": "./dist/esm/decisions/core.mjs",
       "require": "./dist/cjs/decisions/core.cjs"
     },
+    "./decisions/node": {
+      "types": "./dist/types/decisions/node.d.ts",
+      "import": "./dist/esm/decisions/node.mjs",
+      "require": "./dist/cjs/decisions/node.cjs"
+    },
     "./rerank": {
       "types": "./dist/types/rerank/core.d.ts",
       "import": "./dist/esm/rerank/core.mjs",
@@ -132,6 +137,9 @@
       ],
       "decisions": [
         "dist/types/decisions/core.d.ts"
+      ],
+      "decisions/node": [
+        "dist/types/decisions/node.d.ts"
       ],
       "rerank": [
         "dist/types/rerank/core.d.ts"

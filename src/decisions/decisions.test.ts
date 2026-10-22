@@ -806,14 +806,20 @@ describe('HTTP decisionModel', () => {
     });
     expect(limited.calls).toHaveLength(2);
 
-    const seen: boolean[] = [];
+    const seen: Array<{ refresh: boolean; refused?: string }> = [];
     const expiring = fakeFetch([
       { status: 401, body: 'expired' },
       { status: 200, body: measured },
     ]);
-    const credential = async ({ refresh }: { refresh: boolean }) => {
-      seen.push(refresh);
-      return refresh ? 'new' : 'old';
+    const credential = async ({
+      refresh,
+      refused,
+    }: {
+      refresh: boolean;
+      refused?: string;
+    }) => {
+      seen.push(refused === undefined ? { refresh } : { refresh, refused });
+      return refresh ? ' new ' : ' old ';
     };
     await createHttpDecisionModel({
       endpoint: 'https://s1.example',
@@ -826,7 +832,11 @@ describe('HTTP decisionModel', () => {
       'Bearer old',
       'Bearer new',
     ]);
-    expect(seen).toEqual([false, true]);
+    /** The refused key is the one sent, trimmed, not the minter's raw return. */
+    expect(seen).toEqual([
+      { refresh: false },
+      { refresh: true, refused: 'old' },
+    ]);
   });
 
   it('maps HTTP 402 to a quota failure that is never retried', async () => {

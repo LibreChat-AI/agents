@@ -1,0 +1,456 @@
+import type {
+  DecisionFetch,
+  DecisionModel,
+  DecisionCredential,
+  DecisionProbeOptions,
+} from './core';
+import {
+  probe,
+  redact,
+  withBreaker,
+  createBreaker,
+  DecisionError,
+  booleanQuestion,
+  createHttpDecisionModel,
+} from './core';
+
+const ENDPOINT = 'https://decisions.example/v1/systemone';
+const KEY = 'sk-test-0123456789abcdefghijklmnopqrstuvwxyz';
+
+const answered = JSON.stringify({
+  model: 'jev-1.13.0',
+  answers: { q: { type: 'noul', noul: 0.9 } },
+});
+
+function replies(statuses: number[]): {
+  fetch: DecisionFetch;
+  auth: Array<string | undefined>;
+} {
+  const auth: Array<string | undefined> = [];
+  let index = 0;
+  const fetch: DecisionFetch = async (_url, init) => {
+    auth.push(init.headers.Authorization);
+    const status = statuses[Math.min(index++, statuses.length - 1)];
+    return new Response(status === 200 ? answered : 'refused', { status });
+  };
+  return { fetch, auth };
+}
+
+function fused(
+  statuses: number[],
+  apiKey: DecisionCredential,
+  maxRetries = 2
+): {
+  model: ReturnType<typeof withBreaker>;
+  auth: Array<string | undefined>;
+  sleeps: number[];
+} {
+  const { fetch, auth } = replies(statuses);
+  const sleeps: number[] = [];
+  const model = withBreaker(
+    createHttpDecisionModel({
+      endpoint: ENDPOINT,
+      apiKey,
+      dialect: 'systemone',
+      model: 'jev-1.13.0',
+      maxRetries,
+      fetch,
+      sleep: async (ms) => {
+        sleeps.push(ms);
+      },
+    })
+  );
+  return { model, auth, sleeps };
+}
+
+const request = {
+  state: 'synthetic state',
+  questions: { q: booleanQuestion('Is this synthetic?') },
+};
+
+async function failure(model: DecisionModel): Promise<DecisionError> {
+  const error = await model.decide(request).then(
+    () => undefined,
+    (thrown: unknown) => thrown
+  );
+  if (!(error instanceof DecisionError)) {
+    throw new Error('expected a DecisionError');
+  }
+  return error;
+}
+
+describe('withBreaker', () => {
+  it('opens on a 401 with a string key and refuses later calls without a request', async () => {
+    const { model, auth } = fused([401, 200], KEY);
+
+    const first = await failure(model);
+    expect(first).toMatchObject({
+      failure: 'unauthorized',
+      status: 401,
+      circuitOpen: false,
+    });
+    expect(auth).toHaveLength(1);
+    expect(model.breaker.open).toBe(true);
+    expect(model.breaker.error).toBe(first);
+
+    const second = await failure(model);
+    const third = await failure(model);
+    expect(auth).toHaveLength(1);
+    for (const refused of [second, third]) {
+      expect(refused).toMatchObject({
+        failure: 'unauthorized',
+        status: 401,
+        circuitOpen: true,
+        provider: 'http',
+      });
+      expect(refused.message).not.toContain(KEY);
+    }
+  });
+
+  it('refreshes a credential function once, rechecks once, then opens when every key is refused', async () => {
+    const minted: boolean[] = [];
+    const credential: DecisionCredential = async ({ refresh }) => {
+      minted.push(refresh);
+      return `token-${minted.length}`;
+    };
+    const { model, auth } = fused([401, 401, 401, 200], credential);
+
+    const first = await failure(model);
+    expect(first).toMatchObject({ failure: 'unauthorized', status: 401 });
+    /** A minter that mints on every call has a newer key at the recheck; the call sends it once, then gives up. */
+    expect(minted).toEqual([false, true, false]);
+    expect(auth).toEqual([
+      'Bearer token-1',
+      'Bearer token-2',
+      'Bearer token-3',
+    ]);
+    expect(model.breaker.open).toBe(true);
+
+    const refused = await failure(model);
+    expect(refused.circuitOpen).toBe(true);
+    expect(minted).toEqual([false, true, false]);
+    expect(auth).toHaveLength(3);
+  });
+
+  it('opens without re-sending when the recheck after a second 401 has nothing newer', async () => {
+    const seen: Array<{ refresh: boolean; refused?: string }> = [];
+    const credential: DecisionCredential = async ({ refresh, refused }) => {
+      seen.push(refused === undefined ? { refresh } : { refresh, refused });
+      return seen.length === 1 ? 'token-1' : 'token-2';
+    };
+    const { model, auth } = fused([401, 401, 200], credential);
+
+    const first = await failure(model);
+    expect(first).toMatchObject({ failure: 'unauthorized', status: 401 });
+    expect(seen).toEqual([
+      { refresh: false },
+      { refresh: true, refused: 'token-1' },
+      { refresh: false },
+    ]);
+    expect(auth).toEqual(['Bearer token-1', 'Bearer token-2']);
+    expect(model.breaker.open).toBe(true);
+  });
+
+  it('opens on a 402 quota failure after exactly one request', async () => {
+    const { model, auth, sleeps } = fused([402, 200], KEY);
+
+    const first = await failure(model);
+    expect(first).toMatchObject({ failure: 'quota', status: 402 });
+    expect(auth).toHaveLength(1);
+    expect(sleeps).toEqual([]);
+    expect(model.breaker.open).toBe(true);
+
+    const refused = await failure(model);
+    expect(refused).toMatchObject({
+      failure: 'quota',
+      status: 402,
+      circuitOpen: true,
+    });
+    expect(auth).toHaveLength(1);
+  });
+
+  it.each([
+    [429, 'rate_limited'],
+    [500, 'server_error'],
+  ])(
+    'retries a %d exactly maxRetries times and stays closed',
+    async (status, expected) => {
+      const { model, auth, sleeps } = fused([status], KEY, 3);
+
+      const first = await failure(model);
+      expect(first).toMatchObject({ failure: expected, status });
+      expect(auth).toHaveLength(4);
+      expect(sleeps).toHaveLength(3);
+      expect(model.breaker.open).toBe(false);
+
+      await failure(model);
+      expect(auth).toHaveLength(8);
+      expect(model.breaker.open).toBe(false);
+    }
+  );
+
+  it('sends requests again after an explicit reset', async () => {
+    const { model, auth } = fused([401, 200], KEY);
+    await failure(model);
+    expect(model.breaker.open).toBe(true);
+
+    model.breaker.reset();
+    expect(model.breaker.open).toBe(false);
+    expect(model.breaker.error).toBeNull();
+    const result = await model.decide(request);
+    expect(result.model).toBe('jev-1.13.0');
+    expect(auth).toHaveLength(2);
+  });
+
+  it('does not reopen after a reset when a call from before the reset fails', async () => {
+    const auth: Array<string | undefined> = [];
+    const pending: Array<(response: Response) => void> = [];
+    const fetch: DecisionFetch = (_url, init) => {
+      auth.push(init.headers.Authorization);
+      return new Promise<Response>((resolve) => pending.push(resolve));
+    };
+    const model = withBreaker(
+      createHttpDecisionModel({
+        endpoint: ENDPOINT,
+        apiKey: KEY,
+        dialect: 'systemone',
+        fetch,
+      })
+    );
+
+    const first = failure(model);
+    const stale = failure(model);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(pending).toHaveLength(2);
+
+    pending[0](new Response('refused', { status: 402 }));
+    await expect(first).resolves.toMatchObject({ failure: 'quota' });
+    expect(model.breaker.open).toBe(true);
+
+    model.breaker.reset();
+    pending[1](new Response('refused', { status: 402 }));
+    await expect(stale).resolves.toMatchObject({
+      failure: 'quota',
+      circuitOpen: false,
+    });
+    expect(model.breaker.open).toBe(false);
+    expect(model.breaker.generation).toBe(1);
+
+    const next = model.decide(request);
+    await new Promise((resolve) => setImmediate(resolve));
+    pending[2](new Response(answered, { status: 200 }));
+    await expect(next).resolves.toMatchObject({ model: 'jev-1.13.0' });
+    expect(auth).toHaveLength(3);
+  });
+
+  it('ignores a trip carrying a generation from before a reset', () => {
+    const breaker = createBreaker();
+    const seen = breaker.generation;
+    breaker.reset();
+    breaker.trip(new DecisionError('quota', 'stale', { status: 402 }), seen);
+    expect(breaker.open).toBe(false);
+    breaker.trip(
+      new DecisionError('quota', 'current', { status: 402 }),
+      breaker.generation
+    );
+    expect(breaker.open).toBe(true);
+  });
+
+  it('shares one breaker between models that share a credential', async () => {
+    const breaker = createBreaker();
+    const refused = replies([401]);
+    const healthy = replies([200]);
+    const options = {
+      endpoint: ENDPOINT,
+      apiKey: KEY,
+      dialect: 'systemone' as const,
+    };
+    const first = withBreaker(
+      createHttpDecisionModel({ ...options, fetch: refused.fetch }),
+      breaker
+    );
+    const second = withBreaker(
+      createHttpDecisionModel({ ...options, fetch: healthy.fetch }),
+      breaker
+    );
+
+    await failure(first);
+    const error = await failure(second);
+    expect(error.circuitOpen).toBe(true);
+    expect(healthy.auth).toHaveLength(0);
+  });
+
+  it('keeps the first error that tripped it', () => {
+    const breaker = createBreaker();
+    const first = new DecisionError('quota', 'first', { status: 402 });
+    breaker.trip(first);
+    breaker.trip(new DecisionError('unauthorized', 'second', { status: 401 }));
+    expect(breaker.error).toBe(first);
+  });
+});
+
+describe('probe', () => {
+  it('asks one tiny boolean question and reports the answering model', async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const fetch: DecisionFetch = async (_url, init) => {
+      bodies.push(JSON.parse(init.body) as Record<string, unknown>);
+      return new Response(
+        JSON.stringify({
+          model: 'jev-1.13.0',
+          answers: { ok: { type: 'noul', noul: 0.97 } },
+        }),
+        { status: 200 }
+      );
+    };
+    const model = createHttpDecisionModel({
+      endpoint: ENDPOINT,
+      apiKey: KEY,
+      dialect: 'systemone',
+      model: 'jev-latest',
+      fetch,
+    });
+
+    await expect(probe(model)).resolves.toEqual({
+      ok: true,
+      model: 'jev-1.13.0',
+    });
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0]).toEqual({
+      model: 'jev-latest',
+      state: 'decision model readiness probe',
+      questions: {
+        ok: { type: 'noul', instructions: 'Is this text a readiness probe?' },
+      },
+    });
+  });
+
+  it('returns a typed failure instead of throwing, and trips a breaker', async () => {
+    const { model, auth } = fused([402], KEY);
+
+    await expect(probe(model)).resolves.toEqual({
+      ok: false,
+      failure: 'quota',
+      status: 402,
+      circuitOpen: false,
+      detail: 'decision model returned HTTP 402',
+    });
+    await expect(probe(model)).resolves.toMatchObject({
+      ok: false,
+      failure: 'quota',
+      circuitOpen: true,
+    });
+    expect(auth).toHaveLength(1);
+  });
+
+  it('reads a non-SDK exception as a network failure without its message', async () => {
+    const broken: DecisionModel = {
+      id: 'broken',
+      model: 'broken',
+      decide: async () => {
+        throw new Error(`socket closed for Bearer ${KEY}`);
+      },
+    };
+    const result = await probe(broken);
+    expect(result).toEqual({
+      ok: false,
+      failure: 'network',
+      circuitOpen: false,
+      detail: 'decision model probe failed',
+    });
+  });
+
+  it('redacts listed secrets from the failure detail', async () => {
+    const leaky: DecisionModel = {
+      id: 'leaky',
+      model: 'leaky',
+      decide: async () => {
+        throw new DecisionError('unauthorized', 'token short-1 was refused');
+      },
+    };
+    const result = await probe(leaky, { secrets: ['short-1'] });
+    expect(result).toMatchObject({
+      ok: false,
+      detail: 'token [REDACTED] was refused',
+    });
+  });
+
+  it('reads only the start of an oversized failure message', async () => {
+    const message = `token short-1 was refused ${'eyJ-'.repeat(200_000)}`;
+    const huge: DecisionModel = {
+      id: 'huge',
+      model: 'huge',
+      decide: async () => {
+        throw new DecisionError('unauthorized', message);
+      },
+    };
+    const started = performance.now();
+    const result = await probe(huge, { secrets: ['short-1'] });
+    expect(performance.now() - started).toBeLessThan(500);
+    expect(result).toMatchObject({ ok: false, failure: 'unauthorized' });
+    expect(result).toMatchObject({
+      detail: 'token [REDACTED] was refused [REDACTED]',
+    });
+  });
+
+  it('still resolves, without the message, when the secrets it was handed cannot be read', async () => {
+    const leaky: DecisionModel = {
+      id: 'leaky',
+      model: 'leaky',
+      decide: async () => {
+        throw new DecisionError('unauthorized', 'token short-1 was refused');
+      },
+    };
+    /** A JavaScript host passing a missing config value through. */
+    const options = JSON.parse('{"secrets":null}') as DecisionProbeOptions;
+    await expect(probe(leaky, options)).resolves.toEqual({
+      ok: false,
+      failure: 'unauthorized',
+      circuitOpen: false,
+      detail: 'decision model probe failed',
+    });
+  });
+});
+
+describe('redact', () => {
+  it('removes listed secrets, bearer values, JWTs, and long opaque tokens', () => {
+    const jwt =
+      'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.c2lnbmF0dXJlLXZhbHVl';
+    const text = [
+      'Authorization: Bearer abc.def',
+      `jwt=${jwt}`,
+      `key=${KEY}`,
+      'pin=hunter22',
+    ].join(' ');
+    const result = redact(text, ['hunter22', '', null, undefined]);
+    expect(result).toBe(
+      'Authorization: Bearer [REDACTED] jwt=[REDACTED] key=[REDACTED] pin=[REDACTED]'
+    );
+    for (const secret of ['abc.def', jwt, KEY, 'hunter22']) {
+      expect(result).not.toContain(secret);
+    }
+  });
+
+  it('still recognizes shaped credentials that a listed secret overlaps', () => {
+    expect(redact('Bearer live-token', ['ear'])).toBe(
+      'B[REDACTED]er [REDACTED]'
+    );
+    expect(
+      redact('Authorization: Bearer tok12345', ['Authorization: Bearer'])
+    ).toBe('[REDACTED] [REDACTED]');
+    const jwt =
+      'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.c2lnbmF0dXJlLXZhbHVl';
+    expect(redact(`jwt=${jwt}`, ['eyJhbGciOiJIUzI1NiJ9'])).toBe(
+      'jwt=[REDACTED]'
+    );
+    const opaque = `${'a'.repeat(25)}-split-me-${'b'.repeat(27)}`;
+    expect(redact(`key=${opaque} end`, ['-split-me-'])).toBe(
+      'key=[REDACTED] end'
+    );
+  });
+
+  it('replaces a longer secret before a shorter one it contains', () => {
+    expect(redact('a=secret-value-long', ['secret', 'secret-value-long'])).toBe(
+      'a=[REDACTED]'
+    );
+  });
+});

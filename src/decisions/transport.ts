@@ -179,7 +179,7 @@ export function createTransport(options: TransportOptions): Transport {
   }
 
   async function resolveKey(
-    refresh: boolean,
+    refused: string | undefined,
     signal: AbortSignal
   ): Promise<string | null> {
     if (typeof credential === 'string') {
@@ -188,7 +188,11 @@ export function createTransport(options: TransportOptions): Transport {
     if (!credential) {
       return null;
     }
-    const minted: string = await credential({ refresh, signal });
+    const minted: string = await credential(
+      refused === undefined
+        ? { refresh: false, signal }
+        : { refresh: true, refused, signal }
+    );
     const token = typeof minted === 'string' ? minted.trim() : '';
     if (!token) {
       throw new DecisionError(
@@ -233,7 +237,14 @@ export function createTransport(options: TransportOptions): Transport {
             'decision model request interrupted',
             { provider: providerId }
           );
-        let refreshed = false;
+        /**
+         * Keys 401s refused in this call. The first earns a refresh; a second
+         * earns one recheck with `refresh: false`, since another call may have
+         * replaced the key while this request was in flight, and the call
+         * re-sends only a key it has not had refused.
+         */
+        const refused: string[] = [];
+        let refusal: DecisionError | undefined;
         let key: string | null | undefined;
         let lastError: DecisionError | undefined;
         for (let attemptNo = 0; attemptNo <= maxRetries; attemptNo++) {
@@ -242,7 +253,20 @@ export function createTransport(options: TransportOptions): Transport {
           }
           try {
             if (key === undefined) {
-              key = await waitFor(resolveKey(refreshed, signal));
+              key = await waitFor(
+                resolveKey(
+                  refused.length === 1 ? refused[0] : undefined,
+                  signal
+                )
+              );
+              if (
+                refusal !== undefined &&
+                typeof key === 'string' &&
+                refused.includes(key)
+              ) {
+                /** The minter has nothing newer than a key this call had refused: that refusal stands. */
+                throw refusal;
+              }
             }
             const response = await waitFor(
               fetchImpl(endpoint, {
@@ -292,9 +316,12 @@ export function createTransport(options: TransportOptions): Transport {
             if (
               lastError.status === 401 &&
               typeof credential === 'function' &&
-              !refreshed
+              typeof key === 'string' &&
+              refused.length < 2 &&
+              !refused.includes(key)
             ) {
-              refreshed = true;
+              refused.push(key);
+              refusal = lastError;
               key = undefined;
               attemptNo -= 1;
               continue;

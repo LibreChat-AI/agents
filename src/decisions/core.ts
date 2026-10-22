@@ -18,3 +18,6 @@ export { createTransport, failureForStatus, retryAfterMs } from './transport';
 export type { DecisionFetch, Transport, TransportOptions } from './transport';
 export { withDecisionDeadline } from './deadline';
 export type { AwaitWithinDeadline } from './deadline';
+export * from './breaker';
+export * from './probe';
+export { redact } from './redact';

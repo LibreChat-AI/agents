@@ -14,12 +14,23 @@ const run = promisify(execFile);
  * a code-intelligence daemon can use typed decisions and reranking without
  * pulling LangChain or provider SDKs into its process.
  */
-export const lightSubpaths = Object.freeze(['./decisions', './rerank']);
+export const lightSubpaths = Object.freeze([
+  './decisions',
+  './decisions/node',
+  './rerank',
+]);
+
+/**
+ * Light subpaths that must also load without Node built-ins, so they run in
+ * any JavaScript runtime. Node-only helpers live on a `/node` subpath.
+ */
+export const neutralSubpaths = Object.freeze(['./decisions', './rerank']);
 
 /**
  * Load one built package subpath through its own exports map in a fresh Node
  * process, recording every module resolution. `packages` lists bare
- * specifiers that are neither Node built-ins nor the entry itself.
+ * specifiers that are neither Node built-ins nor the entry itself; `builtins`
+ * lists the Node built-ins reached.
  */
 export async function probe(subpath, format) {
   const { stdout } = await run(
@@ -34,6 +45,7 @@ function record(subpath) {
   const entry = `${packageName}${subpath.slice(1)}`;
   const modules = new Set();
   const packages = new Set();
+  const builtins = new Set();
   registerHooks({
     resolve(specifier, context, nextResolve) {
       const result = nextResolve(specifier, context);
@@ -49,14 +61,17 @@ function record(subpath) {
       if (external) {
         packages.add(specifier);
       }
+      if (isBuiltin(specifier)) {
+        builtins.add(specifier.replace(/^node:/, ''));
+      }
       return result;
     },
   });
-  return { entry, modules, packages };
+  return { entry, modules, packages, builtins };
 }
 
 async function runProbe(subpath, format) {
-  const { entry, modules, packages } = record(subpath);
+  const { entry, modules, packages, builtins } = record(subpath);
   if (format === 'cjs') {
     createRequire(path.join(root, 'package.json'))(entry);
   } else {
@@ -68,6 +83,7 @@ async function runProbe(subpath, format) {
       format,
       modules: [...modules].sort(),
       packages: [...packages].sort(),
+      builtins: [...builtins].sort(),
     })
   );
 }
