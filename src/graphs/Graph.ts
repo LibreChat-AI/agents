@@ -3885,7 +3885,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         candidate: BaseMessage[],
         provider: t.ProviderName,
         clientOptions: t.ClientOptions | undefined,
-        maxChars: number
+        maxChars: number,
+        replayImages = true
       ): BaseMessage[] => {
         if (!(candidate[candidate.length - 1] instanceof ToolMessage)) {
           return candidate;
@@ -3902,7 +3903,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         ) {
           return trackProviderMessageOrigins(
             candidate,
-            projectArtifactPayload(candidate, maxChars)
+            projectArtifactPayload(candidate, maxChars, replayImages)
           );
         }
         return candidate;
@@ -3952,7 +3953,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
       let artifactBaseMessages: BaseMessage[] | undefined;
       if (lastMessageY instanceof ToolMessage) {
-        const artifactCandidate = projectServingArtifacts(
+        let artifactCandidate = projectServingArtifacts(
           finalMessages,
           agentContext.provider,
           agentContext.clientOptions,
@@ -3960,7 +3961,17 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         );
 
         if (artifactCandidate !== finalMessages) {
-          const projection = measureProviderPayload(artifactCandidate);
+          let projection = measureProviderPayload(artifactCandidate);
+          if (!projection.fits) {
+            artifactCandidate = projectServingArtifacts(
+              finalMessages,
+              agentContext.provider,
+              agentContext.clientOptions,
+              maxProviderToolResultChars,
+              false
+            );
+            projection = measureProviderPayload(artifactCandidate);
+          }
           if (projection.fits) {
             artifactBaseMessages = finalMessages;
             finalMessages = artifactCandidate;
@@ -3987,14 +3998,28 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       if (artifactBaseMessages != null) {
         if (!finalProjection.fits) {
           finalMessages = projectProviderReferences(
-            applyProviderMessageTransforms(artifactBaseMessages)
+            applyProviderMessageTransforms(
+              projectServingArtifacts(
+                artifactBaseMessages,
+                agentContext.provider,
+                agentContext.clientOptions,
+                maxProviderToolResultChars,
+                false
+              )
+            )
           );
           finalProjection = measureProviderPayload(finalMessages);
+          if (!finalProjection.fits) {
+            finalMessages = projectProviderReferences(
+              applyProviderMessageTransforms(artifactBaseMessages)
+            );
+            finalProjection = measureProviderPayload(finalMessages);
+          }
           emitAgentLog(
             config,
             'warn',
             'graph',
-            'Artifact payload omitted after final provider formatting exceeded the remaining context budget',
+            'Earlier tool images or artifact payload omitted after final provider formatting exceeded the remaining context budget',
             {
               projectedMessageTokens: finalProjection.projectedMessageTokens,
               availableMessageTokens: finalProjection.availableMessageTokens,
@@ -4746,6 +4771,21 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                     servingFallbackMessages
                   );
                   let projection = preparedFallbackRequest.projection;
+                  if (!projection.fits && artifactSource !== boundedSource) {
+                    servingFallbackMessages = transformFallback(
+                      projectServingArtifacts(
+                        boundedSource,
+                        fallbackProvider,
+                        fallbackClientOptions,
+                        fallbackToolResultChars,
+                        false
+                      )
+                    );
+                    preparedFallbackRequest = prepareFallback(
+                      servingFallbackMessages
+                    );
+                    projection = preparedFallbackRequest.projection;
+                  }
                   if (!projection.fits && artifactSource !== boundedSource) {
                     servingFallbackMessages = transformFallback(boundedSource);
                     preparedFallbackRequest = prepareFallback(
