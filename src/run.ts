@@ -1,3 +1,4 @@
+import { normalizeToolResultError, hasRequiredToolExecuteProtection, ToolResultProtectionError } from '@/protection/toolResult';
 // src/run.ts
 import { nanoid } from 'nanoid';
 import { PromptTemplate } from '@langchain/core/prompts';
@@ -478,6 +479,7 @@ export class Run<_T extends t.BaseGraphState> {
   private subagentUsageSink?: t.SubagentUsageSink;
   private preemption?: t.StreamPreemption;
   private maxStopContinuations: number;
+  private toolResultProtection?: t.StandardGraphInput['toolResultProtection'];
   private providerTextProtection?: t.StandardGraphInput['providerTextProtection'];
   private streamLimits?: t.StreamLimits;
   private subagentTasks?: t.SubagentTaskConfig;
@@ -581,9 +583,13 @@ export class Run<_T extends t.BaseGraphState> {
     );
     this.streamLimits = config.streamLimits;
     this.providerTextProtection = config.providerTextProtection;
+    this.toolResultProtection = config.toolResultProtection;
 
     if (!config.graphConfig) {
       throw new Error('Graph config not provided');
+    }
+    if ('toolResultProtection' in config.graphConfig && config.graphConfig.toolResultProtection != null) {
+      throw new ProviderTextProtectionError('incompatible');
     }
     if ('providerTextProtection' in config.graphConfig &&
         config.graphConfig.providerTextProtection != null) {
@@ -686,6 +692,7 @@ export class Run<_T extends t.BaseGraphState> {
         preemption: this.preemption,
         streamLimits: this.streamLimits,
         providerTextProtection: this.providerTextProtection,
+        toolResultProtection: this.toolResultProtection,
         toolExecution: this.toolExecution,
         clientDelegatedToolNames: this.clientDelegatedToolNames,
       },
@@ -734,6 +741,7 @@ export class Run<_T extends t.BaseGraphState> {
         preemption: this.preemption,
         streamLimits: this.streamLimits,
         providerTextProtection: this.providerTextProtection,
+        toolResultProtection: this.toolResultProtection,
         toolExecution: this.toolExecution,
       },
     });
@@ -1099,7 +1107,13 @@ export class Run<_T extends t.BaseGraphState> {
        * close; duplicate callback echoes are absorbed by the terminal-status
        * guard in `closeRunStep`.
        */
+      const requiredToolRequest = eventName === GraphEvents.ON_TOOL_EXECUTE && hasRequiredToolExecuteProtection(data as t.ToolExecuteBatchRequest)
+        ? data as t.ToolExecuteBatchRequest : undefined;
       try {
+        if (requiredToolRequest != null && (!handler || !this.Graph)) {
+          requiredToolRequest.reject(new ToolResultProtectionError('unavailable'));
+          return;
+        }
         if (handler && this.Graph) {
           return await handler.handle(
             eventName,
@@ -1117,6 +1131,9 @@ export class Run<_T extends t.BaseGraphState> {
             this.Graph
           );
         }
+      } catch (error) {
+        if (requiredToolRequest == null) throw error;
+        requiredToolRequest.reject(normalizeToolResultError(error));
       } finally {
         if (
           eventName === GraphEvents.ON_RUN_STEP_COMPLETED &&
