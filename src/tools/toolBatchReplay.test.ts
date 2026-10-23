@@ -47,6 +47,7 @@ describe('checkpoint-owned tool batch replay', () => {
     })));
     const config: RunnableConfig = { configurable: {
       user_id: 'user', thread_id: 'child-thread',
+      __pregel_scratchpad: { resume: [] },
       __librechat_tool_approval_execution_scope: 'fork',
     } };
     restoreToolReplayConfigs(config.configurable!, interrupts, 'source', 'fork', 'child-thread', new Set(interrupts.map(entry => entry.id)));
@@ -602,7 +603,7 @@ describe('checkpoint-owned tool batch replay', () => {
       const owner = (member: string) => JSON.stringify(['scope', '', member, 'user', 'thread']);
       const child = { id: 'child', value: attachSubagentResumeManifest(await attachToolBatchReplayState(approval, owner('left'), new Map()), manifest) };
       const other = { id: 'other', value: kind === 'ownerless' ? { type: 'ask_user_question' } : await attachToolBatchReplayState(approval, owner('right'), new Map()) };
-      const config: RunnableConfig = { configurable: { user_id: 'user', thread_id: 'thread', __librechat_tool_approval_execution_scope: 'scope' } };
+      const config: RunnableConfig = { configurable: { user_id: 'user', thread_id: 'thread', __librechat_tool_approval_execution_scope: 'scope', __pregel_scratchpad: { resume: [] } } };
       restoreToolReplayConfigs(config.configurable!, reverse ? [other, child] : [child, other], 'scope', 'scope', 'thread', new Set(['child']));
       const selected = getToolReplayConfig(config, owner(kind === 'unmatched' ? 'joined' : 'right'));
       expect(selected.configurable?.[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY]).toBeUndefined();
@@ -611,5 +612,39 @@ describe('checkpoint-owned tool batch replay', () => {
       expect(getToolReplayConfig(config, owner('left')).configurable?.[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY]).toEqual(manifest);
     }
   );
+
+  it.each([
+    { runtime: {}, expected: 'reject' },
+    { runtime: { __pregel_scratchpad: { resume: [] }, __pregel_resume_map: { pending: [] } }, expected: 'stale' },
+    { runtime: { __pregel_scratchpad: { resume: [[]] }, __pregel_resume_map: { pending: [], sibling: [] } }, expected: 'reject' },
+    { runtime: { __pregel_scratchpad: { resume: [], nullResume: [] } }, expected: 'reject' },
+    { runtime: { __pregel_scratchpad: { resume: [[]] } }, expected: 'reject' },
+  ])('distinguishes active or ambiguous foreign approval from stale downstream context: $expected %j', async ({ runtime, expected }) => {
+    const config: RunnableConfig = { configurable: { thread_id: 'thread', user_id: 'original', __librechat_tool_approval_execution_scope: 'scope', ...runtime } };
+    const pending = await Promise.all(['left', 'right'].map(async (member) => ({ id: member, value: await attachToolBatchReplayState(approval,
+      JSON.stringify(['scope', '', member, 'original', 'thread']), new Map()) })));
+    restoreToolReplayConfigs(config.configurable!, pending, 'scope', 'scope', 'thread', new Set(['left', 'right']));
+    const changed = { ...config, configurable: { ...config.configurable, thread_id: 'other-thread', user_id: 'other-user' } };
+    const select = () => getToolReplayConfig(changed, getToolBatchReplayOwner(changed, 'left'));
+    if (expected === 'reject') expect(select).toThrow('execution owner changed');
+    else {
+      const neutral = select();
+      expect(neutral.configurable?.[TOOL_REPLAY_CONFIGS_KEY]).toBeUndefined();
+      expect(getToolApprovalReviewEvidence(neutral)).toBeUndefined();
+    }
+  });
+
+  it('does not invent approval authority for an opaque custom resume', async () => {
+    const config: RunnableConfig = { configurable: { user_id: 'original', thread_id: 'thread', __librechat_tool_approval_execution_scope: 'scope',
+      __pregel_scratchpad: { resume: ['custom answer'] }, __pregel_resume_map: { left: 'custom answer', right: 'custom answer' },
+    } };
+    const pending = await Promise.all(['left', 'right'].map(async (member) => ({ id: member, value: await attachToolBatchReplayState({ question: 'Custom question' },
+      JSON.stringify(['scope', '', member, 'original', 'thread']), new Map([[JSON.stringify(['scope', 'completed']), new Map()]])) })));
+    restoreToolReplayConfigs(config.configurable!, pending, 'scope', 'scope', 'thread', new Set(['left', 'right']));
+    const changed = { ...config, configurable: { ...config.configurable, user_id: 'other-user' } };
+    const neutral = getToolReplayConfig(changed, getToolBatchReplayOwner(changed, 'left'));
+    expect(getToolApprovalReviewEvidence(neutral)).toBeUndefined();
+    expect(neutral.configurable?.[TOOL_REPLAY_CONFIGS_KEY]).toBeUndefined();
+  });
 
 });

@@ -397,3 +397,21 @@ describe('parallel root replay isolation', () => {
     }
   );
 });
+
+describe('delegated approval principal authority', () => {
+  afterEach(() => jest.restoreAllMocks());
+  test.each([false, true])('rejects a foreign principal without restarting child work, rebuilt=%s', async (rebuilt) => {
+    const h = harness();
+    const run = await h.build();
+    await run.processStream({ messages: [new HumanMessage('Do both tasks')] }, config);
+    expect(run.getInterrupt()?.pendingInterrupts).toHaveLength(2);
+    const resumed = rebuilt ? await h.build() : run;
+    const failure = await resumed.resume(approve(run), { ...config, configurable: { ...config.configurable, user_id: 'other-user' } })
+      .then(() => undefined, (error: Error) => error);
+    const errors = failure instanceof AggregateError ? failure.errors : [failure];
+    expect(errors.length).toBeGreaterThan(0);
+    for (const error of errors) expect(error instanceof Error && error.message.includes('execution owner changed')).toBe(true);
+    expect(h.effects).not.toHaveBeenCalled();
+    expect(h.hostEffects).not.toHaveBeenCalled();
+  });
+});

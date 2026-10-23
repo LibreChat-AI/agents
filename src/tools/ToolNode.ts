@@ -1073,7 +1073,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           config,
           this.executingAgentId ?? this.agentId ?? ''
         );
-        config = getToolReplayConfig(config, replayOwner);
+        config = getToolReplayConfig(config, replayOwner, activeReplayKey);
         let reviewEvidence = getToolApprovalReviewEvidence(config);
         const replayState = getToolBatchReplayState(config.configurable);
         const ownsParentBatch =

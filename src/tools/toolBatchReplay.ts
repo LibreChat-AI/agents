@@ -283,7 +283,8 @@ export function restoreToolReplayConfigs(
 /** Select a member's evidence before the unchanged owner/proposal safeguards. */
 export function getToolReplayConfig(
   config: RunnableConfig,
-  owner: string
+  owner: string,
+  batch?: string
 ): RunnableConfig {
   const candidate = config.configurable?.[TOOL_REPLAY_CONFIGS_KEY];
   if (!(candidate instanceof Map)) return config;
@@ -303,6 +304,18 @@ export function getToolReplayConfig(
       }
     }
     if (evidence == null) throw new Error('Tool replay execution identity changed before resume');
+  }
+  if (evidence == null) {
+    let hasApproval = false;
+    let hasCheckpointBatch = false;
+    for (const pending of configs.values()) {
+      const replay = pending[TOOL_BATCH_REPLAY_KEY];
+      hasApproval ||= pending[TOOL_APPROVAL_REVIEW_CONFIG_KEY] != null || replay?.approvalOwner != null;
+      hasCheckpointBatch ||= batch != null && replay?.records.some((record) => record.batch === batch) === true;
+    }
+    if (hasApproval && (hasCheckpointBatch || getToolReplayResumeStatus(config, undefined, false) !== 'stale')) {
+      throw new Error('Tool approval execution owner changed before resume — failing closed');
+    }
   }
   const configurable: NonNullable<RunnableConfig['configurable']> = { ...config.configurable };
   delete configurable[TOOL_REPLAY_CONFIGS_KEY];

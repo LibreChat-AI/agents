@@ -93,6 +93,7 @@ const config = {
 function harness(eventDriven: boolean, questionMember?: 'left' | 'right') {
   const checkpointer = new MemorySaver();
   const calls: string[] = [];
+  const reviews: string[] = [];
   const leftEffect = jest.fn(async () => 'left effect');
   const rightEffect = jest.fn(async () => 'right effect');
   const effects = { left: leftEffect, right: rightEffect };
@@ -113,7 +114,7 @@ function harness(eventDriven: boolean, questionMember?: 'left' | 'right') {
       if (id !== questionMember)
         hooks.register('PreToolUse', {
           pattern: `${id}_tool`,
-          hooks: [async () => ({ decision: 'ask' as const })],
+          hooks: [async () => { reviews.push(id); return { decision: 'ask' as const }; }],
         });
     const agents: t.AgentInputs[] = ['entry', 'left', 'right', 'result'].map(
       (id) => ({
@@ -194,7 +195,7 @@ function harness(eventDriven: boolean, questionMember?: 'left' | 'right') {
     run.Graph!.overrideModel = new RootApprovalModel(calls);
     return run;
   };
-  return { build, calls, left, right, leftEffect, rightEffect };
+  return { build, calls, reviews, left, right, leftEffect, rightEffect };
 }
 async function start(run: Run<t.IState>) {
   await run.processStream(
@@ -336,4 +337,50 @@ describe('root parallel HITL', () => {
     expect(h.leftEffect).toHaveBeenCalledTimes(1);
     expect(h.rightEffect).toHaveBeenCalledTimes(1);
   });
+});
+
+describe('parallel approval resume authority', () => {
+  test.each([false, true].flatMap((eventDriven) => [false, true].flatMap((rebuilt) =>
+    ['resume', 'command'].flatMap((entrypoint) => ['left', 'both'].map((addressed) => ({ eventDriven, rebuilt, entrypoint, addressed })))
+  )))('rejects another principal before reusable hooks or effects: %j', async ({ eventDriven, rebuilt, entrypoint, addressed }) => {
+    const h = harness(eventDriven);
+    const run = await h.build();
+    await start(run);
+    const pending = run.getInterrupt()?.pendingInterrupts;
+    expect(pending).toHaveLength(2);
+    const decisions = Object.fromEntries((pending ?? []).filter((entry) => {
+      if (!isToolApprovalInterrupt(entry.payload)) throw new Error('Missing root approval');
+      return addressed === 'both' || entry.payload.action_requests[0].name === 'left_tool';
+    }).map((entry) => [entry.interruptId, [{ type: 'approve' }]]));
+    const resumed = rebuilt ? await h.build() : run;
+    const foreignConfig = { ...config, configurable: { ...config.configurable, user_id: 'other-user' } };
+    const reviews = h.reviews.length;
+    const resume = entrypoint === 'command'
+      ? resumed.processStream(new Command({ resume: decisions }), foreignConfig)
+      : resumed.resume(decisions, foreignConfig);
+    const failure = await resume.then(() => undefined, (error: Error) => error);
+    const errors = failure instanceof AggregateError ? failure.errors : [failure];
+    expect(errors.length).toBeGreaterThan(0);
+    for (const error of errors) expect(error instanceof Error && error.message.includes('execution owner changed')).toBe(true);
+    expect(h.reviews).toHaveLength(reviews);
+    expect(h.left).not.toHaveBeenCalled();
+    expect(h.right).not.toHaveBeenCalled();
+    expect(h.leftEffect).toHaveBeenCalledTimes(1);
+    expect(h.rightEffect).toHaveBeenCalledTimes(1);
+  });
+  test.each([false, true])('rejects an execution-scope change on a real pending root, eventDriven=%s', async (eventDriven) => {
+    const h = harness(eventDriven);
+    const run = await h.build();
+    await start(run);
+    const pending = run.getInterrupt()?.pendingInterrupts;
+    const decisions = Object.fromEntries((pending ?? []).map((entry) => [entry.interruptId, [{ type: 'approve' }]]));
+    const resumed = await h.build();
+    const failure = await resumed.resume(decisions, { ...config, configurable: { ...config.configurable, __librechat_tool_approval_execution_scope: 'other-scope' } })
+      .then(() => undefined, (error: Error) => error);
+    const errors = failure instanceof AggregateError ? failure.errors : [failure];
+    for (const error of errors) expect(error instanceof Error && error.message.includes('execution owner changed')).toBe(true);
+    expect(h.left).not.toHaveBeenCalled();
+    expect(h.right).not.toHaveBeenCalled();
+  });
+
 });
