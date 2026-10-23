@@ -44,7 +44,7 @@ function harness(exposure: Exposure) {
     version: 'v2' as const,
   };
   const ask = (question: string) => () => {
-    const answer = interrupt<string>({ question });
+    const answer = interrupt<Question, string>({ question });
     completed.push(`${question}:${answer}`);
     return { messages: [new AIMessage(`${question}:${answer}`)] };
   };
