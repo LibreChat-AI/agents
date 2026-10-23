@@ -1,6 +1,8 @@
 import { z } from 'zod';
 import { tool } from '@langchain/core/tools';
 import { AIMessage } from '@langchain/core/messages';
+import { CallbackManager } from '@langchain/core/callbacks/manager';
+import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
 import { describe, it, expect, jest, afterEach } from '@jest/globals';
 import type * as t from '@/types';
 import { Constants, GraphEvents } from '@/common';
@@ -969,3 +971,94 @@ describe.each([Constants.EXECUTE_CODE, Constants.BASH_TOOL])(
     });
   }
 );
+
+describe('host-authorized lazy code file staging', () => {
+  it.each([true, false])(
+    'honors RunnableConfig callbacks while staging files only for authorized writers (authorized=%s)',
+    async (authorized) => {
+      const hostToolName = 'host_file_writer';
+      const sessions: t.ToolSessionMap = new Map();
+      const generatedFile: t.FileRef = {
+        id: 'host-output',
+        name: 'generated.csv',
+        storage_session_id: 'host-output-storage',
+      };
+      const dispatchedIds: string[] = [];
+      let secondRequestContext: t.ToolCallRequest['codeSessionContext'];
+      const callbacks = new CallbackManager('host-file-stage-run');
+      callbacks.addHandler(
+        BaseCallbackHandler.fromMethods({
+          handleCustomEvent(eventName: string, payload: unknown): void {
+            if (eventName !== GraphEvents.ON_TOOL_EXECUTE) {
+              return;
+            }
+            const batch = payload as t.ToolExecuteBatchRequest;
+            const request = batch.toolCalls[0];
+            dispatchedIds.push(request.id);
+            if (request.id === 'first') {
+              request.codeSessionContext = {
+                session_id: 'host-input-session',
+                files: [inputs[0]],
+              };
+            } else {
+              secondRequestContext = request.codeSessionContext;
+            }
+            batch.resolve([
+              {
+                toolCallId: request.id,
+                status: 'success',
+                content: 'host execution completed',
+                artifact: {
+                  session_id: 'host-output-session',
+                  files: [generatedFile],
+                },
+              },
+            ]);
+          },
+        }),
+        true,
+      );
+      const node = new ToolNode({
+        tools: [
+          tool(async () => 'unused', {
+            name: hostToolName,
+            description: 'Host file writer',
+            schema: z.object({}),
+          }),
+        ],
+        sessions,
+        codeSessionKey: 'host-session',
+        eventDrivenMode: true,
+        codeSessionToolNames: authorized ? [hostToolName] : [],
+      });
+
+      for (const id of ['first', 'second']) {
+        await node.invoke(
+          {
+            messages: [
+              new AIMessage({
+                content: '',
+                tool_calls: [{ id, name: hostToolName, args: {} }],
+              }),
+            ],
+          },
+          { callbacks },
+        );
+      }
+
+      expect(dispatchedIds).toEqual(['first', 'second']);
+      if (authorized) {
+        expect(secondRequestContext?.session_id).toBe('host-output-session');
+        expect(secondRequestContext?.files?.map((file) => file.id)).toEqual(
+          expect.arrayContaining([inputs[0].id, generatedFile.id]),
+        );
+        expect(sessions.get('host-session')?.files?.map((file) => file.id)).toEqual(
+          expect.arrayContaining([inputs[0].id, generatedFile.id]),
+        );
+      } else {
+        expect(secondRequestContext).toBeUndefined();
+        expect(sessions.has('host-session')).toBe(false);
+      }
+    },
+  );
+});
