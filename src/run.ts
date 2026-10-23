@@ -303,12 +303,14 @@ function getInterruptHookSessionId(payload: unknown): string | undefined {
 
 type InterruptStateSnapshot = {
   config?: RunnableConfig;
+  next?: string[];
   values?: {
     handoffState?: t.HandoffState;
     messages?: BaseMessage[];
     runStepState?: t.RunStepResumeState;
   };
   tasks?: Array<{
+    name?: string;
     interrupts?: Array<{ id?: string; value?: unknown }>;
     state?: RunnableConfig | InterruptStateSnapshot;
   }>;
@@ -397,21 +399,23 @@ function getFirstPersistedInterrupt(
   snapshot: InterruptStateSnapshot
 ): { id: string; value: unknown; pending: Array<{ id: string; value: unknown }> } | undefined {
   const pending: Array<{ id: string; value: unknown }> = [];
+  const nestedStates: InterruptStateSnapshot[] = [];
+  const next = snapshot.next == null ? undefined : new Set(snapshot.next);
   for (const task of snapshot.tasks ?? []) {
+    if (next != null && (task.name == null || !next.has(task.name))) continue;
     for (const entry of task.interrupts ?? []) {
       if (typeof entry.id === 'string' && entry.id.length > 0) {
         pending.push({ id: entry.id, value: entry.value });
       }
     }
-  }
-  if (pending.length === 0) {
-    for (const task of snapshot.tasks ?? []) {
-      const nestedState = task.state;
-      if (nestedState != null && 'tasks' in nestedState && Array.isArray(nestedState.tasks)) {
-        const nested = getFirstPersistedInterrupt(nestedState);
-        if (nested != null) pending.push(...nested.pending);
-      }
+    const nestedState = task.state;
+    if (nestedState != null && 'tasks' in nestedState && Array.isArray(nestedState.tasks)) {
+      nestedStates.push(nestedState);
     }
+  }
+  for (const nestedState of nestedStates) {
+    const nested = getFirstPersistedInterrupt(nestedState);
+    if (nested != null) pending.push(...nested.pending);
   }
   const unique = [...new Map(pending.map((entry) => [entry.id, entry])).values()];
   return unique.length === 0 ? undefined : { ...unique[0], pending: unique };
