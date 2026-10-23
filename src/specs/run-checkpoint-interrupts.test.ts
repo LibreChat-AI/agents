@@ -242,3 +242,38 @@ describe.each(['propagated', 'nested-only'] as const)(
     });
   }
 );
+
+describe('Command field retention at workflow dispatch', () => {
+  test.each([false, true])('preserves Command fields with a resume value=%s', async (hasResume) => {
+    const h = harness('nested-only');
+    const { workflow: initial } = await h.build();
+    await initial.invoke({ messages: [new HumanMessage('Review')] }, h.config);
+    const primary = (await initial.getState(h.config, { subgraphs: true }))
+      .tasks.flatMap((task) => task.interrupts)[0];
+    const interruptId = primary.id;
+    if (interruptId == null) throw new Error('Missing primary interrupt ID');
+    const { run, workflow } = await h.build();
+    const update = { messages: [new HumanMessage('Updated context')] };
+    const command = new Command({
+      ...(hasResume ? { resume: 'approved' } : {}),
+      update,
+      goto: END,
+      graph: Command.PARENT,
+    });
+    command.lc_direct_tool_output = false;
+    const boundary = new Error('Command dispatch boundary reached');
+    const dispatch = jest.spyOn(workflow, 'streamEvents').mockImplementation((input) => {
+      expect(input).toBeInstanceOf(Command);
+      if (!(input instanceof Command)) throw new Error('Missing Command');
+      expect(input.resume).toEqual(hasResume ? { [interruptId]: 'approved' } : undefined);
+      expect(input.update).toMatchObject(update);
+      expect(input.goto).toEqual(command.goto);
+      expect(input.graph).toBe(command.graph);
+      expect(input.lc_direct_tool_output).toBe(false);
+      throw boundary;
+    });
+    await expect(run.processStream(command, h.config)).rejects.toBe(boundary);
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    dispatch.mockRestore();
+  });
+});

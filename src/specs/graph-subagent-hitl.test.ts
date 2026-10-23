@@ -1,23 +1,29 @@
 import { z } from 'zod';
 import { tool } from '@langchain/core/tools';
-import { MemorySaver } from '@langchain/langgraph';
 import { ChatGenerationChunk } from '@langchain/core/outputs';
 import { FakeListChatModel } from '@langchain/core/utils/testing';
+import { IterableReadableStream } from '@langchain/core/utils/stream';
 import {
+  AIMessage,
   AIMessageChunk,
   HumanMessage,
   ToolMessage,
 } from '@langchain/core/messages';
+import { END, START, Command, Annotation, StateGraph, MemorySaver, MessagesAnnotation, interrupt } from '@langchain/langgraph';
+import type { StreamEvent } from '@langchain/core/tracers/log_stream';
+import type { Interrupt, StateSnapshot } from '@langchain/langgraph';
 import type { ToolRunnableConfig } from '@langchain/core/tools';
 import type { ToolCall } from '@langchain/core/messages/tool';
-import type { Interrupt } from '@langchain/langgraph';
 import type * as t from '@/types';
+import { getSubagentResumeManifest, SUBAGENT_RESUME_MANIFEST_CONFIG_KEY, SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY } from '@/tools/subagent/SubagentReplay';
+import { attachRunStepResumeState, getRunStepResumeState, stripRunStepResumeState } from '@/tools/runStepResume';
 import { getPublicToolInterruptPayload } from '@/tools/toolBatchReplay';
 import { Constants, GraphEvents, Providers } from '@/common';
 import { isToolApprovalInterrupt } from '@/types/hitl';
 import { createFakeStreamingLLM } from '@/llm/fake';
 import { askUserQuestion } from '@/hitl';
 import { HookRegistry } from '@/hooks';
+import { Graph } from '@/graphs/Graph';
 import { Run } from '@/run';
 
 const member = (agentId: string): t.AgentInputs => ({
@@ -120,7 +126,8 @@ function harness(
   programmatic = false,
   sessionTools = false,
   completedEffects = false,
-  mixedQuestion?: 'left' | 'right'
+  mixedQuestion?: 'left' | 'right',
+  approvalBarrier?: Promise<void>
 ) {
   const checkpointer = new MemorySaver();
   const calls: string[] = [];
@@ -245,7 +252,8 @@ function harness(
   const build = async (
     definition = graph,
     signal?: AbortSignal,
-    subagentContext?: t.SubagentContextAdapter
+    subagentContext?: t.SubagentContextAdapter,
+    runId = `graph-approval-${Math.random()}`
   ) => {
     const hookRegistry = new HookRegistry();
     for (const id of ['left', 'right']) {
@@ -256,11 +264,14 @@ function harness(
           : `${id}_tool`;
       hookRegistry.register('PreToolUse', {
         pattern: sessionTools ? Constants.EXECUTE_CODE : memberTool,
-        hooks: [async () => ({ decision: 'ask' as const })],
+        hooks: [async () => {
+          if (approvalBarrier != null) await approvalBarrier;
+          return { decision: 'ask' as const };
+        }],
       });
     }
     const run = await Run.create<t.IState>({
-      runId: `graph-approval-${Math.random()}`,
+      runId,
       graphConfig: {
         type: 'standard',
         signal,
@@ -1674,4 +1685,275 @@ describe('graph subagent foreground HITL', () => {
     expect(h.leftExecute).toHaveBeenCalledTimes(1);
     expect(h.rightExecute).toHaveBeenCalledTimes(1);
   });
+});
+
+class OpaqueReviewQuestion {
+  readonly question = 'Continue custom work?';
+  describe(): string {
+    return this.question;
+  }
+}
+
+function installStandaloneTeamWorkflow(run: Run<t.IState>, checkpointer: MemorySaver): void {
+  const graphTools = run.Graph?.agentContexts.get('parent')?.graphTools as t.GenericTool[] | undefined;
+  const spawn = graphTools?.find((candidate) => candidate.name === Constants.SUBAGENT);
+  if (spawn == null) throw new Error('Missing real graph subagent tool');
+  const State = Annotation.Root({
+    ...MessagesAnnotation.spec,
+    runStepState: Annotation<t.RunStepResumeState | undefined>({ reducer: (current, update) => update ?? current, default: () => undefined }),
+  });
+  run.graphRunnable = new StateGraph(State)
+    .addNode('team', async (_state, runnable) => {
+      const content = await spawn.invoke({
+        type: 'tool_call', name: Constants.SUBAGENT, id: 'parent-spawn',
+        args: { description: 'Review the task', subagent_type: 'team' },
+      }, { ...runnable, callbacks: [] });
+      return { messages: [new AIMessage(String(content))] };
+    })
+    .addEdge(START, 'team').addEdge('team', END)
+    .compile({ checkpointer: checkpointer });
+  const v2StreamEvents: (
+      input: t.BaseGraphState,
+      runnable: t.RunStreamConfig & { version: 'v2' },
+      options?: Parameters<t.CompiledStateWorkflow['streamEvents']>[2]
+    ) => IterableReadableStream<StreamEvent> = run.graphRunnable.streamEvents;
+  const streamEvents = v2StreamEvents.bind(run.graphRunnable);
+  Object.defineProperty(run.graphRunnable, 'streamEvents', {
+    value: (input: t.BaseGraphState, runnable: t.RunStreamConfig, options?: Parameters<t.CompiledStateWorkflow['streamEvents']>[2]) =>
+      IterableReadableStream.fromAsyncGenerator((async function* () {
+        for await (const event of streamEvents(input, { ...runnable, version: 'v2' }, options)) {
+          if (event.run_id === run.id) yield event;
+        }
+      })()),
+  });
+}
+
+describe('graph subagent resume contracts', () => {
+  afterEach(() => jest.restoreAllMocks());
+  test.each(
+    (['resume', 'command'] as const).flatMap((entrypoint) =>
+      (['array', 'map'] as const).flatMap((shape) =>
+        (['unchanged', 'implementation', 'partition'] as const).flatMap((change) => [
+          { entrypoint, shape, change, rebuilt: true },
+          ...(change === 'unchanged' ? [{ entrypoint, shape, change, rebuilt: false }] : []),
+        ])
+      )
+    )
+  )('singleton checkpoint identity and sidecars: %j', async ({ entrypoint, shape, change, rebuilt }) => {
+    const h = harness(false, false, false, false, true);
+    h.graph.agents = [{ ...h.graph.agents[1], codeSessionKey: 'original-partition' }];
+    h.graph.edges = [];
+    h.graph.entryAgentId = 'left';
+    h.graph.resultAgentId = 'left';
+    const runId = 'singleton-command-resume';
+    const run = await h.build(h.graph, undefined, undefined, runId);
+    await start(run);
+    const pending = run.getInterrupt()?.pendingInterrupts;
+    expect(pending).toHaveLength(1);
+    const first = pending?.[0];
+    if (first == null) throw new Error('Missing singleton approval');
+    expect(h.leftEffect).toHaveBeenCalledTimes(1);
+    const checkpoint = await h.checkpointer.getTuple(config);
+    const rootInterrupt = checkpoint?.pendingWrites?.find(([, channel]) => channel === '__interrupt__')?.[2] as Interrupt | undefined;
+    const saved = getSubagentResumeManifest(rootInterrupt?.value)?.executions[0];
+    if (saved == null) throw new Error('Missing saved child manifest');
+    expect(saved.graphState.toolCallSteps.length).toBeGreaterThan(0);
+    const replacement = jest.fn(async () => 'replacement effect');
+    const definition = {
+      ...h.graph,
+      configId: change === 'implementation' ? 'implementation-v2' : h.graph.configId,
+      agents: h.graph.agents.map((agent) => ({ ...agent })),
+    };
+    if (change === 'implementation') definition.agents[0].tools = [tool(replacement, {
+      name: 'left_tool', description: 'Requires review', schema: z.object({ value: z.string() }),
+    })];
+    if (change === 'partition') definition.agents[0].codeSessionKey = 'changed-partition';
+    const resumed = rebuilt ? await h.build(definition, undefined, undefined, runId) : run;
+    const restoreState = jest.spyOn(Graph.prototype, 'restoreSubagentResumeState');
+    try {
+      const decisions: t.ToolApprovalDecision[] = [{ type: 'approve' }];
+      const resume = shape === 'map' ? { [first.interruptId]: decisions } : decisions;
+      if (entrypoint === 'command') await resumed.processStream(new Command({ resume }), config);
+      else await resumed.resume(resume, config);
+      expect(replacement).not.toHaveBeenCalled();
+      expect(h.leftEffect).toHaveBeenCalledTimes(1);
+      if (change !== 'unchanged') {
+        expect(h.leftExecute).not.toHaveBeenCalled();
+        expect(restoreState).not.toHaveBeenCalled();
+        expect(resumed.getRunMessages()?.some((message) => String(message.content).includes('changed'))).toBe(true);
+        return;
+      }
+      expect(restoreState).toHaveBeenCalledWith(saved.graphState, runId);
+      expect(h.leftExecute).toHaveBeenCalledTimes(1);
+      expect(h.leftExecute.mock.calls[0][0]).toEqual({ value: 'original' });
+      expect(h.calls.filter((id) => id === 'left')).toHaveLength(2);
+      expect(resumed.getInterrupt()).toBeUndefined();
+    } finally {
+      restoreState.mockRestore();
+    }
+  });
+
+  test.each([
+    { label: 'function', payload: { question: 'Continue?', resolve: () => 'resolved' } },
+    { label: 'symbol', payload: { question: 'Continue?', resolution: Symbol('resolved') } },
+    { label: 'class', payload: new OpaqueReviewQuestion() },
+    { label: 'serializable', payload: { question: 'Continue?', resolution: 'resolved' } },
+  ].flatMap((sample) => (['resume', 'command'] as const).flatMap((entrypoint) => [
+    { ...sample, entrypoint, rebuilt: false },
+    ...(sample.label === 'serializable' ? [{ ...sample, entrypoint, rebuilt: true }] : []),
+  ])))('standalone parallel payload contract: $label $entrypoint rebuilt=$rebuilt', async ({ payload, entrypoint, rebuilt }) => {
+    let releaseCustom: () => void = () => { throw new Error('Custom barrier not initialized'); };
+    const customReady = new Promise<void>((resolve) => { releaseCustom = resolve; });
+    const h = harness(false, false, false, false, false, 'left', customReady);
+    const putWrites = h.checkpointer.putWrites.bind(h.checkpointer);
+    jest.spyOn(h.checkpointer, 'putWrites').mockImplementation(async (...args) => {
+      await putWrites(...args);
+      if (args[1].some(([channel, value]) => channel === '__interrupt__' &&
+        !isToolApprovalInterrupt(getPublicToolInterruptPayload((value as Interrupt).value)))) releaseCustom();
+    });
+    const finished = jest.fn((answer: string) => `custom ${answer}`);
+    h.graph.agents[1].graphTools = [tool(async () => {
+      return finished(interrupt<typeof payload, string>(payload));
+    }, { name: 'left_tool', description: 'Ask a question', schema: z.object({ value: z.string() }) })];
+    const run = await h.build();
+    installStandaloneTeamWorkflow(run, h.checkpointer);
+    await start(run);
+    const result = run.getInterrupt<typeof payload | t.ToolApprovalInterruptPayload>();
+    expect(isToolApprovalInterrupt(result?.payload)).toBe(true);
+    expect(result?.pendingInterrupts).toHaveLength(2);
+    const approval = result?.pendingInterrupts?.find((entry) => isToolApprovalInterrupt(entry.payload));
+    const custom = result?.pendingInterrupts?.find((entry) => !isToolApprovalInterrupt(entry.payload));
+    if (approval == null || custom == null || !isToolApprovalInterrupt(approval.payload)) throw new Error('Missing mixed proposals');
+    expect(custom.payload).toStrictEqual(payload);
+    expect(JSON.stringify(result)).not.toMatch(/__librechat|approvalReplays|checkpoints/);
+    approval.payload.action_requests[0].arguments.value = 'host mutation';
+    approval.payload.review_configs[0].allowed_decisions.length = 0;
+    if (approval.payload.subagent != null) approval.payload.subagent.agent_id = 'foreign-member';
+    const reread = run.getInterrupt();
+    const isolated = reread?.pendingInterrupts?.find((entry) => entry.interruptId === approval.interruptId)?.payload;
+    if (!isToolApprovalInterrupt(isolated)) throw new Error('Missing isolated approval');
+    expect(isolated.action_requests[0].arguments).toEqual({ value: 'original' });
+    expect(isolated.review_configs[0].allowed_decisions).toContain('approve');
+    expect(isolated.subagent?.agent_id).toBe('right');
+    const resumed = rebuilt ? await h.build() : run;
+    if (rebuilt) installStandaloneTeamWorkflow(resumed, h.checkpointer);
+    const decisions = { [approval.interruptId]: [{ type: 'approve' }], [custom.interruptId]: 'resolved' };
+    if (entrypoint === 'command') await resumed.processStream(new Command({ resume: decisions }), config);
+    else await resumed.resume(decisions, config);
+    expect(resumed.getInterrupt()).toBeUndefined();
+    expect(h.rightExecute).toHaveBeenCalledTimes(1);
+    expect(h.rightExecute.mock.calls[0][0]).toEqual({ value: 'original' });
+    expect(finished).toHaveBeenCalledWith('resolved');
+    expect(finished).toHaveBeenCalledTimes(1);
+    expect(h.calls.filter((id) => id === 'entry')).toHaveLength(1);
+    expect(h.calls.filter((id) => id === 'result')).toHaveLength(1);
+  });
+
+  test.each([false, true].flatMap((rebuilt) => ['left', 'right', 'both'].map((addressed) => ({ rebuilt, addressed }))))(
+    'direct parallel Commands preserve pending authority and effects: %j', async ({ rebuilt, addressed }) => {
+      const h = harness(false, false, false, false, true);
+      const run = await h.build();
+      await start(run);
+      const pending = run.getInterrupt()?.pendingInterrupts;
+      expect(pending).toHaveLength(2);
+      const decisions = Object.fromEntries((pending ?? []).filter((entry) => {
+        if (!isToolApprovalInterrupt(entry.payload)) throw new Error('Missing approval');
+        return addressed === 'both' || entry.payload.subagent?.agent_id === addressed;
+      }).map((entry) => [entry.interruptId, [{ type: 'approve' }]]));
+      const resumed = rebuilt ? await h.build() : run;
+      if (resumed.graphRunnable == null) throw new Error('Missing graph');
+      const stream = jest.spyOn(resumed.graphRunnable, 'streamEvents');
+      const copySession = jest.spyOn(HookRegistry.prototype, 'copySession');
+      const callerConfig = { ...config, configurable: {
+        ...config.configurable,
+        [SUBAGENT_RESUME_MANIFEST_CONFIG_KEY]: { version: 999 },
+        [SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY]: 'untrusted-attempt',
+      } };
+      await resumed.processStream(new Command({ resume: decisions }), callerConfig);
+      for (const entry of pending ?? []) {
+        if (isToolApprovalInterrupt(entry.payload) && entry.payload.hook_session_id != null)
+          expect(copySession).toHaveBeenCalledWith(entry.payload.hook_session_id, resumed.id);
+      }
+      const restored = stream.mock.calls[0][1].configurable;
+      expect(restored?.[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY]).toMatchObject({ version: 1 });
+      const firstAttempt = restored?.[SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY];
+      expect(typeof firstAttempt).toBe('string');
+      expect(firstAttempt).not.toBe('untrusted-attempt');
+      expect(callerConfig.configurable[SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY]).toBe('untrusted-attempt');
+      expect(h.leftExecute).toHaveBeenCalledTimes(addressed === 'right' ? 0 : 1);
+      expect(h.rightExecute).toHaveBeenCalledTimes(addressed === 'left' ? 0 : 1);
+      if (addressed !== 'both') {
+        const remaining = resumed.getInterrupt()?.pendingInterrupts;
+        expect(remaining).toHaveLength(1);
+        const last = remaining?.[0];
+        if (last == null) throw new Error('Missing pending sibling');
+        const again = await h.build();
+        if (again.graphRunnable == null) throw new Error('Missing graph');
+        const nextStream = jest.spyOn(again.graphRunnable, 'streamEvents');
+        await again.processStream(new Command({ resume: { [last.interruptId]: [{ type: 'approve' }] } }), config);
+        expect(again.getInterrupt()).toBeUndefined();
+        expect(nextStream.mock.calls[0][1].configurable?.[SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY]).not.toBe(firstAttempt);
+      } else expect(resumed.getInterrupt()).toBeUndefined();
+      expect(h.leftExecute).toHaveBeenCalledTimes(1);
+      expect(h.rightExecute).toHaveBeenCalledTimes(1);
+      expect(h.leftEffect).toHaveBeenCalledTimes(1);
+      expect(h.rightEffect).toHaveBeenCalledTimes(1);
+      expect(h.calls.filter((id) => id === 'entry')).toHaveLength(1);
+      expect(h.calls.filter((id) => id === 'result')).toHaveLength(1);
+    }
+  );
+
+  test.each(['manifest-version', 'user'] as const)(
+    'direct Commands reject foreign or malformed checkpoint authority: %s', async (change) => {
+      const h = harness();
+      h.graph.agents = [h.graph.agents[1]];
+      h.graph.edges = [];
+      h.graph.entryAgentId = 'left';
+      h.graph.resultAgentId = 'left';
+      const runId = 'direct-command-authority';
+      const run = await h.build(h.graph, undefined, undefined, runId);
+      await start(run);
+      const first = run.getInterrupt();
+      if (first == null) throw new Error('Missing approval');
+      const rebuilt = await h.build(h.graph, undefined, undefined, runId);
+      let injected = false;
+      if (change === 'manifest-version') {
+        const workflow = rebuilt.graphRunnable as t.CompiledStateWorkflow &
+          Pick<ReturnType<StateGraph<t.IState>['compile']>, 'getState'>;
+        const getState = workflow.getState.bind(workflow);
+        const corruptSnapshot = (snapshot: StateSnapshot): StateSnapshot => ({
+          ...snapshot,
+          tasks: snapshot.tasks.map((task) => ({
+            ...task,
+            ...(task.state != null && 'tasks' in task.state ? { state: corruptSnapshot(task.state) } : {}),
+            interrupts: task.interrupts.map((stored) => {
+              let body = stored.value;
+              while (getRunStepResumeState(body) != null) body = stripRunStepResumeState(body);
+              if (body == null || typeof body !== 'object') throw new Error('Missing checkpoint envelope');
+              const corrupted = { ...body, [SUBAGENT_RESUME_MANIFEST_CONFIG_KEY]: { version: 999, executions: [] } };
+              const state = getRunStepResumeState(stored.value);
+              const value = state == null ? corrupted : attachRunStepResumeState(corrupted, state);
+              expect(stripRunStepResumeState(value)).toHaveProperty([SUBAGENT_RESUME_MANIFEST_CONFIG_KEY, 'version'], 999);
+              injected = true;
+              return { ...stored, value };
+            }),
+          })),
+        });
+        jest.spyOn(workflow, 'getState').mockImplementation(async (...args) =>
+          corruptSnapshot(await getState(...args))
+        );
+      }
+      const callerConfig = change === 'user'
+        ? { ...config, configurable: { ...config.configurable, user_id: 'foreign-user' } } : config;
+      const resume = rebuilt.processStream(new Command({ resume: { [first.interruptId]: [{ type: 'approve' }] } }), callerConfig);
+      if (change === 'manifest-version') {
+        await expect(resume).rejects.toThrow('Invalid subagent resume manifest');
+        expect(injected).toBe(true);
+        expect(() => rebuilt.getInterrupt()).toThrow('Invalid subagent resume manifest');
+      } else await resume;
+      expect(h.leftExecute).not.toHaveBeenCalled();
+      expect(h.rightExecute).not.toHaveBeenCalled();
+    }
+  );
+
 });

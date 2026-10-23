@@ -11,7 +11,6 @@ import {
   isToolOutputReferenceState,
   stripSubagentResumeManifest,
   requireValidSubagentResumeManifest,
-  getSubagentResumeManifest,
   SUBAGENT_RESUME_MANIFEST_CONFIG_KEY,
 } from '@/tools/subagent/SubagentReplay';
 import {
@@ -217,9 +216,10 @@ export function restoreToolReplayConfigs(
     const replay = restored[TOOL_BATCH_REPLAY_KEY];
     const review = restored[TOOL_APPROVAL_REVIEW_CONFIG_KEY];
     const resumed = pending.id != null && resumedInterruptIds.has(pending.id);
+    const payload = stripRunStepResumeState(pending.value);
     const manifest =
-      getSubagentResumeManifest(pending.value) ??
-      getSubagentResumeManifest(stripToolBatchReplayState(pending.value));
+      requireValidSubagentResumeManifest(payload) ??
+      requireValidSubagentResumeManifest(stripToolBatchReplayState(payload));
     const evidence: ToolReplayConfig = {
       ...(manifest == null ? {} : { [SUBAGENT_RESUME_MANIFEST_CONFIG_KEY]: manifest }),
       [TOOL_BATCH_REPLAY_KEY]: resumed || replay == null
@@ -593,8 +593,10 @@ export async function attachToolBatchReplayState(
   if (records.length === 0 && approvalOwner == null) {
     return payload;
   }
+  const inline = isRecord(publicPayload) &&
+    Object.getPrototypeOf(publicPayload) === Object.prototype;
   const result = {
-    ...(isRecord(publicPayload)
+    ...(inline
       ? publicPayload
       : {
         [TOOL_BATCH_WRAPPER_KEY]: 1,
@@ -604,7 +606,7 @@ export async function attachToolBatchReplayState(
       version: 1,
       approvalOwner,
       records,
-      wrappedPayload: previous?.wrappedPayload ?? !isRecord(publicPayload),
+      wrappedPayload: previous?.wrappedPayload ?? !inline,
     } satisfies ToolBatchReplayState,
   };
   const runStepState = getRunStepResumeState(payload);

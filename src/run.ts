@@ -444,11 +444,19 @@ function overwriteResumeRunStepState(
         ['runStepState', overwrite] as [string, unknown],
     ]
     : { ...(command.update ?? {}), runStepState: overwrite };
+  return copyResumeCommand(command, { update });
+}
+
+function copyResumeCommand(
+  command: Command,
+  overrides: Pick<ConstructorParameters<typeof Command>[0], 'resume' | 'update'>
+): Command {
   const resumed = new Command({
     ...(command.graph == null ? {} : { graph: command.graph }),
     ...(command.resume === undefined ? {} : { resume: command.resume }),
-    update,
+    ...(command.update === undefined ? {} : { update: command.update }),
     ...(command.goto === undefined ? {} : { goto: command.goto }),
+    ...overrides,
   });
   resumed.lc_direct_tool_output = command.lc_direct_tool_output;
   return resumed;
@@ -1317,7 +1325,7 @@ export class Run<_T extends t.BaseGraphState> {
       (callerConfig.recursionLimit ?? DEFAULT_RECURSION_LIMIT) +
       (this.preemption != null ? resolveMaxSeals(this.preemption.maxSeals) : 0);
 
-    const config: t.RunStreamConfig = {
+    let config: t.RunStreamConfig = {
       ...callerConfig,
       recursionLimit,
       configurable: { ...callerConfig.configurable },
@@ -1331,12 +1339,26 @@ export class Run<_T extends t.BaseGraphState> {
     }
     let overwriteLegacyResumeState = false;
     if (isResume) {
-      await this.restoreInterruptFromCheckpoint(
+      config = await this.resolveInterruptResumeConfig(
         config,
-        (inputs as Command).update
+        (inputs as Command).update,
+        (inputs as Command).resume
       );
-      if (config.configurable != null) {
-        this.restoreRootReplayConfig(config.configurable, (inputs as Command).resume);
+      const interruptId = this._interrupt?.interruptId;
+      const command = inputs as Command;
+      if (
+        command.resume !== undefined &&
+        typeof interruptId === 'string' &&
+        interruptId.length > 0 &&
+        !isLangGraphResumeMapForInterrupt(
+          command.resume,
+          interruptId,
+          this.getPendingInterruptState().ids
+        )
+      ) {
+        inputs = copyResumeCommand(command, {
+          resume: { [interruptId]: command.resume },
+        });
       }
       if (graph.getStopContinuationExecutionId() === '') {
         graph.startStopContinuationExecution(nanoid());
@@ -2127,27 +2149,15 @@ export class Run<_T extends t.BaseGraphState> {
       'update' | 'goto'
     >
   ): Promise<MessageContentComplex[] | undefined> {
-    const resumeConfig = await this.resolveInterruptResumeConfig(
+    await this.restoreInterruptFromCheckpoint(
       callerConfig,
-      commandOptions?.update,
-      resumeValue
+      commandOptions?.update
     );
-    const interruptId = this._interrupt?.interruptId;
-    const scopedResume =
-      typeof interruptId === 'string' &&
-      interruptId.length > 0 &&
-      !isLangGraphResumeMapForInterrupt(
-        resumeValue,
-        interruptId,
-        this.getPendingInterruptState().ids
-      )
-        ? { [interruptId]: resumeValue }
-        : resumeValue;
     // langgraph 1.4.5 applies resume + state update + reroute in one superstep
     // (single checkpoint). `update`/`goto` are omitted unless the caller sets them.
     return this.processStream(
       new Command({
-        resume: scopedResume,
+        resume: resumeValue,
         ...(commandOptions?.update !== undefined
           ? { update: commandOptions.update }
           : {}),
@@ -2155,7 +2165,7 @@ export class Run<_T extends t.BaseGraphState> {
           ? { goto: commandOptions.goto }
           : {}),
       }),
-      resumeConfig,
+      callerConfig,
       streamOptions
     );
   }

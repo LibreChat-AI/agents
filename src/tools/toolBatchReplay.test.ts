@@ -21,6 +21,7 @@ import {
 } from './toolBatchReplay';
 import { attachSubagentResumeManifest, SUBAGENT_RESUME_MANIFEST_CONFIG_KEY } from '@/tools/subagent/SubagentReplay';
 import { getToolApprovalReviewEvidence } from '@/hitl/approvalReview';
+import { attachRunStepResumeState } from '@/tools/runStepResume';
 
 const approval = {
   type: 'tool_approval',
@@ -570,4 +571,20 @@ describe('checkpoint-owned tool batch replay', () => {
       getToolBatchReplayState({ [TOOL_BATCH_REPLAY_KEY]: undefined })
     ).toBeUndefined();
   });
+
+  it.each([false, true])('rejects an unaddressed malformed sibling manifest, wrapped=%s', (wrapped) => {
+    const malformed = {
+      type: 'ask_user_question',
+      question: { question: 'Continue?' },
+      [SUBAGENT_RESUME_MANIFEST_CONFIG_KEY]: { version: 2, executions: [] },
+    };
+    const value = wrapped ? attachRunStepResumeState(malformed, {
+      version: 1, revision: 0, nextIndex: 0, steps: [], toolCallSteps: [],
+    }) : malformed;
+    expect(() => restoreToolReplayConfigs({}, [
+      { id: 'addressed', value: approval }, { id: 'unaddressed', value },
+    ], 'source', 'target', 'thread', new Set(['addressed'])))
+      .toThrow('Invalid subagent resume manifest');
+  });
+
 });

@@ -4,6 +4,7 @@ import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import {
   END,
   START,
+  Command,
   StateGraph,
   MemorySaver,
   MessagesAnnotation,
@@ -17,9 +18,9 @@ import {
 import { TOOL_APPROVAL_REVIEW_CONFIG_KEY } from '@/hitl/approvalReview';
 import { TOOL_BATCH_REPLAY_KEY } from '../toolBatchReplay';
 import { askUserQuestion } from '@/hitl';
+import { ToolNode } from '../ToolNode';
 import { Providers } from '@/common';
 import { Run } from '@/run';
-import { ToolNode } from '../ToolNode';
 
 function createHarness(
   carryCheckpointConfig = false,
@@ -303,9 +304,11 @@ describe('approval execution scope', () => {
     expect(rebuilt.getInterrupt()).toBeUndefined();
   });
 
-  it.each(['agent', 'scope', 'principal'])(
-    'fails closed when the %s changes during the pending resume',
-    async (changedIdentity) => {
+  it.each(['resume', 'command'].flatMap((entrypoint) =>
+    ['agent', 'scope', 'principal'].map((changedIdentity) => ({ entrypoint, changedIdentity }))
+  ))(
+    'fails closed when $changedIdentity changes during $entrypoint',
+    async ({ entrypoint, changedIdentity }) => {
       const { createRun, executions } = createHarness();
       const original = await createRun('a', 'run-1');
       await original.processStream(
@@ -316,14 +319,14 @@ describe('approval execution scope', () => {
         changedIdentity === 'agent' ? 'b' : 'a',
         'run-1'
       );
-      await expect(
-        resumed.resume(
-          [{ type: 'approve' }],
-          config(
-            changedIdentity === 'scope' ? 'run-2' : 'run-1',
-            changedIdentity === 'principal' ? 'user-b' : 'user-a'
-          )
-        )
+      const resumeConfig = config(
+        changedIdentity === 'scope' ? 'run-2' : 'run-1',
+        changedIdentity === 'principal' ? 'user-b' : 'user-a'
+      );
+      const decisions = [{ type: 'approve' as const }];
+      await expect(entrypoint === 'command'
+        ? resumed.processStream(new Command({ resume: decisions }), resumeConfig)
+        : resumed.resume(decisions, resumeConfig)
       ).rejects.toThrow('Tool approval execution owner changed');
       expect(executions).toEqual([]);
     }

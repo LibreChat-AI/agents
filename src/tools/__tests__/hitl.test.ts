@@ -1338,8 +1338,12 @@ describe('Run integration — HITL fallback checkpointer + resume', () => {
           checkpoint_ns: '',
         },
       },
+      values: { messages: [] },
+      next: ['tools'],
       tasks: [
         {
+          id: 'persisted-task',
+          name: 'tools',
           interrupts: [
             {
               id: 'persisted-interrupt',
@@ -1358,40 +1362,46 @@ describe('Run integration — HITL fallback checkpointer + resume', () => {
       async (_config: RunnableConfig, _options?: { subgraphs?: boolean }) =>
         persistedState
     );
-    run.graphRunnable = { getState } as unknown as t.CompiledStateWorkflow;
-    const processSpy = jest
-      .spyOn(run, 'processStream')
-      .mockResolvedValue(undefined);
+    const workflow = run.graphRunnable as t.CompiledStateWorkflow &
+      Pick<ReturnType<StateGraph<t.IState>['compile']>, 'getState'>;
+    jest.spyOn(workflow, 'getState').mockImplementation(getState);
+    const boundary = new Error('Resume dispatch boundary reached');
+    const streamSpy = jest.spyOn(workflow, 'streamEvents').mockImplementation(() => {
+      expect(registry.getMatchers('PreToolUse', run.id)).toEqual([persistedMatcher]);
+      throw boundary;
+    });
+    const processStream = run.processStream.bind(run);
+    jest.spyOn(run, 'processStream').mockImplementation((...args) => {
+      expect(run.getInterrupt()).toMatchObject({
+        interruptId: 'persisted-interrupt',
+        threadId: 'durable-thread',
+        payload: {
+          type: 'tool_approval',
+          hook_session_id: 'persisted-hook-session',
+        },
+      });
+      return processStream(...args);
+    });
     const callerConfig = {
       version: 'v2' as const,
       configurable: { thread_id: 'durable-thread' },
     };
     const decision = [{ type: 'approve' as const }];
 
-    await run.resume(decision, callerConfig);
+    await expect(run.resume(decision, callerConfig)).rejects.toBe(boundary);
 
     expect(getState).toHaveBeenCalledWith(callerConfig, { subgraphs: true });
-    const command = processSpy.mock.calls[0]?.[0] as Command;
+    const command = streamSpy.mock.calls[0]?.[0];
+    if (!(command instanceof Command)) throw new Error('Missing resume Command');
     expect(command.resume).toEqual({ 'persisted-interrupt': decision });
-    expect(processSpy.mock.calls[0]?.[1].configurable).toMatchObject({
+    expect(streamSpy.mock.calls[0]?.[1].configurable).toMatchObject({
       thread_id: 'durable-thread',
       checkpoint_id: 'interrupted-checkpoint',
       checkpoint_ns: '',
     });
-    expect(run.getInterrupt()).toMatchObject({
-      interruptId: 'persisted-interrupt',
-      threadId: 'durable-thread',
-      payload: {
-        type: 'tool_approval',
-        hook_session_id: 'persisted-hook-session',
-      },
-    });
     expect(
       registry.getMatchers('PreToolUse', 'persisted-hook-session')
     ).toEqual([persistedMatcher]);
-    expect(registry.getMatchers('PreToolUse', run.id)).toEqual([
-      persistedMatcher,
-    ]);
   });
 
   it('re-exports langgraph HITL primitives from the SDK barrel for host use', async () => {
