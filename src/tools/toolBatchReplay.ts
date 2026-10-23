@@ -221,7 +221,7 @@ export function restoreToolReplayConfigs(
       requireValidSubagentResumeManifest(payload) ??
       requireValidSubagentResumeManifest(stripToolBatchReplayState(payload));
     const evidence: ToolReplayConfig = {
-      ...(manifest == null ? {} : { [SUBAGENT_RESUME_MANIFEST_CONFIG_KEY]: manifest }),
+      [SUBAGENT_RESUME_MANIFEST_CONFIG_KEY]: manifest,
       [TOOL_BATCH_REPLAY_KEY]: resumed || replay == null
         ? replay
         : { ...replay, approvalOwner: undefined },
@@ -244,6 +244,7 @@ export function restoreToolReplayConfigs(
       });
     const owner = review?.owner ?? replay?.approvalOwner;
     if (owner == null && memberRecords.length === 0) configs.set('', {
+      [SUBAGENT_RESUME_MANIFEST_CONFIG_KEY]: undefined,
       [TOOL_BATCH_REPLAY_KEY]: undefined,
       [TOOL_APPROVAL_REVIEW_CONFIG_KEY]: undefined,
     });
@@ -273,6 +274,9 @@ export function restoreToolReplayConfigs(
   delete configurable[TOOL_BATCH_REPLAY_KEY];
   delete configurable[TOOL_APPROVAL_REVIEW_CONFIG_KEY];
   Object.assign(configurable, first);
+  if (first != null && first[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY] === undefined) {
+    delete configurable[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY];
+  }
   if (configs.size > 1) configurable[TOOL_REPLAY_CONFIGS_KEY] = configs;
 }
 
@@ -300,12 +304,15 @@ export function getToolReplayConfig(
     }
     if (evidence == null) throw new Error('Tool replay execution identity changed before resume');
   }
-  if (evidence == null) return config;
-  const configurable: NonNullable<RunnableConfig['configurable']> = {
-    ...config.configurable,
-    ...evidence,
-  };
+  const configurable: NonNullable<RunnableConfig['configurable']> = { ...config.configurable };
   delete configurable[TOOL_REPLAY_CONFIGS_KEY];
+  delete configurable[TOOL_BATCH_REPLAY_KEY];
+  delete configurable[TOOL_APPROVAL_REVIEW_CONFIG_KEY];
+  delete configurable[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY];
+  Object.assign(configurable, evidence);
+  if (configurable[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY] === undefined) {
+    delete configurable[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY];
+  }
   return { ...config, configurable };
 }
 
@@ -377,6 +384,7 @@ export function clearStaleToolApprovalConfig(
   batch: string | undefined
 ): void {
   delete configurable[TOOL_APPROVAL_REVIEW_CONFIG_KEY];
+  delete configurable[TOOL_REPLAY_CONFIGS_KEY];
   const state = getToolBatchReplayState(configurable);
   const records = batch == null
     ? []

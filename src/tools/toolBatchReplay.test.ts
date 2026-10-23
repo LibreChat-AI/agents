@@ -63,7 +63,11 @@ describe('checkpoint-owned tool batch replay', () => {
         ...config,
         configurable: { ...config.configurable, user_id: 'different-user' },
       };
-      expect(getToolReplayConfig(foreign, getToolBatchReplayOwner(foreign, member))).toBe(foreign);
+      const neutral = getToolReplayConfig(foreign, getToolBatchReplayOwner(foreign, member));
+      expect(neutral.configurable?.[TOOL_REPLAY_CONFIGS_KEY]).toBeUndefined();
+      expect(neutral.configurable?.[TOOL_BATCH_REPLAY_KEY]).toBeUndefined();
+      expect(getToolApprovalReviewEvidence(neutral)).toBeUndefined();
+      expect(neutral.configurable?.[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY]).toBeUndefined();
     }
     expect(config.configurable?.[TOOL_BATCH_REPLAY_KEY]).toBe(original);
     expect(getToolBatchReplayState(interrupts[0].value)?.records[0].owner).toBe(JSON.stringify(['source', '', 'left', 'user', 'source-thread']));
@@ -586,5 +590,26 @@ describe('checkpoint-owned tool batch replay', () => {
     ], 'source', 'target', 'thread', new Set(['addressed'])))
       .toThrow('Invalid subagent resume manifest');
   });
+
+  it.each(['approval', 'ownerless', 'unmatched'].flatMap((kind) => [false, true].map((reverse) => ({ kind, reverse }))))(
+    'does not inherit a sibling manifest: %j', async ({ kind, reverse }) => {
+      const manifest: SubagentResumeManifest = { version: 1, executions: [{
+        parentToolCallId: 'shared-spawn', childRunId: 'existing-child', approvalExecutionScope: 'child-scope',
+        checkpoints: [{ threadId: 'child-thread', checkpointId: 'checkpoint', checkpointNs: '' }],
+        graphState: { toolCallSteps: [], toolSessions: [], toolNodes: [], eagerToolUsage: [], eagerToolSuppressions: [] },
+        approvalReplays: [],
+      }] };
+      const owner = (member: string) => JSON.stringify(['scope', '', member, 'user', 'thread']);
+      const child = { id: 'child', value: attachSubagentResumeManifest(await attachToolBatchReplayState(approval, owner('left'), new Map()), manifest) };
+      const other = { id: 'other', value: kind === 'ownerless' ? { type: 'ask_user_question' } : await attachToolBatchReplayState(approval, owner('right'), new Map()) };
+      const config: RunnableConfig = { configurable: { user_id: 'user', thread_id: 'thread', __librechat_tool_approval_execution_scope: 'scope' } };
+      restoreToolReplayConfigs(config.configurable!, reverse ? [other, child] : [child, other], 'scope', 'scope', 'thread', new Set(['child']));
+      const selected = getToolReplayConfig(config, owner(kind === 'unmatched' ? 'joined' : 'right'));
+      expect(selected.configurable?.[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY]).toBeUndefined();
+      expect(selected.configurable?.[TOOL_REPLAY_CONFIGS_KEY]).toBeUndefined();
+      expect(getToolApprovalReviewEvidence(selected)).toBeUndefined();
+      expect(getToolReplayConfig(config, owner('left')).configurable?.[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY]).toEqual(manifest);
+    }
+  );
 
 });

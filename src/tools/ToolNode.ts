@@ -55,6 +55,7 @@ import type { RunBreakerScope } from '@/llm/streamLimits';
 import type * as t from '@/types';
 import {
   TOOL_BATCH_REPLAY_KEY,
+  TOOL_REPLAY_CONFIGS_KEY,
   getToolBatchReplayOwner,
   getToolReplayConfig,
   getToolBatchReplayScope,
@@ -83,6 +84,13 @@ import {
   serializeToolContentBounded,
 } from '@/utils/toolContent';
 import {
+  attachSubagentResumeManifest,
+  SUBAGENT_RESUME_MANIFEST_CONFIG_KEY,
+  SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY,
+  SUBAGENT_PARENT_BATCH_CONFIG_KEY,
+  SUBAGENT_REPLAY_CONTROLLER,
+} from '@/tools/subagent/SubagentReplay';
+import {
   getReviewedToolApproval,
   getToolApprovalReviewEvidence,
   toolApprovalPayloadMatches,
@@ -97,11 +105,6 @@ import {
   recordArgsEqual,
   stableStringify,
 } from '@/tools/eagerEventExecution';
-import {
-  attachSubagentResumeManifest,
-  SUBAGENT_PARENT_BATCH_CONFIG_KEY,
-  SUBAGENT_REPLAY_CONTROLLER,
-} from '@/tools/subagent/SubagentReplay';
 import {
   INTENT_ARG,
   readOutcomeFields,
@@ -143,13 +146,21 @@ function stripToolApprovalReviewConfig(
   if (
     configurable == null ||
     (!(TOOL_APPROVAL_REVIEW_CONFIG_KEY in configurable) &&
-      !(TOOL_BATCH_REPLAY_KEY in configurable))
+      !(TOOL_BATCH_REPLAY_KEY in configurable) &&
+      !(TOOL_REPLAY_CONFIGS_KEY in configurable) &&
+      !(SUBAGENT_RESUME_MANIFEST_CONFIG_KEY in configurable) &&
+      !(SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY in configurable) &&
+      !(SUBAGENT_PARENT_BATCH_CONFIG_KEY in configurable))
   ) {
     return configurable;
   }
   const {
     [TOOL_APPROVAL_REVIEW_CONFIG_KEY]: _review,
     [TOOL_BATCH_REPLAY_KEY]: _replay,
+    [TOOL_REPLAY_CONFIGS_KEY]: _configs,
+    [SUBAGENT_RESUME_MANIFEST_CONFIG_KEY]: _manifest,
+    [SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY]: _attempt,
+    [SUBAGENT_PARENT_BATCH_CONFIG_KEY]: _parentBatch,
     ...rest
   } = configurable;
   return rest;
