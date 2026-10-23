@@ -1,19 +1,19 @@
-import { Command, MemorySaver, isCommand } from '@langchain/langgraph';
 import { isBaseMessage } from '@langchain/core/messages';
+import { Command, MemorySaver, isCommand } from '@langchain/langgraph';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { BaseMessage } from '@langchain/core/messages';
 import type { Interrupt } from '@langchain/langgraph';
-import type { SubagentToolNodeResumeState } from '@/tools/subagent/SubagentReplay';
-import type { ToolApprovalReviewEvidence } from '@/hitl/approvalReview';
+import type { SubagentResumeManifest, SubagentToolNodeResumeState } from '@/tools/subagent/SubagentReplay';
 import type { ToolOutputReferenceState } from '@/tools/toolOutputReferences';
+import type { ToolApprovalReviewEvidence } from '@/hitl/approvalReview';
 import {
   isToolNodeResumeState,
   isToolOutputReferenceState,
   stripSubagentResumeManifest,
   requireValidSubagentResumeManifest,
+  getSubagentResumeManifest,
+  SUBAGENT_RESUME_MANIFEST_CONFIG_KEY,
 } from '@/tools/subagent/SubagentReplay';
-import { isToolApprovalInterrupt } from '@/types/hitl';
-import { TOOL_APPROVAL_EXECUTION_SCOPE_CONFIG_KEY } from '@/hooks/types';
 import {
   TOOL_APPROVAL_REVIEW_CONFIG_KEY,
   getToolApprovalReviewEvidence,
@@ -24,6 +24,9 @@ import {
   getRunStepResumeState,
   stripRunStepResumeState,
 } from '@/tools/runStepResume';
+import { TOOL_APPROVAL_EXECUTION_SCOPE_CONFIG_KEY } from '@/hooks/types';
+import { stableStringify } from '@/tools/eagerEventExecution';
+import { isToolApprovalInterrupt } from '@/types/hitl';
 
 export const TOOL_BATCH_REPLAY_KEY = '__librechat_tool_batch_replay';
 export const TOOL_REPLAY_CONFIGS_KEY = '__librechat_tool_replay_configs';
@@ -65,6 +68,7 @@ interface ToolBatchReplayState {
 type ToolReplayConfig = {
   [TOOL_BATCH_REPLAY_KEY]?: ToolBatchReplayState;
   [TOOL_APPROVAL_REVIEW_CONFIG_KEY]?: ToolApprovalReviewEvidence;
+  [SUBAGENT_RESUME_MANIFEST_CONFIG_KEY]?: SubagentResumeManifest;
 };
 
 /** Use the same message/Command codec as LangGraph checkpoints. */
@@ -142,6 +146,48 @@ export function restoreToolReplayConfig(
   }
 }
 
+/** Several child proposals can carry the same parent's checkpointed batch. */
+function mergeParentReplayConfig(
+  left: ToolReplayConfig,
+  right: ToolReplayConfig
+): ToolReplayConfig {
+  const leftState = left[TOOL_BATCH_REPLAY_KEY];
+  const rightState = right[TOOL_BATCH_REPLAY_KEY];
+  const records = new Map<string, ToolBatchReplayRecord>();
+  for (const record of [...(leftState?.records ?? []), ...(rightState?.records ?? [])]) {
+    const key = JSON.stringify([record.owner, record.batch]);
+    const previous = records.get(key);
+    if (previous != null && stableStringify(previous) !== stableStringify(record)) {
+      throw new Error('Conflicting parent tool replay checkpoint records');
+    }
+    records.set(key, record);
+  }
+  const manifest = left[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY];
+  const other = right[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY];
+  const executions = new Map<string, SubagentResumeManifest['executions'][number]>();
+  for (const execution of [...(manifest?.executions ?? []), ...(other?.executions ?? [])]) {
+    const key = JSON.stringify([execution.parentToolCallId, execution.childRunId]);
+    const previous = executions.get(key);
+    if (previous != null && stableStringify(previous) !== stableStringify(execution)) {
+      throw new Error('Conflicting parent subagent checkpoint manifests');
+    }
+    executions.set(key, execution);
+  }
+  const review = left[TOOL_APPROVAL_REVIEW_CONFIG_KEY] ?? right[TOOL_APPROVAL_REVIEW_CONFIG_KEY];
+  return {
+    [TOOL_APPROVAL_REVIEW_CONFIG_KEY]: review,
+    [TOOL_BATCH_REPLAY_KEY]: {
+      ...(leftState ?? rightState),
+      version: 1,
+      records: [...records.values()],
+      approvalOwner: review?.owner,
+      interruptId: review?.interruptId ?? leftState?.interruptId ?? rightState?.interruptId,
+    },
+    [SUBAGENT_RESUME_MANIFEST_CONFIG_KEY]: executions.size === 0
+      ? undefined : { version: 1, executions: [...executions.values()] },
+  };
+}
+
 /** Restore each checkpointed interrupt without sharing member authorization. */
 export function restoreToolReplayConfigs(
   configurable: NonNullable<RunnableConfig['configurable']>,
@@ -153,6 +199,7 @@ export function restoreToolReplayConfigs(
 ): void {
   delete configurable[TOOL_REPLAY_CONFIGS_KEY];
   const configs = new Map<string, ToolReplayConfig>();
+  const parents = new Map<string, ToolReplayConfig>();
   let first: ToolReplayConfig | undefined;
   for (const pending of interrupts) {
     const restored: ToolReplayConfig &
@@ -170,7 +217,11 @@ export function restoreToolReplayConfigs(
     const replay = restored[TOOL_BATCH_REPLAY_KEY];
     const review = restored[TOOL_APPROVAL_REVIEW_CONFIG_KEY];
     const resumed = pending.id != null && resumedInterruptIds.has(pending.id);
+    const manifest =
+      getSubagentResumeManifest(pending.value) ??
+      getSubagentResumeManifest(stripToolBatchReplayState(pending.value));
     const evidence: ToolReplayConfig = {
+      ...(manifest == null ? {} : { [SUBAGENT_RESUME_MANIFEST_CONFIG_KEY]: manifest }),
       [TOOL_BATCH_REPLAY_KEY]: resumed || replay == null
         ? replay
         : { ...replay, approvalOwner: undefined },
@@ -191,6 +242,19 @@ export function restoreToolReplayConfigs(
       }
       configs.set(owner, evidence);
     }
+    if (manifest != null) {
+      for (const record of replay?.records ?? []) {
+        if (record.owner === owner) continue;
+        const previous = parents.get(record.owner);
+        parents.set(
+          record.owner,
+          previous == null ? evidence : mergeParentReplayConfig(previous, evidence)
+        );
+      }
+    }
+  }
+  for (const [owner, evidence] of parents) {
+    if (!configs.has(owner)) configs.set(owner, evidence);
   }
   delete configurable[TOOL_BATCH_REPLAY_KEY];
   delete configurable[TOOL_APPROVAL_REVIEW_CONFIG_KEY];
