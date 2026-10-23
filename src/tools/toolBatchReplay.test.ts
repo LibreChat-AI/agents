@@ -5,6 +5,8 @@ import type { SubagentResumeManifest } from '@/tools/subagent/SubagentReplay';
 import {
   TOOL_BATCH_REPLAY_KEY,
   TOOL_REPLAY_CONFIGS_KEY,
+  TOOL_PENDING_APPROVAL_KEY,
+  getCheckpointPendingApproval,
   getToolReplayConfig,
   restoreToolReplayConfigs,
   attachToolBatchReplayState,
@@ -66,6 +68,7 @@ describe('checkpoint-owned tool batch replay', () => {
       };
       const neutral = getToolReplayConfig(foreign, getToolBatchReplayOwner(foreign, member));
       expect(neutral.configurable?.[TOOL_REPLAY_CONFIGS_KEY]).toBeUndefined();
+      expect(neutral.configurable?.[TOOL_PENDING_APPROVAL_KEY]).toBeUndefined();
       expect(neutral.configurable?.[TOOL_BATCH_REPLAY_KEY]).toBeUndefined();
       expect(getToolApprovalReviewEvidence(neutral)).toBeUndefined();
       expect(neutral.configurable?.[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY]).toBeUndefined();
@@ -92,6 +95,7 @@ describe('checkpoint-owned tool batch replay', () => {
     const leftOwner = getToolBatchReplayOwner(config, 'left');
     const left = getToolReplayConfig(config, leftOwner);
     expect(getToolApprovalReviewEvidence(left)).toBeUndefined();
+    expect(getCheckpointPendingApproval(left)?.interruptId).toBe(question ? undefined : 'left-interrupt');
     expect(getToolBatchReplayState(left.configurable)?.approvalOwner).toBeUndefined();
     expect((await restoreToolBatchReplayState(left, leftOwner))[0].results[0][1].output).toMatchObject({ content: 'left completed' });
     expect(getToolApprovalReviewEvidence(config)?.interruptId).toBe(question || !resumeRight ? undefined : 'right-interrupt');

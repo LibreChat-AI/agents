@@ -92,6 +92,8 @@ const config = {
 };
 function harness(eventDriven: boolean, questionMember?: 'left' | 'right') {
   const checkpointer = new MemorySaver();
+  let policy: 'ask' | 'allow' | 'none' = 'ask';
+  const protection = { enabled: true };
   const calls: string[] = [];
   const reviews: string[] = [];
   const leftEffect = jest.fn(async () => 'left effect');
@@ -111,10 +113,10 @@ function harness(eventDriven: boolean, questionMember?: 'left' | 'right') {
   const build = async () => {
     const hooks = new HookRegistry();
     for (const id of ['left', 'right'])
-      if (id !== questionMember)
+      if (id !== questionMember && policy !== 'none')
         hooks.register('PreToolUse', {
           pattern: `${id}_tool`,
-          hooks: [async () => { reviews.push(id); return { decision: 'ask' as const }; }],
+          hooks: [async () => { reviews.push(id); return { decision: policy === 'ask' ? 'ask' as const : 'allow' as const }; }],
         });
     const agents: t.AgentInputs[] = ['entry', 'left', 'right', 'result'].map(
       (id) => ({
@@ -155,8 +157,8 @@ function harness(eventDriven: boolean, questionMember?: 'left' | 'right') {
     }
     const run = await Run.create<t.IState>({
       runId: `root-approval-${Math.random()}`,
-      hooks,
-      humanInTheLoop: { enabled: true },
+      ...(policy === 'none' ? {} : { hooks }),
+      humanInTheLoop: protection,
       returnContent: true,
       skipCleanup: true,
       graphConfig: {
@@ -195,7 +197,7 @@ function harness(eventDriven: boolean, questionMember?: 'left' | 'right') {
     run.Graph!.overrideModel = new RootApprovalModel(calls);
     return run;
   };
-  return { build, calls, reviews, left, right, leftEffect, rightEffect };
+  return { build, calls, reviews, left, right, leftEffect, rightEffect, setPolicy: (next: typeof policy) => { policy = next; }, protection };
 }
 async function start(run: Run<t.IState>) {
   await run.processStream(
@@ -383,4 +385,40 @@ describe('parallel approval resume authority', () => {
     expect(h.right).not.toHaveBeenCalled();
   });
 
+});
+
+describe('checkpoint-owned pending approval barrier', () => {
+  test.each([... [false, true].flatMap((eventDriven) => [false, true].flatMap((rebuilt) =>
+    ['resume', 'command'].flatMap((entrypoint) => ['left', 'right'].map((addressed) => ({ eventDriven, rebuilt, entrypoint, addressed, policy: 'allow', decision: 'approve' as const })))
+  )), ...[false, true].flatMap((eventDriven) => ['none', 'disabled'].map((policy) => ({ eventDriven, rebuilt: true, entrypoint: 'resume', addressed: 'left', policy, decision: 'approve' as const })))])(
+    'keeps unaddressed proposals pending across policy changes: %j', async ({ eventDriven, rebuilt, entrypoint, addressed, policy, decision }) => {
+      const h = harness(eventDriven);
+      const run = await h.build();
+      await start(run);
+      const pending = run.getInterrupt()?.pendingInterrupts;
+      expect(pending).toHaveLength(2);
+      const selected = pending?.find((entry) => isToolApprovalInterrupt(entry.payload) && entry.payload.action_requests[0].name === `${addressed}_tool`);
+      const sibling = pending?.find((entry) => entry !== selected);
+      if (selected == null || sibling == null) throw new Error('Missing parallel approvals');
+      h.setPolicy(policy === 'none' ? 'none' : 'allow');
+      if (policy === 'disabled') h.protection.enabled = false;
+      const resumed = rebuilt ? await h.build() : run;
+      const decisions = { [selected.interruptId]: [{ type: decision }] };
+      if (entrypoint === 'command') await resumed.processStream(new Command({ resume: decisions }), config);
+      else await resumed.resume(decisions, config);
+      expect(h[addressed as 'left' | 'right']).toHaveBeenCalledTimes(policy === 'disabled' ? 0 : 1);
+      const other = addressed === 'left' ? 'right' : 'left';
+      expect(h[other].mock.calls.length).toBe(0);
+      expect(resumed.getInterrupt()?.pendingInterrupts).toEqual([sibling]);
+      h.protection.enabled = true;
+      const finished = rebuilt ? await h.build() : resumed;
+      await finished.resume({ [sibling.interruptId]: [{ type: 'approve' }] }, config);
+      expect(finished.getInterrupt()).toBeUndefined();
+      expect(h[other]).toHaveBeenCalledTimes(1);
+      expect(h.leftEffect).toHaveBeenCalledTimes(1);
+      expect(h.rightEffect).toHaveBeenCalledTimes(1);
+      expect(h.calls.filter((id) => id === 'entry')).toHaveLength(1);
+      expect(h.calls.filter((id) => id === 'result')).toHaveLength(1);
+    }
+  );
 });

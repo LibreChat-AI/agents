@@ -118,17 +118,18 @@ import {
   SUBAGENT_RESUME_MANIFEST_CONFIG_KEY,
 } from './SubagentReplay';
 import {
+  TOOL_REPLAY_CONFIGS_KEY,
+  TOOL_PENDING_APPROVAL_KEY,
+  rebindToolBatchReplayPayload,
+  restoreToolReplayConfigs,
+  getPublicToolInterruptPayload,
+} from '@/tools/toolBatchReplay';
+import {
   logSubagentResolutionFailure,
   SubagentResolutionError,
   getSubagentHostArgumentFailure,
   getSubagentHostArgumentFailureMessage,
 } from './diagnostics';
-import {
-  TOOL_REPLAY_CONFIGS_KEY,
-  rebindToolBatchReplayPayload,
-  restoreToolReplayConfigs,
-  getPublicToolInterruptPayload,
-} from '@/tools/toolBatchReplay';
 import {
   getSubagentHostArgSpecs,
   resolveSubagentHostArgs,
@@ -4301,6 +4302,7 @@ function isLangGraphRuntimeConfigKey(key: string): boolean {
     key === SUBAGENT_PARENT_BATCH_CONFIG_KEY ||
     key === TOOL_APPROVAL_EXECUTION_SCOPE_CONFIG_KEY ||
     key === TOOL_REPLAY_CONFIGS_KEY ||
+    key === TOOL_PENDING_APPROVAL_KEY ||
     /** The parent batch's breaker scope must not leak into the child
      * workflow's configurable — children own separate controllers. */
     key === RUN_BREAKER_SCOPE_CONFIG_KEY

@@ -56,6 +56,9 @@ import type * as t from '@/types';
 import {
   TOOL_BATCH_REPLAY_KEY,
   TOOL_REPLAY_CONFIGS_KEY,
+  TOOL_PENDING_APPROVAL_KEY,
+  getCheckpointPendingApproval,
+  matchesToolReplayBatch,
   getToolBatchReplayOwner,
   getToolReplayConfig,
   getToolBatchReplayScope,
@@ -148,6 +151,7 @@ function stripToolApprovalReviewConfig(
     (!(TOOL_APPROVAL_REVIEW_CONFIG_KEY in configurable) &&
       !(TOOL_BATCH_REPLAY_KEY in configurable) &&
       !(TOOL_REPLAY_CONFIGS_KEY in configurable) &&
+      !(TOOL_PENDING_APPROVAL_KEY in configurable) &&
       !(SUBAGENT_RESUME_MANIFEST_CONFIG_KEY in configurable) &&
       !(SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY in configurable) &&
       !(SUBAGENT_PARENT_BATCH_CONFIG_KEY in configurable))
@@ -158,6 +162,7 @@ function stripToolApprovalReviewConfig(
     [TOOL_APPROVAL_REVIEW_CONFIG_KEY]: _review,
     [TOOL_BATCH_REPLAY_KEY]: _replay,
     [TOOL_REPLAY_CONFIGS_KEY]: _configs,
+    [TOOL_PENDING_APPROVAL_KEY]: _pending,
     [SUBAGENT_RESUME_MANIFEST_CONFIG_KEY]: _manifest,
     [SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY]: _attempt,
     [SUBAGENT_PARENT_BATCH_CONFIG_KEY]: _parentBatch,
@@ -1073,7 +1078,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           config,
           this.executingAgentId ?? this.agentId ?? ''
         );
-        config = getToolReplayConfig(config, replayOwner, activeReplayKey);
+        config = getToolReplayConfig(config, replayOwner, activeReplayKey, assistantBatch?.message.id);
         let reviewEvidence = getToolApprovalReviewEvidence(config);
         const replayState = getToolBatchReplayState(config.configurable);
         const ownsParentBatch =
@@ -1129,6 +1134,20 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             'Cannot verify the active tool approval resume — failing closed'
           );
         }
+        const checkpointPending = getCheckpointPendingApproval(config);
+        const pendingBatch = checkpointPending != null && (
+          replayState?.records.some((record) => matchesToolReplayBatch(record.batch, activeReplayKey, assistantBatch?.message.id)) === true || ((replayState?.records.length ?? 0) === 0 &&
+            assistantBatch?.message.tool_calls?.some((call) =>
+              getReviewedToolApproval(checkpointPending.payload, call.id) != null
+            ) === true)
+        );
+        if (pendingBatch && checkpointPending.owner != null && checkpointPending.owner !== replayOwner && !isChildReplay) {
+          throw new Error('Tool approval execution owner changed before resume — failing closed');
+        }
+        if (pendingBatch && checkpointPending.owner === replayOwner &&
+          (replayState?.records.length ?? 0) > 0 && !ownsParentBatch) {
+          throw new Error('Tool batch proposal changed before approval replay — failing closed');
+        }
         if (replayResumeStatus === 'stale') {
           const configurable = { ...config.configurable };
           clearStaleToolApprovalConfig(
@@ -1136,6 +1155,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             replayOwner,
             activeReplayKey
           );
+          if (pendingBatch) configurable[TOOL_PENDING_APPROVAL_KEY] = checkpointPending;
           config = {
             ...config,
             configurable,
@@ -2441,13 +2461,14 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           approvalReplaySessionId,
           approvalReplayKey
         );
-    const approvalReviewEvidence = getToolApprovalReviewEvidence(
-      config,
-      getToolBatchReplayOwner(
-        config,
-        this.executingAgentId ?? this.agentId ?? ''
-      )
-    );
+    const replayOwner = getToolBatchReplayOwner(config, this.executingAgentId ?? this.agentId ?? '');
+    const approvalReviewEvidence = getToolApprovalReviewEvidence(config, replayOwner);
+    const checkpointPending = getCheckpointPendingApproval(config);
+    if (approvalReviewEvidence == null && checkpointPending != null &&
+      (checkpointPending.owner == null || checkpointPending.owner === replayOwner) &&
+      getReviewedToolApproval(checkpointPending.payload, call.id) != null) {
+      throw new GraphInterrupt([{ id: checkpointPending.interruptId, value: checkpointPending.value }]);
+    }
     const reviewedApproval = getReviewedToolApproval(
       approvalReviewEvidence?.payload,
       call.id
@@ -3627,13 +3648,14 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       config,
       runId
     );
-    const approvalReviewEvidence = getToolApprovalReviewEvidence(
-      config,
-      getToolBatchReplayOwner(
-        config,
-        this.executingAgentId ?? this.agentId ?? ''
-      )
-    );
+    const replayOwner = getToolBatchReplayOwner(config, this.executingAgentId ?? this.agentId ?? '');
+    const approvalReviewEvidence = getToolApprovalReviewEvidence(config, replayOwner);
+    const checkpointPending = getCheckpointPendingApproval(config);
+    if (approvalReviewEvidence == null && checkpointPending != null &&
+      (checkpointPending.owner == null || checkpointPending.owner === replayOwner) &&
+      preToolCalls.some((entry) => getReviewedToolApproval(checkpointPending.payload, entry.call.id) != null)) {
+      throw new GraphInterrupt([{ id: checkpointPending.interruptId, value: checkpointPending.value }]);
+    }
     const hasPendingApproval = preToolCalls.some(
       (entry) =>
         entry.call.id != null &&
@@ -3965,6 +3987,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           entry.call.id
         );
         if (reviewedApproval != null) {
+          if (this.humanInTheLoop?.enabled !== true) {
+            blockEntry(entry, 'Foreground tool approval is disabled');
+            continue;
+          }
           if (hookResult.updatedInput == null) {
             entry.args = this.coerceEventToolArgs(
               entry.call.name,

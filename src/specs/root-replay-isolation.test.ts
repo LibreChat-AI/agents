@@ -21,6 +21,7 @@ import { Run } from '@/run';
 
 type Root = 'left' | 'right';
 const privateKeys = [
+  '__librechat_tool_pending_approval',
   '__librechat_tool_replay_configs',
   '__librechat_tool_batch_replay',
   '__librechat_tool_approval_review',

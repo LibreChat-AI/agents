@@ -28,6 +28,16 @@ import type { MultiAgentGraph } from '@/graphs/MultiAgentGraph';
 import type { StandardGraph } from '@/graphs/Graph';
 import type * as t from '@/types';
 import {
+  TOOL_BATCH_REPLAY_KEY,
+  TOOL_REPLAY_CONFIGS_KEY,
+  TOOL_PENDING_APPROVAL_KEY,
+  restoreToolReplayConfig,
+  restoreToolReplayConfigs,
+  getToolBatchReplayScope,
+  stripToolBatchReplayState,
+  getPublicToolInterruptPayload,
+} from '@/tools/toolBatchReplay';
+import {
   Callback,
   GraphEvents,
   TitleMethod,
@@ -38,15 +48,6 @@ import {
   DEFAULT_MAX_STOP_CONTINUATIONS,
   DEFAULT_RECURSION_LIMIT,
 } from '@/common';
-import {
-  TOOL_BATCH_REPLAY_KEY,
-  TOOL_REPLAY_CONFIGS_KEY,
-  restoreToolReplayConfig,
-  restoreToolReplayConfigs,
-  getToolBatchReplayScope,
-  stripToolBatchReplayState,
-  getPublicToolInterruptPayload,
-} from '@/tools/toolBatchReplay';
 import {
   createLangfuseTraceMetadata,
   createLangfuseHandler,
@@ -1333,6 +1334,7 @@ export class Run<_T extends t.BaseGraphState> {
     delete config.configurable?.[TOOL_APPROVAL_REVIEW_CONFIG_KEY];
     delete config.configurable?.[TOOL_BATCH_REPLAY_KEY];
     delete config.configurable?.[TOOL_REPLAY_CONFIGS_KEY];
+    delete config.configurable?.[TOOL_PENDING_APPROVAL_KEY];
     if (!isResume) {
       delete config.configurable?.[SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY];
       delete config.configurable?.[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY];
@@ -2240,6 +2242,7 @@ export class Run<_T extends t.BaseGraphState> {
     delete resumeConfigurable[TOOL_APPROVAL_REVIEW_CONFIG_KEY];
     delete resumeConfigurable[TOOL_BATCH_REPLAY_KEY];
     delete resumeConfigurable[TOOL_REPLAY_CONFIGS_KEY];
+    delete resumeConfigurable[TOOL_PENDING_APPROVAL_KEY];
     delete resumeConfigurable[SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY];
     delete resumeConfigurable[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY];
     resumeConfigurable[SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY] = nanoid();

@@ -129,6 +129,7 @@ function harness(
   mixedQuestion?: 'left' | 'right',
   approvalBarrier?: Promise<void>
 ) {
+  let policy: 'ask' | 'allow' | 'none' = 'ask';
   const checkpointer = new MemorySaver();
   const calls: string[] = [];
   const leftExecute = jest.fn(
@@ -257,7 +258,7 @@ function harness(
   ) => {
     const hookRegistry = new HookRegistry();
     for (const id of ['left', 'right']) {
-      if (id === mixedQuestion) continue;
+      if (id === mixedQuestion || policy === 'none') continue;
       const memberTool =
         programmatic && id === 'left'
           ? Constants.PROGRAMMATIC_TOOL_CALLING
@@ -266,7 +267,7 @@ function harness(
         pattern: sessionTools ? Constants.EXECUTE_CODE : memberTool,
         hooks: [async () => {
           if (approvalBarrier != null) await approvalBarrier;
-          return { decision: 'ask' as const };
+          return { decision: policy === 'ask' ? 'ask' as const : 'allow' as const };
         }],
       });
     }
@@ -317,7 +318,7 @@ function harness(
           },
         }
         : {}),
-      hooks: hookRegistry,
+      ...(policy === 'none' ? {} : { hooks: hookRegistry }),
       returnContent: true,
       skipCleanup: true,
     });
@@ -338,6 +339,7 @@ function harness(
     return run;
   };
   return {
+    setPolicy: (next: typeof policy) => { policy = next; },
     checkpointer,
     graph,
     calls,
@@ -1950,10 +1952,52 @@ describe('graph subagent resume contracts', () => {
         await expect(resume).rejects.toThrow('Invalid subagent resume manifest');
         expect(injected).toBe(true);
         expect(() => rebuilt.getInterrupt()).toThrow('Invalid subagent resume manifest');
-      } else await resume;
+      } else await expect(resume).rejects.toThrow('execution owner changed');
       expect(h.leftExecute).not.toHaveBeenCalled();
       expect(h.rightExecute).not.toHaveBeenCalled();
     }
   );
 
+});
+
+describe('graph member checkpoint approval barriers', () => {
+  test.each([
+    ...[false, true].flatMap((eventDriven) => [false, true].flatMap((rebuilt) =>
+      ['resume', 'command'].map((entrypoint) => ({ eventDriven, rebuilt, entrypoint, policy: 'allow', decision: 'approve' }))
+    )),
+    ...[false, true].flatMap((eventDriven) => ['reject', 'edit', 'respond'].map((decision) => ({ eventDriven, rebuilt: true, entrypoint: 'resume', policy: 'none', decision }))),
+  ])('keeps the unaddressed member paused and resumes it explicitly: %j', async ({ eventDriven, rebuilt, entrypoint, policy, decision }) => {
+    const h = harness(eventDriven, false, false, false, true);
+    const run = await h.build();
+    await start(run);
+    const pending = run.getInterrupt()?.pendingInterrupts;
+    expect(pending).toHaveLength(2);
+    const selectedName = entrypoint === 'command' ? 'right' : 'left';
+    const selected = pending?.find((entry) => isToolApprovalInterrupt(entry.payload) && entry.payload.subagent?.agent_id === selectedName);
+    const sibling = pending?.find((entry) => entry !== selected);
+    if (selected == null || sibling == null) throw new Error('Missing member approvals');
+    h.setPolicy(policy === 'none' ? 'none' : 'allow');
+    const resumed = rebuilt ? await h.build() : run;
+    let value: t.ToolApprovalDecision = { type: 'approve' };
+    if (decision === 'reject') value = { type: 'reject', reason: 'Not this task' };
+    else if (decision === 'edit') value = { type: 'edit', updatedInput: { value: 'reviewed' } };
+    else if (decision === 'respond') value = { type: 'respond', responseText: 'Human result' };
+    const decisions = { [selected.interruptId]: [value] };
+    if (entrypoint === 'command') await resumed.processStream(new Command({ resume: decisions }), config);
+    else await resumed.resume(decisions, config);
+    const selectedEffect = selectedName === 'left' ? h.leftExecute : h.rightExecute;
+    const siblingEffect = selectedName === 'left' ? h.rightExecute : h.leftExecute;
+    expect(selectedEffect.mock.calls.length).toBe(decision === 'reject' || decision === 'respond' ? 0 : 1);
+    expect(siblingEffect.mock.calls.length).toBe(0);
+    if (decision === 'edit') expect(selectedEffect.mock.calls[0][0]).toEqual({ value: 'reviewed' });
+    expect(resumed.getInterrupt()?.pendingInterrupts).toEqual([sibling]);
+    const finished = rebuilt ? await h.build() : resumed;
+    await finished.resume({ [sibling.interruptId]: [{ type: 'approve' }] }, config);
+    expect(finished.getInterrupt()).toBeUndefined();
+    expect(siblingEffect).toHaveBeenCalledTimes(1);
+    expect(h.leftEffect).toHaveBeenCalledTimes(1);
+    expect(h.rightEffect).toHaveBeenCalledTimes(1);
+    expect(h.calls.filter((id) => id === 'entry')).toHaveLength(1);
+    expect(h.calls.filter((id) => id === 'result')).toHaveLength(1);
+  });
 });
