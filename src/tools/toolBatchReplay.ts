@@ -228,13 +228,27 @@ export function restoreToolReplayConfigs(
       [TOOL_APPROVAL_REVIEW_CONFIG_KEY]: resumed ? review : undefined,
     };
     if (resumed) first ??= evidence;
+    const childScopes = new Set<string>();
+    const executions = [...(manifest?.executions ?? [])];
+    while (executions.length > 0) {
+      const execution = executions.pop()!;
+      if (execution.descendant == null) {
+        childScopes.add(execution.approvalExecutionScope);
+      } else executions.push(...execution.descendant.executions);
+    }
+    const memberRecords = manifest == null
+      ? replay?.records ?? []
+      : (replay?.records ?? []).filter((record) => {
+        const identity: unknown = JSON.parse(record.owner);
+        return Array.isArray(identity) && childScopes.has(identity[0]);
+      });
     const owner = review?.owner ?? replay?.approvalOwner;
-    if (owner == null && (replay?.records.length ?? 0) === 0) configs.set('', {
+    if (owner == null && memberRecords.length === 0) configs.set('', {
       [TOOL_BATCH_REPLAY_KEY]: undefined,
       [TOOL_APPROVAL_REVIEW_CONFIG_KEY]: undefined,
     });
     const owners = owner == null
-      ? new Set(replay?.records.map(record => record.owner))
+      ? new Set(memberRecords.map(record => record.owner))
       : new Set([owner]);
     for (const owner of owners) {
       if (configs.has(owner)) {
@@ -244,7 +258,7 @@ export function restoreToolReplayConfigs(
     }
     if (manifest != null) {
       for (const record of replay?.records ?? []) {
-        if (record.owner === owner) continue;
+        if (owners.has(record.owner)) continue;
         const previous = parents.get(record.owner);
         parents.set(
           record.owner,

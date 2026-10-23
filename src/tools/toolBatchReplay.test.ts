@@ -1,6 +1,7 @@
-import { ToolMessage } from '@langchain/core/messages';
 import { Command } from '@langchain/langgraph';
+import { ToolMessage } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
+import type { SubagentResumeManifest } from '@/tools/subagent/SubagentReplay';
 import {
   TOOL_BATCH_REPLAY_KEY,
   TOOL_REPLAY_CONFIGS_KEY,
@@ -18,6 +19,7 @@ import {
   getPublicToolInterruptPayload,
   rebindToolBatchReplayPayload,
 } from './toolBatchReplay';
+import { attachSubagentResumeManifest, SUBAGENT_RESUME_MANIFEST_CONFIG_KEY } from '@/tools/subagent/SubagentReplay';
 import { getToolApprovalReviewEvidence } from '@/hitl/approvalReview';
 
 const approval = {
@@ -107,6 +109,60 @@ describe('checkpoint-owned tool batch replay', () => {
     const foreignThread = { configurable: { ...config.configurable, thread_id: 'other-thread' } };
     expect(() => getToolReplayConfig(foreignThread, getToolBatchReplayOwner(foreignThread, 'right'))).toThrow('execution identity changed');
   });
+
+  it.each([false, true].flatMap(reverse => [false, true].flatMap(nested => ['left', 'right', 'both'].map(addressed => ({ reverse, nested, addressed })))))(
+    'merges inherited parent records without conflating question members: %j',
+    async ({ reverse, nested, addressed }) => {
+      const parentOwner = JSON.stringify([nested ? 'middle-scope' : 'root-scope', 'root-ns', 'parent', 'user', 'thread']);
+      const manifest: SubagentResumeManifest = { version: 1, executions: [{
+        parentToolCallId: 'spawn', childRunId: 'child-run', approvalExecutionScope: 'child-scope',
+        checkpoints: [{ threadId: 'child-thread', checkpointNs: '', checkpointId: 'checkpoint' }],
+        graphState: { toolCallSteps: [], toolSessions: [], toolNodes: [], eagerToolUsage: [], eagerToolSuppressions: [] },
+        approvalReplays: [],
+      }] };
+      if (nested) {
+        manifest.executions = [{
+          ...manifest.executions[0],
+          childRunId: 'middle-run',
+          approvalExecutionScope: 'middle-scope',
+          descendant: { version: 1, executions: [{ ...manifest.executions[0] }] },
+        }];
+      }
+      const pending = await Promise.all(['left', 'right'].map(async member => {
+        const leaf = await attachToolBatchReplayState(
+          { type: 'ask_user_question', question: { question: member } },
+          JSON.stringify(['child-scope', '', member, 'user', 'child-thread']),
+          new Map([[JSON.stringify(['child-scope', 'child-batch']), new Map()]]),
+        );
+        return { id: member, value: await attachToolBatchReplayState(
+          attachSubagentResumeManifest(leaf, manifest), parentOwner,
+          new Map([[JSON.stringify(['root-scope', 'parent-batch']), new Map()]]),
+        ) };
+      }));
+      const config: RunnableConfig = { configurable: { user_id: 'user', thread_id: 'thread', __librechat_tool_approval_execution_scope: 'root-scope' } };
+      restoreToolReplayConfigs(config.configurable!, reverse ? [...pending].reverse() : pending,
+        'root-scope', 'root-scope', 'thread', new Set(addressed === 'both' ? ['left', 'right'] : [addressed]));
+      const restoredParent = getToolReplayConfig(config, parentOwner);
+      expect(await restoreToolBatchReplayState(restoredParent, parentOwner)).toHaveLength(1);
+      expect(restoredParent.configurable?.[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY]).toEqual(manifest);
+      expect(getToolApprovalReviewEvidence(restoredParent)).toBeUndefined();
+      for (const member of ['left', 'right']) {
+        const owner = JSON.stringify(['child-scope', '', member, 'user', 'child-thread']);
+        const leaf = getToolReplayConfig(config, owner);
+        expect(await restoreToolBatchReplayState(leaf, owner)).toHaveLength(1);
+        expect(getToolApprovalReviewEvidence(leaf)).toBeUndefined();
+        expect(getToolBatchReplayState(leaf.configurable)?.approvalOwner).toBeUndefined();
+      }
+      const state = getToolBatchReplayState(pending[1].value)!;
+      const inherited = state.records.find(record => record.owner === parentOwner)!;
+      inherited.data = 'conflicting';
+      pending[1].value = attachSubagentResumeManifest({
+        type: 'ask_user_question', question: { question: 'right' },
+        [TOOL_BATCH_REPLAY_KEY]: state,
+      }, manifest);
+      expect(() => restoreToolReplayConfigs({}, pending, 'root-scope', 'root-scope', 'thread', new Set(['left', 'right']))).toThrow('Conflicting parent tool replay');
+    },
+  );
 
   it('rejects ambiguous member evidence rather than accepting the last checkpoint', async () => {
     const payload = await attachToolBatchReplayState(approval, JSON.stringify(['source', '', 'member']), new Map());

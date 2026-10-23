@@ -273,23 +273,14 @@ function getToolCompletion(
 function isLangGraphResumeMapForInterrupt(
   value: unknown,
   interruptId: string,
-  manifest?: SubagentResumeManifest,
-  rootInterrupts?: t.RunInterruptResult<unknown>['pendingInterrupts']
+  pendingIds: ReadonlySet<string>
 ): value is Record<string, unknown> {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
     return false;
   }
   if (Object.prototype.hasOwnProperty.call(value, interruptId)) return true;
-  if (rootInterrupts?.some(entry => Object.prototype.hasOwnProperty.call(value, entry.interruptId)) === true) return true;
-  const pending = [...(manifest?.executions ?? [])];
-  while (pending.length > 0) {
-    const execution = pending.pop()!;
-    if (
-      execution.pendingInterruptIds?.some(
-        (id) => Object.prototype.hasOwnProperty.call(value, id)
-      ) === true
-    ) return true;
-    pending.push(...(execution.descendant?.executions ?? []));
+  for (const id of pendingIds) {
+    if (Object.prototype.hasOwnProperty.call(value, id)) return true;
   }
   return false;
 }
@@ -1952,6 +1943,38 @@ export class Run<_T extends t.BaseGraphState> {
     return this._streamResult;
   }
 
+  private getPendingInterruptState(): {
+    pending: NonNullable<t.RunInterruptResult<unknown>['pendingInterrupts']>;
+    ids: Set<string>;
+    } {
+    const roots = this._interrupt?.pendingInterrupts ??
+      (this._interrupt == null ? [] : [this._interrupt]);
+    const pending = new Map<
+      string, Pick<t.RunInterruptResult<unknown>, 'interruptId' | 'payload'>
+    >();
+    const ids = new Set<string>();
+    const executions: SubagentResumeManifest['executions'] = [];
+    for (const root of roots) {
+      pending.set(root.interruptId, root);
+      ids.add(root.interruptId);
+      const payload = stripRunStepResumeState(root.payload);
+      const manifest =
+        requireValidSubagentResumeManifest(payload) ??
+        requireValidSubagentResumeManifest(stripToolBatchReplayState(payload));
+      executions.push(...(manifest?.executions ?? []));
+    }
+    for (let index = 0; index < executions.length; index++) {
+      const execution = executions[index];
+      for (const id of execution.pendingInterruptIds ?? []) ids.add(id);
+      for (const entry of execution.pendingInterrupts ?? []) {
+        ids.add(entry.interruptId);
+        pending.set(entry.interruptId, entry);
+      }
+      executions.push(...(execution.descendant?.executions ?? []));
+    }
+    return { pending: [...pending.values()], ids };
+  }
+
   /**
    * Returns the pending interrupt captured during the most recent
    * `processStream` (or `resume`) invocation. `undefined` when the run
@@ -1979,30 +2002,13 @@ export class Run<_T extends t.BaseGraphState> {
     if (this._interrupt == null) {
       return undefined;
     }
-    const pendingInterrupts = new Map<
-      string, Pick<t.RunInterruptResult<unknown>, 'interruptId' | 'payload'>
-    >();
-    for (const pending of this._interrupt.pendingInterrupts ?? [this._interrupt]) {
-      pendingInterrupts.set(pending.interruptId, pending);
-    }
-    const replayPayload = stripRunStepResumeState(this._interrupt.payload);
-    const manifest =
-      requireValidSubagentResumeManifest(replayPayload) ??
-      requireValidSubagentResumeManifest(stripToolBatchReplayState(replayPayload));
-    const executions = [...(manifest?.executions ?? [])];
-    while (executions.length > 0) {
-      const execution = executions.pop()!;
-      for (const pending of execution.pendingInterrupts ?? []) {
-        pendingInterrupts.set(pending.interruptId, pending);
-      }
-      executions.push(...(execution.descendant?.executions ?? []));
-    }
+    const { pending } = this.getPendingInterruptState();
     return {
       ...this._interrupt,
       payload: cloneToolApprovalInterruptPayload(
         getPublicToolInterruptPayload(this._interrupt.payload)
       ),
-      pendingInterrupts: [...pendingInterrupts.values()].map((pending) => ({
+      pendingInterrupts: pending.map((pending) => ({
         interruptId: pending.interruptId,
         payload: cloneToolApprovalInterruptPayload(getPublicToolInterruptPayload(pending.payload)),
       })),
@@ -2129,8 +2135,7 @@ export class Run<_T extends t.BaseGraphState> {
       !isLangGraphResumeMapForInterrupt(
         resumeValue,
         interruptId,
-        requireValidSubagentResumeManifest(resumeConfig.configurable),
-        this._interrupt?.pendingInterrupts
+        this.getPendingInterruptState().ids
       )
         ? { [interruptId]: resumeValue }
         : resumeValue;
