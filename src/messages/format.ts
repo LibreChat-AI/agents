@@ -14,11 +14,6 @@ import type {
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type {
-  OrderedToolHistoryProjection,
-  ToolHistoryPreparation,
-  ToolHistoryCallMirrors,
-} from './toolHistoryProjection';
-import type {
   BedrockReasoningContentText,
   ExtendedMessageContent,
   GoogleReasoningContentText,
@@ -37,6 +32,11 @@ import type {
   CompactionSemanticIndexEntry,
   CompactionSemanticIndexSnapshot,
 } from '@/types';
+import type {
+  OrderedToolHistoryProjection,
+  ToolHistoryPreparation,
+  ToolHistoryCallMirrors,
+} from './toolHistoryProjection';
 import type {
   ProviderMessageAttribution,
   ProviderMessageProvenancePart,
@@ -71,6 +71,11 @@ import {
   serializeStructuredValueBounded,
 } from '@/utils/toolContent';
 import {
+  createToolHistoryPreparation,
+  isToolHistoryCallMirror,
+  recordToolHistoryCallMirror,
+} from './toolHistoryProjection';
+import {
   Providers,
   ContentTypes,
   Constants,
@@ -78,15 +83,10 @@ import {
 } from '@/common';
 import { normalizeAnthropicToolCallId } from '@/llm/anthropic/utils/message_inputs';
 import { toLangChainContent, toLangChainMessageFields } from './langchain';
-import { isReasoningContentBlock } from './reasoningTypes';
 import { flattenLegacyContent, isLegacyConvertible } from './content';
 import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
+import { isReasoningContentBlock } from './reasoningTypes';
 import { emitAgentLog } from '@/utils/events';
-import {
-  createToolHistoryPreparation,
-  isToolHistoryCallMirror,
-  recordToolHistoryCallMirror,
-} from './toolHistoryProjection';
 
 interface MediaMessageParams {
   message: {
@@ -1332,6 +1332,43 @@ function formatToolCallOutput(
  * from the next user turn. Non-empty by necessity — see the push site.
  */
 const STEER_ANCHOR_PLACEHOLDER = '_';
+
+/**
+ * Stand-in text for a user message whose content reduces to nothing visible
+ * (`userContentHasNoVisibleText` below): providers with strict payload
+ * validation (Anthropic, Bedrock, Maritaca) reject such a message — and with
+ * it the entire request — while lenient ones (OpenAI, Google, xAI) accept it
+ * silently, which hides the issue until the model list changes.
+ */
+const EMPTY_USER_MESSAGE_PLACEHOLDER = '(no text)';
+
+/**
+ * True when a message's content would serialize to something strict providers
+ * reject for the whole request: `null`/`undefined`, an empty string, an empty
+ * array, or an array whose parts are all text parts with no visible text.
+ * Non-text parts (images, files) make a turn usable by definition, so a
+ * vision turn is never "empty". This is the shape a promptless send takes
+ * when its attachments are no longer re-sent during history replay.
+ */
+function userContentHasNoVisibleText(
+  content: string | MessageContentComplex[] | undefined | null
+): boolean {
+  if (content == null || content === '') {
+    return true;
+  }
+  if (!Array.isArray(content)) {
+    return false;
+  }
+  if (content.length === 0) {
+    return true;
+  }
+  return content.every(
+    (part) =>
+      part != null &&
+      part.type === ContentTypes.TEXT &&
+      !getTextContent(part).trim()
+  );
+}
 
 /**
  * True when an assistant message replayed as a steer and nothing followed it,
@@ -2934,6 +2971,30 @@ export const formatAgentMessages = (
     }
 
     if (message.role !== 'assistant') {
+      /**
+       * Strict providers (Anthropic, Bedrock, Maritaca) reject a user message
+       * whose effective content is empty — and with it the entire request.
+       * History replay of a promptless send reaches here in exactly that
+       * shape once its attachments are no longer re-sent. Dropping the turn
+       * is not safe either: adjacent messages would collapse into consecutive
+       * same-role turns those providers also reject. Keep the turn and give it
+       * the smallest honest stand-in. Vision turns keep their image parts —
+       * `userContentHasNoVisibleText` only matches text-only-empty content.
+       */
+      if (
+        message.role === 'user' &&
+        userContentHasNoVisibleText(message.content)
+      ) {
+        message = {
+          ...message,
+          content: [
+            {
+              type: ContentTypes.TEXT,
+              [ContentTypes.TEXT]: EMPTY_USER_MESSAGE_PLACEHOLDER,
+            },
+          ],
+        };
+      }
       const formattedMessage = formatMessage({
         message: message as MessageInput,
         langChain: true,
@@ -3675,9 +3736,7 @@ function getSyntheticProviderContextProvenanceParts(
     }
     for (const attribution of source.additionalAttributions ?? []) {
       const sourceMessageId =
-        sourceMessageIds.length === 1
-          ? sourceMessageIds[0]
-          : undefined;
+        sourceMessageIds.length === 1 ? sourceMessageIds[0] : undefined;
       const retainedSourceId =
         retainedSourceIds.size === 1
           ? retainedSourceIds.values().next().value
