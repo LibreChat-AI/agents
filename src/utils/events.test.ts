@@ -1,6 +1,6 @@
 import { dispatchCustomEvent } from '@langchain/core/callbacks/dispatch';
 import type { ToolExecuteBatchRequest, ToolExecuteResult } from '@/types/tools';
-import { safeDispatchCustomEvent } from './events';
+import { RequiredHostEventError, safeDispatchCustomEvent } from './events';
 import { traceHostToolResults } from '@/langfuse';
 import { GraphEvents } from '@/common';
 
@@ -53,4 +53,32 @@ describe('host tool metadata completion', () => {
       }
     }
   );
+});
+
+describe('required host event failures', () => {
+  it('rethrows marked failures through custom-event dispatch', async () => {
+    const cause = new Error('required callback failed');
+    const failure = new RequiredHostEventError({ cause });
+    jest.mocked(dispatchCustomEvent).mockRejectedValueOnce(failure);
+
+    await expect(
+      safeDispatchCustomEvent(GraphEvents.ON_CONTEXT_USAGE, {})
+    ).rejects.toBe(failure);
+    expect(failure.cause).toBe(cause);
+  });
+
+  it('keeps unmarked observer failures best-effort', async () => {
+    const error = new Error('optional observer failed');
+    const log = jest.spyOn(console, 'error').mockImplementation(() => {});
+    jest.mocked(dispatchCustomEvent).mockRejectedValueOnce(error);
+
+    try {
+      await expect(
+        safeDispatchCustomEvent(GraphEvents.ON_AGENT_LOG, {})
+      ).resolves.toBe(false);
+      expect(log).toHaveBeenCalledWith('Error dispatching custom event:', error);
+    } finally {
+      log.mockRestore();
+    }
+  });
 });

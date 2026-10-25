@@ -119,6 +119,7 @@ import { isFadingTier } from '@/messages/fading';
 import { resolveMaxSeals } from '@/llm/preempt';
 import { isBuiltRuntime } from '@/lazyRequire';
 import { initializeModel } from '@/llm/init';
+import { isRequiredHostEventError } from '@/utils/events';
 import { HandlerRegistry } from '@/events';
 
 /** Source-mode runs have no dist siblings for the lazy-loading seam, so every
@@ -1117,6 +1118,13 @@ export class Run<_T extends t.BaseGraphState> {
             this.Graph
           );
         }
+      } catch (error) {
+        if (isRequiredHostEventError(error)) {
+          throw error;
+        }
+        /** Preserve the callback's prior best-effort behavior for optional events. */
+        // eslint-disable-next-line no-console
+        console.warn('Optional custom event handler failed.');
       } finally {
         if (
           eventName === GraphEvents.ON_RUN_STEP_COMPLETED &&
@@ -1404,6 +1412,7 @@ export class Run<_T extends t.BaseGraphState> {
       [Callback.CUSTOM_EVENT]: customEventCallback,
     });
     customHandler.awaitHandlers = true;
+    customHandler.raiseError = true;
 
     config.callbacks = appendCallbacks(
       config.callbacks,
