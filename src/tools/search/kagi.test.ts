@@ -320,10 +320,37 @@ describe('Kagi Search v1', () => {
     });
   });
 
+  it.each(['search', 'images', 'videos', 'news'] as const)(
+    'accepts omitted optional buckets for the %s workflow',
+    async (type) => {
+      jest.spyOn(axios, 'post').mockResolvedValueOnce({ data: { data: {} } });
+      expect(await searchAPI().getSources({ query: 'test', type })).toEqual({
+        success: true,
+        data: { organic: [], topStories: [] },
+      });
+    }
+  );
+
+  it('preserves secondary results when the primary bucket is omitted', async () => {
+    jest.spyOn(axios, 'post').mockResolvedValueOnce({
+      data: { data: { news: [row] } },
+    });
+    expect(await searchAPI().getSources({ query: 'test' })).toEqual({
+      success: true,
+      data: {
+        organic: [],
+        topStories: [],
+        news: [expect.objectContaining({ link: url })],
+      },
+    });
+  });
+
   it.each([
     null,
     {},
-    { data: {} },
+    { data: null },
+    { data: 'invalid' },
+    { data: 42 },
     { data: [] },
     { data: { search: null } },
     { data: { search: {} } },
@@ -337,6 +364,27 @@ describe('Kagi Search v1', () => {
       success: false,
       error: 'Kagi Search API returned an invalid response',
     });
+  });
+
+  it.each([
+    'javascript:alert(1)',
+    'data:text/html,unsafe',
+    'file:///etc/passwd',
+    '/relative',
+    'not a URL',
+    `https://user:${secret}@example.com/article`,
+  ])('rejects unsafe result and image URLs: %s', async (unsafeUrl) => {
+    const post = jest.spyOn(axios, 'post');
+    for (const result of [
+      { ...row, url: unsafeUrl },
+      { ...row, image: { url: unsafeUrl } },
+    ]) {
+      post.mockResolvedValueOnce({ data: { data: { search: [result] } } });
+      expect(await searchAPI().getSources({ query: 'test' })).toEqual({
+        success: false,
+        error: 'Kagi Search API returned an invalid response',
+      });
+    }
   });
 
   it('sanitizes an envelope error even when data is present', async () => {
@@ -538,13 +586,74 @@ describe('Kagi Extract v1', () => {
   });
 
   it('handles empty batches and invalid URLs without HTTP', async () => {
-    const post = jest.spyOn(axios, 'post');
+    const post = jest
+      .spyOn(axios, 'post')
+      .mockRejectedValue(new Error('Unexpected HTTP request'));
     const scraper = createKagiScraper({ apiKey: 'key' });
     expect(await scraper.scrapeUrls([])).toEqual([]);
-    const results = await scraper.scrapeUrls(['', 'file:///etc/passwd']);
+    const results = await scraper.scrapeUrls([
+      '',
+      'file:///etc/passwd',
+      `https://user:${secret}@example.com/article`,
+    ]);
     expect(results.every(([, result]) => !result.success)).toBe(true);
     expect(post).not.toHaveBeenCalled();
   });
+
+  it('rejects credential-bearing URLs without sending them to Kagi', async () => {
+    const privateUrl = `https://user:${secret}@example.com/article`;
+    const post = jest.spyOn(axios, 'post').mockResolvedValueOnce({
+      data: { data: [{ url, markdown: '# Public page' }] },
+    });
+    const results = await createKagiScraper({ apiKey: 'key' }).scrapeUrls([
+      privateUrl,
+      url,
+    ]);
+    expect(results[0][1].success).toBe(false);
+    expect(results[1][1].success).toBe(true);
+    expect(post.mock.calls[0][1]).toEqual({
+      pages: [{ url }],
+      format: 'json',
+    });
+    expect(JSON.stringify(post.mock.calls)).not.toContain(secret);
+  });
+
+  it.each([
+    ['https://EXAMPLE.com:443', 'https://example.com/'],
+    [`${url}#section`, url],
+    [url, `${url}#section`],
+  ])(
+    'matches equivalent URL %s while retaining the input identity',
+    async (input, returned) => {
+      const post = jest.spyOn(axios, 'post').mockResolvedValueOnce({
+        data: { data: [{ url: returned, markdown: '# Evidence' }] },
+      });
+      expect(
+        await createKagiScraper({ apiKey: 'key' }).scrapeUrl(input)
+      ).toEqual([
+        input,
+        { success: true, data: { url: input, markdown: '# Evidence' } },
+      ]);
+      expect(JSON.stringify(post.mock.calls[0][1])).not.toContain('#section');
+    }
+  );
+
+  it.each([
+    `${url}/`,
+    `${url}?different=1`,
+    'http://example.com/article',
+    'https://other.example/article',
+  ])(
+    'does not attribute content from a different resource: %s',
+    async (returned) => {
+      jest.spyOn(axios, 'post').mockResolvedValueOnce({
+        data: { data: [{ url: returned, markdown: '# Wrong page' }] },
+      });
+      expect(
+        (await createKagiScraper({ apiKey: 'key' }).scrapeUrl(url))[1].success
+      ).toBe(false);
+    }
+  );
 
   it('allows a per-call HTTP timeout override and passes configured agents', async () => {
     const httpAgent = new HttpAgent();
@@ -722,6 +831,41 @@ describe('Kagi tool pipeline', () => {
       expect(JSON.stringify(result)).toContain('Evidence');
     }
   );
+
+  it('keeps unsafe search URLs out of callbacks, artifacts and mixed-provider scraping', async () => {
+    const unsafeUrl = `https://user:${secret}@example.com/article`;
+    const post = jest.spyOn(axios, 'post').mockResolvedValue({
+      data: { data: { search: [{ ...row, url: unsafeUrl }] } },
+    });
+    const onSearchResults = jest.fn();
+    const error = jest.spyOn(logger, 'error');
+    const warn = jest.spyOn(logger, 'warn');
+    const message = await createSearchTool({
+      searchProvider: 'kagi',
+      scraperProvider: 'serper',
+      kagiApiKey: 'key',
+      serperApiKey: 'key',
+      rerankerType: 'none',
+      logger,
+      onSearchResults,
+    }).invoke({
+      type: 'tool_call',
+      id: 'unsafe-call',
+      name: 'web_search',
+      args: { query: 'test' },
+    });
+    expect(post).toHaveBeenCalledTimes(1);
+    const serialized = JSON.stringify([
+      message,
+      onSearchResults.mock.calls,
+      error.mock.calls,
+      warn.mock.calls,
+    ]);
+    expect(serialized).toContain(
+      'Kagi Search API returned an invalid response'
+    );
+    expect(serialized).not.toContain(secret);
+  });
 
   it('keeps HTTP errors out of tool output, artifacts, callbacks and logs', async () => {
     jest.spyOn(axios, 'post').mockRejectedValueOnce(new Error(secret));

@@ -1,6 +1,6 @@
 import axios from 'axios';
 import type * as t from './types';
-import { resolveKagiKey } from './kagi-search';
+import { getKagiUrl, resolveKagiKey } from './kagi';
 
 interface KagiPage {
   url: string;
@@ -53,17 +53,18 @@ export class KagiScraper implements t.BaseScraper {
     urls: string[],
     options: KagiScrapeOptions
   ): Promise<KagiScrapeEntry[]> {
-    const validUrls = urls.filter((url) => {
-      try {
-        const parsed = new URL(url);
-        return parsed.protocol === 'https:' || parsed.protocol === 'http:';
-      } catch {
-        return false;
+    const urlKeys = new Map<string, string>();
+    const validUrls: string[] = [];
+    for (const url of urls) {
+      const key = getKagiUrl(url);
+      if (key !== undefined) {
+        urlKeys.set(url, key);
+        validUrls.push(key);
       }
-    });
+    }
     if (validUrls.length === 0) {
       return urls.map((url) =>
-        failure(url, 'Kagi Extract requires an HTTP(S) URL')
+        failure(url, 'Kagi Extract requires an HTTP(S) URL without credentials')
       );
     }
 
@@ -101,16 +102,23 @@ export class KagiScraper implements t.BaseScraper {
       }
       const pages = new Map<string, KagiPage>();
       for (const page of envelope.data) {
-        if (page != null && typeof page.url === 'string') {
-          pages.set(page.url, page);
+        if (page == null || typeof page.url !== 'string') {
+          continue;
+        }
+        const key = getKagiUrl(page.url);
+        if (key !== undefined) {
+          pages.set(key, page);
         }
       }
-      const requested = new Set(validUrls);
       return urls.map((url) => {
-        if (!requested.has(url)) {
-          return failure(url, 'Kagi Extract requires an HTTP(S) URL');
+        const key = urlKeys.get(url);
+        if (key === undefined) {
+          return failure(
+            url,
+            'Kagi Extract requires an HTTP(S) URL without credentials'
+          );
         }
-        const page = pages.get(url);
+        const page = pages.get(key);
         if (
           page == null ||
           page.error != null ||

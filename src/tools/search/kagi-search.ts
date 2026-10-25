@@ -1,5 +1,6 @@
 import axios from 'axios';
 import type * as t from './types';
+import { getKagiUrl, resolveKagiKey } from './kagi';
 import { DATE_RANGE } from './schema';
 
 interface KagiResult {
@@ -31,15 +32,6 @@ interface KagiSearchPayload {
   lens?: { time_relative: 'day' | 'week' | 'month' };
 }
 
-/** Explicitly empty credentials disable environment fallback. */
-export function resolveKagiKey(apiKey?: string): string {
-  const key = apiKey ?? process.env.KAGI_API_KEY;
-  if (key == null || key.trim() === '') {
-    throw new Error('Kagi API key is required');
-  }
-  return key;
-}
-
 function validResults(
   results: Array<KagiResult | null>
 ): results is KagiResult[] {
@@ -47,12 +39,14 @@ function validResults(
     (result) =>
       result != null &&
       typeof result.url === 'string' &&
-      result.url.trim() !== '' &&
+      getKagiUrl(result.url) !== undefined &&
       typeof result.title === 'string' &&
       (result.snippet === undefined || typeof result.snippet === 'string') &&
       (result.time === undefined || typeof result.time === 'string') &&
       (result.image === undefined ||
-        (result.image != null && typeof result.image.url === 'string'))
+        (result.image != null &&
+          typeof result.image.url === 'string' &&
+          getKagiUrl(result.image.url) !== undefined))
   );
 }
 
@@ -99,6 +93,7 @@ export function createKagiAPI(
       };
     } else if (date != null) {
       const intervals = {
+        /** Kagi has no hourly interval; use its narrowest supported window. */
         [DATE_RANGE.PAST_HOUR]: 'day',
         [DATE_RANGE.PAST_24_HOURS]: 'day',
         [DATE_RANGE.PAST_WEEK]: 'week',
@@ -130,18 +125,7 @@ export function createKagiAPI(
         return { success: false, error: 'Kagi Search API returned an error' };
       }
       const data = envelope?.data;
-      const resultKeys = {
-        search: 'search',
-        images: 'image',
-        videos: 'video',
-        news: 'news',
-      } as const;
-      const resultKey = resultKeys[type];
-      if (
-        data == null ||
-        Array.isArray(data) ||
-        !Array.isArray(data[resultKey])
-      ) {
+      if (data == null || typeof data !== 'object' || Array.isArray(data)) {
         return {
           success: false,
           error: 'Kagi Search API returned an invalid response',
