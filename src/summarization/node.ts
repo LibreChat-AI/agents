@@ -1045,6 +1045,7 @@ function findStreamLimitAbortReason(
 const PRESERVATION_REASONS: Partial<
   Record<NonNullable<t.SummarizationNodeInput['reason']>, string>
 > = {
+  trigger: 'prune-triggered compaction',
   overflow: 'overflow recovery',
   manual: 'manual compaction',
 };
@@ -1457,22 +1458,14 @@ export function createSummarizeNode({
 
     /**
      * The metadata stub describes the history rather than summarizing it, so
-     * committing it means removing the head and keeping nothing of what it
-     * said. That trade is never worth making to paper over an overflow, and
-     * never for a manual compaction, which would replace the whole history
-     * with a message count: the recovery would "succeed" only by destroying
-     * the conversation it was supposed to preserve. Leave state untouched
-     * and let the provider error surface instead.
+     * committing it would remove the head while preserving none of its
+     * meaning. Keep the history intact for every failed summarization path.
      */
-    if (
-      usedMetadataStub === true &&
-      (request.reason === 'overflow' ||
-        request.reason === 'manual' ||
-        usedIntraTurnFallback)
-    ) {
-      const preservationReason =
-        PRESERVATION_REASONS[request.reason ?? 'trigger'] ??
-        'intra-turn compaction';
+    if (usedMetadataStub === true) {
+      const preservationReason = usedIntraTurnFallback
+        ? 'intra-turn compaction'
+        : (PRESERVATION_REASONS[request.reason ?? 'trigger'] ??
+          'prune-triggered compaction');
       log(
         'warn',
         `Summarization failed during ${preservationReason}; keeping history rather than replacing it with a metadata stub`
