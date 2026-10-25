@@ -8,6 +8,20 @@ import type { AgentLogEvent } from '@/types/graph';
 import { traceHostToolResults } from '@/langfuse';
 import { GraphEvents } from '@/common';
 
+/** Marks a failure from an awaited host event that must stop the current run. */
+export class RequiredHostEventError extends Error {
+  constructor(options?: ErrorOptions) {
+    super('A required host event could not be completed.', options);
+    this.name = 'RequiredHostEventError';
+  }
+}
+
+export function isRequiredHostEventError(
+  error: unknown
+): error is RequiredHostEventError {
+  return error instanceof RequiredHostEventError;
+}
+
 /**
  * Safely dispatches a custom event and properly awaits it to avoid
  * race conditions where events are dispatched after run cleanup.
@@ -40,6 +54,9 @@ export async function safeDispatchCustomEvent(
     await dispatchCustomEvent(event, payload, config);
     return true;
   } catch (e) {
+    if (isRequiredHostEventError(e)) {
+      throw e;
+    }
     // Check if this is the known EventStreamCallbackHandler error
     if (
       e instanceof Error &&

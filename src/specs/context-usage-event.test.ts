@@ -1,12 +1,19 @@
 import { z } from 'zod';
 import { DynamicStructuredTool } from '@langchain/core/tools';
-import { AIMessage, HumanMessage, BaseMessage } from '@langchain/core/messages';
+import {
+  AIMessage,
+  HumanMessage,
+  BaseMessage,
+} from '@langchain/core/messages';
+import { dispatchCustomEvent } from '@langchain/core/callbacks/dispatch';
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
 import type { ChatGenerationChunk } from '@langchain/core/outputs';
+import type { RunnableConfig } from '@langchain/core/runnables';
 import type * as t from '@/types';
 import { GraphEvents, Providers } from '@/common';
 import { FakeChatModel } from '@/llm/fake';
 import { Run } from '@/run';
+import { RequiredHostEventError } from '@/utils';
 
 class CapturingFakeChatModel extends FakeChatModel {
   readonly invocations: BaseMessage[][] = [];
@@ -17,6 +24,21 @@ class CapturingFakeChatModel extends FakeChatModel {
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
     this.invocations.push(messages);
+    yield* super._streamResponseChunks(messages, options, runManager);
+  }
+}
+
+class RawDispatchFakeChatModel extends CapturingFakeChatModel {
+  override async *_streamResponseChunks(
+    messages: BaseMessage[],
+    options: this['ParsedCallOptions'],
+    runManager?: CallbackManagerForLLMRun
+  ): AsyncGenerator<ChatGenerationChunk> {
+    await dispatchCustomEvent(
+      GraphEvents.ON_AGENT_LOG,
+      { type: 'raw_custom_event' },
+      options as RunnableConfig
+    );
     yield* super._streamResponseChunks(messages, options, runManager);
   }
 }
@@ -103,6 +125,119 @@ describe('ON_CONTEXT_USAGE event', () => {
         (event.remainingContextTokens as number)
     );
   });
+
+  it('stops before the provider when a required context event fails', async () => {
+    const cause = new Error('required context observer failed');
+    const failure = new RequiredHostEventError({ cause });
+    const model = new CapturingFakeChatModel({ responses: ['must not run'] });
+    const run = await Run.create<t.IState>({
+      runId: 'test-context-usage-required-host-failure',
+      graphConfig: {
+        type: 'standard',
+        llmConfig,
+        instructions: 'You are a helpful assistant.',
+        maxContextTokens: 4_000,
+      },
+      returnContent: true,
+      skipCleanup: true,
+      customHandlers: {
+        [GraphEvents.ON_CONTEXT_USAGE]: {
+          handle: async (): Promise<void> => {
+            throw failure;
+          },
+        },
+      },
+      tokenCounter: charCounter,
+      indexTokenCountMap: {},
+    });
+    run.Graph!.overrideModel = model;
+
+    await expect(
+      run.processStream(
+        { messages: [new HumanMessage('hello')] },
+        streamConfig
+      )
+    ).rejects.toBe(failure);
+
+    expect(failure.cause).toBe(cause);
+    expect(model.invocations).toHaveLength(0);
+  });
+
+  it('keeps unmarked context observer failures best-effort', async () => {
+    const failure = new Error('optional context observer failed');
+    const model = new CapturingFakeChatModel({ responses: ['provider ran'] });
+    const log = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const run = await Run.create<t.IState>({
+      runId: 'test-context-usage-optional-host-failure',
+      graphConfig: {
+        type: 'standard',
+        llmConfig,
+        instructions: 'You are a helpful assistant.',
+        maxContextTokens: 4_000,
+      },
+      returnContent: true,
+      skipCleanup: true,
+      customHandlers: {
+        [GraphEvents.ON_CONTEXT_USAGE]: {
+          handle: async (): Promise<void> => {
+            throw failure;
+          },
+        },
+      },
+      tokenCounter: charCounter,
+      indexTokenCountMap: {},
+    });
+    run.Graph!.overrideModel = model;
+
+    try {
+      await run.processStream(
+        { messages: [new HumanMessage('hello')] },
+        streamConfig
+      );
+      expect(model.invocations).toHaveLength(1);
+      expect(log).toHaveBeenCalledWith('Optional custom event handler failed.');
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it('keeps an unmarked observer failure best-effort on raw LangChain dispatch', async () => {
+    const model = new RawDispatchFakeChatModel({ responses: ['provider ran'] });
+    const warning = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const run = await Run.create<t.IState>({
+      runId: 'test-raw-custom-event-optional-host-failure',
+      graphConfig: {
+        type: 'standard',
+        llmConfig,
+        instructions: 'You are a helpful assistant.',
+        maxContextTokens: 4_000,
+      },
+      returnContent: true,
+      skipCleanup: true,
+      customHandlers: {
+        [GraphEvents.ON_AGENT_LOG]: {
+          handle: async (): Promise<void> => {
+            throw new Error('optional raw observer failure');
+          },
+        },
+      },
+      tokenCounter: charCounter,
+      indexTokenCountMap: {},
+    });
+    run.Graph!.overrideModel = model;
+
+    try {
+      await run.processStream(
+        { messages: [new HumanMessage('hello')] },
+        streamConfig
+      );
+      expect(model.invocations).toHaveLength(1);
+      expect(warning).toHaveBeenCalledWith('Optional custom event handler failed.');
+    } finally {
+      warning.mockRestore();
+    }
+  });
+
   it('accounts for the retained exchange in the final provider-facing snapshot', async () => {
     const received: t.ContextUsageEvent[] = [];
     const retainedResult = `tool-result:${'x'.repeat(10_000)}`;
