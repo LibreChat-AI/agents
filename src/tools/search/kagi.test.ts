@@ -186,6 +186,26 @@ describe('Kagi Search v1', () => {
     );
   });
 
+  it.each([
+    ['search', 'search'],
+    ['images', 'image'],
+    ['videos', 'video'],
+    ['news', 'news'],
+  ] as const)(
+    'always supplies source arrays for the %s workflow callback',
+    async (type, bucket) => {
+      jest.spyOn(axios, 'post').mockResolvedValueOnce({
+        data: { data: { [bucket]: [row] } },
+      });
+      const result = await searchAPI().getSources({ query: 'test', type });
+      expect(result.success).toBe(true);
+      expect(result.data?.organic).toEqual(
+        type === 'search' ? [expect.objectContaining({ link: url })] : []
+      );
+      expect(result.data?.topStories).toEqual([]);
+    }
+  );
+
   it('uses the image resource URL when no separate thumbnail exists', async () => {
     jest.spyOn(axios, 'post').mockResolvedValueOnce({
       data: { data: { image: [{ url, title: 'Image' }] } },
@@ -296,7 +316,7 @@ describe('Kagi Search v1', () => {
       .mockResolvedValueOnce({ data: { data: { search: [] }, error: [] } });
     expect(await searchAPI().getSources({ query: 'test' })).toEqual({
       success: true,
-      data: { organic: [] },
+      data: { organic: [], topStories: [] },
     });
   });
 

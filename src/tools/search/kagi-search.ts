@@ -147,7 +147,7 @@ export function createKagiAPI(
           error: 'Kagi Search API returned an invalid response',
         };
       }
-      const results: t.SearchResultData = {};
+      const results: t.SearchResultData = { organic: [], topStories: [] };
       for (const name of [
         'search',
         'image',
