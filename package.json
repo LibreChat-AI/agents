@@ -351,7 +351,8 @@
     "openai": "^6.46.0",
     "reova": "^0.4.1",
     "socks-proxy-agent": "^8.0.5",
-    "uuid": "^11.1.1"
+    "uuid": "^11.1.1",
+    "zod-v4": "npm:zod@4.6.7"
   },
   "peerDependencies": {
     "@anthropic-ai/sandbox-runtime": "^0.0.78"

@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { z as z4 } from 'zod/v4';
+import { z as currentZod } from 'zod-v4';
 import { $ZodString, globalRegistry } from 'zod/v4/core';
 import { toJsonSchema } from './schema';
 
@@ -100,32 +101,45 @@ describe('toJsonSchema', () => {
     });
   });
 
-  it('uses the schema-owning converter to retain checks across Zod installations', () => {
-    let separateZod = z4;
-    jest.isolateModules(() => {
-      separateZod = jest.requireActual<typeof import('zod/v4')>('zod/v4').z;
-    });
-    const schema = separateZod.object({
-      id: separateZod.string().regex(/^[a-z]+$/),
-      count: separateZod.number().int().min(1).max(4),
-    });
-    const convertible = Object.assign(schema, {
-      toJSONSchema: (params: Parameters<typeof separateZod.toJSONSchema>[1]) =>
-        separateZod.toJSONSchema(schema, params),
+  it('retains current Zod 4 constraints', () => {
+    const schema = currentZod.object({
+      id: currentZod.string().regex(/^[a-z]+$/),
+      count: currentZod.number().int().min(1).max(4),
     });
 
-    const nativeConversion = jest.spyOn(convertible, 'toJSONSchema');
-
-    expect(toJsonSchema(convertible)).toMatchObject({
+    expect(toJsonSchema(schema)).toMatchObject({
       properties: {
         id: { type: 'string', pattern: '^[a-z]+$' },
         count: { type: 'integer', minimum: 1, maximum: 4 },
       },
     });
-    expect(nativeConversion).toHaveBeenCalledWith({
-      target: 'draft-7',
-      io: 'input',
-      unrepresentable: 'any',
+  });
+
+  it.each([
+    z4.number().prefault(0),
+    z4.boolean().prefault(false),
+    z4.string().prefault(''),
+    z4.null().prefault(null),
+  ])('keeps a falsy early-Zod prefault in the input schema', (field) => {
+    expect(toJsonSchema(z4.object({ value: field }))).toMatchObject({
+      properties: { value: { default: field.parse(undefined) } },
+    });
+  });
+
+  it('converts an early-Zod field inside a current-Zod object', () => {
+    const query = z4.string().min(1).max(10).describe('Legacy query');
+    const schema = currentZod.object({ query });
+
+    expect(toJsonSchema(schema)).toMatchObject({
+      properties: {
+        query: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 10,
+          description: 'Legacy query',
+        },
+      },
+      required: ['query'],
     });
   });
 

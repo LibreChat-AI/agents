@@ -1,34 +1,21 @@
 import { zodToJsonSchema } from 'zod-to-json-schema';
 import { isZodSchemaV4 } from '@langchain/core/utils/types';
-import { globalRegistry, registry, toJSONSchema } from 'zod/v4/core';
-import type { $ZodType, GlobalMeta, JSONSchema } from 'zod/v4/core';
-import type { ZodType as ZodV4Type } from 'zod/v4';
+import { globalRegistry as earlyRegistry } from 'zod/v4/core';
+import { globalRegistry, registry, toJSONSchema } from 'zod-v4';
+import type { $ZodType, GlobalMeta } from 'zod-v4/v4/core';
+import type { ZodType as ZodV4Type } from 'zod-v4';
 import type { ZodTypeAny } from 'zod';
 
-const INPUT_SCHEMA_OPTIONS = {
-  target: 'draft-7',
-  io: 'input',
-  unrepresentable: 'any',
-} as const;
-
-type SchemaWithConverter = $ZodType & {
-  toJSONSchema?: (
-    options: typeof INPUT_SCHEMA_OPTIONS
-  ) => JSONSchema.BaseSchema;
-};
-
 /** Separate Zod installations may not share their global metadata registry. */
+const earlyMetadata = earlyRegistry as {
+  get(schema: object): GlobalMeta | undefined;
+};
 const schemaMetadata = registry<GlobalMeta>();
 schemaMetadata.get = (schema): GlobalMeta | undefined => {
   const annotated = schema as $ZodType & Partial<Pick<ZodV4Type, 'meta'>>;
   return typeof annotated.meta === 'function'
     ? annotated.meta()
-    : globalRegistry.get(schema);
-};
-
-const FALLBACK_SCHEMA_OPTIONS = {
-  ...INPUT_SCHEMA_OPTIONS,
-  metadata: schemaMetadata,
+    : (globalRegistry.get(schema) ?? earlyMetadata.get(schema));
 };
 
 /** Checks if a schema is a Zod schema by looking for the _def property */
@@ -48,13 +35,13 @@ export function toJsonSchema(
   description?: string
 ): Record<string, unknown> {
   if (isZodSchemaV4(schema)) {
-    const zodSchema = schema as SchemaWithConverter;
-    const jsonSchema =
-      typeof zodSchema.toJSONSchema === 'function'
-        ? zodSchema.toJSONSchema(INPUT_SCHEMA_OPTIONS)
-        : toJSONSchema(zodSchema, FALLBACK_SCHEMA_OPTIONS);
     return {
-      ...jsonSchema,
+      ...toJSONSchema(schema as $ZodType, {
+        target: 'draft-7',
+        io: 'input',
+        unrepresentable: 'any',
+        metadata: schemaMetadata,
+      }),
       ...(name != null && name !== '' ? { title: name } : {}),
       ...(description != null && description !== '' ? { description } : {}),
     };
