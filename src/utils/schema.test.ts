@@ -100,6 +100,35 @@ describe('toJsonSchema', () => {
     });
   });
 
+  it('uses the schema-owning converter to retain checks across Zod installations', () => {
+    let separateZod = z4;
+    jest.isolateModules(() => {
+      separateZod = jest.requireActual<typeof import('zod/v4')>('zod/v4').z;
+    });
+    const schema = separateZod.object({
+      id: separateZod.string().regex(/^[a-z]+$/),
+      count: separateZod.number().int().min(1).max(4),
+    });
+    const convertible = Object.assign(schema, {
+      toJSONSchema: (params: Parameters<typeof separateZod.toJSONSchema>[1]) =>
+        separateZod.toJSONSchema(schema, params),
+    });
+
+    const nativeConversion = jest.spyOn(convertible, 'toJSONSchema');
+
+    expect(toJsonSchema(convertible)).toMatchObject({
+      properties: {
+        id: { type: 'string', pattern: '^[a-z]+$' },
+        count: { type: 'integer', minimum: 1, maximum: 4 },
+      },
+    });
+    expect(nativeConversion).toHaveBeenCalledWith({
+      target: 'draft-7',
+      io: 'input',
+      unrepresentable: 'any',
+    });
+  });
+
   it('keeps global metadata for core schemas without a meta accessor', () => {
     const schema = new $ZodString({ type: 'string' });
     globalRegistry.add(schema, { description: 'Core field' });

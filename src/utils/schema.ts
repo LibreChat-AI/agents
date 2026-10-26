@@ -1,9 +1,21 @@
 import { zodToJsonSchema } from 'zod-to-json-schema';
 import { isZodSchemaV4 } from '@langchain/core/utils/types';
 import { globalRegistry, registry, toJSONSchema } from 'zod/v4/core';
-import type { $ZodType, GlobalMeta } from 'zod/v4/core';
+import type { $ZodType, GlobalMeta, JSONSchema } from 'zod/v4/core';
 import type { ZodType as ZodV4Type } from 'zod/v4';
 import type { ZodTypeAny } from 'zod';
+
+const INPUT_SCHEMA_OPTIONS = {
+  target: 'draft-7',
+  io: 'input',
+  unrepresentable: 'any',
+} as const;
+
+type SchemaWithConverter = $ZodType & {
+  toJSONSchema?: (
+    options: typeof INPUT_SCHEMA_OPTIONS
+  ) => JSONSchema.BaseSchema;
+};
 
 /** Separate Zod installations may not share their global metadata registry. */
 const schemaMetadata = registry<GlobalMeta>();
@@ -12,6 +24,11 @@ schemaMetadata.get = (schema): GlobalMeta | undefined => {
   return typeof annotated.meta === 'function'
     ? annotated.meta()
     : globalRegistry.get(schema);
+};
+
+const FALLBACK_SCHEMA_OPTIONS = {
+  ...INPUT_SCHEMA_OPTIONS,
+  metadata: schemaMetadata,
 };
 
 /** Checks if a schema is a Zod schema by looking for the _def property */
@@ -31,13 +48,13 @@ export function toJsonSchema(
   description?: string
 ): Record<string, unknown> {
   if (isZodSchemaV4(schema)) {
+    const zodSchema = schema as SchemaWithConverter;
+    const jsonSchema =
+      typeof zodSchema.toJSONSchema === 'function'
+        ? zodSchema.toJSONSchema(INPUT_SCHEMA_OPTIONS)
+        : toJSONSchema(zodSchema, FALLBACK_SCHEMA_OPTIONS);
     return {
-      ...toJSONSchema(schema as $ZodType, {
-        target: 'draft-7',
-        io: 'input',
-        unrepresentable: 'any',
-        metadata: schemaMetadata,
-      }),
+      ...jsonSchema,
       ...(name != null && name !== '' ? { title: name } : {}),
       ...(description != null && description !== '' ? { description } : {}),
     };
