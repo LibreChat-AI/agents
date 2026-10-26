@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { z as z4 } from 'zod/v4';
+import { $ZodString, globalRegistry } from 'zod/v4/core';
 import { toJsonSchema } from './schema';
 
 describe('toJsonSchema', () => {
@@ -71,6 +72,42 @@ describe('toJsonSchema', () => {
       properties: { filters: { description: 'Search filters' } },
     });
     expect(schema.parse(input)).toEqual({ filters: { query: 'files' } });
+  });
+
+  it('reads nested metadata from another Zod installation', () => {
+    let separateZod = z4;
+    jest.isolateModules(() => {
+      separateZod = jest.requireActual<typeof import('zod/v4')>('zod/v4').z;
+    });
+    const schema = separateZod.object({
+      filters: separateZod
+        .object({ query: separateZod.string().describe('Query text') })
+        .meta({
+          description: 'Search filters',
+          examples: [{ query: 'files' }],
+        }),
+    });
+
+    expect(toJsonSchema(schema, 'search')).toMatchObject({
+      title: 'search',
+      properties: {
+        filters: {
+          description: 'Search filters',
+          examples: [{ query: 'files' }],
+          properties: { query: { description: 'Query text' } },
+        },
+      },
+    });
+  });
+
+  it('keeps global metadata for core schemas without a meta accessor', () => {
+    const schema = new $ZodString({ type: 'string' });
+    globalRegistry.add(schema, { description: 'Core field' });
+
+    expect(toJsonSchema(schema)).toMatchObject({
+      type: 'string',
+      description: 'Core field',
+    });
   });
 
   it('keeps recursive Zod 4 references rooted when the tool is named', () => {
