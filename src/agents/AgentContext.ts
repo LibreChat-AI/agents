@@ -27,6 +27,7 @@ import {
 import {
   addTailCacheControl,
   addBedrockTailCacheControl,
+  stripBedrockCacheControl,
   stripAnthropicCacheControl,
   addCacheControlToStablePrefixMessages,
   buildAnthropicCacheControl,
@@ -1107,7 +1108,9 @@ export class AgentContext {
         ? 1
         : 0;
       let room = 0;
-      if (movedBedrockTail) {
+      if (bedrockCache) {
+        /** Counts the message checkpoints the graph already placed too: the tail and,
+         *  with a second one for the latest human message, that one. */
         room =
           MAX_PROMPT_CACHE_BREAKPOINTS -
           bedrockToolCheckpoints -
@@ -1223,7 +1226,7 @@ export class AgentContext {
    * Bedrock counterpart of `buildBodyWithPromptCacheDynamicTail`: the tail goes
    * right before the newest user message, with one checkpoint at the end of the
    * history in front of it and one at the end of the request. The opening message
-   * is not an anchor, as for Anthropic.
+   * is not an anchor, as for Anthropic, and loses any checkpoint the graph gave it.
    */
   private buildBedrockBodyWithDynamicTail(
     messages: BaseMessage[],
@@ -1236,7 +1239,7 @@ export class AgentContext {
     const ttl = this.getBedrockPromptCacheTtl();
     const stablePrefix = messages.slice(0, tailIndex);
     return [
-      ...stablePrefix.slice(0, 1),
+      ...stripBedrockCacheControl(stablePrefix.slice(0, 1)),
       ...addBedrockTailCacheControl(stablePrefix.slice(1), ttl),
       ...tail,
       ...addBedrockTailCacheControl(messages.slice(tailIndex), ttl),
