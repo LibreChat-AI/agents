@@ -26,12 +26,14 @@ import {
 } from '@/tools/CallerCapabilities';
 import {
   addTailCacheControl,
+  addBedrockTailCacheControl,
   stripAnthropicCacheControl,
   addCacheControlToStablePrefixMessages,
   buildAnthropicCacheControl,
   buildBedrockCachePoint,
   resolvePromptCacheTtl,
   resolveBedrockPromptCacheTtl,
+  supportsBedrockToolCache,
   cloneMessage,
   type PromptCacheTtl,
 } from '@/messages/cache';
@@ -90,6 +92,16 @@ function countCacheControlMessages(messages: BaseMessage[]): number {
       Array.isArray(message.content) &&
       message.content.some(
         (block) => typeof block === 'object' && 'cache_control' in block
+      )
+  ).length;
+}
+
+function countCachePointMessages(messages: BaseMessage[]): number {
+  return messages.filter(
+    (message) =>
+      Array.isArray(message.content) &&
+      message.content.some(
+        (block) => typeof block === 'object' && 'cachePoint' in block
       )
   ).length;
 }
@@ -1006,10 +1018,18 @@ export class AgentContext {
     }
 
     const promptCacheProvider = this.getPromptCacheProvider();
+    /**
+     * Bedrock reads `tools`, `system` and `messages` in that order, so text after the
+     * last system checkpoint sits in front of the whole history and a changing tail
+     * there misses every message checkpoint. With prompt caching the tail moves behind
+     * the history, as for Anthropic.
+     */
+    const bedrockCache = this.hasBedrockPromptCache();
     const shouldMoveDynamicInstructions =
-      promptCacheProvider != null &&
+      (promptCacheProvider != null || bedrockCache) &&
       (stableInstructions !== '' || conversationInstructions !== '') &&
       dynamicInstructions !== '';
+    const movedBedrockTail = bedrockCache && shouldMoveDynamicInstructions;
     const systemParts = {
       stableInstructions,
       conversationInstructions,
@@ -1023,7 +1043,7 @@ export class AgentContext {
     });
     /** Same text with three breakpoints, for bodies that carry two of their own. */
     const systemMessageWithinBreakpointLimit =
-      promptCacheProvider != null &&
+      (promptCacheProvider != null || bedrockCache) &&
       stableInstructions !== '' &&
       conversationInstructions !== ''
         ? this.buildSystemMessage({ ...systemParts, markConversation: false })
@@ -1049,20 +1069,23 @@ export class AgentContext {
         this.hasSummary();
 
       const bodyWithSummary =
-        hasSummaryBody && promptCacheProvider == null
+        hasSummaryBody && promptCacheProvider == null && !movedBedrockTail
           ? [this.buildSummaryHumanMessage(promptCacheProvider), ...messages]
           : messages;
       const dynamicTail = this.buildPromptCacheDynamicTail({
         dynamicInstructions,
         hasSummaryBody,
-        promptCacheProvider,
+        promptCacheProvider:
+          promptCacheProvider ?? (movedBedrockTail ? Providers.BEDROCK : undefined),
         shouldMoveDynamicInstructions,
       });
-      let body = this.buildBodyWithPromptCacheDynamicTail(
-        bodyWithSummary,
-        dynamicTail,
-        promptCacheProvider
-      );
+      let body = movedBedrockTail
+        ? this.buildBedrockBodyWithDynamicTail(bodyWithSummary, dynamicTail)
+        : this.buildBodyWithPromptCacheDynamicTail(
+          bodyWithSummary,
+          dynamicTail,
+          promptCacheProvider
+        );
 
       if (
         promptCacheProvider != null &&
@@ -1078,13 +1101,25 @@ export class AgentContext {
       // Tools, stable instructions, stable history and the tail already use
       // Anthropic's four breakpoints; the conversation block and then the
       // summary get a breakpoint only while any are left.
-      const room =
-        promptCacheProvider == null
-          ? 0
-          : MAX_PROMPT_CACHE_BREAKPOINTS -
-            1 -
-            (stableInstructions !== '' ? 1 : 0) -
-            countCacheControlMessages(body);
+      const bedrockToolCheckpoints = supportsBedrockToolCache(
+        (this.clientOptions as { model?: string } | undefined)?.model
+      )
+        ? 1
+        : 0;
+      let room = 0;
+      if (movedBedrockTail) {
+        room =
+          MAX_PROMPT_CACHE_BREAKPOINTS -
+          bedrockToolCheckpoints -
+          (stableInstructions !== '' ? 1 : 0) -
+          countCachePointMessages(body);
+      } else if (promptCacheProvider != null) {
+        room =
+          MAX_PROMPT_CACHE_BREAKPOINTS -
+          1 -
+          (stableInstructions !== '' ? 1 : 0) -
+          countCacheControlMessages(body);
+      }
       if (summaryMessageFirst) {
         const summaryRoom = room - (conversationInstructions !== '' ? 1 : 0);
         body = [
@@ -1139,7 +1174,7 @@ export class AgentContext {
   }: {
     dynamicInstructions: string;
     hasSummaryBody: boolean;
-    promptCacheProvider: PromptCacheProvider | undefined;
+    promptCacheProvider: PromptCacheProvider | Providers.BEDROCK | undefined;
     shouldMoveDynamicInstructions: boolean;
   }): BaseMessage[] {
     if (promptCacheProvider == null) {
@@ -1182,6 +1217,30 @@ export class AgentContext {
     );
 
     return [...cacheablePrefix, ...tail, ...cacheableTrailingMessages];
+  }
+
+  /**
+   * Bedrock counterpart of `buildBodyWithPromptCacheDynamicTail`: the tail goes
+   * right before the newest user message, with one checkpoint at the end of the
+   * history in front of it and one at the end of the request. The opening message
+   * is not an anchor, as for Anthropic.
+   */
+  private buildBedrockBodyWithDynamicTail(
+    messages: BaseMessage[],
+    tail: BaseMessage[]
+  ): BaseMessage[] {
+    const tailIndex =
+      this._summaryLocation === 'user_message' && this.summaryPrecedesMessages
+        ? 0
+        : this.getPromptCacheDynamicTailIndex(messages, Providers.ANTHROPIC);
+    const ttl = this.getBedrockPromptCacheTtl();
+    const stablePrefix = messages.slice(0, tailIndex);
+    return [
+      ...stablePrefix.slice(0, 1),
+      ...addBedrockTailCacheControl(stablePrefix.slice(1), ttl),
+      ...tail,
+      ...addBedrockTailCacheControl(messages.slice(tailIndex), ttl),
+    ];
   }
 
   private getPromptCacheDynamicTailIndex(
@@ -1355,16 +1414,20 @@ export class AgentContext {
     ) {
       const ttl = this.getBedrockPromptCacheTtl();
       const content: AgentSystemContentBlock[] = [];
-      for (const text of [stableInstructions, conversationInstructions]) {
+      const blocks: Array<[string, boolean]> = [
+        [stableInstructions, true],
+        [conversationInstructions, markConversation],
+      ];
+      for (const [text, marked] of blocks) {
         if (text) {
           content.push(
             { type: 'text', text },
-            { cachePoint: buildBedrockCachePoint(ttl) }
+            ...(marked ? [{ cachePoint: buildBedrockCachePoint(ttl) }] : [])
           );
         }
       }
-      if (dynamicInstructions) {
-        content.push({ type: 'text', text: dynamicInstructions });
+      if (systemDynamic) {
+        content.push({ type: 'text', text: systemDynamic });
       }
       return new SystemMessage({ content } as BaseMessageFields);
     }

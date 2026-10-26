@@ -382,6 +382,7 @@ function bedrockCase(name: string, promptCache: boolean): ProviderCase {
     },
     reduce: reduceBedrock,
     breakpoints: promptCache ? BEDROCK_BREAKPOINTS : undefined,
+    movesDynamicPart: promptCache,
     strictAlternation: true,
   };
 }
