@@ -1,5 +1,7 @@
-// src/utils/schema.ts
+import { toJSONSchema } from 'zod/v4/core';
 import { zodToJsonSchema } from 'zod-to-json-schema';
+import { isZodSchemaV4 } from '@langchain/core/utils/types';
+import type { $ZodType } from 'zod/v4/core';
 import type { ZodTypeAny } from 'zod';
 
 /** Checks if a schema is a Zod schema by looking for the _def property */
@@ -18,6 +20,17 @@ export function toJsonSchema(
   name?: string,
   description?: string
 ): Record<string, unknown> {
+  if (isZodSchemaV4(schema)) {
+    return {
+      ...toJSONSchema(schema as $ZodType, {
+        target: 'draft-7',
+        io: 'input',
+        unrepresentable: 'any',
+      }),
+      ...(name != null && name !== '' ? { title: name } : {}),
+      ...(description != null && description !== '' ? { description } : {}),
+    };
+  }
   if (isZodSchema(schema)) {
     const zodSchema = schema as ZodTypeAny & {
       describe: (desc: string) => ZodTypeAny;
