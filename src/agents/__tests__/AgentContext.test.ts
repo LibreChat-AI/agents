@@ -1,5 +1,6 @@
 // src/agents/__tests__/AgentContext.test.ts
 import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
+import type { BaseMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
 import { markTokenCounterCacheCompatible } from '@/llm/tokenCounterCacheCompatibility';
 import { buildSummaryCarrierText } from '@/summarization/shared';
@@ -314,7 +315,7 @@ describe('AgentContext', () => {
       );
     });
 
-    it('places the Bedrock cache point before dynamic system text', async () => {
+    it('moves the dynamic Bedrock text out of the system message', async () => {
       const ctx = createBasicContext({
         agentConfig: {
           provider: Providers.BEDROCK,
@@ -332,8 +333,125 @@ describe('AgentContext', () => {
       expect(content).toEqual([
         { type: 'text', text: 'Stable instructions' },
         { cachePoint: { type: 'default', ttl: '1h' } },
-        { type: 'text', text: 'Dynamic instructions' },
       ]);
+      expect(result[1].content).toBe('Dynamic instructions');
+    });
+
+    it('keeps the Bedrock history in front of the moved tail and marks both ends of it', async () => {
+      const build = (dynamic: string): AgentContext =>
+        createBasicContext({
+          agentConfig: {
+            provider: Providers.BEDROCK,
+            clientOptions: {
+              model: 'anthropic.claude-sonnet-4-5-20250929-v1:0',
+              promptCache: true,
+            },
+            instructions: 'Stable instructions',
+            additional_instructions: dynamic,
+          },
+        });
+      const history = (): BaseMessage[] => [
+        new HumanMessage('Q1'),
+        new AIMessage('A1'),
+        new HumanMessage('Q2'),
+        new AIMessage('A2'),
+        new HumanMessage('Q3'),
+      ];
+      const first = await build('Tail one').systemRunnable!.invoke(history());
+      const second = await build('Tail two').systemRunnable!.invoke(history());
+
+      /** system, Q1, A1, Q2, A2, tail, Q3 */
+      expect(first.map((message) => message.content)).toEqual([
+        [
+          { type: 'text', text: 'Stable instructions' },
+          { cachePoint: { type: 'default', ttl: '1h' } },
+        ],
+        'Q1',
+        'A1',
+        'Q2',
+        [
+          { type: 'text', text: 'A2' },
+          { cachePoint: { type: 'default', ttl: '1h' } },
+        ],
+        'Tail one',
+        [
+          { type: 'text', text: 'Q3' },
+          { cachePoint: { type: 'default', ttl: '1h' } },
+        ],
+      ]);
+      expect(JSON.stringify(second.slice(0, 5))).toBe(
+        JSON.stringify(first.slice(0, 5))
+      );
+      expect(second[5].content).toBe('Tail two');
+    });
+
+    it('leaves one Bedrock checkpoint for the tools and never exceeds the limit of four', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.BEDROCK,
+          clientOptions: {
+            model: 'anthropic.claude-sonnet-4-5-20250929-v1:0',
+            promptCache: true,
+          },
+          instructions: 'Stable instructions',
+          conversation_instructions: 'Conversation context',
+          additional_instructions: 'Dynamic instructions',
+        },
+      });
+      const result = await ctx.systemRunnable!.invoke([
+        new HumanMessage('Q1'),
+        new AIMessage('A1'),
+        new HumanMessage('Q2'),
+        new AIMessage('A2'),
+        new HumanMessage('Q3'),
+      ]);
+      const checkpoints = JSON.stringify(result).match(/"cachePoint"/g) ?? [];
+
+      /** Tools (added when the request is built) + stable + history + request end. */
+      expect(checkpoints).toHaveLength(3);
+      expect(JSON.stringify(result[0].content)).not.toContain(
+        'Conversation context","cachePoint'
+      );
+    });
+
+    it('gives the Bedrock conversation block its checkpoint while there is room', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.BEDROCK,
+          clientOptions: {
+            model: 'anthropic.claude-sonnet-4-5-20250929-v1:0',
+            promptCache: true,
+          },
+          instructions: 'Stable instructions',
+          conversation_instructions: 'Conversation context',
+          additional_instructions: 'Dynamic instructions',
+        },
+      });
+      const result = await ctx.systemRunnable!.invoke([new HumanMessage('Q1')]);
+      const content = result[0].content as TestSystemContentBlock[];
+
+      expect(content.map((block) => ('text' in block ? block.text : 'cachePoint'))).toEqual([
+        'Stable instructions',
+        'cachePoint',
+        'Conversation context',
+        'cachePoint',
+      ]);
+      expect(result[1].content).toBe('Dynamic instructions');
+    });
+
+    it('keeps the Bedrock tail in the system message without prompt caching', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.BEDROCK,
+          clientOptions: { model: 'anthropic.claude-sonnet-4-5-20250929-v1:0' },
+          instructions: 'Stable instructions',
+          additional_instructions: 'Dynamic instructions',
+        },
+      });
+      const result = await ctx.systemRunnable!.invoke([new HumanMessage('Q1')]);
+
+      expect(result[0].content).toBe('Stable instructions\n\nDynamic instructions');
+      expect(result).toHaveLength(2);
     });
 
     it('uses plain Bedrock system text when only dynamic system text exists', async () => {
@@ -520,8 +638,8 @@ describe('AgentContext', () => {
           'cachePoint',
           'Conversation context',
           'cachePoint',
-          'Per-turn context',
         ]);
+        expect(result[1].content).toBe('Per-turn context');
       });
 
       it('joins the blocks in order and sends the summary as the first message', async () => {
@@ -1256,7 +1374,6 @@ describe('AgentContext', () => {
       expect(finalMessages[0].content).toEqual([
         { type: 'text', text: 'Stable instructions' },
         { cachePoint: { type: 'default', ttl: '1h' } },
-        { type: 'text', text: 'Dynamic instructions' },
       ]);
     });
   });
