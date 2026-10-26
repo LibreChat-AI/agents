@@ -2,6 +2,8 @@ import path from 'node:path';
 import test from 'node:test';
 import { access } from 'node:fs/promises';
 import assert from 'node:assert/strict';
+import { promisify } from 'node:util';
+import { execFile } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 import {
@@ -14,6 +16,36 @@ import { packageEntries } from './package-entries.mjs';
 import manifest from '../package.json' with { type: 'json' };
 
 const root = path.resolve(fileURLToPath(import.meta.url), '../..');
+const run = promisify(execFile);
+
+for (const format of ['esm', 'cjs']) {
+  test(`schema conversion loads with only declared dependencies (${format})`, async () => {
+    const extension = format === 'esm' ? 'mjs' : 'cjs';
+    const script = `
+      import assert from 'node:assert/strict';
+      import { isBuiltin, registerHooks } from 'node:module';
+      import manifest from './package.json' with { type: 'json' };
+      import { z } from 'zod-v4';
+      const entry = new URL('./dist/${format}/utils/schema.${extension}', import.meta.url);
+      registerHooks({
+        resolve(specifier, context, nextResolve) {
+          if (context.parentURL === entry.href && !isBuiltin(specifier) &&
+              !specifier.startsWith('.') && !specifier.startsWith('file:')) {
+            const name = specifier.split('/').slice(0, specifier.startsWith('@') ? 2 : 1).join('/');
+            assert.ok(manifest.dependencies[name] || manifest.peerDependencies?.[name],
+              'Undeclared runtime dependency: ' + name);
+          }
+          return nextResolve(specifier, context);
+        },
+      });
+      const { toJsonSchema } = await import(entry.href);
+      assert.equal(toJsonSchema(z.object({ query: z.string() })).properties.query.type, 'string');
+    `;
+    await run(process.execPath, ['--input-type=module', '--eval', script], {
+      cwd: root,
+    });
+  });
+}
 
 test('light subpaths are built entries with esm, cjs and declaration outputs', async () => {
   for (const subpath of lightSubpaths) {
