@@ -439,6 +439,77 @@ describe('AgentContext', () => {
       expect(result[1].content).toBe('Dynamic instructions');
     });
 
+    it.each([
+      ['one message checkpoint', 1, true],
+      ['two message checkpoints', 2, false],
+    ])(
+      'keeps the Bedrock request at four checkpoints when the graph placed %s and there is no tail',
+      async (_name, marked, conversationMarked) => {
+        const ctx = createBasicContext({
+          agentConfig: {
+            provider: Providers.BEDROCK,
+            clientOptions: {
+              model: 'anthropic.claude-sonnet-4-5-20250929-v1:0',
+              promptCache: true,
+            },
+            instructions: 'Stable instructions',
+            conversation_instructions: 'Conversation context',
+          },
+        });
+        const cp = { cachePoint: { type: 'default', ttl: '1h' } };
+        const history = [
+          new HumanMessage({
+            content: [{ type: 'text', text: 'Q1' }, ...(marked === 2 ? [cp] : [])] as never,
+          }),
+          new AIMessage('A1'),
+          new HumanMessage({ content: [{ type: 'text', text: 'Q2' }, cp] as never }),
+        ];
+        const result = await ctx.systemRunnable!.invoke(history);
+        const system = result[0].content as TestSystemContentBlock[];
+        const points = JSON.stringify(result).match(/"cachePoint"/g) ?? [];
+
+        expect(system.some((block) => 'text' in block && block.text === 'Conversation context' )).toBe(true);
+        expect(system.filter((block) => 'cachePoint' in block)).toHaveLength(
+          conversationMarked ? 2 : 1
+        );
+        /** Plus the tool list checkpoint added when the request is built. */
+        expect(points.length + 1).toBeLessThanOrEqual(4);
+      }
+    );
+
+    it('never marks the moved Bedrock tail message', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.BEDROCK,
+          clientOptions: {
+            model: 'anthropic.claude-sonnet-4-5-20250929-v1:0',
+            promptCache: true,
+          },
+          instructions: 'Stable instructions',
+          additional_instructions: 'Dynamic instructions',
+        },
+      });
+      const cp = { cachePoint: { type: 'default', ttl: '1h' } };
+      const result = await ctx.systemRunnable!.invoke([
+        new HumanMessage({ content: [{ type: 'text', text: 'Q1' }, cp] as never }),
+        new AIMessage('A1'),
+        new HumanMessage({ content: [{ type: 'text', text: 'Q2' }, cp] as never }),
+        new AIMessage({
+          content: '',
+          tool_calls: [{ id: 'call_1', name: 'calculator', args: {} }],
+        }),
+        new ToolMessage({ content: '4', tool_call_id: 'call_1' }),
+      ]);
+      const tail = result.find((message) => message.content === 'Dynamic instructions');
+
+      expect(tail).toBeDefined();
+      expect(JSON.stringify(tail)).not.toContain('cachePoint');
+      expect(result.indexOf(tail!)).toBe(result.findIndex((m) => m.getType() === 'human' && JSON.stringify(m.content).includes('Q2')) - 1);
+      /** Tools take one, the system block one: the opening message keeps none. */
+      expect(JSON.stringify(result).match(/"cachePoint"/g)?.length).toBeLessThanOrEqual(3);
+      expect(JSON.stringify(result[1])).not.toContain('cachePoint');
+    });
+
     it('keeps the Bedrock tail in the system message without prompt caching', async () => {
       const ctx = createBasicContext({
         agentConfig: {
