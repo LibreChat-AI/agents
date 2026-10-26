@@ -935,6 +935,33 @@ export function addBedrockCacheControl<
   return updatedMessages;
 }
 
+/** Bedrock accepts at most this many cachePoints per request across tools, system and messages. */
+export const BEDROCK_MAX_CACHE_POINTS = 4;
+
+/**
+ * Message cachePoints that fit beside the system checkpoints already in
+ * `messages[0]` and one checkpoint reserved for the tool list: 2 when they fit,
+ * otherwise 1 (the tail).
+ */
+export function getBedrockMessageCachePointBudget(
+  messages: ReadonlyArray<
+    MessageWithContent & { getType?: () => string; role?: string }
+  >
+): number {
+  const first = messages[0] as
+    | (MessageWithContent & { getType?: () => string; role?: string })
+    | undefined;
+  const isSystem =
+    first != null &&
+    (first.role === 'system' ||
+      (typeof first.getType === 'function' && first.getType() === 'system'));
+  const systemContent = isSystem ? first.content : undefined;
+  const systemCachePoints = Array.isArray(systemContent)
+    ? systemContent.filter((block) => isCachePoint(block)).length
+    : 0;
+  return BEDROCK_MAX_CACHE_POINTS - systemCachePoints - 1 >= 2 ? 2 : 1;
+}
+
 /**
  * Bedrock Converse API: single tail cache breakpoint (default strategy).
  *
@@ -950,17 +977,23 @@ export function addBedrockCacheControl<
  * anchored. Synthetic skill/meta messages are skipped as anchors so their
  * volatile content cannot pin the cache.
  *
+ * With `maxCachePoints` of 2, the same pass also anchors the latest real human
+ * message before the tail. Bedrock only looks back about 20 content blocks from
+ * a cachePoint, so after a tool-heavy turn the previous turn's cached prefix is
+ * out of reach of the tail alone; the human message that opened it still ends
+ * exactly where an earlier tail cached it.
+ *
  * Returns a new array - only clones messages that require modification.
  */
 export function addBedrockTailCacheControl<
   T extends MessageWithContent & { getType?: () => string; role?: string },
->(messages: T[], ttl?: PromptCacheTtl): T[] {
+>(messages: T[], ttl?: PromptCacheTtl, maxCachePoints = 1): T[] {
   if (!Array.isArray(messages) || messages.length === 0) {
     return messages;
   }
 
   const updatedMessages: T[] = [...messages];
-  let cachePointPlaced = false;
+  let cachePointsPlaced = 0;
 
   for (let i = updatedMessages.length - 1; i >= 0; i--) {
     const originalMessage = updatedMessages[i];
@@ -991,8 +1024,10 @@ export function addBedrockTailCacheControl<
     const isComputerOutput =
       originalMessage instanceof BaseMessage &&
       hasComputerCallOutputMarker(originalMessage);
+    const isHumanMessage = messageType === 'human' || messageRole === 'user';
     const canPlaceCachePoint =
-      !cachePointPlaced &&
+      (cachePointsPlaced === 0 ||
+        (cachePointsPlaced < maxCachePoints && isHumanMessage)) &&
       !isEmptyString &&
       !isSyntheticMetaMessage(originalMessage) &&
       !isComputerOutput &&
@@ -1038,7 +1073,7 @@ export function addBedrockTailCacheControl<
         workingContent.splice(lastNonEmptyTextIndex + 1, 0, {
           cachePoint: buildBedrockCachePoint(ttl),
         } as MessageContentComplex);
-        cachePointPlaced = true;
+        cachePointsPlaced++;
         modified = true;
       }
     } else if (typeof content === 'string' && canPlaceCachePoint) {
@@ -1046,7 +1081,7 @@ export function addBedrockTailCacheControl<
         { type: ContentTypes.TEXT, text: content },
         { cachePoint: buildBedrockCachePoint(ttl) } as MessageContentComplex,
       ];
-      cachePointPlaced = true;
+      cachePointsPlaced++;
     } else if (typeof content === 'string' && hasSerializationProps) {
       workingContent = content;
     } else {
