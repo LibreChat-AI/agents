@@ -3,10 +3,10 @@ import type { UsageMetadata, BaseMessage } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { RenderedCompactionSemanticIndex } from '@/summarization/semanticIndex';
 import type { StreamLimitState } from '@/llm/streamLimits';
-import type { OnChunk, ReasoningReplaySource } from '@/llm/invoke';
 import type { AgentContext } from '@/agents/AgentContext';
 import type { EncodingName } from '@/utils/tokens';
 import type { HookRegistry } from '@/hooks';
+import type { OnChunk } from '@/llm/invoke';
 import type * as t from '@/types';
 import {
   DEFAULT_SUMMARIZATION_PROMPT,
@@ -59,14 +59,8 @@ import { renderCompactionSemanticIndex } from '@/summarization/semanticIndex';
 import { ProviderTextProtectionError } from '@/protection/providerText';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { prepareToolsForPromptCache } from '@/llm/promptCacheTools';
-import {
-  attemptInvoke,
-  tryFallbackProviders,
-  filterReasoningReplayForInvocation,
-  resolveReasoningReplaySource,
-} from '@/llm/invoke';
+import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { calculateMaxToolResultChars } from '@/utils/truncation';
-import { stripSignedReasoning } from '@/messages/reasoningTypes';
 import { makeIsDeferred } from '@/messages/anthropicToolCache';
 import { createRemoveAllMessage } from '@/messages/reducer';
 import { getProviderFamily } from '@/llm/providerRegistry';
@@ -680,14 +674,6 @@ async function executeSummarizationWithFallback(params: {
   let summaryText = '';
   let summaryUsage: Partial<UsageMetadata> | undefined;
   let usedMetadataStub = false;
-  let summarizationMessages = messages;
-  let reasoningReplaySource: ReasoningReplaySource | undefined =
-    agentContext.providerReasoningReplay
-      ? (agentContext.reasoningReplaySource ?? {
-        provider: agentContext.provider,
-        model: resolveClientOptionsModel(agentContext.clientOptions),
-      })
-      : undefined;
 
   try {
     /**
@@ -715,24 +701,9 @@ async function executeSummarizationWithFallback(params: {
       tools: summarizationTools,
     }) as t.ChatModel;
 
-    if (reasoningReplaySource != null) {
-      const summarizationReplaySource = resolveReasoningReplaySource({
-        model: summarizationModel,
-        provider: clientConfig.provider as Providers,
-        clientOptions: clientConfig.clientOptions as t.ClientOptions,
-        callOptions: summarizeConfig,
-      });
-      summarizationMessages = filterReasoningReplayForInvocation({
-        messages,
-        source: reasoningReplaySource,
-        target: summarizationReplaySource,
-      });
-      reasoningReplaySource = summarizationReplaySource;
-    }
-
     const result = await summarizeWithCacheHit({
       model: summarizationModel,
-      messages: summarizationMessages,
+      messages,
       promptText: clientConfig.promptText,
       updatePromptText: clientConfig.updatePromptText,
       priorSummaryText,
@@ -824,7 +795,7 @@ async function executeSummarizationWithFallback(params: {
           fallbacks,
           tools: agentContext.getToolsForBinding(),
           messages: [
-            ...summarizationMessages,
+            ...messages,
             new HumanMessage(
               buildSummarizationInstruction(
                 clientConfig.promptText,
@@ -841,7 +812,6 @@ async function executeSummarizationWithFallback(params: {
           primaryError,
           onChunk,
           streamLimitState: graph,
-          reasoningReplaySource,
         });
         const fbMsg = fbResult?.messages?.[0];
         if (fbMsg) {
@@ -1275,10 +1245,7 @@ export function createSummarizeNode({
      * specific indices), so the same tailStartIndex slices both arrays
      * at the same turn boundary.
      */
-    /** The signatures bind each block to the history the summary now replaces. */
-    const messagesToRetain = stripSignedReasoning(
-      state.messages.slice(tailStartIndex)
-    );
+    const messagesToRetain = state.messages.slice(tailStartIndex);
 
     if (messagesToRefine.length === 0) {
       if (request.reason === 'manual') {
@@ -1478,7 +1445,7 @@ export function createSummarizeNode({
       usedMetadataStub,
     } = await executeSummarizationWithFallback({
       agentContext,
-      messages: stripSignedReasoning(messagesToRefine),
+      messages: messagesToRefine,
       clientConfig,
       summarizeConfig,
       stepId,

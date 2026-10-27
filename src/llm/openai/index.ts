@@ -229,11 +229,7 @@ function stripResponsesToolCacheControl<T>(tools: T): T {
 type ResponsesReplayTarget = {
   replayOrigin: string;
   zdrEnabled?: boolean;
-  /** Clock of the replay gate in epoch seconds; defaults to the system clock. */
-  replayNowSeconds?: () => number;
 };
-
-const systemNowSeconds = (): number => Math.floor(Date.now() / 1000);
 
 function projectOpenAIResponsesProviderMessages(
   messages: BaseMessage[],
@@ -247,7 +243,7 @@ function projectOpenAIResponsesProviderMessages(
     ),
     target.replayOrigin,
     target.zdrEnabled === true,
-    (target.replayNowSeconds ?? systemNowSeconds)()
+    Math.floor(Date.now() / 1000)
   );
 }
 
@@ -2328,7 +2324,6 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
 
 class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
   protected firstPartyEndpoint?: boolean;
-  replayNowSeconds?: () => number;
 
   get replayOrigin(): string {
     return getResponsesReplayOrigin(
@@ -2651,7 +2646,6 @@ class LibreChatAzureOpenAICompletions extends OriginalAzureChatOpenAICompletions
 
 class LibreChatAzureOpenAIResponses extends OriginalAzureChatOpenAIResponses {
   protected firstPartyEndpoint?: boolean;
-  replayNowSeconds?: () => number;
 
   get replayOrigin(): string {
     return getResponsesReplayOrigin(

@@ -52,19 +52,6 @@ function _isAnthropicCompactionBlock(
   );
 }
 
-/**
- * `input_transformations` reports what the API changed in the request history
- * (for example dropped thinking blocks); it is absent unless the request
- * opted into thinking binding controls.
- */
-function pickInputTransformations(source: unknown): {
-  input_transformations?: unknown;
-} {
-  const value = (source as { input_transformations?: unknown } | null)
-    ?.input_transformations;
-  return value === undefined ? {} : { input_transformations: value };
-}
-
 export function _makeMessageChunkFromAnthropicEvent(
   data: Anthropic.Beta.Messages.BetaRawMessageStreamEvent,
   fields: {
@@ -91,7 +78,6 @@ export function _makeMessageChunkFromAnthropicEvent(
         usage_metadata: fields.streamUsage ? usageMetadata : undefined,
         response_metadata: {
           ...responseMetadata,
-          ...pickInputTransformations(data.message),
           usage: {
             ...rest,
           },
@@ -100,11 +86,7 @@ export function _makeMessageChunkFromAnthropicEvent(
       }),
     };
   } else if (data.type === 'message_delta') {
-    const messageDeltaResponseMetadata = {
-      ...responseMetadata,
-      ...pickInputTransformations(data),
-      ...pickInputTransformations(data.delta),
-    };
+    const messageDeltaResponseMetadata = { ...responseMetadata };
     if ('context_management' in data.delta) {
       Object.assign(messageDeltaResponseMetadata, {
         context_management: data.delta.context_management,

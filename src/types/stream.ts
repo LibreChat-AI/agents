@@ -440,10 +440,6 @@ export type BedrockReasoningReplay = {
 export type ProviderReasoningReplay = {
   anthropic?: AnthropicReasoningReplay;
   bedrock?: BedrockReasoningReplay;
-  /** Withdraws the blocks already delivered for the part: a later request
-   *  rewrote the prefix they are bound to and was sent without them. Kept on
-   *  the part so a restored history knows the turn was sent bare, not lost. */
-  invalidated?: boolean;
 };
 
 export type ReasoningDeltaUpdate = {

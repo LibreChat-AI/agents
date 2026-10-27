@@ -13,7 +13,6 @@ import type {
 } from '@langchain/core/messages';
 import type { RunnableConfig, Runnable } from '@langchain/core/runnables';
 import type { ExactTokenCountCache } from '@/llm/contextPressureMeter';
-import type { SentPrefix } from '@/messages/reasoningTypes';
 import type * as t from '@/types';
 import {
   type CallerCapabilityProjection,
@@ -27,21 +26,19 @@ import {
 } from '@/tools/CallerCapabilities';
 import {
   addTailCacheControl,
-  addBedrockTailCacheControl,
-  stripBedrockCacheControl,
   stripAnthropicCacheControl,
   addCacheControlToStablePrefixMessages,
   buildAnthropicCacheControl,
   buildBedrockCachePoint,
   resolvePromptCacheTtl,
   resolveBedrockPromptCacheTtl,
-  supportsBedrockToolCache,
   cloneMessage,
   type PromptCacheTtl,
 } from '@/messages/cache';
 import {
   isProgrammaticRunnerAutoBound,
   isProgrammaticRunnerResolvedDirectly,
+  filterToolsByLocalAllowlist,
   resolveLocalImplementationNames,
   resolveLocalToolRegistry,
 } from '@/tools/local/resolveLocalExecutionTools';
@@ -80,29 +77,6 @@ type AgentSystemContentBlock =
   | { cachePoint: { type: 'default'; ttl?: '1h' } };
 
 type PromptCacheProvider = Providers.ANTHROPIC | Providers.OPENROUTER;
-
-/** Anthropic's limit of cache_control blocks per request. */
-const MAX_PROMPT_CACHE_BREAKPOINTS = 4;
-
-function countCacheControlMessages(messages: BaseMessage[]): number {
-  return messages.filter(
-    (message) =>
-      Array.isArray(message.content) &&
-      message.content.some(
-        (block) => typeof block === 'object' && 'cache_control' in block
-      )
-  ).length;
-}
-
-function countCachePointMessages(messages: BaseMessage[]): number {
-  return messages.filter(
-    (message) =>
-      Array.isArray(message.content) &&
-      message.content.some(
-        (block) => typeof block === 'object' && 'cachePoint' in block
-      )
-  ).length;
-}
 
 type ProgrammaticToolInstructionTarget = {
   name: string;
@@ -146,10 +120,10 @@ export class AgentContext {
       toolDefinitions,
       instructions,
       additional_instructions,
-      conversation_instructions,
       streamBuffer,
       maxContextTokens,
       reasoningKey,
+      providerReasoningReplay,
       useLegacyContent,
       discoveredTools,
       summarizationEnabled,
@@ -163,7 +137,6 @@ export class AgentContext {
       subagentConfigs,
       maxSubagentDepth,
       graphTools,
-      providerReasoningReplay,
     } = agentConfig;
 
     const agentContext = new AgentContext({
@@ -183,7 +156,6 @@ export class AgentContext {
       toolDefinitions,
       instructions,
       additionalInstructions: additional_instructions,
-      conversationInstructions: conversation_instructions,
       reasoningKey,
       toolEnd,
       instructionTokens: 0,
@@ -207,6 +179,18 @@ export class AgentContext {
         };
     agentContext.subagentConfigs = subagentConfigs;
     agentContext.maxSubagentDepth = maxSubagentDepth;
+    /**
+     * Host-supplied direct tools (see `AgentInputs.graphTools`). Copied — never
+     * aliased — because the SDK later pushes graph-managed tools (handoff /
+     * subagent) into this same array and must not mutate the host's input.
+     */
+    if (graphTools && graphTools.length > 0) {
+      agentContext.graphTools = [
+        ...((filterToolsByLocalAllowlist(graphTools, toolExecution) as
+          | t.GenericTool[]
+          | undefined) ?? []),
+      ] as t.GraphTools;
+    }
     if (providerReasoningReplay === true) {
       agentContext.providerReasoningReplay = true;
       if (provider === Providers.ANTHROPIC) {
@@ -220,14 +204,6 @@ export class AgentContext {
           retryWithoutReasoningOnRejection: true,
         } as t.ClientOptions;
       }
-    }
-    /**
-     * Host-supplied direct tools (see `AgentInputs.graphTools`). Copied — never
-     * aliased — because the SDK later pushes graph-managed tools (handoff /
-     * subagent) into this same array and must not mutate the host's input.
-     */
-    if (graphTools && graphTools.length > 0) {
-      agentContext.graphTools = [...graphTools];
     }
 
     if (initialSummary?.text != null && initialSummary.text !== '') {
@@ -244,7 +220,28 @@ export class AgentContext {
       agentContext.baseIndexTokenCountMap = { ...tokenMap };
       agentContext.indexTokenCountMap = tokenMap;
 
-      if (toolSchemaTokens != null && toolSchemaTokens > 0) {
+      /** A cached total counts the host's unfiltered tools. Once the local
+       *  allowlist removed some, recount, but only when the recount can
+       *  measure every retained tool (it reads `.schema`); otherwise the
+       *  larger cached total is the safer budget. */
+      const allowlistRemovedTools =
+        (tools?.length ?? 0) !== (agentContext.tools?.length ?? 0) ||
+        (toolDefinitions?.length ?? 0) !==
+          (agentContext.toolDefinitions?.length ?? 0) ||
+        (graphTools?.length ?? 0) !== (agentContext.graphTools?.length ?? 0);
+      const recountMeasuresAll = [
+        ...((agentContext.tools as unknown[] | undefined) ?? []),
+        ...((agentContext.graphTools as unknown[] | undefined) ?? []),
+      ].every(
+        (tool) =>
+          tool != null &&
+          typeof (tool as { schema?: unknown }).schema === 'object'
+      );
+      if (
+        toolSchemaTokens != null &&
+        toolSchemaTokens > 0 &&
+        !(allowlistRemovedTools && recountMeasuresAll)
+      ) {
         /** Use pre-computed (cached) tool schema tokens — skip calculateInstructionTokens */
         agentContext.toolSchemaTokens = toolSchemaTokens;
         agentContext.tokenCalculationPromise = Promise.resolve();
@@ -334,8 +331,6 @@ export class AgentContext {
   resolvedInstructionOverhead?: number;
   private _pendingOriginalToolContent?: Map<number, string>;
   private pendingOriginalToolContentChars = 0;
-  /** What the last request sent, for dropping reasoning bound to a rewritten prefix. */
-  readonly sentPrefix: SentPrefix = { stale: new Set<string>() };
   /** Provider-bound projection for this Run; graph messages remain canonical. */
   private providerProjectedMessages?: BaseMessage[];
   /** Canonical object identities corresponding to the projected slots. */
@@ -361,12 +356,10 @@ export class AgentContext {
     }
   }
 
-  /** Total instruction overhead: system message + tool schemas + summary carried as a message. */
+  /** Total instruction overhead: system message + tool schemas + pending summary. */
   get instructionTokens(): number {
     const summaryOverhead =
-      this._summaryLocation === 'user_message' || this.summaryAsMessage
-        ? this.summaryTokenCount
-        : 0;
+      this._summaryLocation === 'user_message' ? this.summaryTokenCount : 0;
     return (
       this.systemMessageTokens +
       this.dynamicInstructionTokens +
@@ -408,8 +401,6 @@ export class AgentContext {
   instructions?: string;
   /** Additional instructions for this agent */
   additionalInstructions?: string;
-  /** Per-conversation instructions kept at a fixed position after `instructions` */
-  conversationInstructions?: string;
   /** Reasoning key for this agent */
   reasoningKey: 'reasoning_content' | 'reasoning' = 'reasoning_content';
   /** Last token for reasoning detection */
@@ -420,11 +411,6 @@ export class AgentContext {
   reasoningTransitionCount = 0;
   /** Streamed reasoning carries signed provider blocks (`provider_replay`). */
   providerReasoningReplay = false;
-  /** Native replay shape currently present in formatted conversation messages. */
-  reasoningReplaySource?: {
-    provider: t.ProviderName;
-    model?: string;
-  };
   /** Current token type being processed */
   currentTokenType: ContentTypes.TEXT | ContentTypes.THINK | 'think_and_text' =
     ContentTypes.TEXT;
@@ -461,8 +447,6 @@ export class AgentContext {
    * - `'system_prompt'`: cross-run summary, included in the dynamic system tail
    * - `'user_message'`: mid-run compaction, injected as HumanMessage on clean slate
    * - `'none'`: no summary present
-   * With `conversation_instructions` both kinds are injected as the same
-   * message right after the system message (see `summaryAsMessage`).
    */
   private _summaryLocation: 'system_prompt' | 'user_message' | 'none' = 'none';
   /** Whether a mid-run summary must appear before every retained message. */
@@ -541,7 +525,6 @@ export class AgentContext {
     toolDefinitions,
     instructions,
     additionalInstructions,
-    conversationInstructions,
     reasoningKey,
     toolEnd,
     instructionTokens,
@@ -571,7 +554,6 @@ export class AgentContext {
     toolDefinitions?: t.LCTool[];
     instructions?: string;
     additionalInstructions?: string;
-    conversationInstructions?: string;
     reasoningKey?: 'reasoning_content' | 'reasoning';
     toolEnd?: boolean;
     instructionTokens?: number;
@@ -598,17 +580,19 @@ export class AgentContext {
       tokenCounter != null && isTokenCounterCacheCompatible(tokenCounter)
         ? createExactTokenCountCache(tokenCounter)
         : undefined;
-    this.tools = tools;
+    this.tools = filterToolsByLocalAllowlist(tools, toolExecution);
     this.toolMap = toolMap;
     this.toolRegistry = resolveLocalToolRegistry({
       toolRegistry,
       toolExecution,
     });
     this.toolExecution = toolExecution;
-    this.toolDefinitions = toolDefinitions;
+    this.toolDefinitions = filterToolsByLocalAllowlist(
+      toolDefinitions as t.GraphTools | undefined,
+      toolExecution
+    ) as t.LCTool[] | undefined;
     this.instructions = instructions;
     this.additionalInstructions = additionalInstructions;
-    this.conversationInstructions = conversationInstructions;
     if (reasoningKey) {
       this.reasoningKey = reasoningKey;
     }
@@ -872,7 +856,6 @@ export class AgentContext {
 
     this.cachedSystemRunnable = this.buildSystemRunnable({
       stableInstructions: this.buildStableInstructionsString(),
-      conversationInstructions: this.buildConversationInstructionsString(),
       dynamicInstructions: this.buildDynamicInstructionsString(),
     });
     this.systemRunnableStale = false;
@@ -887,7 +870,6 @@ export class AgentContext {
     if (this.systemRunnableStale || this.cachedSystemRunnable === undefined) {
       this.cachedSystemRunnable = this.buildSystemRunnable({
         stableInstructions: this.buildStableInstructionsString(),
-        conversationInstructions: this.buildConversationInstructionsString(),
         dynamicInstructions: this.buildDynamicInstructionsString(),
       });
       this.systemRunnableStale = false;
@@ -919,25 +901,6 @@ export class AgentContext {
   }
 
   /**
-   * Builds the per-conversation block. It changes only at a conversation's
-   * start, so it keeps a fixed position right after the stable instructions.
-   */
-  private buildConversationInstructionsString(): string {
-    return this.conversationInstructions ?? '';
-  }
-
-  /**
-   * With `conversation_instructions` the summary is its own message right
-   * after the system message, rendered the same way whether it came from a
-   * compaction in this run or from `initialSummary`, so the requests after a
-   * compaction and the next run share their prefix. Hosts that do not pass
-   * the field keep the earlier placement.
-   */
-  private get summaryAsMessage(): boolean {
-    return this.conversationInstructions != null;
-  }
-
-  /**
    * Builds the dynamic system-tail string (without creating SystemMessage).
    * Keep this out of prompt-cache-marked content so volatile context does not
    * invalidate the stable prefix.
@@ -957,7 +920,6 @@ export class AgentContext {
     // summaries are injected as a HumanMessage on the post-compaction clean
     // slate instead (see buildSystemRunnable).
     if (
-      !this.summaryAsMessage &&
       this._summaryLocation === 'system_prompt' &&
       this.summaryText != null &&
       this.summaryText !== ''
@@ -1002,11 +964,9 @@ export class AgentContext {
    */
   private buildSystemRunnable({
     stableInstructions,
-    conversationInstructions,
     dynamicInstructions,
   }: {
     stableInstructions: string;
-    conversationInstructions: string;
     dynamicInstructions: string;
   }):
     | Runnable<
@@ -1016,51 +976,27 @@ export class AgentContext {
       >
     | undefined {
     const hasMidRunSummary =
-      (this.summaryAsMessage || this._summaryLocation === 'user_message') &&
-      this.hasSummary();
+      this._summaryLocation === 'user_message' &&
+      this.summaryText != null &&
+      this.summaryText !== '';
 
-    if (
-      !stableInstructions &&
-      !conversationInstructions &&
-      !dynamicInstructions &&
-      !hasMidRunSummary
-    ) {
+    if (!stableInstructions && !dynamicInstructions && !hasMidRunSummary) {
       this.systemMessageTokens = 0;
       this.dynamicInstructionTokens = 0;
       return undefined;
     }
 
     const promptCacheProvider = this.getPromptCacheProvider();
-    /**
-     * Bedrock reads `tools`, `system` and `messages` in that order, so text after the
-     * last system checkpoint sits in front of the whole history and a changing tail
-     * there misses every message checkpoint. With prompt caching the tail moves behind
-     * the history, as for Anthropic.
-     */
-    const bedrockCache = this.hasBedrockPromptCache();
     const shouldMoveDynamicInstructions =
-      (promptCacheProvider != null || bedrockCache) &&
-      (stableInstructions !== '' || conversationInstructions !== '') &&
+      promptCacheProvider != null &&
+      stableInstructions !== '' &&
       dynamicInstructions !== '';
-    const movedBedrockTail = bedrockCache && shouldMoveDynamicInstructions;
-    const systemParts = {
+    const systemMessage = this.buildSystemMessage({
       stableInstructions,
-      conversationInstructions,
       dynamicInstructions,
       promptCacheProvider,
       shouldMoveDynamicInstructions,
-    };
-    const systemMessage = this.buildSystemMessage({
-      ...systemParts,
-      markConversation: true,
     });
-    /** Same text with three breakpoints, for bodies that carry two of their own. */
-    const systemMessageWithinBreakpointLimit =
-      (promptCacheProvider != null || bedrockCache) &&
-      stableInstructions !== '' &&
-      conversationInstructions !== ''
-        ? this.buildSystemMessage({ ...systemParts, markConversation: false })
-        : systemMessage;
 
     if (this.tokenCounter) {
       this.systemMessageTokens = systemMessage
@@ -1072,33 +1008,31 @@ export class AgentContext {
     }
 
     return markProviderTextInput(RunnableLambda.from((messages: BaseMessage[]) => {
+      const prefix: BaseMessage[] = systemMessage ? [systemMessage] : [];
+
       // Build the non-system portion (summary + conversation), then apply
       // cache markers separately so addCacheControl doesn't strip the
       // SystemMessage's own cache_control breakpoint set above.
-      const summaryMessageFirst = this.summaryAsMessage && this.hasSummary();
       const hasSummaryBody =
-        !this.summaryAsMessage &&
         this._summaryLocation === 'user_message' &&
-        this.hasSummary();
+        this.summaryText != null &&
+        this.summaryText !== '';
 
       const bodyWithSummary =
-        hasSummaryBody && promptCacheProvider == null && !movedBedrockTail
+        hasSummaryBody && promptCacheProvider == null
           ? [this.buildSummaryHumanMessage(promptCacheProvider), ...messages]
           : messages;
       const dynamicTail = this.buildPromptCacheDynamicTail({
         dynamicInstructions,
         hasSummaryBody,
-        promptCacheProvider:
-          promptCacheProvider ?? (movedBedrockTail ? Providers.BEDROCK : undefined),
+        promptCacheProvider,
         shouldMoveDynamicInstructions,
       });
-      let body = movedBedrockTail
-        ? this.buildBedrockBodyWithDynamicTail(bodyWithSummary, dynamicTail)
-        : this.buildBodyWithPromptCacheDynamicTail(
-          bodyWithSummary,
-          dynamicTail,
-          promptCacheProvider
-        );
+      let body = this.buildBodyWithPromptCacheDynamicTail(
+        bodyWithSummary,
+        dynamicTail,
+        promptCacheProvider
+      );
 
       if (
         promptCacheProvider != null &&
@@ -1110,51 +1044,16 @@ export class AgentContext {
           this.getPromptCacheTtl(promptCacheProvider)
         );
       }
-
-      // Tools, stable instructions, stable history and the tail already use
-      // Anthropic's four breakpoints; the conversation block and then the
-      // summary get a breakpoint only while any are left.
-      const bedrockToolCheckpoints = supportsBedrockToolCache(
-        (this.clientOptions as { model?: string } | undefined)?.model
-      )
-        ? 1
-        : 0;
-      let room = 0;
-      if (bedrockCache) {
-        /** Counts the message checkpoints the graph already placed too: the tail and,
-         *  with a second one for the latest human message, that one. */
-        room =
-          MAX_PROMPT_CACHE_BREAKPOINTS -
-          bedrockToolCheckpoints -
-          (stableInstructions !== '' ? 1 : 0) -
-          countCachePointMessages(body);
-      } else if (promptCacheProvider != null) {
-        room =
-          MAX_PROMPT_CACHE_BREAKPOINTS -
-          1 -
-          (stableInstructions !== '' ? 1 : 0) -
-          countCacheControlMessages(body);
-      }
-      if (summaryMessageFirst) {
-        const summaryRoom = room - (conversationInstructions !== '' ? 1 : 0);
-        body = [
-          this.buildSummaryMessage(
-            summaryRoom >= 1 ? promptCacheProvider : undefined
-          ),
-          ...body,
-        ];
-      }
-      const system = room >= 1 ? systemMessage : systemMessageWithinBreakpointLimit;
-      return system ? [system, ...body] : body;
+      return [...prefix, ...body];
     })).withConfig({ runName: 'prompt' });
   }
 
-  private buildSummaryMessage(
-    markedFor: PromptCacheProvider | undefined
+  private buildSummaryHumanMessage(
+    promptCacheProvider: PromptCacheProvider | undefined
   ): HumanMessage {
     const wrappedSummary = buildSummaryCarrierText(this.summaryText as string);
 
-    if (markedFor == null) {
+    if (promptCacheProvider !== Providers.ANTHROPIC) {
       return new HumanMessage(wrappedSummary);
     }
 
@@ -1164,21 +1063,11 @@ export class AgentContext {
           type: 'text',
           text: wrappedSummary,
           cache_control: buildAnthropicCacheControl(
-            this.getPromptCacheTtl(markedFor)
+            this.getPromptCacheTtl(Providers.ANTHROPIC)
           ),
         },
       ],
     });
-  }
-
-  private buildSummaryHumanMessage(
-    promptCacheProvider: PromptCacheProvider | undefined
-  ): HumanMessage {
-    return this.buildSummaryMessage(
-      promptCacheProvider === Providers.ANTHROPIC
-        ? Providers.ANTHROPIC
-        : undefined
-    );
   }
 
   private buildPromptCacheDynamicTail({
@@ -1189,7 +1078,7 @@ export class AgentContext {
   }: {
     dynamicInstructions: string;
     hasSummaryBody: boolean;
-    promptCacheProvider: PromptCacheProvider | Providers.BEDROCK | undefined;
+    promptCacheProvider: PromptCacheProvider | undefined;
     shouldMoveDynamicInstructions: boolean;
   }): BaseMessage[] {
     if (promptCacheProvider == null) {
@@ -1232,30 +1121,6 @@ export class AgentContext {
     );
 
     return [...cacheablePrefix, ...tail, ...cacheableTrailingMessages];
-  }
-
-  /**
-   * Bedrock counterpart of `buildBodyWithPromptCacheDynamicTail`: the tail goes
-   * right before the newest user message, with one checkpoint at the end of the
-   * history in front of it and one at the end of the request. The opening message
-   * is not an anchor, as for Anthropic, and loses any checkpoint the graph gave it.
-   */
-  private buildBedrockBodyWithDynamicTail(
-    messages: BaseMessage[],
-    tail: BaseMessage[]
-  ): BaseMessage[] {
-    const tailIndex =
-      this._summaryLocation === 'user_message' && this.summaryPrecedesMessages
-        ? 0
-        : this.getPromptCacheDynamicTailIndex(messages, Providers.ANTHROPIC);
-    const ttl = this.getBedrockPromptCacheTtl();
-    const stablePrefix = messages.slice(0, tailIndex);
-    return [
-      ...stripBedrockCacheControl(stablePrefix.slice(0, 1)),
-      ...addBedrockTailCacheControl(stablePrefix.slice(1), ttl),
-      ...tail,
-      ...addBedrockTailCacheControl(messages.slice(tailIndex), ttl),
-    ];
   }
 
   private getPromptCacheDynamicTailIndex(
@@ -1365,90 +1230,67 @@ export class AgentContext {
 
   private buildSystemMessage({
     stableInstructions,
-    conversationInstructions,
     dynamicInstructions,
     promptCacheProvider,
     shouldMoveDynamicInstructions,
-    markConversation,
   }: {
     stableInstructions: string;
-    conversationInstructions: string;
     dynamicInstructions: string;
     promptCacheProvider: PromptCacheProvider | undefined;
     shouldMoveDynamicInstructions: boolean;
-    markConversation: boolean;
   }): SystemMessage | undefined {
-    if (!stableInstructions && !conversationInstructions && !dynamicInstructions) {
+    if (!stableInstructions && !dynamicInstructions) {
       return undefined;
     }
 
-    const systemDynamic = shouldMoveDynamicInstructions
-      ? ''
-      : dynamicInstructions;
-
-    if (
-      promptCacheProvider === Providers.OPENROUTER &&
-      !stableInstructions &&
-      !conversationInstructions
-    ) {
-      return new SystemMessage(dynamicInstructions);
-    }
-
-    if (promptCacheProvider != null) {
-      const cacheControl = buildAnthropicCacheControl(
-        this.getPromptCacheTtl(promptCacheProvider)
-      );
+    if (promptCacheProvider === Providers.ANTHROPIC) {
       const content: AgentSystemContentBlock[] = [];
       if (stableInstructions) {
         content.push({
           type: 'text',
           text: stableInstructions,
-          cache_control: cacheControl,
+          cache_control: buildAnthropicCacheControl(
+            this.getPromptCacheTtl(promptCacheProvider)
+          ),
         });
       }
-      if (conversationInstructions) {
-        content.push(
-          markConversation
-            ? {
-              type: 'text',
-              text: conversationInstructions,
-              cache_control: cacheControl,
-            }
-            : { type: 'text', text: conversationInstructions }
-        );
-      }
-      if (systemDynamic) {
-        content.push({ type: 'text', text: systemDynamic });
+      if (dynamicInstructions && !shouldMoveDynamicInstructions) {
+        content.push({ type: 'text', text: dynamicInstructions });
       }
       return new SystemMessage({ content } as BaseMessageFields);
     }
 
-    if (
-      this.hasBedrockPromptCache() &&
-      (stableInstructions || conversationInstructions)
-    ) {
-      const ttl = this.getBedrockPromptCacheTtl();
-      const content: AgentSystemContentBlock[] = [];
-      const blocks: Array<[string, boolean]> = [
-        [stableInstructions, true],
-        [conversationInstructions, markConversation],
+    if (promptCacheProvider === Providers.OPENROUTER && !stableInstructions) {
+      return new SystemMessage(dynamicInstructions);
+    }
+
+    if (promptCacheProvider === Providers.OPENROUTER) {
+      return new SystemMessage({
+        content: [
+          {
+            type: 'text',
+            text: stableInstructions,
+            cache_control: buildAnthropicCacheControl(
+              this.getPromptCacheTtl(promptCacheProvider)
+            ),
+          },
+        ],
+      } as BaseMessageFields);
+    }
+
+    if (this.hasBedrockPromptCache() && stableInstructions) {
+      const content: AgentSystemContentBlock[] = [
+        { type: 'text', text: stableInstructions },
+        { cachePoint: buildBedrockCachePoint(this.getBedrockPromptCacheTtl()) },
       ];
-      for (const [text, marked] of blocks) {
-        if (text) {
-          content.push(
-            { type: 'text', text },
-            ...(marked ? [{ cachePoint: buildBedrockCachePoint(ttl) }] : [])
-          );
-        }
-      }
-      if (systemDynamic) {
-        content.push({ type: 'text', text: systemDynamic });
+      if (dynamicInstructions) {
+        content.push({ type: 'text', text: dynamicInstructions });
       }
       return new SystemMessage({ content } as BaseMessageFields);
     }
 
     return new SystemMessage(
-      [stableInstructions, conversationInstructions, dynamicInstructions]
+      [stableInstructions, dynamicInstructions]
         .filter((part) => part !== '')
         .join('\n\n')
     );
@@ -1474,7 +1316,6 @@ export class AgentContext {
     this.lastStreamCall = undefined;
     this.tokenTypeSwitch = undefined;
     this.reasoningTransitionCount = 0;
-    this.reasoningReplaySource = undefined;
     this.currentTokenType = ContentTypes.TEXT;
     this.discoveredToolNames.clear();
     this.handoffContext = undefined;
@@ -1752,8 +1593,7 @@ export class AgentContext {
     this.summaryText = text;
     this.summaryTokenCount = tokenCount;
     this._summaryLocation = 'user_message';
-    this.summaryPrecedesMessages =
-      !this.summaryAsMessage && options?.precedesMessages === true;
+    this.summaryPrecedesMessages = options?.precedesMessages === true;
     this._durableSummaryText = text;
     this._durableSummaryTokenCount = tokenCount;
     this.durableSummaryPrecedesMessages = this.summaryPrecedesMessages;

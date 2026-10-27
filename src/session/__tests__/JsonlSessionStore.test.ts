@@ -15,6 +15,7 @@ import { toJsonValue } from '@/session/messageSerialization';
 import * as providers from '@/llm/providers';
 import { GraphEvents } from '@/common';
 import { Run } from '@/run';
+import { AgentContext } from '@/agents/AgentContext';
 
 type MockRun = {
   processStream: jest.MockedFunction<Run<t.IState>['processStream']>;
@@ -176,6 +177,32 @@ describe('JsonlSessionStore', () => {
     await session.run('third');
     expect(getProcessedMessages(mockRun)[0].content).toBe('external edit');
     expect(getPath).toHaveBeenCalledTimes(2);
+  });
+
+  it('builds the manual compaction context with the run tool execution config', async () => {
+    mockSummarizer('summary of prior work');
+    mockRunCreate(createMockRun('answer'));
+    const toolExecution: t.ToolExecutionConfig = {
+      engine: 'local',
+      local: { codingToolNames: ['read_file'] },
+    };
+    const session = await createAgentSession({
+      cwd: dir,
+      sessionPath: join(dir, 'compact-tool-execution.jsonl'),
+      runId: 'template-run',
+      toolExecution,
+      graphConfig: {
+        type: 'standard',
+        llmConfig: { provider: 'openAI' as never, model: 'test-model' },
+        instructions: 'test',
+      },
+    });
+    await session.run('first');
+    const fromConfig = jest.spyOn(AgentContext, 'fromConfig');
+    await session.compact({ retainRecentTurns: 0 });
+    expect(fromConfig).toHaveBeenCalled();
+    expect(fromConfig.mock.calls.at(-1)?.[3]).toBe(toolExecution);
+    fromConfig.mockRestore();
   });
 
   it('keeps the unexposed cache coherent through compaction, HITL resume, branching, and reopening', async () => {

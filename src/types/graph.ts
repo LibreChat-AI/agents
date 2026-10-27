@@ -1024,22 +1024,9 @@ interface AgentInputFields {
   maxContextTokens?: number;
   /** Per-agent Langfuse tracing configuration. */
   langfuse?: LangfuseConfig;
-  /**
-   * Per-turn volatile context appended after the other instructions without
-   * provider cache markers. With Anthropic or OpenRouter prompt caching it
-   * travels as a user message ahead of the newest human message, so a change
-   * every turn leaves the cached history intact.
-   */
+  /** Dynamic system tail appended after stable instructions without provider cache markers. */
   additional_instructions?: string;
-  /**
-   * Per-conversation context that stays the same for a whole conversation
-   * (for example its start time, memory, attached file lists). Kept in the
-   * system message right after `instructions`, never moved, with its own
-   * prompt-cache breakpoint where the provider supports one, so each request
-   * of the conversation extends the previous one while `instructions` stays
-   * shared across conversations. The compaction summary follows it.
-   */
-  conversation_instructions?: string;
+  reasoningKey?: 'reasoning_content' | 'reasoning';
   /**
    * Opt-in persistence of signed provider reasoning (Anthropic `thinking` /
    * `redacted_thinking`, Bedrock `reasoningContent`). When set, streamed
@@ -1050,7 +1037,6 @@ interface AgentInputFields {
    * option of `formatAgentMessages`.
    */
   providerReasoningReplay?: boolean;
-  reasoningKey?: 'reasoning_content' | 'reasoning';
   /** Format content blocks as strings (for legacy compatibility i.e. Ollama/Azure Serverless) */
   useLegacyContent?: boolean;
   /**
@@ -1095,8 +1081,7 @@ interface AgentInputFields {
    */
   compactionSemanticIndex?: CompactionSemanticIndex;
   /** Cross-run summary from a previous run, forwarded from formatAgentMessages.
-   *  Rendered in the system message after `conversation_instructions`, where
-   *  the run that created it placed it. */
+   *  Injected into the dynamic system tail via AgentContext. */
   initialSummary?: { text: string; tokenCount: number };
   contextPruningConfig?: ContextPruningConfig;
   maxToolResultChars?: number;

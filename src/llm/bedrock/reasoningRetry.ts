@@ -1,6 +1,6 @@
 import { AIMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
-import { ContentTypes } from '@/common';
+import { ContentTypes, Providers } from '@/common';
 
 const REASONING_REJECTION = /signature|thinking|reasoning|redacted/i;
 
@@ -23,24 +23,38 @@ export function isReasoningRejection(error: unknown): boolean {
   return rejected && REASONING_REJECTION.test(failure.message ?? '');
 }
 
+/** Signed reasoning block types per provider; only the model that signed them accepts them. */
+const SIGNED_REASONING_TYPES: Partial<Record<string, ReadonlySet<string>>> = {
+  [Providers.ANTHROPIC]: new Set([ContentTypes.THINKING, 'redacted_thinking']),
+  [Providers.BEDROCK]: new Set([ContentTypes.REASONING_CONTENT]),
+};
+
 /**
- * The messages without any signed reasoning block. The same array when there is
- * none, so a caller can tell a retry would send the same request.
+ * The messages without the signed reasoning blocks of `provider`. The same
+ * array when there is none, so a caller can tell a retry would send the same
+ * request.
  */
-export function stripBedrockReasoning(messages: BaseMessage[]): BaseMessage[] {
-  const state = { changed: false };
+export function stripSignedReasoning(
+  messages: BaseMessage[],
+  provider: string
+): BaseMessage[] {
+  const types = SIGNED_REASONING_TYPES[provider];
+  if (types == null) {
+    return messages;
+  }
+  let changed = false;
   const stripped = messages.flatMap((message) => {
     if (message.getType() !== 'ai' || !Array.isArray(message.content)) {
       return [message];
     }
     const aiMessage = message as AIMessage;
     const content = (aiMessage.content as Array<{ type?: string }>).filter(
-      (part) => part.type !== ContentTypes.REASONING_CONTENT
+      (part) => !types.has(part.type ?? '')
     );
     if (content.length === aiMessage.content.length) {
       return [message];
     }
-    state.changed = true;
+    changed = true;
     if (
       content.length === 0 &&
       (aiMessage.tool_calls?.length ?? 0) === 0 &&
@@ -50,16 +64,10 @@ export function stripBedrockReasoning(messages: BaseMessage[]): BaseMessage[] {
     }
     return [
       new AIMessage({
-        id: aiMessage.id,
-        name: aiMessage.name,
+        ...aiMessage.lc_kwargs,
         content: content as AIMessage['content'],
-        additional_kwargs: aiMessage.additional_kwargs,
-        response_metadata: aiMessage.response_metadata,
-        tool_calls: aiMessage.tool_calls,
-        invalid_tool_calls: aiMessage.invalid_tool_calls,
-        usage_metadata: aiMessage.usage_metadata,
       }),
     ];
   });
-  return state.changed ? stripped : messages;
+  return changed ? stripped : messages;
 }

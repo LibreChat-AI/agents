@@ -60,7 +60,8 @@ import {
 } from '@/llm/stream/smoother';
 import { modelDisallowsAssistantPrefill } from '@/llm/anthropic/utils/message_inputs';
 import { linkStreamLimitCanonical } from '@/llm/streamLimits';
-import { isReasoningRejection, stripBedrockReasoning } from './reasoningRetry';
+import { isReasoningRejection, stripSignedReasoning } from './reasoningRetry';
+import { Providers } from '@/common';
 import { isBedrockOpenAIModel } from './utils/message_inputs';
 import { neutralizeHarmonyToolConfig } from './utils/harmony';
 import { insertBedrockToolCachePoint } from './toolCache';
@@ -384,6 +385,7 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
     options: this['ParsedCallOptions'] & CustomChatBedrockConverseCallOptions,
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
+    // Without the retry the stream is returned as is: an extra generator layer shifts the smoother's pacing
     return this.retryWithoutReasoningOnRejection === true
       ? this.streamWithReasoningRetry(messages, options, runManager)
       : this.streamConverse(messages, options, runManager);
@@ -429,16 +431,8 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
     ) {
       return undefined;
     }
-    const stripped = stripBedrockReasoning(messages);
-    if (stripped === messages) {
-      return undefined;
-    }
-    // eslint-disable-next-line no-console
-    console.warn(
-      '[bedrock] Replayed reasoning was rejected; retrying once without it:',
-      error instanceof Error ? error.message : error
-    );
-    return stripped;
+    const stripped = stripSignedReasoning(messages, Providers.BEDROCK);
+    return stripped === messages ? undefined : stripped;
   }
 
   private async *streamConverse(

@@ -30,9 +30,10 @@ import { createLocalFileCheckpointer } from './FileCheckpointer';
 import { isWorkspaceClientTimeoutError } from './workspaceFS';
 import { applyEdit, locateEdit } from './editStrategies';
 import { decodeFile, encodeFile } from './textEncoding';
-import { runPostEditSyntaxCheck } from './syntaxCheck';
 import { withIntent } from '@/tools/intentArg';
-import { Constants } from '@/common';
+import { runPostEditSyntaxCheck } from './syntaxCheck';
+import { capHeadTail, capLines } from './toolResultCaps';
+import { Constants, LOCAL_CODING_BUNDLE_NAMES } from '@/common';
 
 const MAX_READ_CHARS = 256000;
 const DEFAULT_MAX_RESULTS = 200;
@@ -233,6 +234,49 @@ function lineWindow(
     text: truncateLocalOutput(numbered, MAX_READ_CHARS),
     truncated: !exhausted || numbered.length > MAX_READ_CHARS,
   };
+}
+
+/** Reads whole lines from `offset` until `maxChars` or `limit` lines, then says how to continue. */
+function cappedLineWindow(
+  content: string,
+  offset: number | undefined,
+  limit: number | undefined,
+  maxChars: number
+): string {
+  const start = Math.max(offset ?? 1, 1);
+  // Walk newline indices instead of splitting the file, so a page costs
+  // O(offset + page) rather than O(file).
+  let cursor = 0;
+  for (let line = 1; line < start; line++) {
+    const next = content.indexOf('\n', cursor);
+    if (next === -1) return '';
+    cursor = next + 1;
+  }
+  const maxLines = limit != null && limit > 0 ? limit : Infinity;
+  const kept: string[] = [];
+  let used = 0;
+  while (cursor <= content.length && kept.length < maxLines) {
+    const newline = content.indexOf('\n', cursor);
+    const lineEnd = newline === -1 ? content.length : newline;
+    const text = content.slice(cursor, Math.min(lineEnd, cursor + maxChars));
+    const full = `${String(start + kept.length).padStart(6, ' ')}\t${text}`;
+    const numbered =
+      lineEnd - cursor > maxChars || full.length > maxChars
+        ? `${full.slice(0, maxChars)} [line truncated]`
+        : full;
+    if (used + numbered.length + 1 > maxChars && kept.length > 0) break;
+    kept.push(numbered);
+    used += numbered.length + 1;
+    if (newline === -1) {
+      cursor = content.length + 1;
+      break;
+    }
+    cursor = newline + 1;
+  }
+  const end = start + kept.length - 1;
+  return cursor <= content.length
+    ? `${kept.join('\n')}\n[showing lines ${start}-${end}; continue with offset=${end + 1}]`
+    : kept.join('\n');
 }
 
 const MAX_DIFF_CHARS = 4000;
@@ -500,6 +544,17 @@ export function createLocalReadFileTool(
       }
 
       const content = await fs.readFile(path, 'utf8');
+      if (config.toolResultMaxChars != null && config.toolResultMaxChars > 0) {
+        return [
+          cappedLineWindow(
+            content,
+            input.offset,
+            input.limit,
+            config.toolResultMaxChars
+          ),
+          { path, bytes: fileStat.size },
+        ];
+      }
       const result = lineWindow(content, input.offset, input.limit);
       return [
         result.truncated ? `${result.text}\n[truncated]` : result.text,
@@ -1000,6 +1055,34 @@ function formatFallbackGrepDisplay(result: FallbackGrepResult): string {
   return 'No matches found.';
 }
 
+/**
+ * Fallback grep display under `toolResultMaxChars`: skip notices get at most
+ * a fifth of the budget (with a count of the ones left out), matches get the
+ * rest, so neither can push the result past the cap or hide the other.
+ */
+function capFallbackGrepDisplay(
+  matches: string[],
+  skipped: string[],
+  maxChars: number
+): string {
+  const skipText =
+    skipped.length === 0
+      ? ''
+      : capLines(
+        skipped,
+        Math.max(1, Math.floor(maxChars / 5)),
+        (omitted) => `${omitted} more files skipped`
+      );
+  if (matches.length === 0) {
+    return skipText === '' ? 'No matches found.' : skipText;
+  }
+  const matchText = capLines(
+    matches,
+    Math.max(1, maxChars - skipText.length)
+  );
+  return skipText === '' ? matchText : `${matchText}\n${skipText}`;
+}
+
 async function fallbackGrep(
   root: string,
   pattern: string,
@@ -1167,8 +1250,12 @@ export function createLocalGrepSearchTool(
           (result.exitCode != null && result.exitCode > 1)
         ) {
           const detail = result.stderr.trim() || `rg exited ${result.exitCode}`;
+          const shown =
+            config.toolResultMaxChars != null && config.toolResultMaxChars > 0
+              ? capHeadTail(detail, config.toolResultMaxChars)
+              : detail;
           return [
-            `grep_search failed: ${detail}`,
+            `grep_search failed: ${shown}`,
             {
               matches: 0,
               engine: 'ripgrep',
@@ -1181,10 +1268,17 @@ export function createLocalGrepSearchTool(
           .split('\n')
           .filter(Boolean)
           .slice(0, maxResults);
-        const output =
+        const joined =
           lines.length > 0
             ? lines.join('\n')
             : result.stderr.trim() || 'No matches found.';
+        let output = joined;
+        if (config.toolResultMaxChars != null && config.toolResultMaxChars > 0) {
+          output =
+            lines.length > 0
+              ? capLines(lines, config.toolResultMaxChars)
+              : capHeadTail(joined, config.toolResultMaxChars);
+        }
         return [output, { matches: lines.length, engine: 'ripgrep' }];
       }
 
@@ -1198,7 +1292,10 @@ export function createLocalGrepSearchTool(
         );
         // Artifact count: ONLY real matches (Codex P2 [43] —
         // skip sentinels used to inflate the count and the budget).
-        const display = formatFallbackGrepDisplay({ matches, skipped });
+        const display =
+          config.toolResultMaxChars != null && config.toolResultMaxChars > 0
+            ? capFallbackGrepDisplay(matches, skipped, config.toolResultMaxChars)
+            : formatFallbackGrepDisplay({ matches, skipped });
         return [
           display,
           {
@@ -1209,8 +1306,12 @@ export function createLocalGrepSearchTool(
         ];
       } catch (e) {
         if (e instanceof FallbackGrepError) {
+          const reason =
+            config.toolResultMaxChars != null && config.toolResultMaxChars > 0
+              ? capHeadTail(e.message, config.toolResultMaxChars)
+              : e.message;
           return [
-            `grep_search refused the pattern: ${e.message}`,
+            `grep_search refused the pattern: ${reason}`,
             {
               matches: 0,
               engine: 'node-fallback',
@@ -1360,19 +1461,38 @@ export function createLocalCodingTools(
     (config.fileCheckpointing === true
       ? createLocalFileCheckpointer({ fs: config.exec?.fs })
       : undefined);
-  return [
-    createLocalReadFileTool(config),
-    createLocalWriteFileTool(config, checkpointer),
-    createLocalEditFileTool(config, checkpointer),
-    createLocalGrepSearchTool(config),
-    createLocalGlobSearchTool(config),
-    createLocalListDirectoryTool(config),
-    createCompileCheckTool(config),
-    createLocalBashExecutionTool({ config }),
-    createLocalCodeExecutionTool(config),
-    createLocalProgrammaticToolCallingTool(config),
-    createLocalBashProgrammaticToolCallingTool(config),
-  ];
+  const create = (name: string): DynamicStructuredTool => {
+    switch (name) {
+    case Constants.READ_FILE:
+      return createLocalReadFileTool(config);
+    case Constants.WRITE_FILE:
+      return createLocalWriteFileTool(config, checkpointer);
+    case Constants.EDIT_FILE:
+      return createLocalEditFileTool(config, checkpointer);
+    case Constants.GREP_SEARCH:
+      return createLocalGrepSearchTool(config);
+    case Constants.GLOB_SEARCH:
+      return createLocalGlobSearchTool(config);
+    case Constants.LIST_DIRECTORY:
+      return createLocalListDirectoryTool(config);
+    case Constants.COMPILE_CHECK:
+      return createCompileCheckTool(config);
+    case Constants.BASH_TOOL:
+      return createLocalBashExecutionTool({ config });
+    case Constants.EXECUTE_CODE:
+      return createLocalCodeExecutionTool(config);
+    case Constants.PROGRAMMATIC_TOOL_CALLING:
+      return createLocalProgrammaticToolCallingTool(config);
+    default:
+      return createLocalBashProgrammaticToolCallingTool(config);
+    }
+  };
+  // Select by name before constructing, so omitted tools are never built.
+  const names =
+    config.codingToolNames == null ? undefined : new Set(config.codingToolNames);
+  return LOCAL_CODING_BUNDLE_NAMES.filter(
+    (name) => names == null || names.has(name)
+  ).map(create);
 }
 
 /**

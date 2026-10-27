@@ -91,6 +91,12 @@ jobs:
       - name: Check circular dependencies
         run: npm run check:circular-deps
 
+      - name: Build declarations
+        run: npx tsc -p tsconfig.build.json
+
+      - name: Test light entry points
+        run: npm run test:light-entries
+
   unit-tests:
     name: 'unit tests (shard ${{ matrix.shard }}/4)'
     needs: install

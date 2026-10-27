@@ -484,114 +484,33 @@ function getReasoningTextFromContentPart(
   );
 }
 
-interface ServingIdentity {
-  provider?: string;
-  model?: string;
+interface SignedReasoningPart {
+  type?: string;
+  thinking?: string;
+  reasoning?: string;
+  signature?: string;
+  data?: string;
+  reasoningText?: { text?: string; signature?: string };
+  redactedContent?: string;
 }
 
-const asNonEmpty = (value: unknown): string | undefined =>
-  typeof value === 'string' && value !== '' ? value : undefined;
-
-/**
- * Identity of the model that actually served this call: the attempt stamp
- * (primary or fallback), then what the graph resolved for the call (override
- * model, `modelName` alias), then the configured client options.
- */
-function resolveServingIdentity(
-  agentContext: AgentContext,
-  metadata?: Record<string, unknown>
-): ServingIdentity {
-  return {
-    provider:
-      asNonEmpty(metadata?.[Constants.INVOKED_PROVIDER]) ??
-      agentContext.reasoningReplaySource?.provider ??
-      agentContext.provider,
-    model:
-      asNonEmpty(metadata?.[Constants.INVOKED_MODEL]) ??
-      agentContext.reasoningReplaySource?.model ??
-      resolveClientOptionsModel(agentContext.clientOptions),
-  };
-}
-
-function getBedrockReasoningReplay(
+/** The signed blocks a streamed reasoning part carries, tagged with the model that served the call. */
+function getReasoningReplay(
   contentPart: t.MessageContentComplex,
-  serving: ServingIdentity
+  model: string | undefined
 ): t.ProviderReasoningReplay | undefined {
-  const model = serving.model;
-  if (
-    typeof model !== 'string' ||
-    model === '' ||
-    contentPart.type !== ContentTypes.REASONING_CONTENT
-  ) {
+  const part = contentPart as SignedReasoningPart;
+  if (model == null || model === '') {
     return undefined;
   }
-  const block = contentPart as Partial<t.BedrockReasoningReplayBlock>;
-  const reasoningText = block.reasoningText;
+  const hasSignature = typeof part.signature === 'string';
   if (
-    reasoningText != null &&
-    (typeof reasoningText.text === 'string' ||
-      typeof reasoningText.signature === 'string')
+    part.type === ContentTypes.THINKING ||
+    (part.type === ContentTypes.REASONING && hasSignature)
   ) {
-    return {
-      bedrock: {
-        model,
-        blocks: [
-          {
-            type: ContentTypes.REASONING_CONTENT,
-            reasoningText: {
-              ...(typeof reasoningText.text === 'string' && {
-                text: reasoningText.text,
-              }),
-              ...(typeof reasoningText.signature === 'string' && {
-                signature: reasoningText.signature,
-              }),
-            },
-          },
-        ],
-      },
-    };
-  }
-  if (
-    typeof block.redactedContent === 'string' &&
-    block.redactedContent !== ''
-  ) {
-    return {
-      bedrock: {
-        model,
-        blocks: [
-          {
-            type: ContentTypes.REASONING_CONTENT,
-            redactedContent: block.redactedContent,
-          },
-        ],
-      },
-    };
-  }
-  return undefined;
-}
-
-function getAnthropicReasoningReplay(
-  contentPart: t.MessageContentComplex,
-  serving: ServingIdentity
-): t.ProviderReasoningReplay | undefined {
-  const model = serving.model;
-  if (typeof model !== 'string' || model === '') {
-    return undefined;
-  }
-  if (
-    contentPart.type === ContentTypes.THINKING ||
-    contentPart.type === ContentTypes.REASONING
-  ) {
-    const block = contentPart as Partial<t.AnthropicReasoningReplayBlock> & {
-      thinking?: string;
-      reasoning?: string;
-      signature?: string;
-    };
     const thinking =
-      contentPart.type === ContentTypes.THINKING
-        ? block.thinking
-        : block.reasoning;
-    if (typeof thinking !== 'string' && typeof block.signature !== 'string') {
+      part.type === ContentTypes.THINKING ? part.thinking : part.reasoning;
+    if (typeof thinking !== 'string' && !hasSignature) {
       return undefined;
     }
     return {
@@ -600,26 +519,48 @@ function getAnthropicReasoningReplay(
         blocks: [
           {
             type: ContentTypes.THINKING,
-            ...(typeof thinking === 'string' && {
-              thinking,
-            }),
-            ...(typeof block.signature === 'string' && {
-              signature: block.signature,
-            }),
+            ...(typeof thinking === 'string' && { thinking }),
+            ...(hasSignature && { signature: part.signature }),
           },
         ],
       },
     };
   }
-  if (contentPart.type === 'redacted_thinking') {
-    const data = (contentPart as { data?: unknown }).data;
-    if (typeof data !== 'string' || data === '') {
-      return undefined;
-    }
+  if (part.type === 'redacted_thinking' && part.data != null && part.data !== '') {
     return {
-      anthropic: {
+      anthropic: { model, blocks: [{ type: 'redacted_thinking', data: part.data }] },
+    };
+  }
+  if (part.type !== ContentTypes.REASONING_CONTENT) {
+    return undefined;
+  }
+  const { text, signature } = part.reasoningText ?? {};
+  if (typeof text === 'string' || typeof signature === 'string') {
+    return {
+      bedrock: {
         model,
-        blocks: [{ type: 'redacted_thinking', data }],
+        blocks: [
+          {
+            type: ContentTypes.REASONING_CONTENT,
+            reasoningText: {
+              ...(typeof text === 'string' && { text }),
+              ...(typeof signature === 'string' && { signature }),
+            },
+          },
+        ],
+      },
+    };
+  }
+  if (part.redactedContent != null && part.redactedContent !== '') {
+    return {
+      bedrock: {
+        model,
+        blocks: [
+          {
+            type: ContentTypes.REASONING_CONTENT,
+            redactedContent: part.redactedContent,
+          },
+        ],
       },
     };
   }
@@ -2333,22 +2274,18 @@ hasToolCallChunks: ${hasToolCallChunks}
         metadata
       );
     } else if (content.every((c) => isReasoningContentBlock(c))) {
+      const invokedModel = metadata?.[Constants.INVOKED_MODEL];
+      const servingModel =
+        typeof invokedModel === 'string' && invokedModel !== ''
+          ? invokedModel
+          : resolveClientOptionsModel(agentContext.clientOptions);
       await graph.dispatchReasoningDelta(
         stepId,
         {
           content: content.map((c) => {
-            const serving = resolveServingIdentity(agentContext, metadata);
-            const isAnthropicReplayShape =
-              c.type === ContentTypes.THINKING ||
-              c.type === 'redacted_thinking' ||
-              (c.type === ContentTypes.REASONING &&
-                typeof (c as { signature?: unknown }).signature === 'string');
-            let providerReplay: t.ProviderReasoningReplay | undefined;
-            if (agentContext.providerReasoningReplay) {
-              providerReplay = isAnthropicReplayShape
-                ? getAnthropicReasoningReplay(c, serving)
-                : getBedrockReasoningReplay(c, serving);
-            }
+            const providerReplay = agentContext.providerReasoningReplay
+              ? getReasoningReplay(c, servingModel)
+              : undefined;
             return {
               type: ContentTypes.THINK,
               think:
@@ -2455,6 +2392,53 @@ hasToolCallChunks: ${hasToolCallChunks}
   }
 }
 
+type SignedText = Record<string, string | undefined>;
+
+function appendReplayBlock<B extends object>(
+  blocks: B[],
+  incoming: B,
+  signedText: (block: B) => SignedText | undefined,
+  textKey: 'thinking' | 'text'
+): void {
+  const next = signedText(incoming);
+  const current =
+    blocks.length > 0 ? signedText(blocks[blocks.length - 1]) : undefined;
+  // A signature closes its block, so later text or a signature of its own starts the next one
+  const startsNewBlock =
+    current?.signature != null &&
+    current.signature !== '' &&
+    (typeof next?.[textKey] === 'string' ||
+      (next?.signature != null && next.signature !== ''));
+  if (next == null || current == null || startsNewBlock) {
+    blocks.push(structuredClone(incoming));
+    return;
+  }
+  for (const key of [textKey, 'signature']) {
+    if (typeof next[key] === 'string') {
+      current[key] = (current[key] ?? '') + next[key];
+    }
+  }
+}
+
+function mergeReplayBlocks<B extends object>(
+  existing: { model: string; blocks: B[] } | undefined,
+  incoming: { model: string; blocks: B[] } | undefined,
+  signedText: (block: B) => SignedText | undefined,
+  textKey: 'thinking' | 'text'
+): { model: string; blocks: B[] } | undefined {
+  if (incoming == null) {
+    return existing;
+  }
+  const merged =
+    existing?.model === incoming.model
+      ? structuredClone(existing)
+      : { model: incoming.model, blocks: [] as B[] };
+  for (const block of incoming.blocks) {
+    appendReplayBlock(merged.blocks, block, signedText, textKey);
+  }
+  return merged;
+}
+
 function mergeProviderReasoningReplay(
   existing: t.ProviderReasoningReplay | undefined,
   incoming: t.ProviderReasoningReplay | undefined
@@ -2462,93 +2446,21 @@ function mergeProviderReasoningReplay(
   if (incoming == null) {
     return existing;
   }
-  if (incoming.invalidated === true) {
-    return { invalidated: true };
-  }
-  const anthropicModelChanged =
-    incoming.anthropic != null &&
-    existing?.anthropic?.model !== incoming.anthropic.model;
-  const anthropic = anthropicModelChanged
-    ? structuredClone(incoming.anthropic)
-    : structuredClone(existing?.anthropic);
-  if (
-    !anthropicModelChanged &&
-    anthropic != null &&
-    incoming.anthropic != null
-  ) {
-    for (const incomingBlock of incoming.anthropic.blocks) {
-      const lastBlock = anthropic.blocks[anthropic.blocks.length - 1];
-      /**
-       * A signature closes its block and arrives whole, so a later block starts at its thinking
-       * text or at its own signature; with omitted thinking display only the signature is sent.
-       */
-      const startsNewSignedBlock =
-        incomingBlock.type === ContentTypes.THINKING &&
-        (typeof incomingBlock.thinking === 'string' ||
-          (typeof incomingBlock.signature === 'string' &&
-            incomingBlock.signature !== '')) &&
-        anthropic.blocks.length > 0 &&
-        lastBlock.type === ContentTypes.THINKING &&
-        typeof lastBlock.signature === 'string' &&
-        lastBlock.signature !== '';
-      if (
-        incomingBlock.type === ContentTypes.THINKING &&
-        anthropic.blocks.length > 0 &&
-        lastBlock.type === ContentTypes.THINKING &&
-        !startsNewSignedBlock
-      ) {
-        if (typeof incomingBlock.thinking === 'string') {
-          lastBlock.thinking =
-            (lastBlock.thinking ?? '') + incomingBlock.thinking;
-        }
-        if (typeof incomingBlock.signature === 'string') {
-          lastBlock.signature =
-            (lastBlock.signature ?? '') + incomingBlock.signature;
-        }
-        continue;
-      }
-      anthropic.blocks.push(structuredClone(incomingBlock));
-    }
-  }
-  const bedrockModelChanged =
-    incoming.bedrock != null &&
-    existing?.bedrock?.model !== incoming.bedrock.model;
-  const bedrock = bedrockModelChanged
-    ? structuredClone(incoming.bedrock)
-    : structuredClone(existing?.bedrock);
-  if (!bedrockModelChanged && bedrock != null && incoming.bedrock != null) {
-    for (const incomingBlock of incoming.bedrock.blocks) {
-      const incomingReasoningText = incomingBlock.reasoningText;
-      const lastBlock = bedrock.blocks[bedrock.blocks.length - 1];
-      const lastReasoningText =
-        bedrock.blocks.length > 0 ? lastBlock.reasoningText : undefined;
-      const startsNewSignedBlock =
-        (typeof incomingReasoningText?.text === 'string' ||
-          (typeof incomingReasoningText?.signature === 'string' &&
-            incomingReasoningText.signature !== '')) &&
-        lastReasoningText?.signature != null;
-      if (
-        incomingReasoningText != null &&
-        lastReasoningText != null &&
-        !startsNewSignedBlock
-      ) {
-        if (typeof incomingReasoningText.text === 'string') {
-          lastReasoningText.text =
-            (lastReasoningText.text ?? '') + incomingReasoningText.text;
-        }
-        if (typeof incomingReasoningText.signature === 'string') {
-          lastReasoningText.signature =
-            (lastReasoningText.signature ?? '') +
-            incomingReasoningText.signature;
-        }
-        continue;
-      }
-      bedrock.blocks.push(structuredClone(incomingBlock));
-    }
-  }
+  const anthropic = mergeReplayBlocks(
+    existing?.anthropic,
+    incoming.anthropic,
+    (block) => (block.type === ContentTypes.THINKING ? block : undefined),
+    'thinking'
+  );
+  const bedrock = mergeReplayBlocks(
+    existing?.bedrock,
+    incoming.bedrock,
+    (block) => block.reasoningText,
+    'text'
+  );
   return {
-    ...(anthropic != null && anthropic.blocks.length > 0 && { anthropic }),
-    ...(bedrock != null && bedrock.blocks.length > 0 && { bedrock }),
+    ...(anthropic != null && { anthropic }),
+    ...(bedrock != null && { bedrock }),
   };
 }
 
@@ -2788,13 +2700,14 @@ export function createContentAggregator(): t.ContentAggregatorResult {
       typeof contentPart.think === 'string'
     ) {
       const currentContent = contentParts[index] as t.ReasoningDeltaUpdate;
+      const providerReplay = mergeProviderReasoningReplay(
+        currentContent.provider_replay,
+        (contentPart as t.ReasoningContentText).provider_replay
+      );
       const update: t.ReasoningDeltaUpdate = {
         type: ContentTypes.THINK,
         think: (currentContent.think || '') + contentPart.think,
-        provider_replay: mergeProviderReasoningReplay(
-          currentContent.provider_replay,
-          (contentPart as t.ReasoningContentText).provider_replay
-        ),
+        ...(providerReplay != null && { provider_replay: providerReplay }),
       };
       contentParts[index] = update;
     } else if (

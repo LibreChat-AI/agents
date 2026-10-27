@@ -69,268 +69,76 @@ describe('ContentAggregator empty deltas', () => {
   });
 });
 
-describe('ContentAggregator Bedrock reasoning replay', () => {
-  it('merges streamed reasoning text and signature into one persisted replay block', () => {
+describe('ContentAggregator provider reasoning replay', () => {
+  const anthropic = (block: t.AnthropicReasoningReplayBlock) => ({
+    anthropic: { model: anthropicModel, blocks: [block] },
+  });
+  const bedrock = (block: t.BedrockReasoningReplayBlock) => ({
+    bedrock: { model: bedrockModel, blocks: [block] },
+  });
+  const aggregate = (replays: t.ProviderReasoningReplay[]) => {
     const { contentParts, aggregateContent } = createContentAggregator();
     aggregateContent({
       event: GraphEvents.ON_RUN_STEP,
-      data: createRunStep('step_bedrock_reasoning'),
+      data: createRunStep('step_reasoning'),
     });
-
-    for (const content of [
-      {
-        type: ContentTypes.THINK,
-        think: 'first ',
-        provider_replay: {
-          bedrock: {
-            model: bedrockModel,
-            blocks: [
-              {
-                type: ContentTypes.REASONING_CONTENT,
-                reasoningText: { text: 'first ' },
-              },
-            ],
-          },
-        },
-      },
-      {
-        type: ContentTypes.THINK,
-        think: 'second',
-        provider_replay: {
-          bedrock: {
-            model: bedrockModel,
-            blocks: [
-              {
-                type: ContentTypes.REASONING_CONTENT,
-                reasoningText: { text: 'second' },
-              },
-            ],
-          },
-        },
-      },
-      {
-        type: ContentTypes.THINK,
-        think: '',
-        provider_replay: {
-          bedrock: {
-            model: bedrockModel,
-            blocks: [
-              {
-                type: ContentTypes.REASONING_CONTENT,
-                reasoningText: { signature: 'sig-abc' },
-              },
-            ],
-          },
-        },
-      },
-    ] satisfies t.ReasoningContentText[]) {
+    for (const provider_replay of replays) {
       aggregateContent({
         event: GraphEvents.ON_REASONING_DELTA,
         data: {
-          id: 'step_bedrock_reasoning',
-          delta: { content: [content] },
-        },
-      });
-    }
-
-    expect(contentParts).toEqual([
-      {
-        type: ContentTypes.THINK,
-        think: 'first second',
-        provider_replay: {
-          bedrock: {
-            model: bedrockModel,
-            blocks: [
-              {
-                type: ContentTypes.REASONING_CONTENT,
-                reasoningText: {
-                  text: 'first second',
-                  signature: 'sig-abc',
-                },
-              },
-            ],
-          },
-        },
-      },
-    ]);
-  });
-});
-
-describe('ContentAggregator Anthropic reasoning replay', () => {
-  it('merges streamed thinking and signature while preserving redacted blocks', () => {
-    const { contentParts, aggregateContent } = createContentAggregator();
-    aggregateContent({
-      event: GraphEvents.ON_RUN_STEP,
-      data: createRunStep('step_anthropic_reasoning'),
-    });
-
-    for (const content of [
-      {
-        type: ContentTypes.THINK,
-        think: 'first ',
-        provider_replay: {
-          anthropic: {
-            model: anthropicModel,
-            blocks: [{ type: ContentTypes.THINKING, thinking: 'first ' }],
-          },
-        },
-      },
-      {
-        type: ContentTypes.THINK,
-        think: 'second',
-        provider_replay: {
-          anthropic: {
-            model: anthropicModel,
-            blocks: [{ type: ContentTypes.THINKING, thinking: 'second' }],
-          },
-        },
-      },
-      {
-        type: ContentTypes.THINK,
-        think: '',
-        provider_replay: {
-          anthropic: {
-            model: anthropicModel,
-            blocks: [{ type: ContentTypes.THINKING, signature: 'sig-abc' }],
-          },
-        },
-      },
-      {
-        type: ContentTypes.THINK,
-        think: '',
-        provider_replay: {
-          anthropic: {
-            model: anthropicModel,
-            blocks: [{ type: 'redacted_thinking', data: 'encrypted-thinking' }],
-          },
-        },
-      },
-    ] satisfies t.ReasoningContentText[]) {
-      aggregateContent({
-        event: GraphEvents.ON_REASONING_DELTA,
-        data: {
-          id: 'step_anthropic_reasoning',
-          delta: { content: [content] },
-        },
-      });
-    }
-
-    expect(contentParts).toEqual([
-      {
-        type: ContentTypes.THINK,
-        think: 'first second',
-        provider_replay: {
-          anthropic: {
-            model: anthropicModel,
-            blocks: [
-              {
-                type: ContentTypes.THINKING,
-                thinking: 'first second',
-                signature: 'sig-abc',
-              },
-              {
-                type: 'redacted_thinking',
-                data: 'encrypted-thinking',
-              },
-            ],
-          },
-        },
-      },
-    ]);
-  });
-});
-
-describe('ContentAggregator consecutive signed reasoning blocks', () => {
-  const stream = (blocks: t.ReasoningContentText[]): t.ReasoningContentText[] =>
-    blocks;
-
-  it('keeps Anthropic blocks apart when omitted thinking display leaves only their signatures', () => {
-    const { contentParts, aggregateContent } = createContentAggregator();
-    aggregateContent({
-      event: GraphEvents.ON_RUN_STEP,
-      data: createRunStep('step_anthropic_two_blocks'),
-    });
-
-    for (const signature of ['sig-first', 'sig-second']) {
-      for (const content of stream([
-        {
-          type: ContentTypes.THINK,
-          think: '',
-          provider_replay: {
-            anthropic: {
-              model: anthropicModel,
-              blocks: [{ type: ContentTypes.THINKING, signature }],
-            },
-          },
-        },
-      ])) {
-        aggregateContent({
-          event: GraphEvents.ON_REASONING_DELTA,
-          data: {
-            id: 'step_anthropic_two_blocks',
-            delta: { content: [content] },
-          },
-        });
-      }
-    }
-
-    expect(contentParts[0]).toMatchObject({
-      provider_replay: {
-        anthropic: {
-          blocks: [
-            { type: ContentTypes.THINKING, signature: 'sig-first' },
-            { type: ContentTypes.THINKING, signature: 'sig-second' },
-          ],
-        },
-      },
-    });
-  });
-
-  it('keeps Bedrock blocks apart when only their signatures are streamed', () => {
-    const { contentParts, aggregateContent } = createContentAggregator();
-    aggregateContent({
-      event: GraphEvents.ON_RUN_STEP,
-      data: createRunStep('step_bedrock_two_blocks'),
-    });
-
-    for (const signature of ['sig-first', 'sig-second']) {
-      aggregateContent({
-        event: GraphEvents.ON_REASONING_DELTA,
-        data: {
-          id: 'step_bedrock_two_blocks',
+          id: 'step_reasoning',
           delta: {
-            content: [
-              {
-                type: ContentTypes.THINK,
-                think: '',
-                provider_replay: {
-                  bedrock: {
-                    model: bedrockModel,
-                    blocks: [
-                      {
-                        type: ContentTypes.REASONING_CONTENT,
-                        reasoningText: { signature },
-                      },
-                    ],
-                  },
-                },
-              },
-            ],
+            content: [{ type: ContentTypes.THINK, think: '', provider_replay }],
           },
         },
       });
     }
+    return contentParts[0] as t.ReasoningContentText;
+  };
 
-    expect(contentParts[0]).toMatchObject({
-      provider_replay: {
-        bedrock: {
-          blocks: [
-            { reasoningText: { signature: 'sig-first' } },
-            { reasoningText: { signature: 'sig-second' } },
-          ],
-        },
+  it('merges streamed Anthropic thinking and signature into one block and keeps redacted blocks', () => {
+    const part = aggregate([
+      anthropic({ type: ContentTypes.THINKING, thinking: 'first ' }),
+      anthropic({ type: ContentTypes.THINKING, thinking: 'second' }),
+      anthropic({ type: ContentTypes.THINKING, signature: 'sig-abc' }),
+      anthropic({ type: 'redacted_thinking', data: 'opaque' }),
+    ]);
+
+    expect(part.provider_replay?.anthropic?.blocks).toEqual([
+      { type: ContentTypes.THINKING, thinking: 'first second', signature: 'sig-abc' },
+      { type: 'redacted_thinking', data: 'opaque' },
+    ]);
+  });
+
+  it('merges streamed Bedrock reasoning text and signature into one block', () => {
+    const part = aggregate([
+      bedrock({ type: ContentTypes.REASONING_CONTENT, reasoningText: { text: 'first ' } }),
+      bedrock({ type: ContentTypes.REASONING_CONTENT, reasoningText: { text: 'second' } }),
+      bedrock({ type: ContentTypes.REASONING_CONTENT, reasoningText: { signature: 'sig-abc' } }),
+    ]);
+
+    expect(part.provider_replay?.bedrock?.blocks).toEqual([
+      {
+        type: ContentTypes.REASONING_CONTENT,
+        reasoningText: { text: 'first second', signature: 'sig-abc' },
       },
-    });
+    ]);
+  });
+
+  it('keeps consecutive blocks apart when only their signatures stream', () => {
+    const anthropicPart = aggregate(
+      ['sig-first', 'sig-second'].map((signature) =>
+        anthropic({ type: ContentTypes.THINKING, signature })
+      )
+    );
+    const bedrockPart = aggregate(
+      ['sig-first', 'sig-second'].map((signature) =>
+        bedrock({ type: ContentTypes.REASONING_CONTENT, reasoningText: { signature } })
+      )
+    );
+
+    expect(anthropicPart.provider_replay?.anthropic?.blocks).toHaveLength(2);
+    expect(bedrockPart.provider_replay?.bedrock?.blocks).toHaveLength(2);
   });
 });
 
