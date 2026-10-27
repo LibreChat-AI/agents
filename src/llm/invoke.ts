@@ -1610,6 +1610,7 @@ export function getFallbackOverflowCandidates(
 export async function tryFallbackProviders({
   fallbacks,
   tools,
+  disableToolCalling,
   messages,
   config,
   primaryError,
@@ -1624,6 +1625,7 @@ export async function tryFallbackProviders({
 }: {
   fallbacks: t.FallbackConfig[];
   tools?: t.GraphTools;
+  disableToolCalling?: boolean;
   messages: BaseMessage[];
   config?: RunnableConfig;
   primaryError: unknown;
@@ -1689,6 +1691,7 @@ export async function tryFallbackProviders({
         provider: fb.provider,
         clientOptions: fb.clientOptions,
         tools,
+        ...(disableToolCalling == null ? {} : {disableToolCalling}),
       });
       /**
        * Stamp the fallback's configured model onto callback metadata so

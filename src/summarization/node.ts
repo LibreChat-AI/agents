@@ -630,6 +630,7 @@ async function executeSummarizationWithFallback(params: {
       provider: clientConfig.provider,
       clientOptions: clientConfig.clientOptions as t.ClientOptions,
       tools: summarizationTools,
+      disableToolCalling: true,
     }) as t.ChatModel;
 
     const signal = withBreakerSignal(summarizeConfig, graph)?.signal;
@@ -772,6 +773,7 @@ async function executeSummarizationWithFallback(params: {
         });
         const fbResult = await tryFallbackProviders({
           fallbacks: boundedFallbacks,
+          disableToolCalling: true,
           tools: agentContext.getToolsForBinding(),
           messages,
           prepareProviderRequest: async ({

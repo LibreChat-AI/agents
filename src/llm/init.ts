@@ -1,12 +1,14 @@
 import type { Runnable } from '@langchain/core/runnables';
 import type * as t from '@/types';
-import { getChatModelClass } from '@/llm/providers';
 import { isOpenAILike, isLibreChatOpenAIModel, constructorChainHasLcName } from '@/utils';
+import { getProviderFamily } from '@/llm/providerRegistry';
+import { getChatModelClass } from '@/llm/providers';
 import { Providers } from '@/common';
 
 type InitializeModelParams<P extends t.ProviderName> = {
   provider: P;
   tools?: t.GraphTools;
+  disableToolCalling?: boolean;
 } & (
   | {
       override: t.ChatModelInstance;
@@ -49,6 +51,7 @@ export function initializeModel<P extends t.ProviderName>({
   provider,
   clientOptions,
   tools,
+  disableToolCalling,
   override,
 }: InitializeModelParams<P>): Runnable {
   const model =
@@ -89,5 +92,8 @@ export function initializeModel<P extends t.ProviderName>({
     );
   }
 
-  return model.bindTools(tools);
+  const family = getProviderFamily(provider);
+  const canDisableTools = family === 'openai' || family === 'anthropic' || family === 'google';
+  if (disableToolCalling !== true || !canDisableTools) return model.bindTools(tools);
+  return model.bindTools(tools, {tool_choice: 'none'});
 }

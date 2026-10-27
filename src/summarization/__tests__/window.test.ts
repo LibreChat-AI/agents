@@ -174,6 +174,7 @@ describe('compaction request windows', () => {
       expect(model.calls[0]).toContain(windowMessages.at(-1));
       expect(result.messages?.slice(1)).toEqual(windowMessages.slice(-4));
       expect(agentContext.getSummaryText()).toBe('CLEAN_SUMMARY');
+      expect(init.initializeModel).toHaveBeenCalledWith(expect.objectContaining({disableToolCalling: true}));
     }
   );
 
