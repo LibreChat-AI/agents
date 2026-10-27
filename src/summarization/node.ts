@@ -67,7 +67,7 @@ import { serializeToolContentBounded } from '@/utils/toolContent';
 import { makeIsDeferred } from '@/messages/anthropicToolCache';
 import { createRemoveAllMessage } from '@/messages/reducer';
 import { getProviderFamily } from '@/llm/providerRegistry';
-import { getTruncationStopReason } from '@/llm/truncation';
+import { getProviderStopReasons } from '@/llm/truncation';
 import { isProviderCancellation } from '@/utils/errors';
 import { initializeModel } from '@/llm/init';
 import { getChunkContent } from '@/stream';
@@ -1785,11 +1785,10 @@ function extractResponseText(response: { content: string | object }): string {
 }
 
 function isReasoningOnlySummary(response: BaseMessage): boolean {
-  const metadata = response.response_metadata as {stop_reason?: string; finish_reason?: string} | undefined;
-  const kwargs = response.additional_kwargs as {refusal?: string; stop_reason?: string} | undefined;
-  const stopReason = kwargs?.stop_reason ?? metadata?.stop_reason ?? metadata?.finish_reason;
-  if (getTruncationStopReason(response) != null || kwargs?.refusal != null ||
-    stopReason === 'refusal' || stopReason === 'content_filter' || stopReason === 'stop_sequence') return false;
+  const kwargs = response.additional_kwargs as {refusal?: string} | undefined;
+  if (kwargs?.refusal != null || getProviderStopReasons(response).some(
+    reason => reason !== 'end_turn' && reason !== 'stop'
+  )) return false;
   if ('tool_calls' in response && Array.isArray(response.tool_calls) && response.tool_calls.length > 0) return false;
   if ('invalid_tool_calls' in response && Array.isArray(response.invalid_tool_calls) && response.invalid_tool_calls.length > 0) return false;
   if (!Array.isArray(response.content)) return false;

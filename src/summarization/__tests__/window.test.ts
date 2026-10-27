@@ -5,10 +5,12 @@ import {
   HumanMessage,
   ToolMessage,
 } from '@langchain/core/messages';
+import type {ConverseStreamCommandOutput, ConverseCommandOutput, ConverseStreamOutput} from '@aws-sdk/client-bedrock-runtime';
 import type { BaseMessage, UsageMetadata } from '@langchain/core/messages';
 import type * as t from '@/types';
 import { createSummarizeNode } from '@/summarization/node';
 import { resolveClientOptionsModel } from '@/llm/request';
+import { CustomChatBedrockConverse } from '@/llm/bedrock';
 import { resolveStreamLimits } from '@/llm/streamLimits';
 import { AgentContext } from '@/agents/AgentContext';
 import { createTokenCounter } from '@/utils/tokens';
@@ -1207,6 +1209,47 @@ describe('compaction request windows', () => {
       ).toHaveLength(0);
     }
   );
+
+  it.each(['stream', 'invoke'] as const)('preserves history without retrying a native Bedrock %s stop sequence', async mode => {
+    const model = new CustomChatBedrockConverse({model: 'anthropic.claude-sonnet-4-5',
+      region: 'us-east-1', credentials: {accessKeyId: 'offline-test', secretAccessKey: 'offline-test'},
+      _lc_stream_delay: 0,
+    });
+    let response: ConverseCommandOutput | ConverseStreamCommandOutput;
+    if (mode === 'stream') {
+      response = {$metadata: {}, stream: (async function* (): AsyncGenerator<ConverseStreamOutput> {
+        yield {messageStart: {role: 'assistant' as const}};
+        yield {contentBlockDelta: {contentBlockIndex: 0, delta: {reasoningContent: {text: 'PRIVATE_REASONING_ONLY'}}}};
+        yield {contentBlockStop: {contentBlockIndex: 0}};
+        yield {messageStop: {stopReason: 'stop_sequence' as const}};
+        yield {metadata: {usage: {inputTokens: 100, outputTokens: 10, totalTokens: 110}, metrics: {latencyMs: 0}}};
+      })()} satisfies ConverseStreamCommandOutput;
+    } else {
+      Object.defineProperty(model, 'stream', {value: undefined});
+      response = {$metadata: {}, output: {message: {role: 'assistant',
+        content: [{reasoningContent: {reasoningText: {text: 'PRIVATE_REASONING_ONLY', signature: 'offline-signature'}}}],
+      }}, stopReason: 'stop_sequence', usage: {inputTokens: 100, outputTokens: 10, totalTokens: 110},
+      metrics: {latencyMs: 0}} satisfies ConverseCommandOutput;
+    }
+    const send = jest.fn(async () => response);
+    Object.defineProperty(model.client, 'send', {value: send});
+    const {node, emitted, agentContext, graph} = harness({provider: Providers.BEDROCK});
+    graph.streamLimits = resolveStreamLimits({maxDeltaEventsPerTurn: 10});
+    jest.spyOn(init, 'initializeModel').mockReturnValue(model);
+    const messages = history(6);
+    const before = JSON.stringify(messages);
+    const result = await node({messages, summarizationRequest: {agentId: 'agent', remainingContextTokens: 0, windowMessages: messages}}, {});
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(result.messages).toBeUndefined();
+    expect(JSON.stringify(messages)).toBe(before);
+    expect(agentContext.getSummaryText()).toBeUndefined();
+    expect(agentContext.summarizationFailures).toBe(1);
+    expect(emitted.filter(({event}) => event === GraphEvents.ON_SUMMARIZE_DELTA)).toHaveLength(0);
+    const completed = emitted.filter(({event}) => event === GraphEvents.ON_SUMMARIZE_COMPLETE);
+    expect(completed).toHaveLength(1);
+    expect(completed[0].data).toMatchObject({errorCode: 'unknown'});
+    expect(JSON.stringify(completed)).not.toContain('PRIVATE_REASONING_ONLY');
+  });
 
   const cancellations = [
     Object.assign(new Error('SDK failure'), { name: 'CancelledError' }),
