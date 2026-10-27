@@ -7,6 +7,7 @@ import { Calculator } from '@/tools/Calculator';
 import {
   HumanMessage,
   AIMessage,
+  AIMessageChunk,
   SystemMessage,
   ToolMessage,
   BaseMessage,
@@ -59,14 +60,54 @@ function createSpies(): {
   };
 }
 
+function getSummarizationCompletionStats(data: t.ModelEndData): {
+  stopReason: string;
+  blockTypes: Record<string, number>;
+  textCharacters: number;
+  toolCalls: number;
+  inputTokens: number;
+  outputTokens: number;
+} {
+  const output = data?.output;
+  const reason = output?.response_metadata.stop_reason ?? output?.response_metadata.finish_reason;
+  const stopReason = ['end_turn', 'max_tokens', 'stop_sequence', 'tool_use', 'pause_turn', 'refusal', 'stop', 'length', 'tool_calls', 'content_filter'].find((allowed) => allowed === reason) ?? 'unknown';
+  const allowedTypes = ['text', 'thinking', 'redacted_thinking', 'reasoning', 'tool_use'];
+  const blockTypes: Record<string, number> = {};
+  const content = typeof output?.content === 'string'
+    ? [{ type: 'text', text: output.content }]
+    : output?.content ?? [];
+  let textCharacters = 0;
+  for (const block of content) {
+    const type = allowedTypes.find((allowed) => allowed === block.type) ?? 'unknown';
+    blockTypes[type] = (blockTypes[type] ?? 0) + 1;
+    if (type === 'text' && typeof block.text === 'string') textCharacters += block.text.length;
+  }
+  const tokens = (value: number | undefined): number =>
+    typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : 0;
+  return {
+    stopReason, blockTypes, textCharacters,
+    toolCalls: Array.isArray(output?.tool_calls) ? output.tool_calls.length : 0,
+    inputTokens: tokens(output?.usage_metadata?.input_tokens),
+    outputTokens: tokens(output?.usage_metadata?.output_tokens),
+  };
+}
+
 function buildHandlers(
   collectedUsage: UsageMetadata[],
   aggregateContent: t.ContentAggregator,
   spies: ReturnType<typeof createSpies>
 ): Record<string | GraphEvents, t.EventHandler> {
+  const eventModelEndHandler = new ModelEndHandler(collectedUsage);
   return {
     [GraphEvents.TOOL_END]: new ToolEndHandler(),
-    [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(collectedUsage),
+    [GraphEvents.CHAT_MODEL_END]: {
+      handle: async (...args: Parameters<ModelEndHandler['handle']>): Promise<void> => {
+        await eventModelEndHandler.handle(...args);
+        if (args[2]?.summarization === true) {
+          console.log('  Summarization completion:', getSummarizationCompletionStats(args[1]));
+        }
+      },
+    },
     [GraphEvents.ON_RUN_STEP_COMPLETED]: {
       handle: (
         event: GraphEvents.ON_RUN_STEP_COMPLETED,
@@ -347,6 +388,65 @@ describe('Local summarization fixtures (no API keys)', () => {
     expect(() => assertSummarizationEvents(spies)).toThrow(
       'Summarization failed (context_exceeded): Summarization failed; conversation history was preserved'
     );
+  });
+});
+
+describe('Summarization completion diagnostics (no API keys)', () => {
+  test('logs only canonical stats and preserves the original usage handler', async () => {
+    const privateValue = 'PRIVATE-CONTENT-NAME-REASON';
+    const usage = { input_tokens: 12, output_tokens: 3, total_tokens: 15 };
+    const data: t.ModelEndData = { output: new AIMessageChunk({
+      content: [
+        { type: 'text', text: privateValue },
+        { type: 'thinking', thinking: privateValue },
+        { type: 'thinking', thinking: privateValue },
+        { type: privateValue, text: privateValue },
+      ],
+      tool_calls: [{ id: privateValue, name: privateValue, args: { privateValue } }],
+      response_metadata: { stop_reason: privateValue, privateValue },
+      usage_metadata: usage,
+    }) };
+    const collectedUsage: UsageMetadata[] = [];
+    const handler = buildHandlers(collectedUsage, createContentAggregator().aggregateContent, createSpies())[GraphEvents.CHAT_MODEL_END];
+    const { Graph } = await Run.create<t.IState>({
+      runId: 'safe-diagnostics',
+      graphConfig: { type: 'standard', llmConfig: {
+        provider: Providers.OPENAI, model: 'gpt-4o-mini', apiKey: 'offline-test-key',
+      } },
+    });
+    const logSpy = jest.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      await handler.handle(GraphEvents.CHAT_MODEL_END, data, { summarization: true, privateValue }, Graph);
+      expect(collectedUsage[0]).toBe(usage);
+      expect(logSpy.mock.calls).toEqual([['  Summarization completion:', {
+        stopReason: 'unknown', blockTypes: { text: 1, thinking: 2, unknown: 1 },
+        textCharacters: privateValue.length, toolCalls: 1, inputTokens: 12, outputTokens: 3,
+      }]]);
+      expect(JSON.stringify(logSpy.mock.calls)).not.toContain(privateValue);
+      logSpy.mockClear();
+      for (const summarization of [undefined, false, 'true', 1]) {
+        await handler.handle(GraphEvents.CHAT_MODEL_END, data, { summarization }, Graph);
+      }
+      expect(logSpy).not.toHaveBeenCalled();
+      expect(collectedUsage).toHaveLength(5);
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  test('normalizes empty, text, stopped and invalid-token completions', () => {
+    const empty = { stopReason: 'unknown', blockTypes: {}, textCharacters: 0, toolCalls: 0, inputTokens: 0, outputTokens: 0 };
+    expect(getSummarizationCompletionStats(undefined)).toEqual(empty);
+    for (const tokens of [NaN, Infinity, -1, 1.5]) {
+      const output = new AIMessageChunk({ content: '', usage_metadata: {
+        input_tokens: tokens, output_tokens: tokens, total_tokens: tokens,
+      } });
+      expect(getSummarizationCompletionStats({ output })).toEqual({ ...empty, blockTypes: { text: 1 } });
+    }
+    for (const key of ['stop_reason', 'finish_reason']) {
+      const output = new AIMessageChunk({ content: 'private', response_metadata: { [key]: 'max_tokens' } });
+      expect(getSummarizationCompletionStats({ output })).toEqual({ ...empty, stopReason: 'max_tokens', blockTypes: { text: 1 }, textCharacters: 7 });
+    }
   });
 });
 

@@ -8,6 +8,7 @@ import {
 import type { BaseMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
 import { createSummarizeNode } from '@/summarization/node';
+import { resolveClientOptionsModel } from '@/llm/request';
 import { resolveStreamLimits } from '@/llm/streamLimits';
 import { AgentContext } from '@/agents/AgentContext';
 import { GraphEvents, Providers } from '@/common';
@@ -78,7 +79,7 @@ function harness({
   maxContextTokens?: number;
   model?: SummaryModel;
   provider?: Providers;
-  clientOptions?: t.ClientOptions;
+  clientOptions?: t.ClientOptions & Pick<t.BuiltInLLMConfig, 'fallbacks'>;
   tokenCounter?: t.TokenCounter;
   summarizationConfig?: t.SummarizationConfig;
 } = {}) {
@@ -514,6 +515,127 @@ describe('compaction request windows', () => {
     expect(model.calls).toHaveLength(1);
     expect(agentContext.getSummaryText()).toBeUndefined();
     expect(agentContext.summaryVersion).toBe(0);
+  });
+
+  it.each([
+    { maxContextTokens: 3_000, maxTokens: 1_000 },
+    { maxContextTokens: 2_000, maxTokens: 64 },
+  ])('uses the serving fallback allowance: %j', async (fallbackLimits) => {
+    const primary = new SummaryModel();
+    const fallback = new SummaryModel();
+    const { node, agentContext } = harness({
+      maxContextTokens: 2_000,
+      model: primary,
+      clientOptions: {
+        model: 'primary',
+        fallbacks: [
+          {
+            provider: Providers.OPENAI,
+            maxContextTokens: fallbackLimits.maxContextTokens,
+            clientOptions: {
+              model: 'fallback',
+              maxTokens: fallbackLimits.maxTokens,
+            },
+          },
+        ],
+      },
+      summarizationConfig: {
+        maxSummaryTokens: 1_000,
+        prompt: 'Write a checkpoint.',
+        retainRecent: { turns: 0 },
+      },
+    });
+    jest
+      .spyOn(init, 'initializeModel')
+      .mockImplementation(({ clientOptions }) =>
+        resolveClientOptionsModel(clientOptions) === 'fallback' ? fallback : primary
+      );
+    const newest = new HumanMessage('q'.repeat(7_000));
+    const messages = [
+      new HumanMessage('old'),
+      new AIMessage('old answer'),
+      newest,
+    ];
+    const result = await node(
+      {
+        messages,
+        summarizationRequest: {
+          agentId: 'agent',
+          remainingContextTokens: 0,
+          reason: 'manual',
+          windowMessages: messages,
+        },
+      },
+      {}
+    );
+    expect(primary.calls).toHaveLength(0);
+    expect(fallback.calls).toHaveLength(1);
+    expect(fallback.calls[0]).toContain(newest);
+    expect(fallback.calls[0][0].getType()).toBe('system');
+    expect(
+      fallback.calls[0].reduce(
+        (total, message) => total + count(message),
+        fallbackLimits.maxTokens
+      )
+    ).toBeLessThanOrEqual(fallbackLimits.maxContextTokens);
+    expect(agentContext.getSummaryText()).toBe('CLEAN_SUMMARY');
+    expect(result.messages?.[0].getType()).toBe('remove');
+  });
+
+  it('skips a too-small fallback without preventing a viable later fallback', async () => {
+    const primary = new SummaryModel();
+    const small = new SummaryModel();
+    const large = new SummaryModel();
+    const { node, agentContext } = harness({
+      maxContextTokens: 2_000,
+      model: primary,
+      clientOptions: {
+        model: 'primary',
+        fallbacks: [
+          {
+            provider: Providers.OPENAI,
+            maxContextTokens: 1_000,
+            clientOptions: { model: 'small', maxTokens: 64 },
+          },
+          {
+            provider: Providers.ANTHROPIC,
+            maxContextTokens: 3_000,
+            clientOptions: { model: 'large', maxTokens: 128 },
+          },
+        ],
+      },
+      summarizationConfig: {
+        maxSummaryTokens: 1_000,
+        prompt: 'Write a checkpoint.',
+        retainRecent: { turns: 0 },
+      },
+    });
+    jest
+      .spyOn(init, 'initializeModel')
+      .mockImplementation(({ clientOptions }) => {
+        if (resolveClientOptionsModel(clientOptions) === 'small') return small;
+        return resolveClientOptionsModel(clientOptions) === 'large' ? large : primary;
+      });
+    const messages = [new HumanMessage('q'.repeat(7_000))];
+    const before = JSON.stringify(messages);
+    await node(
+      {
+        messages,
+        summarizationRequest: {
+          agentId: 'agent',
+          remainingContextTokens: 0,
+          reason: 'manual',
+          windowMessages: messages,
+        },
+      },
+      {}
+    );
+    expect(primary.calls).toHaveLength(0);
+    expect(small.calls).toHaveLength(0);
+    expect(large.calls).toHaveLength(1);
+    expect(large.calls[0]).toContain(messages[0]);
+    expect(JSON.stringify(messages)).toBe(before);
+    expect(agentContext.getSummaryText()).toBe('CLEAN_SUMMARY');
   });
 
   it('preserves automatic history and reports a safe code after retry exhaustion', async () => {

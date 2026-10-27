@@ -58,6 +58,7 @@ import { renderCompactionSemanticIndex } from '@/summarization/semanticIndex';
 import { classifySummarizationError, withSummarizationRetry } from './retry';
 import { ProviderTextProtectionError } from '@/protection/providerText';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
+import { prepareProviderRequest } from '@/llm/prepareProviderRequest';
 import { prepareToolsForPromptCache } from '@/llm/promptCacheTools';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { serializeToolContentBounded } from '@/utils/toolContent';
@@ -182,28 +183,14 @@ function buildSummarizationClientConfig(
     clientOptions.modelName = modelName;
   }
 
-  const reasoningOptions = clientOptions as t.AnthropicReasoning &
-    Pick<t.BedrockAnthropicInput, 'additionalModelRequestFields'> &
-    Pick<t.OpenAIClientOptions, 'modelKwargs'>;
-  const thinking = reasoningOptions.thinking ??
-    reasoningOptions.additionalModelRequestFields?.thinking ??
-    (reasoningOptions.modelKwargs?.thinking as t.AnthropicReasoning['thinking']);
-  let thinkingBudget = 0;
-  if (typeof thinking === 'object' && thinking.type === 'enabled') {
-    thinkingBudget = thinking.budget_tokens;
-  } else if (thinking === true) {
-    thinkingBudget = reasoningOptions.thinkingBudget ?? reasoningOptions.additionalModelRequestFields?.thinkingBudget ?? 0;
-  }
-  const defaultOutputTokens = thinkingBudget + Math.min(
-    DEFAULT_SUMMARY_OUTPUT_TOKENS,
-    Math.max(1, Math.floor((agentContext.maxContextTokens ?? 40_960) * 0.1))
-  );
   const effectiveMaxSummaryTokens =
     paramMaxSummaryTokens ??
     summarizationConfig?.maxSummaryTokens ??
-    (clientOptions[getMaxOutputTokensKey(provider)] as number | undefined) ??
-    defaultOutputTokens;
-
+    resolveSummaryOutputTokens(
+      provider,
+      clientOptions,
+      agentContext.maxContextTokens
+    );
   clientOptions[getMaxOutputTokensKey(provider)] = effectiveMaxSummaryTokens;
 
   return {
@@ -214,6 +201,40 @@ function buildSummarizationClientConfig(
     promptText,
     updatePromptText,
   };
+}
+
+function resolveSummaryOutputTokens(
+  provider: t.ProviderName,
+  clientOptions: Record<string, unknown>,
+  maxContextTokens?: number
+): number {
+  const reasoningOptions = clientOptions as t.AnthropicReasoning &
+    Pick<t.BedrockAnthropicInput, 'additionalModelRequestFields'> &
+    Pick<t.OpenAIClientOptions, 'modelKwargs'>;
+  const thinking =
+    reasoningOptions.thinking ??
+    reasoningOptions.additionalModelRequestFields?.thinking ??
+    (reasoningOptions.modelKwargs
+      ?.thinking as t.AnthropicReasoning['thinking']);
+  let thinkingBudget = 0;
+  if (typeof thinking === 'object' && thinking.type === 'enabled') {
+    thinkingBudget = thinking.budget_tokens;
+  } else if (thinking === true) {
+    thinkingBudget =
+      reasoningOptions.thinkingBudget ??
+      reasoningOptions.additionalModelRequestFields?.thinkingBudget ??
+      0;
+  }
+  const defaultOutputTokens =
+    thinkingBudget +
+    Math.min(
+      DEFAULT_SUMMARY_OUTPUT_TOKENS,
+      Math.max(1, Math.floor((maxContextTokens ?? 40_960) * 0.1))
+    );
+  return (
+    (clientOptions[getMaxOutputTokensKey(provider)] as number | undefined) ??
+    defaultOutputTokens
+  );
 }
 
 /**
@@ -617,8 +638,7 @@ async function executeSummarizationWithFallback(params: {
         summarizeWithCacheHit({
           agentContext,
           shrinkInput,
-          outputTokens:
-            clientConfig.effectiveMaxSummaryTokens,
+          outputTokens: clientConfig.effectiveMaxSummaryTokens,
           model: summarizationModel,
           messages,
           promptText: clientConfig.promptText,
@@ -723,21 +743,23 @@ async function executeSummarizationWithFallback(params: {
           priorSummaryText,
           semanticIndex.appendix
         );
-        const budget =
-          agentContext.maxContextTokens == null
-            ? Number.MAX_SAFE_INTEGER
-            : Math.floor(
-              (agentContext.maxContextTokens -
-                  agentContext.instructionTokens -
-                  clientConfig.effectiveMaxSummaryTokens -
-                  counter(new HumanMessage(instruction))) /
-                  Math.max(1, agentContext.calibrationRatio)
-            );
-        const fallbackHistory = boundSummarizationInput({
-          messages,
-          tokenCounter: counter,
-          budget,
-          provider: agentContext.provider,
+        const boundedFallbacks = fallbacks.map((fallback) => {
+          const maxContextTokens =
+            fallback.maxContextTokens ?? agentContext.maxContextTokens;
+          const clientOptions = {
+            ...fallback.clientOptions,
+            [getMaxOutputTokensKey(fallback.provider)]:
+              resolveSummaryOutputTokens(
+                fallback.provider,
+                { ...fallback.clientOptions },
+                maxContextTokens
+              ),
+          };
+          return {
+            ...fallback,
+            clientOptions,
+            maxContextTokens,
+          } as t.FallbackConfig;
         });
         const pendingDeltas: t.SummarizeDeltaEvent[] = [];
         const onChunk = createSummarizationChunkHandler({
@@ -749,9 +771,55 @@ async function executeSummarizationWithFallback(params: {
           graph,
         });
         const fbResult = await tryFallbackProviders({
-          fallbacks,
+          fallbacks: boundedFallbacks,
           tools: agentContext.getToolsForBinding(),
-          messages: [...fallbackHistory, new HumanMessage(instruction)],
+          messages,
+          prepareProviderRequest: async ({
+            model,
+            provider,
+            clientOptions,
+            maxContextTokens,
+            config,
+          }) => {
+            config?.signal?.throwIfAborted();
+            const system =
+              provider === agentContext.provider
+                ? agentContext.systemRunnable
+                : undefined;
+            const overhead =
+              system == null
+                ? agentContext.toolSchemaTokens
+                : agentContext.instructionTokens;
+            const outputTokens = resolveSummaryOutputTokens(
+              provider,
+              { ...clientOptions },
+              maxContextTokens
+            );
+            const budget =
+              maxContextTokens == null
+                ? Number.MAX_SAFE_INTEGER
+                : Math.floor(
+                  (maxContextTokens -
+                      overhead -
+                      outputTokens -
+                      counter(new HumanMessage(instruction))) /
+                      Math.max(1, agentContext.calibrationRatio)
+                );
+            const bounded = boundSummarizationInput({
+              messages,
+              tokenCounter: counter,
+              budget,
+              provider,
+            });
+            const history =
+              system == null ? bounded : await system.invoke(bounded, config);
+            return prepareProviderRequest({
+              model,
+              messages: [...history, new HumanMessage(instruction)],
+              provider,
+              config,
+            });
+          },
           config: withBreakerSignal(
             traceConfig(summarizeConfig, 'cache_hit_compaction'),
             graph
@@ -762,6 +830,8 @@ async function executeSummarizationWithFallback(params: {
         });
         const fbMsg = fbResult?.messages?.[0];
         if (fbMsg) {
+          if ('usage_metadata' in fbMsg)
+            summaryUsage = fbMsg.usage_metadata as UsageMetadata;
           summaryText = extractResponseText(
             fbMsg as { content: string | object }
           );
@@ -1162,10 +1232,17 @@ export function createSummarizeNode({
       agentContext.contextPressureTokenCounts?.count ??
       agentContext.tokenCounter ??
       (await createTokenCounter(encodingForReceivingAgent(agentContext)));
-    const retainTokens = retainRecent?.tokens ?? (retainRecent == null ? Math.min(
-      DEFAULT_RETAIN_RECENT_TOKENS,
-      Math.max(1, Math.floor((agentContext.maxContextTokens ?? 100_000) * 0.16))
-    ) : undefined);
+    const retainTokens =
+      retainRecent?.tokens ??
+      (retainRecent == null
+        ? Math.min(
+          DEFAULT_RETAIN_RECENT_TOKENS,
+          Math.max(
+            1,
+            Math.floor((agentContext.maxContextTokens ?? 100_000) * 0.16)
+          )
+        )
+        : undefined);
     const {
       head: compactableHead,
       tail: messagesToRetain,
@@ -1184,11 +1261,14 @@ export function createSummarizeNode({
       }),
     });
 
-    const hasPrunedHistory = windowMessages.length > 0 &&
-      (windowMessages.length < state.messages.length || request.reason === 'overflow');
-    const messagesToRefine = compactableHead.length > 0 || !hasPrunedHistory
-      ? compactableHead
-      : windowMessages;
+    const hasPrunedHistory =
+      windowMessages.length > 0 &&
+      (windowMessages.length < state.messages.length ||
+        request.reason === 'overflow');
+    const messagesToRefine =
+      compactableHead.length > 0 || !hasPrunedHistory
+        ? compactableHead
+        : windowMessages;
 
     if (messagesToRefine.length === 0) {
       if (request.reason === 'manual') {
