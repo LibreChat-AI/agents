@@ -109,6 +109,19 @@ const SUMMARY_TEXT =
 
 const INSTRUCTIONS = 'You are a helpful math tutor. Be concise.';
 
+function addAccountingPressure(history: BaseMessage[]): void {
+  const detail =
+    'Keep the verified result, token usage, calibration ratio, and summary overhead for the next run. '.repeat(2);
+  const pressure: BaseMessage[] = [];
+  for (let turn = 0; turn < 8; turn++) {
+    pressure.push(
+      new HumanMessage(`Accounting exchange ${turn}: ${detail}`),
+      new AIMessage(`Recorded exchange ${turn}: ${detail}`)
+    );
+  }
+  history.unshift(...pressure);
+}
+
 const streamConfig = {
   configurable: { thread_id: 'token-e2e' },
   streamMode: 'values',
@@ -180,6 +193,9 @@ describe('Token accounting E2E — Run + Graph + real token counter', () => {
         summarizationEnabled: true,
         summarizationConfig: {
           provider: Providers.OPENAI,
+          prompt: 'Checkpoint the verified results and accounting context concisely.',
+          updatePrompt: 'Merge the new accounting context into the prior checkpoint.',
+          maxSummaryTokens: 64,
         },
         initialSummary: opts.initialSummary,
       },
@@ -275,9 +291,10 @@ describe('Token accounting E2E — Run + Graph + real token counter', () => {
 
     // --- Turn 3: tight budget forces pruning and summarization ---
     // Real token count for the 4 messages above is ~150+ tokens.
-    // A budget of 50 guarantees pruning → summarization.
+    // Bounded padding forces pruning while leaving room for a real summary.
+    addAccountingPressure(conversationHistory);
     run = await createRun({
-      maxTokens: 50,
+      maxTokens: 512,
       conversationHistory,
       spies,
     });
@@ -286,12 +303,7 @@ describe('Token accounting E2E — Run + Graph + real token counter', () => {
       1
     );
 
-    let error: Error | undefined;
-    try {
-      await runTurn({ run, conversationHistory }, 'Now summarize everything.');
-    } catch (err) {
-      error = err as Error;
-    }
+    await runTurn({ run, conversationHistory }, 'Now summarize everything.');
 
     // Summarization should have fired
     expect(spies.onSummarizeStartSpy).toHaveBeenCalled();
@@ -301,17 +313,13 @@ describe('Token accounting E2E — Run + Graph + real token counter', () => {
       .calls[0][0] as t.SummarizeCompleteEvent;
     const summaryText = getSummaryText(completePayload.summary);
     expect(summaryText).toBe(SUMMARY_TEXT);
+    expect(completePayload.error).toBeUndefined();
     expect(completePayload.summary!.tokenCount).toBeGreaterThan(0);
 
     // Token count should match what our real counter computes
     const summaryTokenCount = completePayload.summary!.tokenCount ?? 0;
     expect(summaryTokenCount).toBeGreaterThan(5);
 
-    // Even if the model call errored (empty_messages for tiny context),
-    // summarization itself should have completed without crashing
-    if (error) {
-      expect(error.message).not.toContain('Recursion limit');
-    }
   });
 
   // =========================================================================
@@ -373,8 +381,9 @@ describe('Token accounting E2E — Run + Graph + real token counter', () => {
     expect(conversationHistory.length).toBeGreaterThanOrEqual(4);
 
     // --- Turn 3: tight context with usage → triggers summarization ---
+    addAccountingPressure(conversationHistory);
     run = await createRun({
-      maxTokens: 50,
+      maxTokens: 512,
       conversationHistory,
       spies,
     });
@@ -387,12 +396,7 @@ describe('Token accounting E2E — Run + Graph + real token counter', () => {
       },
     }) as any;
 
-    try {
-      await runTurn({ run, conversationHistory }, 'Continue.');
-    } catch {
-      // Tiny context may throw empty_messages — that's fine
-      conversationHistory.pop();
-    }
+    await runTurn({ run, conversationHistory }, 'Continue.');
 
     // Summarization should fire even with usage_metadata in the mix
     expect(
@@ -400,6 +404,7 @@ describe('Token accounting E2E — Run + Graph + real token counter', () => {
     ).toBeGreaterThanOrEqual(1);
     const payload = spies.onSummarizeCompleteSpy.mock
       .calls[0][0] as t.SummarizeCompleteEvent;
+    expect(payload.error).toBeUndefined();
     expect(payload.summary!.tokenCount).toBeGreaterThan(0);
   });
 
@@ -454,7 +459,7 @@ describe('Token accounting E2E — Run + Graph + real token counter', () => {
 
     conversationHistory.push(new HumanMessage('Continue.'));
 
-    let pruningOccurred = false;
+    let pruningOccurred: boolean;
     try {
       await run.processStream(
         { messages: conversationHistory },
@@ -584,19 +589,16 @@ describe('Token accounting E2E — Run + Graph + real token counter', () => {
       'What is the square root of 16? Explain the concept of square roots.'
     );
 
-    // Force summarization — budget of 50 is well below the ~150 token conversation
+    // Bounded padding forces pruning without starving the summarizer.
+    addAccountingPressure(conversationHistory);
     run = await createRun({
-      maxTokens: 50,
+      maxTokens: 512,
       conversationHistory,
       spies,
     });
     run.Graph?.overrideTestModel(['Got it.'], 1);
 
-    try {
-      await runTurn({ run, conversationHistory }, 'Continue.');
-    } catch {
-      conversationHistory.pop();
-    }
+    await runTurn({ run, conversationHistory }, 'Continue.');
 
     const completeCalls = spies.onSummarizeCompleteSpy.mock.calls;
     expect(completeCalls.length).toBeGreaterThanOrEqual(1);
@@ -782,18 +784,15 @@ describe('Token accounting E2E — Run + Graph + real token counter', () => {
     expect(conversationHistory.length).toBeGreaterThanOrEqual(8);
 
     // Turn 3: tight budget → force summarization of the tool-heavy history
+    addAccountingPressure(conversationHistory);
     run = await createRun({
-      maxTokens: 50,
+      maxTokens: 512,
       conversationHistory,
       spies,
     });
     run.Graph?.overrideTestModel(['Understood, continuing.'], 1);
 
-    try {
-      await runTurn({ run, conversationHistory }, 'Summarize everything.');
-    } catch {
-      conversationHistory.pop();
-    }
+    await runTurn({ run, conversationHistory }, 'Summarize everything.');
 
     // Summarization should fire on the tool-heavy history
     expect(spies.onSummarizeStartSpy).toHaveBeenCalled();
@@ -801,6 +800,7 @@ describe('Token accounting E2E — Run + Graph + real token counter', () => {
 
     const payload = spies.onSummarizeCompleteSpy.mock
       .calls[0][0] as t.SummarizeCompleteEvent;
+    expect(payload.error).toBeUndefined();
     expect(payload.summary).toBeDefined();
     expect(payload.summary!.tokenCount).toBeGreaterThan(0);
     expect(getSummaryText(payload.summary)).toBe(SUMMARY_TEXT);
@@ -954,18 +954,15 @@ describe('Token accounting E2E — Run + Graph + real token counter', () => {
     expect(conversationHistory.length).toBeGreaterThanOrEqual(8);
 
     // Turn 3: tight budget to force summarization
+    addAccountingPressure(conversationHistory);
     run = await createRun({
-      maxTokens: 50,
+      maxTokens: 512,
       conversationHistory,
       spies,
     });
     run.Graph?.overrideTestModel(['Understood.'], 1);
 
-    try {
-      await runTurn({ run, conversationHistory }, 'What were all the results?');
-    } catch {
-      conversationHistory.pop();
-    }
+    await runTurn({ run, conversationHistory }, 'What were all the results?');
 
     // Summarization should fire — tool messages are part of the history being summarized
     expect(spies.onSummarizeStartSpy).toHaveBeenCalled();
@@ -973,6 +970,7 @@ describe('Token accounting E2E — Run + Graph + real token counter', () => {
 
     const completePayload = spies.onSummarizeCompleteSpy.mock
       .calls[0][0] as t.SummarizeCompleteEvent;
+    expect(completePayload.error).toBeUndefined();
     expect(completePayload.summary).toBeDefined();
     expect(completePayload.summary!.tokenCount).toBeGreaterThan(0);
 

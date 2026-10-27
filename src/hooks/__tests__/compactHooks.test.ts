@@ -97,7 +97,7 @@ async function createCompactingRun(
         streamUsage: false,
       },
       instructions: 'Be concise.',
-      maxContextTokens: 200,
+      maxContextTokens: 2_000,
       summarizationEnabled: true,
       summarizationConfig: {
         provider: Providers.OPENAI,

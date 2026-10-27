@@ -182,14 +182,27 @@ function buildSummarizationClientConfig(
     clientOptions.modelName = modelName;
   }
 
+  const reasoningOptions = clientOptions as t.AnthropicReasoning &
+    Pick<t.BedrockAnthropicInput, 'additionalModelRequestFields'> &
+    Pick<t.OpenAIClientOptions, 'modelKwargs'>;
+  const thinking = reasoningOptions.thinking ??
+    reasoningOptions.additionalModelRequestFields?.thinking ??
+    (reasoningOptions.modelKwargs?.thinking as t.AnthropicReasoning['thinking']);
+  let thinkingBudget = 0;
+  if (typeof thinking === 'object' && thinking.type === 'enabled') {
+    thinkingBudget = thinking.budget_tokens;
+  } else if (thinking === true) {
+    thinkingBudget = reasoningOptions.thinkingBudget ?? reasoningOptions.additionalModelRequestFields?.thinkingBudget ?? 0;
+  }
+  const defaultOutputTokens = thinkingBudget + Math.min(
+    DEFAULT_SUMMARY_OUTPUT_TOKENS,
+    Math.max(1, Math.floor((agentContext.maxContextTokens ?? 40_960) * 0.1))
+  );
   const effectiveMaxSummaryTokens =
     paramMaxSummaryTokens ??
     summarizationConfig?.maxSummaryTokens ??
     (clientOptions[getMaxOutputTokensKey(provider)] as number | undefined) ??
-    Math.min(
-      DEFAULT_SUMMARY_OUTPUT_TOKENS,
-      Math.max(1, Math.floor((agentContext.maxContextTokens ?? 40_960) * 0.1))
-    );
+    defaultOutputTokens;
 
   clientOptions[getMaxOutputTokensKey(provider)] = effectiveMaxSummaryTokens;
 
@@ -1149,17 +1162,12 @@ export function createSummarizeNode({
       agentContext.contextPressureTokenCounts?.count ??
       agentContext.tokenCounter ??
       (await createTokenCounter(encodingForReceivingAgent(agentContext)));
-    const retainTokens =
-      retainRecent?.tokens ??
-      Math.min(
-        DEFAULT_RETAIN_RECENT_TOKENS,
-        Math.max(
-          1,
-          Math.floor((agentContext.maxContextTokens ?? 100_000) * 0.16)
-        )
-      );
+    const retainTokens = retainRecent?.tokens ?? (retainRecent == null ? Math.min(
+      DEFAULT_RETAIN_RECENT_TOKENS,
+      Math.max(1, Math.floor((agentContext.maxContextTokens ?? 100_000) * 0.16))
+    ) : undefined);
     const {
-      head: messagesToRefine,
+      head: compactableHead,
       tail: messagesToRetain,
       usedIntraTurnFallback,
     } = splitAtRecencyBoundary(windowMessages, {
@@ -1175,6 +1183,12 @@ export function createSummarizeNode({
         maxContextTokens: agentContext.maxContextTokens,
       }),
     });
+
+    const hasPrunedHistory = windowMessages.length > 0 &&
+      (windowMessages.length < state.messages.length || request.reason === 'overflow');
+    const messagesToRefine = compactableHead.length > 0 || !hasPrunedHistory
+      ? compactableHead
+      : windowMessages;
 
     if (messagesToRefine.length === 0) {
       if (request.reason === 'manual') {

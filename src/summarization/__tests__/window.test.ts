@@ -1,14 +1,21 @@
 import { ChatGenerationChunk } from '@langchain/core/outputs';
-import { AIMessage, AIMessageChunk, HumanMessage, ToolMessage } from '@langchain/core/messages';
+import {
+  AIMessage,
+  AIMessageChunk,
+  HumanMessage,
+  ToolMessage,
+} from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
 import { createSummarizeNode } from '@/summarization/node';
 import { resolveStreamLimits } from '@/llm/streamLimits';
 import { AgentContext } from '@/agents/AgentContext';
 import { GraphEvents, Providers } from '@/common';
+import { ChatModelStreamHandler } from '@/stream';
 import { FakeChatModel } from '@/llm/fake';
 import * as events from '@/utils/events';
 import * as init from '@/llm/init';
+import { Run } from '@/run';
 
 const count: t.TokenCounter = (message) =>
   Math.ceil(JSON.stringify(message.content).length / 4) + 4;
@@ -63,15 +70,25 @@ function history(turns: number): BaseMessage[] {
 function harness({
   maxContextTokens = 32_000,
   model = new SummaryModel(),
+  provider = Providers.OPENAI,
+  clientOptions,
+  summarizationConfig = { maxSummaryTokens: 128 },
+}: {
+  maxContextTokens?: number;
+  model?: SummaryModel;
+  provider?: Providers;
+  clientOptions?: t.ClientOptions;
+  summarizationConfig?: t.SummarizationConfig;
 } = {}) {
   const agentContext = AgentContext.fromConfig(
     {
       agentId: 'agent',
-      provider: Providers.OPENAI,
+      provider,
+      clientOptions,
       instructions: 'The turn system prompt',
       maxContextTokens,
       summarizationEnabled: true,
-      summarizationConfig: { maxSummaryTokens: 128 },
+      summarizationConfig,
     },
     count
   );
@@ -156,6 +173,52 @@ describe('compaction request windows', () => {
       expect(agentContext.getSummaryText()).toBe('CLEAN_SUMMARY');
     }
   );
+
+  it.each(['manual', 'trigger', 'overflow'] as const)(
+    'does not skip %s when pruning leaves only the retained recent turn',
+    async (reason) => {
+      const { node, model, agentContext } = harness();
+      const messages = history(360);
+      const windowMessages = messages.slice(reason === 'overflow' ? -4 : -2);
+      const result = await node(
+        {
+          messages,
+          summarizationRequest: {
+            agentId: 'agent',
+            remainingContextTokens: 0,
+            reason,
+            allowSummarization: true,
+            windowMessages,
+          },
+        },
+        {}
+      );
+      expect(model.calls).toHaveLength(1);
+      expect(agentContext.getSummaryText()).toBe('CLEAN_SUMMARY');
+      expect(result.messages?.slice(1)).toEqual(windowMessages);
+    }
+  );
+
+  it('honors an explicit turns-only policy without adding a default token cap', async () => {
+    const { node } = harness({
+      maxContextTokens: 100_000,
+      summarizationConfig: { retainRecent: { turns: 3 } },
+    });
+    const messages = history(5);
+    for (const message of messages) message.content = 'context '.repeat(1750);
+    const result = await node(
+      {
+        messages,
+        summarizationRequest: {
+          agentId: 'agent',
+          remainingContextTokens: 0,
+          windowMessages: messages,
+        },
+      },
+      {}
+    );
+    expect(result.messages?.slice(1)).toEqual(messages.slice(-6));
+  });
 
   it('reserves instruction and output space without splitting parallel tool calls', async () => {
     const { node, model, agentContext } = harness({ maxContextTokens: 2_000 });
@@ -270,6 +333,113 @@ describe('compaction request windows', () => {
     );
     expect(completed).toHaveLength(1);
     expect(JSON.stringify(completed)).toContain('CLEAN_SUMMARY');
+  });
+
+  it.each([
+    [
+      Providers.ANTHROPIC,
+      { thinking: { type: 'enabled', budget_tokens: 1024 } },
+    ],
+    [
+      Providers.BEDROCK,
+      {
+        additionalModelRequestFields: {
+          thinking: { type: 'enabled', budget_tokens: 1024 },
+        },
+      },
+    ],
+    [
+      Providers.OPENAI,
+      { modelKwargs: { thinking: { type: 'enabled', budget_tokens: 1024 } } },
+    ],
+    [
+      Providers.BEDROCK,
+      {
+        additionalModelRequestFields: { thinking: true, thinkingBudget: 1024 },
+      },
+    ],
+  ] as const)(
+    'reserves inherited thinking plus visible summary output for %s',
+    async (provider, clientOptions) => {
+      const { node, agentContext } = harness({
+        maxContextTokens: 3_000,
+        provider,
+        clientOptions,
+        summarizationConfig: {},
+      });
+      const messages = history(6);
+      await node(
+        {
+          messages,
+          summarizationRequest: {
+            agentId: 'agent',
+            remainingContextTokens: 0,
+            windowMessages: messages,
+          },
+        },
+        {}
+      );
+      expect(init.initializeModel).toHaveBeenCalledWith(
+        expect.objectContaining({
+          clientOptions: expect.objectContaining({ maxTokens: 1324 }),
+        })
+      );
+      expect(agentContext.getSummaryText()).toBe('CLEAN_SUMMARY');
+    }
+  );
+
+  it('keeps summary callback echoes out of ordinary message steps during real streamed retries', async () => {
+    const model = new SummaryModel();
+    model.failure = (_messages, attempt) =>
+      attempt === 1
+        ? new Error('Our servers are currently overloaded')
+        : undefined;
+    jest.spyOn(init, 'initializeModel').mockReturnValue(model);
+    let ordinaryDeltaCount = 0;
+    const summaries: t.SummarizeCompleteEvent[] = [];
+    const run = await Run.create<t.IState>({
+      runId: 'summary-retry-callbacks',
+      streamLimits: { maxDeltaEventsPerTurn: 2 },
+      tokenCounter: count,
+      returnContent: true,
+      skipCleanup: true,
+      graphConfig: {
+        type: 'standard',
+        llmConfig: { provider: Providers.OPENAI },
+        instructions: 'Test system prompt',
+        maxContextTokens: 32_000,
+        summarizationEnabled: true,
+        summarizeOnly: true,
+        summarizationConfig: {
+          maxSummaryTokens: 128,
+          retainRecent: { turns: 0 },
+        },
+      },
+      customHandlers: {
+        [GraphEvents.CHAT_MODEL_STREAM]: new ChatModelStreamHandler(),
+        [GraphEvents.ON_MESSAGE_DELTA]: {
+          handle: (): void => { ordinaryDeltaCount++; },
+        },
+        [GraphEvents.ON_SUMMARIZE_COMPLETE]: {
+          handle: (_event, data): void => {
+            summaries.push(data as t.SummarizeCompleteEvent);
+          },
+        },
+      },
+    });
+    await run.processStream(
+      { messages: history(6) },
+      {
+        configurable: { thread_id: 'summary-retry' },
+        version: 'v2',
+      }
+    );
+    expect(model.calls).toHaveLength(2);
+    expect(ordinaryDeltaCount).toBe(0);
+    expect(run.Graph?.contentData).toHaveLength(1);
+    expect(summaries).toHaveLength(1);
+    expect(JSON.stringify(summaries)).toContain('CLEAN_SUMMARY');
+    expect(JSON.stringify(summaries)).not.toContain('FAILED_ONLY');
   });
 
   it('preserves automatic history and reports a safe code after retry exhaustion', async () => {

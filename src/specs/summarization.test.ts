@@ -35,6 +35,12 @@ function getSummaryText(summary: t.SummaryContentBlock | undefined): string {
     .join('');
 }
 
+const LOCAL_SUMMARY_CONFIG = {
+  prompt: 'Write one concise checkpoint with Goal, Progress, and Next Steps sections.',
+  updatePrompt: 'Merge the new messages into the existing checkpoint without duplicate sections.',
+  maxSummaryTokens: 128,
+} satisfies t.SummarizationConfig;
+
 // ---------------------------------------------------------------------------
 // Shared test infrastructure
 // ---------------------------------------------------------------------------
@@ -205,6 +211,11 @@ function assertSummarizationEvents(spies: ReturnType<typeof createSpies>): {
 
   const completePayload = spies.onSummarizeCompleteSpy.mock
     .calls[0][0] as t.SummarizeCompleteEvent;
+  if (completePayload.error != null) {
+    throw new Error(
+      `Summarization failed (${completePayload.errorCode ?? 'unknown'}): ${completePayload.error}`
+    );
+  }
   expect(completePayload.agentId).toBeDefined();
   expect(completePayload.summary).toBeDefined();
   expect(completePayload.summary!.type).toBe(ContentTypes.SUMMARY);
@@ -288,18 +299,56 @@ function logTurn(
 
 function addDeterministicSummarizationPressure(
   conversationHistory: BaseMessage[],
-  label: string
+  label: string,
+  turns = 16
 ): void {
-  const pressure = `${label} stable compaction evidence. `.repeat(300);
-  conversationHistory.push(
-    new HumanMessage(
-      `Retain this deterministic context for the summarization check. ${pressure}`
-    ),
-    new AIMessage(
-      `Recorded the deterministic context for the summarization check. ${pressure}`
-    )
-  );
+  const pressure =
+    'Verified compaction context: preserve calculation results, source identifiers, observations, and the next action for the continuing task. '.repeat(8);
+  for (let turn = 0; turn < turns; turn++) {
+    conversationHistory.push(
+      new HumanMessage(`${label} exchange ${turn}: ${pressure}`),
+      new AIMessage(`Recorded ${label} exchange ${turn}: ${pressure}`)
+    );
+  }
 }
+
+describe('Local summarization fixtures (no API keys)', () => {
+  test('exceeds the test budgets with individually bounded exchanges', async () => {
+    const history: BaseMessage[] = [];
+    const count = await createTokenCounter();
+    addDeterministicSummarizationPressure(history, 'bounded-pressure');
+
+    expect(history).toHaveLength(32);
+    let total = 0;
+    for (let index = 0; index < history.length; index += 2) {
+      expect(history[index]).toBeInstanceOf(HumanMessage);
+      expect(history[index + 1]).toBeInstanceOf(AIMessage);
+      const exchangeTokens = count(history[index]) + count(history[index + 1]);
+      expect(exchangeTokens).toBeLessThan(512);
+      total += exchangeTokens;
+    }
+    expect(total).toBeGreaterThan(4_000);
+  });
+
+  test('reports sanitized completion errors before asserting a summary exists', () => {
+    const spies = createSpies();
+    spies.onSummarizeStartSpy({
+      agentId: 'agent_0',
+      provider: Providers.OPENAI,
+      messagesToRefineCount: 1,
+    });
+    spies.onSummarizeCompleteSpy({
+      id: 'failed-summary',
+      agentId: 'agent_0',
+      errorCode: 'context_exceeded',
+      error: 'Summarization failed; conversation history was preserved',
+    } satisfies t.SummarizeCompleteEvent);
+
+    expect(() => assertSummarizationEvents(spies)).toThrow(
+      'Summarization failed (context_exceeded): Summarization failed; conversation history was preserved'
+    );
+  });
+});
 
 // ---------------------------------------------------------------------------
 // Anthropic Summarization Tests
@@ -1530,6 +1579,7 @@ describe('Cross-run summary lifecycle (no API keys)', () => {
           maxContextTokens: maxTokens,
           summarizationEnabled: true,
           summarizationConfig: {
+            ...LOCAL_SUMMARY_CONFIG,
             provider: Providers.OPENAI,
           },
         },
@@ -1594,10 +1644,9 @@ describe('Cross-run summary lifecycle (no API keys)', () => {
     expect(conversationHistory.length).toBeGreaterThanOrEqual(4);
 
     // --- Turn 3: tight context to force pruning and summarization ---
-    // Budget must be large enough to hold instructions + summary + at least
-    // one message after summarization fires (summary adds ~26 tokens to the
-    // system message, so 50 is too tight).
-    run = await createRun(150);
+    // Keep both the bounded history and the summarizer's reserved output viable.
+    addDeterministicSummarizationPressure(conversationHistory, 'lifecycle', 4);
+    run = await createRun(1024);
     run.Graph?.overrideTestModel(
       ['Got it, continuing with the summary context.'],
       1
@@ -2132,6 +2181,7 @@ describe('Tight context with oversized tool results (no API keys)', () => {
           maxContextTokens: maxTokens,
           summarizationEnabled: true,
           summarizationConfig: {
+            ...LOCAL_SUMMARY_CONFIG,
             provider: Providers.OPENAI,
           },
         },
@@ -2186,7 +2236,8 @@ describe('Tight context with oversized tool results (no API keys)', () => {
     );
 
     // Force first summarization
-    run = await createRunHelper(50);
+    addDeterministicSummarizationPressure(conversationHistory, 'structured-checkpoint', 4);
+    run = await createRunHelper(1024);
     run.Graph?.overrideTestModel(['Continuing after summary.'], 1);
     try {
       await runTurn({ run, conversationHistory }, 'Continue.', streamConfig);
@@ -2195,6 +2246,7 @@ describe('Tight context with oversized tool results (no API keys)', () => {
     }
 
     const firstSumCount = spies.onSummarizeCompleteSpy.mock.calls.length;
+    expect(firstSumCount).toBeGreaterThan(0);
 
     // Build more conversation
     run = await createRunHelper(4000);
@@ -2209,7 +2261,8 @@ describe('Tight context with oversized tool results (no API keys)', () => {
     );
 
     // Force second summarization
-    run = await createRunHelper(50);
+    addDeterministicSummarizationPressure(conversationHistory, 'structured-checkpoint', 4);
+    run = await createRunHelper(1024);
     run.Graph?.overrideTestModel(['Continuing after second summary.'], 1);
     try {
       await runTurn(
@@ -2227,12 +2280,13 @@ describe('Tight context with oversized tool results (no API keys)', () => {
     );
 
     // At least one summarization should have fired
-    expect(totalSumCount).toBeGreaterThanOrEqual(1);
+    expect(totalSumCount).toBeGreaterThan(firstSumCount);
 
     // The summary response from our fake model has structured format
     const lastComplete = spies.onSummarizeCompleteSpy.mock.calls[
       totalSumCount - 1
     ][0] as t.SummarizeCompleteEvent;
+    expect(lastComplete.error).toBeUndefined();
     const summaryText = getSummaryText(lastComplete.summary);
 
     // Our SUMMARY_RESPONSE includes ## Goal and ## Progress
@@ -2248,10 +2302,10 @@ describe('Tight context with oversized tool results (no API keys)', () => {
     const conversationHistory: BaseMessage[] = [];
     const tokenCounter = await createTokenCounter();
 
-    // Track what system messages are passed to the summarizer model.
+    // The compaction instruction is appended as the final human message.
     // Override _streamResponseChunks (not _generate) because FakeListChatModel
     // has its own _streamResponseChunks that bypasses _generate during streaming.
-    const capturedSystemMessages: string[] = [];
+    const capturedInstructions: string[] = [];
     getChatModelClassSpy.mockRestore();
     getChatModelClassSpy = jest
       .spyOn(providers, 'getChatModelClass')
@@ -2266,19 +2320,10 @@ describe('Tight context with oversized tool results (no API keys)', () => {
               options: any,
               runManager?: any
             ) {
-              // Capture the system message content for inspection
-              if (Array.isArray(messages)) {
-                for (const msg of messages) {
-                  const msgType = msg.getType?.() ?? msg._getType?.();
-                  if (msgType === 'system') {
-                    const content =
-                      typeof msg.content === 'string'
-                        ? msg.content
-                        : JSON.stringify(msg.content);
-                    capturedSystemMessages.push(content);
-                  }
-                }
-              }
+              const content = messages.at(-1)?.content ?? '';
+              capturedInstructions.push(
+                typeof content === 'string' ? content : JSON.stringify(content)
+              );
               yield* super._streamResponseChunks(messages, options, runManager);
             }
           } as any;
@@ -2304,6 +2349,7 @@ describe('Tight context with oversized tool results (no API keys)', () => {
           maxContextTokens: maxTokens,
           summarizationEnabled: true,
           summarizationConfig: {
+            ...LOCAL_SUMMARY_CONFIG,
             provider: Providers.OPENAI,
           },
           initialSummary,
@@ -2363,7 +2409,8 @@ describe('Tight context with oversized tool results (no API keys)', () => {
     );
 
     // Force first summarization
-    run = await createRunHelper(50);
+    addDeterministicSummarizationPressure(conversationHistory, 'update-checkpoint', 4);
+    run = await createRunHelper(1024);
     run.Graph?.overrideTestModel(['Continuing after first summary.'], 1);
     try {
       await runTurn(
@@ -2378,21 +2425,14 @@ describe('Tight context with oversized tool results (no API keys)', () => {
     const firstSumCount = spies.onSummarizeCompleteSpy.mock.calls.length;
     console.log(`  First summarization: ${firstSumCount} complete events`);
 
-    // Extract summary from first round to use as initialSummary
-    let priorSummary: { text: string; tokenCount: number } | undefined;
-    if (firstSumCount > 0) {
-      const firstComplete = spies.onSummarizeCompleteSpy.mock.calls[
-        firstSumCount - 1
-      ][0] as t.SummarizeCompleteEvent;
-      priorSummary = {
-        text: getSummaryText(firstComplete.summary),
-        tokenCount: firstComplete.summary!.tokenCount ?? 0,
-      };
-    }
-
-    // Clear captured messages — we only care about the SECOND summarization
-    const firstRoundCaptures = capturedSystemMessages.length;
-    capturedSystemMessages.length = 0;
+    expect(firstSumCount).toBeGreaterThan(0);
+    const { completePayload: firstComplete } = assertSummarizationEvents(spies);
+    const priorSummary = {
+      text: getSummaryText(firstComplete.summary),
+      tokenCount: firstComplete.summary!.tokenCount ?? 0,
+    };
+    expect(capturedInstructions).toContain(LOCAL_SUMMARY_CONFIG.prompt);
+    capturedInstructions.length = 0;
 
     // --- Step 2: Build more conversation with initialSummary, trigger SECOND summarization ---
     // Since initialSummary is set, the summarize node should use the update prompt.
@@ -2421,7 +2461,8 @@ describe('Tight context with oversized tool results (no API keys)', () => {
     );
 
     // Force second summarization (with prior summary in AgentContext)
-    run = await createRunHelper(50, priorSummary);
+    addDeterministicSummarizationPressure(conversationHistory, 'update-checkpoint', 4);
+    run = await createRunHelper(1024, priorSummary);
     run.Graph?.overrideTestModel(['Continuing after second summary.'], 1);
     try {
       await runTurn({ run, conversationHistory }, 'Continue.', streamConfig);
@@ -2431,36 +2472,12 @@ describe('Tight context with oversized tool results (no API keys)', () => {
 
     const secondSumCount =
       spies.onSummarizeCompleteSpy.mock.calls.length - firstSumCount;
-    console.log(
-      `  Second summarization: ${secondSumCount} complete events, ` +
-        `captured ${capturedSystemMessages.length} system messages (first round had ${firstRoundCaptures})`
-    );
-
-    if (capturedSystemMessages.length > 0) {
-      // When a prior summary exists, verify the summarizer received context.
-      // With multi-pass (chunks 1+), the FRESH prompt + continuation prefix is
-      // used instead of the UPDATE prompt. Chunk 0 uses UPDATE only when it's
-      // a cross-cycle prior (tested in node.test.ts unit tests).
-      // In this integration test, verify that EITHER the UPDATE prompt OR the
-      // continuation prefix (context-from-earlier-messages) was used, confirming
-      // the prior summary was passed to the summarizer.
-      const usedUpdateOrContinuation = capturedSystemMessages.some(
-        (msg: string) =>
-          msg.includes('Merge the new messages') ||
-          msg.includes('Update the existing summary') ||
-          msg.includes('context-from-earlier-messages')
-      );
-      expect(usedUpdateOrContinuation).toBe(true);
-      console.log(
-        `  System message snippet: "${capturedSystemMessages[0].substring(0, 120)}…"`
-      );
-    } else if (firstRoundCaptures > 0) {
-      // First round used fresh prompt, second didn't fire — still validates first-round behavior
-      console.log(
-        '  Second summarization did not fire, but first round confirmed fresh prompt was used'
-      );
-    } else {
-      console.log('  No system messages captured');
+    expect(secondSumCount).toBeGreaterThan(0);
+    expect(capturedInstructions.length).toBeGreaterThan(0);
+    for (const instruction of capturedInstructions) {
+      expect(instruction.startsWith(LOCAL_SUMMARY_CONFIG.updatePrompt)).toBe(true);
+      expect(instruction).toContain('<previous-summary>');
+      expect(instruction).toContain(priorSummary.text);
     }
   });
 
@@ -2939,7 +2956,9 @@ describe('Enrichment and prompt selection (no API keys)', () => {
     const tokenCounter = await createTokenCounter();
 
     // Build conversation with a tool failure
-    const conversationHistory: BaseMessage[] = [
+    const conversationHistory: BaseMessage[] = [];
+    addDeterministicSummarizationPressure(conversationHistory, 'tool-failure', 4);
+    conversationHistory.push(
       new HumanMessage('Run the linter on my code.'),
       new AIMessage({
         content: [
@@ -2969,8 +2988,8 @@ describe('Enrichment and prompt selection (no API keys)', () => {
       new HumanMessage('Try again with the correct path.'),
       new AIMessage(
         'I will try again. The correct path would need to be provided by you since I cannot verify file existence.'
-      ),
-    ];
+      )
+    );
 
     const indexTokenCountMap = buildIndexTokenCountMap(
       conversationHistory,
@@ -2984,9 +3003,10 @@ describe('Enrichment and prompt selection (no API keys)', () => {
         type: 'standard',
         llmConfig: getLLMConfig(Providers.OPENAI),
         instructions: INSTRUCTIONS,
-        maxContextTokens: 50, // Very tight to force summarization
+        maxContextTokens: 1024,
         summarizationEnabled: true,
         summarizationConfig: {
+          ...LOCAL_SUMMARY_CONFIG,
           provider: Providers.OPENAI,
         },
       },
@@ -3032,24 +3052,11 @@ describe('Enrichment and prompt selection (no API keys)', () => {
       // empty_messages is acceptable for tiny context
     }
 
-    if (spies.onSummarizeCompleteSpy.mock.calls.length > 0) {
-      const completePayload = spies.onSummarizeCompleteSpy.mock
-        .calls[0][0] as t.SummarizeCompleteEvent;
-      const summaryText = getSummaryText(completePayload.summary);
-
-      // The enrichment step in node.ts should append ## Tool Failures
-      expect(summaryText).toContain('## Tool Failures');
-      expect(summaryText).toContain('run_linter');
-      expect(summaryText).toContain('ENOENT');
-
-      console.log(`  Enriched summary: "${summaryText.substring(0, 200)}…"`);
-    } else {
-      // If summarization didn't fire due to context being too tight,
-      // the test is inconclusive but not a failure
-      console.log(
-        '  Summarization did not fire (context too tight for any message)'
-      );
-    }
+    const { completePayload } = assertSummarizationEvents(spies);
+    const summaryText = getSummaryText(completePayload.summary);
+    expect(summaryText).toContain('## Tool Failures');
+    expect(summaryText).toContain('run_linter');
+    expect(summaryText).toContain('ENOENT');
   });
 });
 
@@ -3144,6 +3151,7 @@ describe('Summarization deduplication correctness (no API keys)', () => {
           maxContextTokens: maxTokens,
           summarizationEnabled: true,
           summarizationConfig: {
+            ...LOCAL_SUMMARY_CONFIG,
             provider: Providers.OPENAI,
             parameters: {},
           },
@@ -3224,7 +3232,8 @@ describe('Summarization deduplication correctness (no API keys)', () => {
     );
 
     // Now force summarization with tight context
-    run = await createRunHelper(50);
+    addDeterministicSummarizationPressure(conversationHistory, 'dedup-checkpoint', 4);
+    run = await createRunHelper(1024);
     run.Graph?.overrideTestModel(['Continuing after summary.'], 1);
     try {
       await runTurn({ run, conversationHistory }, 'Continue.', streamConfig);
@@ -3308,6 +3317,7 @@ describe('Summarization deduplication correctness (no API keys)', () => {
           maxContextTokens: maxTokens,
           summarizationEnabled: true,
           summarizationConfig: {
+            ...LOCAL_SUMMARY_CONFIG,
             provider: Providers.OPENAI,
           },
           initialSummary,
@@ -3348,7 +3358,8 @@ describe('Summarization deduplication correctness (no API keys)', () => {
     run.Graph?.overrideTestModel(['Answer 2 with more explanation.'], 1);
     await runTurn({ run, conversationHistory }, 'Question 2.', streamConfig);
 
-    run = await createRunHelper(50);
+    addDeterministicSummarizationPressure(conversationHistory, 'repeat-checkpoint', 4);
+    run = await createRunHelper(1024);
     run.Graph?.overrideTestModel(['OK.'], 1);
     try {
       await runTurn({ run, conversationHistory }, 'Summarize.', streamConfig);
@@ -3357,6 +3368,7 @@ describe('Summarization deduplication correctness (no API keys)', () => {
     }
 
     const cycle1SumCount = spies.onSummarizeCompleteSpy.mock.calls.length;
+    expect(cycle1SumCount).toBeGreaterThan(0);
 
     // Extract the summary from cycle 1 for use as initialSummary in cycle 2
     let priorSummary: { text: string; tokenCount: number } | undefined;
@@ -3379,7 +3391,8 @@ describe('Summarization deduplication correctness (no API keys)', () => {
       streamConfig
     );
 
-    run = await createRunHelper(50, priorSummary);
+    addDeterministicSummarizationPressure(conversationHistory, 'repeat-checkpoint', 4);
+    run = await createRunHelper(1024, priorSummary);
     run.Graph?.overrideTestModel(['OK cycle 2.'], 1);
     try {
       await runTurn(
@@ -3397,13 +3410,14 @@ describe('Summarization deduplication correctness (no API keys)', () => {
     );
 
     // At least one summarization should have fired
-    expect(totalSumCount).toBeGreaterThanOrEqual(1);
+    expect(totalSumCount).toBeGreaterThan(cycle1SumCount);
 
     // Every summary should have exactly one ## Goal (no duplicates)
     for (let i = 0; i < totalSumCount; i++) {
       const complete = spies.onSummarizeCompleteSpy.mock.calls[
         i
       ][0] as t.SummarizeCompleteEvent;
+      expect(complete.error).toBeUndefined();
       const text = getSummaryText(complete.summary);
       const goalCount = (text.match(/## Goal/g) || []).length;
       if (goalCount !== 1) {
@@ -3455,6 +3469,7 @@ describe('Summarization deduplication correctness (no API keys)', () => {
           maxContextTokens: maxTokens,
           summarizationEnabled: true,
           summarizationConfig: {
+            ...LOCAL_SUMMARY_CONFIG,
             provider: Providers.OPENAI,
             parameters: {},
           },
@@ -3484,7 +3499,8 @@ describe('Summarization deduplication correctness (no API keys)', () => {
     }
 
     // Trigger summarization
-    let run = await createRunHelper(100);
+    addDeterministicSummarizationPressure(conversationHistory, 'continue-checkpoint', 4);
+    let run = await createRunHelper(1024);
     run.Graph?.overrideTestModel(['Summary acknowledged.'], 1);
     try {
       await runTurn({ run, conversationHistory }, 'Continue.', streamConfig);
