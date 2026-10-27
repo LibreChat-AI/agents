@@ -11,6 +11,13 @@ const MAX_ATTEMPTS = 3;
 const BACKOFF_MS = 250;
 const MAX_ERROR_DEPTH = 4;
 
+export class ReasoningOnlySummaryError extends Error {
+  constructor() {
+    super('The summarizer returned reasoning without summary text');
+    this.name = 'ReasoningOnlySummaryError';
+  }
+}
+
 interface ProviderError {
   name?: string;
   code?: string | number;
@@ -66,7 +73,7 @@ function describeFailure(error: unknown): {
   let errorCode: SummarizationErrorCode = isContextOverflowError(error)
     ? 'context_exceeded'
     : 'unknown';
-  let retryable = false;
+  let retryable = error instanceof ReasoningOnlySummaryError;
 
   for (const cause of errorChain(error)) {
     const record: ProviderError =

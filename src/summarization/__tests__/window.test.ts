@@ -53,6 +53,33 @@ class SummaryModel extends FakeChatModel {
   }
 }
 
+class ReasoningOnlyModel extends SummaryModel {
+  constructor(private readonly reasoningAttempts: number) {
+    super();
+  }
+
+  override async *_streamResponseChunks(
+    messages: BaseMessage[]
+  ): AsyncGenerator<ChatGenerationChunk> {
+    if (this.calls.length >= this.reasoningAttempts) {
+      yield* super._streamResponseChunks(messages);
+      return;
+    }
+    this.calls.push(messages);
+    yield new ChatGenerationChunk({
+      text: '',
+      message: new AIMessageChunk({
+        content: [{ type: 'thinking', thinking: 'PRIVATE_REASONING_ONLY' }],
+        usage_metadata: {
+          input_tokens: 100,
+          output_tokens: 74,
+          total_tokens: 174,
+        },
+      }),
+    });
+  }
+}
+
 function history(turns: number): BaseMessage[] {
   const result: BaseMessage[] = [];
   for (let i = 0; i < turns; i++) {
@@ -740,14 +767,16 @@ describe('compaction request windows', () => {
       },
     });
     const invokeOnly = new SummaryModel();
-    Object.defineProperty(invokeOnly, 'stream', {value: undefined});
-    jest.spyOn(invokeOnly, 'invoke').mockResolvedValue(new AIMessageChunk('CLEAN_SUMMARY'));
+    Object.defineProperty(invokeOnly, 'stream', { value: undefined });
+    jest
+      .spyOn(invokeOnly, 'invoke')
+      .mockResolvedValue(new AIMessageChunk('CLEAN_SUMMARY'));
     jest
       .spyOn(init, 'initializeModel')
       .mockImplementation(({ clientOptions }) => {
         const name = resolveClientOptionsModel(clientOptions);
         if (name === 'failed') return failed;
-        return name === 'invoke-only' ? (invokeOnly) : primary;
+        return name === 'invoke-only' ? invokeOnly : primary;
       });
     const messages = history(6);
     await node(
@@ -892,6 +921,167 @@ describe('compaction request windows', () => {
     expect(agentContext.getSummaryText()).toBe('CLEAN_SUMMARY');
   });
 
+  it.each(['manual', 'trigger'] as const)(
+    'retries reasoning-only %s summaries without changing the cached request or leaking partial output',
+    async (reason) => {
+      jest.useFakeTimers();
+      const model = new ReasoningOnlyModel(1);
+      const { node, emitted, agentContext, graph } = harness({
+        model,
+        provider: Providers.ANTHROPIC,
+      });
+      const messages = history(6);
+      const pending = node(
+        {
+          messages,
+          summarizationRequest: {
+            agentId: 'agent',
+            remainingContextTokens: 0,
+            reason,
+            windowMessages: messages,
+          },
+        },
+        {}
+      );
+      await jest.runAllTimersAsync();
+      const result = await pending;
+      expect(model.calls).toHaveLength(2);
+      expect(model.calls[1]).toEqual(model.calls[0]);
+      expect(agentContext.getSummaryText()).toBe('CLEAN_SUMMARY');
+      expect(agentContext.summarizationFailures).toBe(0);
+      expect(graph.dispatchRunStep).toHaveBeenCalledTimes(1);
+      expect(result.messages?.[0].getType()).toBe('remove');
+      const deltas = emitted.filter(
+        ({ event }) => event === GraphEvents.ON_SUMMARIZE_DELTA
+      );
+      expect(deltas).toHaveLength(2);
+      expect(JSON.stringify(deltas)).not.toContain('PRIVATE_REASONING_ONLY');
+      expect(
+        emitted.filter(
+          ({ event }) => event === GraphEvents.ON_SUMMARIZE_COMPLETE
+        )
+      ).toHaveLength(1);
+    }
+  );
+
+  it('keeps history and publishes no reasoning after reasoning-only retry exhaustion', async () => {
+    jest.useFakeTimers();
+    const model = new ReasoningOnlyModel(3);
+    const { node, emitted, agentContext } = harness({
+      model,
+      provider: Providers.ANTHROPIC,
+    });
+    const messages = history(6);
+    const before = JSON.stringify(messages);
+    const pending = node(
+      {
+        messages,
+        summarizationRequest: {
+          agentId: 'agent',
+          remainingContextTokens: 0,
+          windowMessages: messages,
+        },
+      },
+      {}
+    );
+    await jest.runAllTimersAsync();
+    const result = await pending;
+    expect(model.calls).toHaveLength(3);
+    expect(result.messages).toBeUndefined();
+    expect(agentContext.getSummaryText()).toBeUndefined();
+    expect(agentContext.summarizationFailures).toBe(1);
+    expect(JSON.stringify(messages)).toBe(before);
+    expect(
+      emitted.filter(({ event }) => event === GraphEvents.ON_SUMMARIZE_DELTA)
+    ).toHaveLength(0);
+    const completed = emitted.filter(
+      ({ event }) => event === GraphEvents.ON_SUMMARIZE_COMPLETE
+    );
+    expect(completed).toHaveLength(1);
+    expect(completed[0].data).toMatchObject({ errorCode: 'unknown' });
+    expect(JSON.stringify(completed)).not.toContain('PRIVATE_REASONING_ONLY');
+  });
+
+  it('tries the configured fallback after reasoning-only primary retries are exhausted', async () => {
+    jest.useFakeTimers();
+    const primary = new ReasoningOnlyModel(3);
+    const fallback = new SummaryModel();
+    const { node, emitted, agentContext } = harness({
+      model: primary,
+      clientOptions: {
+        fallbacks: [
+          {
+            provider: Providers.ANTHROPIC,
+            clientOptions: { model: 'fallback' },
+          },
+        ],
+      },
+    });
+    jest
+      .spyOn(init, 'initializeModel')
+      .mockImplementation(({ provider }) =>
+        provider === Providers.ANTHROPIC ? fallback : primary
+      );
+    const messages = history(6);
+    const pending = node(
+      {
+        messages,
+        summarizationRequest: {
+          agentId: 'agent',
+          remainingContextTokens: 0,
+          windowMessages: messages,
+        },
+      },
+      {}
+    );
+    await jest.runAllTimersAsync();
+    await pending;
+    expect(primary.calls).toHaveLength(3);
+    expect(fallback.calls).toHaveLength(1);
+    expect(agentContext.getSummaryText()).toBe('CLEAN_SUMMARY');
+    const deltas = emitted.filter(
+      ({ event }) => event === GraphEvents.ON_SUMMARIZE_DELTA
+    );
+    expect(deltas).toHaveLength(2);
+    expect(JSON.stringify(deltas)).not.toContain('PRIVATE_REASONING_ONLY');
+  });
+
+  it.each([
+    { response_metadata: { stop_reason: 'max_tokens' } },
+    { response_metadata: { stop_reason: 'refusal' } },
+    { response_metadata: { stop_reason: 'stop_sequence' } },
+    { additional_kwargs: { refusal: 'Cannot comply' } },
+    { tool_calls: [{ id: 'tool', name: 'search', args: {} }] },
+  ])(
+    'does not retry known truncation, refusal, or tool-use outcomes as reasoning-only: %j',
+    async (extra) => {
+      const model = new SummaryModel();
+      Object.defineProperty(model, 'stream', { value: undefined });
+      const invoke = jest.spyOn(model, 'invoke').mockResolvedValue(
+        new AIMessageChunk({
+          content: [{ type: 'thinking', thinking: 'PRIVATE_REASONING_ONLY' }],
+          ...extra,
+        })
+      );
+      const { node, agentContext } = harness({ model });
+      const messages = history(6);
+      const result = await node(
+        {
+          messages,
+          summarizationRequest: {
+            agentId: 'agent',
+            remainingContextTokens: 0,
+            windowMessages: messages,
+          },
+        },
+        {}
+      );
+      expect(invoke).toHaveBeenCalledTimes(1);
+      expect(result.messages).toBeUndefined();
+      expect(agentContext.getSummaryText()).toBeUndefined();
+    }
+  );
+
   const cancellations = [
     Object.assign(new Error('SDK failure'), { name: 'CancelledError' }),
     Object.assign(new Error('SDK failure'), { name: 'CanceledError' }),
@@ -973,7 +1163,7 @@ describe('compaction request windows', () => {
       primary.failure = () => new Error('Primary failed');
       failed.failure = () => new Error('Fallback failed');
       const empty = new SummaryModel();
-      Object.defineProperty(empty, 'stream', {value: undefined});
+      Object.defineProperty(empty, 'stream', { value: undefined });
       jest.spyOn(empty, 'invoke').mockResolvedValue(new AIMessageChunk(''));
       const { node, emitted, agentContext } = harness({
         model: primary,
@@ -996,7 +1186,7 @@ describe('compaction request windows', () => {
         .mockImplementation(({ clientOptions }) => {
           const name = resolveClientOptionsModel(clientOptions);
           if (name === 'failed') return failed;
-          return name === 'empty' ? (empty) : primary;
+          return name === 'empty' ? empty : primary;
         });
       const messages = history(6);
       const before = JSON.stringify(messages);

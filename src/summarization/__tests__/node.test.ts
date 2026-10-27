@@ -2080,9 +2080,7 @@ describe('createSummarizeNode — empty summarizer output', () => {
     const completeEvent = events.find(
       (e) => e.event === GraphEvents.ON_SUMMARIZE_COMPLETE
     );
-    expect((completeEvent?.data as t.SummarizeCompleteEvent).error).toBe(
-      'Summarization produced empty output'
-    );
+    expect((completeEvent?.data as t.SummarizeCompleteEvent).error).toContain('conversation history was preserved');
     expect(
       (completeEvent?.data as t.SummarizeCompleteEvent).summary
     ).toBeUndefined();

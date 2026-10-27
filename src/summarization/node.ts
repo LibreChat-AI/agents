@@ -39,6 +39,7 @@ import {
   DEFAULT_SUMMARY_OUTPUT_TOKENS,
   DEFAULT_RETAIN_RECENT_TOKENS,
 } from './input';
+import { classifySummarizationError, withSummarizationRetry, ReasoningOnlySummaryError } from './retry';
 import {
   createTokenCounter,
   encodingForModel,
@@ -56,16 +57,17 @@ import {
   resolveClientOptionsModel,
 } from '@/llm/request';
 import { renderCompactionSemanticIndex } from '@/summarization/semanticIndex';
-import { classifySummarizationError, withSummarizationRetry } from './retry';
 import { ProviderTextProtectionError } from '@/protection/providerText';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { prepareProviderRequest } from '@/llm/prepareProviderRequest';
 import { prepareToolsForPromptCache } from '@/llm/promptCacheTools';
+import { isReasoningContentBlock } from '@/messages/reasoningTypes';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { serializeToolContentBounded } from '@/utils/toolContent';
 import { makeIsDeferred } from '@/messages/anthropicToolCache';
 import { createRemoveAllMessage } from '@/messages/reducer';
 import { getProviderFamily } from '@/llm/providerRegistry';
+import { getTruncationStopReason } from '@/llm/truncation';
 import { isProviderCancellation } from '@/utils/errors';
 import { initializeModel } from '@/llm/init';
 import { getChunkContent } from '@/stream';
@@ -1767,6 +1769,23 @@ function extractResponseText(response: { content: string | object }): string {
   return parts.join('').trim();
 }
 
+function isReasoningOnlySummary(response: BaseMessage): boolean {
+  const metadata = response.response_metadata as {stop_reason?: string; finish_reason?: string} | undefined;
+  const kwargs = response.additional_kwargs as {refusal?: string} | undefined;
+  const stopReason = metadata?.stop_reason ?? metadata?.finish_reason;
+  if (getTruncationStopReason(response) != null || kwargs?.refusal != null ||
+    stopReason === 'refusal' || stopReason === 'content_filter' || stopReason === 'stop_sequence') return false;
+  if ('tool_calls' in response && Array.isArray(response.tool_calls) && response.tool_calls.length > 0) return false;
+  if ('invalid_tool_calls' in response && Array.isArray(response.invalid_tool_calls) && response.invalid_tool_calls.length > 0) return false;
+  if (!Array.isArray(response.content)) return false;
+  let hasReasoning = false;
+  for (const block of response.content) {
+    if (isReasoningContentBlock(block)) {hasReasoning = true; continue;}
+    if (block.type !== 'text' || typeof block.text !== 'string' || block.text.trim() !== '') return false;
+  }
+  return hasReasoning;
+}
+
 /** Creates an `onChunk` callback that dispatches `ON_SUMMARIZE_DELTA` events for streaming. */
 export function createSummarizationChunkHandler({
   stepId,
@@ -2050,6 +2069,7 @@ async function summarizeWithCacheHit({
       );
       signalConfig?.signal?.throwIfAborted();
       const response = result.messages?.[0];
+      if (response != null && isReasoningOnlySummary(response)) throw new ReasoningOnlySummaryError();
       if (response != null && extractResponseText(response) !== '') {
         await flushSummarizationDeltas(pendingDeltas, config, graph);
       }

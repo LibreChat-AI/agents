@@ -1,5 +1,6 @@
 import {
   classifySummarizationError,
+  ReasoningOnlySummaryError,
   withSummarizationRetry,
 } from '@/summarization/retry';
 import { ProviderTextProtectionError } from '@/protection/providerText';
@@ -15,6 +16,7 @@ function streamLimitError(): StreamLimitExceededError {
 }
 
 const transientErrors = [
+  ['reasoning-only summary', new ReasoningOnlySummaryError()],
   ['overload status', { status: 529 }],
   ['overload stream event', { error: { type: 'overloaded_error' } }],
   ['overload message', new Error('Overloaded')],
