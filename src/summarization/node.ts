@@ -679,6 +679,8 @@ async function executeSummarizationWithFallback(params: {
 }): Promise<{
   text: string;
   usage?: Partial<UsageMetadata>;
+  provider: string;
+  model?: string;
   errorCode?: t.SummarizationErrorCode;
 }> {
   const {
@@ -697,6 +699,8 @@ async function executeSummarizationWithFallback(params: {
   const priorSummaryText = agentContext.getSummaryText()?.trim() ?? '';
 
   let summaryText = '';
+  let summaryProvider = clientConfig.provider;
+  let summaryModel = clientConfig.modelName;
   let summaryUsage: Partial<UsageMetadata> | undefined;
   let errorCode: t.SummarizationErrorCode | undefined;
 
@@ -851,6 +855,7 @@ async function executeSummarizationWithFallback(params: {
             maxContextTokens,
           } as t.FallbackConfig;
         });
+        let fallbackIdentity: {provider: string; model?: string} | undefined;
         const pendingDeltas: t.SummarizeDeltaEvent[] = [];
         const onChunk = createSummarizationChunkHandler({
           pendingDeltas,
@@ -895,12 +900,14 @@ async function executeSummarizationWithFallback(params: {
             });
             const history =
               system == null ? bounded : await system.invoke(bounded, config);
-            return prepareProviderRequest({
+            const request = prepareProviderRequest({
               model,
               messages: [...history, new HumanMessage(instruction)],
               provider,
               config,
             });
+            fallbackIdentity = {provider, model: request.modelId ?? resolveClientOptionsModel(clientOptions)};
+            return request;
           },
           config: withBreakerSignal(
             traceConfig(summarizeConfig, 'cache_hit_compaction'),
@@ -917,12 +924,16 @@ async function executeSummarizationWithFallback(params: {
           summaryText = extractResponseText(
             fbMsg as { content: string | object }
           );
-          if (summaryText !== '')
+          if (summaryText !== '') {
+            if (fallbackIdentity == null) throw new Error('Missing successful fallback identity', {cause: primaryError});
+            summaryProvider = fallbackIdentity.provider;
+            summaryModel = fallbackIdentity.model;
             await flushSummarizationDeltas(
               pendingDeltas,
               summarizeConfig,
               graph
             );
+          }
         }
       } catch (fbErr) {
         const trip = findStreamLimitAbortReason(
@@ -966,6 +977,8 @@ async function executeSummarizationWithFallback(params: {
   return {
     text: summaryText,
     usage: summaryUsage,
+    provider: summaryProvider,
+    model: summaryModel,
     ...(summaryText === '' ? { errorCode } : {}),
   };
 }
@@ -1556,6 +1569,8 @@ export function createSummarizeNode({
     const {
       text: rawText,
       usage: summaryUsage,
+      provider: summaryProvider,
+      model: summaryModel,
       errorCode,
     } = await executeSummarizationWithFallback({
       agentContext,
@@ -1694,8 +1709,8 @@ export function createSummarizeNode({
       coverage: resolveSummaryCoverage(messagesToRetain),
       stepId,
       stepIndex: runStep.index,
-      modelName: clientConfig.modelName,
-      provider: clientConfig.provider,
+      modelName: summaryModel,
+      provider: summaryProvider,
       summaryVersion: agentContext.summaryVersion,
     });
 
@@ -1771,8 +1786,8 @@ function extractResponseText(response: { content: string | object }): string {
 
 function isReasoningOnlySummary(response: BaseMessage): boolean {
   const metadata = response.response_metadata as {stop_reason?: string; finish_reason?: string} | undefined;
-  const kwargs = response.additional_kwargs as {refusal?: string} | undefined;
-  const stopReason = metadata?.stop_reason ?? metadata?.finish_reason;
+  const kwargs = response.additional_kwargs as {refusal?: string; stop_reason?: string} | undefined;
+  const stopReason = kwargs?.stop_reason ?? metadata?.stop_reason ?? metadata?.finish_reason;
   if (getTruncationStopReason(response) != null || kwargs?.refusal != null ||
     stopReason === 'refusal' || stopReason === 'content_filter' || stopReason === 'stop_sequence') return false;
   if ('tool_calls' in response && Array.isArray(response.tool_calls) && response.tool_calls.length > 0) return false;

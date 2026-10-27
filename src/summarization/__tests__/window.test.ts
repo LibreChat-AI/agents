@@ -5,7 +5,7 @@ import {
   HumanMessage,
   ToolMessage,
 } from '@langchain/core/messages';
-import type { BaseMessage } from '@langchain/core/messages';
+import type { BaseMessage, UsageMetadata } from '@langchain/core/messages';
 import type * as t from '@/types';
 import { createSummarizeNode } from '@/summarization/node';
 import { resolveClientOptionsModel } from '@/llm/request';
@@ -25,6 +25,7 @@ const count: t.TokenCounter = (message) =>
 class SummaryModel extends FakeChatModel {
   readonly calls: BaseMessage[][] = [];
   failure?: (messages: BaseMessage[], attempt: number) => Error | undefined;
+  summaryUsage?: UsageMetadata;
 
   constructor() {
     super({ responses: ['CLEAN_SUMMARY'] });
@@ -48,13 +49,19 @@ class SummaryModel extends FakeChatModel {
     });
     yield new ChatGenerationChunk({
       text: 'SUMMARY',
-      message: new AIMessageChunk({ content: 'SUMMARY' }),
+      message: new AIMessageChunk({
+        content: 'SUMMARY',
+        usage_metadata: this.summaryUsage,
+      }),
     });
   }
 }
 
 class ReasoningOnlyModel extends SummaryModel {
-  constructor(private readonly reasoningAttempts: number) {
+  constructor(
+    private readonly reasoningAttempts: number,
+    private readonly stopReason?: string
+  ) {
     super();
   }
 
@@ -70,6 +77,8 @@ class ReasoningOnlyModel extends SummaryModel {
       text: '',
       message: new AIMessageChunk({
         content: [{ type: 'thinking', thinking: 'PRIVATE_REASONING_ONLY' }],
+        additional_kwargs:
+          this.stopReason == null ? {} : { stop_reason: this.stopReason },
         usage_metadata: {
           input_tokens: 100,
           output_tokens: 74,
@@ -135,7 +144,7 @@ function harness({
     contentIndexMap: new Map<string, number>(),
     isMultiAgent: false,
     streamLimits: resolveStreamLimits({ maxDeltaEventsPerTurn: 2 }),
-    dispatchRunStep: jest.fn(async (): Promise<void> => {}),
+    dispatchRunStep: jest.fn(async (_step: t.RunStep): Promise<void> => {}),
     dispatchRunStepCompleted: jest.fn(async (): Promise<void> => {}),
     closeRunStep: jest.fn(async (): Promise<void> => {}),
   };
@@ -1079,6 +1088,123 @@ describe('compaction request windows', () => {
       expect(invoke).toHaveBeenCalledTimes(1);
       expect(result.messages).toBeUndefined();
       expect(agentContext.getSummaryText()).toBeUndefined();
+    }
+  );
+
+  it.each(['stream', 'invoke'] as const)(
+    'keeps successful fallback identity and usage together in %s completions',
+    async (mode) => {
+      const primary = new SummaryModel();
+      const failed = new SummaryModel();
+      const successful = new SummaryModel();
+      primary.failure = () => new Error('Primary failed');
+      failed.failure = () => new Error('First fallback failed');
+      const usage = { input_tokens: 321, output_tokens: 45, total_tokens: 366 };
+      successful.summaryUsage = usage;
+      if (mode === 'invoke') {
+        Object.defineProperty(successful, 'stream', { value: undefined });
+        jest.spyOn(successful, 'invoke').mockResolvedValue(
+          new AIMessageChunk({
+            content: 'CLEAN_SUMMARY',
+            usage_metadata: usage,
+          })
+        );
+      }
+      const { node, emitted, graph } = harness({
+        model: primary,
+        clientOptions: {
+          model: 'primary',
+          fallbacks: [
+            { provider: Providers.OPENAI, clientOptions: { model: 'failed' } },
+            {
+              provider: Providers.ANTHROPIC,
+              clientOptions: { modelName: 'successful' },
+            },
+          ],
+        },
+        summarizationConfig: {
+          model: 'primary-summary',
+          maxSummaryTokens: 128,
+        },
+      });
+      jest
+        .spyOn(init, 'initializeModel')
+        .mockImplementation(({ clientOptions }) => {
+          const name = resolveClientOptionsModel(clientOptions);
+          if (name === 'failed') return failed;
+          return name === 'successful' ? successful : primary;
+        });
+      const messages = history(6);
+      await node(
+        {
+          messages,
+          summarizationRequest: {
+            agentId: 'agent',
+            remainingContextTokens: 0,
+            windowMessages: messages,
+          },
+        },
+        {}
+      );
+      const completed = emitted.filter(
+        ({ event }) => event === GraphEvents.ON_SUMMARIZE_COMPLETE
+      );
+      expect(completed).toHaveLength(1);
+      expect(completed[0].data).toMatchObject({
+        summary: { provider: Providers.ANTHROPIC, model: 'successful' },
+      });
+      const step = graph.dispatchRunStep.mock.calls[0][0];
+      expect(step.summary).toMatchObject({
+        provider: Providers.ANTHROPIC,
+        model: 'successful',
+      });
+      expect(step.usage).toEqual({
+        prompt_tokens: 321,
+        completion_tokens: 45,
+        total_tokens: 366,
+      });
+      expect(graph.dispatchRunStepCompleted).toHaveBeenCalledWith(
+        'summary-step',
+        expect.objectContaining({
+          summary: expect.objectContaining({
+            provider: Providers.ANTHROPIC,
+            model: 'successful',
+          }),
+        }),
+        expect.anything()
+      );
+    }
+  );
+
+  it.each(['refusal', 'stop_sequence', 'max_tokens'] as const)(
+    'does not retry a reasoning-only stream terminated by %s',
+    async (stopReason) => {
+      jest.useFakeTimers();
+      const model = new ReasoningOnlyModel(3, stopReason);
+      const { node, emitted, agentContext } = harness({
+        model,
+        provider: Providers.ANTHROPIC,
+      });
+      const messages = history(6);
+      const pending = node(
+        {
+          messages,
+          summarizationRequest: {
+            agentId: 'agent',
+            remainingContextTokens: 0,
+            windowMessages: messages,
+          },
+        },
+        {}
+      );
+      await jest.runAllTimersAsync();
+      const result = await pending;
+      expect(model.calls).toHaveLength(1);
+      expect(result.messages).toBeUndefined();
+      expect(agentContext.getSummaryText()).toBeUndefined();
+      expect(
+        emitted.filter(({ event }) => event === GraphEvents.ON_SUMMARIZE_DELTA)
+      ).toHaveLength(0);
     }
   );
 
