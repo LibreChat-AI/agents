@@ -1487,6 +1487,8 @@ export function createSummarizeNode({
       config?.signal
     );
     if (commitTrip != null) throw commitTrip;
+    runnableConfig?.signal?.throwIfAborted();
+    entryBreakerSignal?.throwIfAborted();
     if (usedIntraTurnFallback) {
       agentContext.setSummary(summaryText, tokenCount, {
         precedesMessages: true,

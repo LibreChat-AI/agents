@@ -863,3 +863,34 @@ describe('splitAtRecencyBoundary', () => {
     });
   });
 });
+
+describe('pruned windows that begin inside a tool-running turn', () => {
+  const units = (native: boolean): BaseMessage[] => Array.from({length: 4}, (_, i) => native ? [
+    new AIMessage({content: [{type: 'tool_use', id: `call-${i}`, name: 'search', input: {}}]}),
+    new HumanMessage({content: [{type: 'tool_result', tool_use_id: `call-${i}`, content: `result ${i}`}]}),
+  ] : [
+    new AIMessage({content: '', tool_calls: [{id: `call-${i}`, name: 'search', args: {}}]}),
+    new ToolMessage({content: `result ${i}`, tool_call_id: `call-${i}`}),
+  ]).flat();
+
+  it.each([false, true])('retains a bounded, paired tool tail without a user message (native=%s)', (native) => {
+    const messages = units(native);
+    const split = splitAtRecencyBoundary(messages, {turns: 2, tokens: 30, tokenCounter: () => 10});
+    expect(split.head).toEqual(messages.slice(0, -2));
+    expect(split.tail).toEqual(messages.slice(-2));
+    expect(split.usedIntraTurnFallback).toBe(true);
+  });
+
+  it('retains an entire indivisible newest exchange when its budget is smaller', () => {
+    const messages = units(false).slice(-2);
+    const split = splitAtRecencyBoundary(messages, {tokens: 5, tokenCounter: () => 10});
+    expect(split.tail).toEqual(messages);
+  });
+
+  it('honors an explicitly disabled recent tail', () => {
+    const messages = units(false);
+    const split = splitAtRecencyBoundary(messages, {turns: 0, tokens: 30, tokenCounter: () => 10});
+    expect(split.head).toBe(messages);
+    expect(split.tail).toEqual([]);
+  });
+});

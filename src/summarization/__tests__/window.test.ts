@@ -72,12 +72,14 @@ function harness({
   model = new SummaryModel(),
   provider = Providers.OPENAI,
   clientOptions,
+  tokenCounter = count,
   summarizationConfig = { maxSummaryTokens: 128 },
 }: {
   maxContextTokens?: number;
   model?: SummaryModel;
   provider?: Providers;
   clientOptions?: t.ClientOptions;
+  tokenCounter?: t.TokenCounter;
   summarizationConfig?: t.SummarizationConfig;
 } = {}) {
   const agentContext = AgentContext.fromConfig(
@@ -90,7 +92,7 @@ function harness({
       summarizationEnabled: true,
       summarizationConfig,
     },
-    count
+    tokenCounter
   );
   const emitted: Array<{ event: string; data: t.StreamEventData }> = [];
   jest
@@ -196,6 +198,47 @@ describe('compaction request windows', () => {
       expect(model.calls).toHaveLength(1);
       expect(agentContext.getSummaryText()).toBe('CLEAN_SUMMARY');
       expect(result.messages?.slice(1)).toEqual(windowMessages);
+    }
+  );
+
+  it.each(['manual', 'trigger', 'overflow'] as const)(
+    'keeps paired recent tool results when the %s window starts mid-turn',
+    async (reason) => {
+      const { node, model } = harness({
+        summarizationConfig: {
+          maxSummaryTokens: 128,
+          retainRecent: { tokens: 30 },
+        },
+      });
+      const windowMessages: BaseMessage[] = [];
+      for (let i = 0; i < 4; i++) {
+        windowMessages.push(
+          new AIMessage({
+            content: '',
+            tool_calls: [{ id: `call-${i}`, name: 'search', args: {} }],
+          })
+        );
+        windowMessages.push(
+          new ToolMessage({ content: `result ${i}`, tool_call_id: `call-${i}` })
+        );
+      }
+      const messages = [...history(100), ...windowMessages];
+      const result = await node(
+        {
+          messages,
+          summarizationRequest: {
+            agentId: 'agent',
+            remainingContextTokens: 0,
+            reason,
+            allowSummarization: true,
+            windowMessages,
+          },
+        },
+        {}
+      );
+      expect(model.calls).toHaveLength(1);
+      expect(result.messages?.slice(1)).toEqual(windowMessages.slice(-4));
+      expect(result.messages?.at(-1)).toBe(windowMessages.at(-1));
     }
   );
 
@@ -418,7 +461,9 @@ describe('compaction request windows', () => {
       customHandlers: {
         [GraphEvents.CHAT_MODEL_STREAM]: new ChatModelStreamHandler(),
         [GraphEvents.ON_MESSAGE_DELTA]: {
-          handle: (): void => { ordinaryDeltaCount++; },
+          handle: (): void => {
+            ordinaryDeltaCount++;
+          },
         },
         [GraphEvents.ON_SUMMARIZE_COMPLETE]: {
           handle: (_event, data): void => {
@@ -440,6 +485,35 @@ describe('compaction request windows', () => {
     expect(summaries).toHaveLength(1);
     expect(JSON.stringify(summaries)).toContain('CLEAN_SUMMARY');
     expect(JSON.stringify(summaries)).not.toContain('FAILED_ONLY');
+  });
+
+  it('does not commit a summary when cancellation arrives during final token counting', async () => {
+    const controller = new AbortController();
+    const reason = new DOMException('Cancelled by user', 'AbortError');
+    const { node, agentContext, model } = harness({
+      tokenCounter: (message) => {
+        if (String(message.content).includes('CLEAN_SUMMARY'))
+          controller.abort(reason);
+        return count(message);
+      },
+    });
+    const messages = history(6);
+    await expect(
+      node(
+        {
+          messages,
+          summarizationRequest: {
+            agentId: 'agent',
+            remainingContextTokens: 0,
+            windowMessages: messages,
+          },
+        },
+        { signal: controller.signal }
+      )
+    ).rejects.toBe(reason);
+    expect(model.calls).toHaveLength(1);
+    expect(agentContext.getSummaryText()).toBeUndefined();
+    expect(agentContext.summaryVersion).toBe(0);
   });
 
   it('preserves automatic history and reports a safe code after retry exhaustion', async () => {

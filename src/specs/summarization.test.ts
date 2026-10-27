@@ -972,7 +972,7 @@ const hasAnthropic = hasEnv('ANTHROPIC_API_KEY');
     };
 
     const createRun = async (
-      maxTokens = 3000
+      maxTokens = 6000
     ): Promise<{
       run: Run<t.IState>;
       contentParts: t.MessageContentComplex[];
@@ -994,6 +994,7 @@ const hasAnthropic = hasEnv('ANTHROPIC_API_KEY');
         spies,
         tokenCounter,
         indexTokenCountMap,
+        maxSummaryTokens: 2048,
         llmConfigOverride: {
           model: 'claude-sonnet-4-5',
           thinking: {
@@ -1062,7 +1063,7 @@ const hasAnthropic = hasEnv('ANTHROPIC_API_KEY');
 
     // Turn 5: tighter context to trigger summarization
     if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
-      ({ run, contentParts } = await createRun(2500));
+      ({ run, contentParts } = await createRun(5000));
       await runTurn(
         { run, conversationHistory },
         'What is 999 * 999? Use the calculator.',
@@ -1082,7 +1083,7 @@ const hasAnthropic = hasEnv('ANTHROPIC_API_KEY');
         conversationHistory,
         'anthropic-thinking'
       );
-      ({ run, contentParts } = await createRun(2500));
+      ({ run, contentParts } = await createRun(5000));
       await runTurn(
         { run, conversationHistory },
         'What is 42 * 42? Use the calculator.',

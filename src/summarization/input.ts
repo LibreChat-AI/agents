@@ -31,40 +31,61 @@ export function boundSummarizationInput({
   provider: ProviderName;
   shrink?: boolean;
 }): BaseMessage[] {
-  const count = (message: BaseMessage): number => tokenCounter(message);
+  const counts = new WeakMap<BaseMessage, number>();
+  const count = (message: BaseMessage): number => {
+    const cached = counts.get(message);
+    if (cached != null) return cached;
+    const tokens = tokenCounter(message);
+    counts.set(message, tokens);
+    return tokens;
+  };
   let total = 0;
   for (const message of messages) total += count(message);
   if (!shrink && total <= budget) return messages;
   if (budget <= 0) throw new SummarizationInputTooLargeError();
 
-  let toolCount = 0;
-  for (const message of messages) {
-    if (message instanceof ToolMessage) toolCount++;
+  const minimal = messages.map((message) => {
+    if (!(message instanceof ToolMessage)) return message;
+    const result = compactToolContent(message.content, 0);
+    if (!result.changed) return message;
+    const candidate = cloneToolMessageWithContent(message, result.content);
+    return count(candidate) < count(message) ? candidate : message;
+  });
+  const minimumSuffix = new Array<number>(messages.length + 1);
+  const toolCounts = new Array<number>(messages.length + 1);
+  minimumSuffix[messages.length] = 0;
+  toolCounts[messages.length] = 0;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    minimumSuffix[i] = minimumSuffix[i + 1] + count(minimal[i]);
+    toolCounts[i] = toolCounts[i + 1] + Number(messages[i] instanceof ToolMessage);
   }
-  const maxToolChars = Math.max(
-    0,
-    Math.floor((budget * 2) / Math.max(1, toolCount))
-  );
-  const compacted =
-    toolCount === 0
-      ? messages
-      : messages.map((message) => {
-        if (!(message instanceof ToolMessage)) return message;
-        const result = compactToolContent(message.content, maxToolChars);
-        return result.changed
-          ? cloneToolMessageWithContent(message, result.content)
-          : message;
-      });
-  const suffixTokens = new Array<number>(compacted.length + 1);
-  suffixTokens[compacted.length] = 0;
-  for (let i = compacted.length - 1; i >= 0; i--) {
-    suffixTokens[i] = suffixTokens[i + 1] + count(compacted[i]);
-  }
-  const starts = getPairingBalancedSuffixStarts(compacted, provider);
-  for (const start of starts) {
-    if (suffixTokens[start] <= budget) {
-      return start === 0 ? compacted : compacted.slice(start);
+  const starts = getPairingBalancedSuffixStarts(messages, provider);
+  const start = starts.find((index) => minimumSuffix[index] <= budget);
+  if (start == null) throw new SummarizationInputTooLargeError();
+
+  const additionalTokens = budget - minimumSuffix[start];
+  const maxChars = Math.max(0, Math.floor((additionalTokens * 2) / Math.max(1, toolCounts[start])));
+  for (const scale of [1, 0.5, 0.25, 0.125, 0]) {
+    let tokens = 0;
+    const candidate: BaseMessage[] = [];
+    for (let i = start; i < messages.length; i++) {
+      const original = messages[i];
+      let message = original;
+      if (original instanceof ToolMessage) {
+        message = minimal[i];
+        if (scale > 0) {
+          const result = compactToolContent(original.content, Math.floor(maxChars * scale));
+          if (!result.changed) message = original;
+          else {
+            const compacted = cloneToolMessageWithContent(original, result.content);
+            message = count(compacted) < count(original) ? compacted : original;
+          }
+        }
+      }
+      tokens += count(message);
+      candidate.push(message);
     }
+    if (tokens <= budget) return candidate;
   }
   throw new SummarizationInputTooLargeError();
 }
