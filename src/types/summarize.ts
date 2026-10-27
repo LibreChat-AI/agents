@@ -1,4 +1,4 @@
-import type { BaseMessage } from '@langchain/core/messages';
+import type { UsageMetadata, BaseMessage } from '@langchain/core/messages';
 import type { SummaryContentBlock } from '@/types/stream';
 import type { ProviderName } from '@/types/llm';
 
@@ -174,10 +174,17 @@ export type SummarizationErrorCode =
   | 'timeout'
   | 'unknown';
 
+export interface SummarizationAttemptUsage {
+  provider: ProviderName;
+  model?: string;
+  usage: Partial<UsageMetadata>;
+}
+
 export interface SummarizeCompleteEvent {
   id: string;
   agentId: string;
   summary?: SummaryContentBlock;
   error?: string;
   errorCode?: SummarizationErrorCode;
+  attemptUsage?: readonly SummarizationAttemptUsage[];
 }

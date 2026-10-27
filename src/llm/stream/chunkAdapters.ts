@@ -159,7 +159,7 @@ export function hasToolCallChunks(message: AIMessageChunk): boolean {
   return (message.tool_call_chunks?.length ?? 0) > 0;
 }
 
-export function hasReasoningKwargs(message: AIMessageChunk): boolean {
+export function hasReasoningKwargs(message: Pick<AIMessageChunk, 'additional_kwargs'>): boolean {
   const kwargs = message.additional_kwargs;
   if (
     typeof kwargs.reasoning_content === 'string' &&

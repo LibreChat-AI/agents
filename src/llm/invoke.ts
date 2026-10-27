@@ -1622,8 +1622,11 @@ export async function tryFallbackProviders({
   overflowContext,
   prepareProviderRequest: prepareFallbackRequest,
   prepareProviderMessages,
+  invokeModel = attemptInvoke,
 }: {
   fallbacks: t.FallbackConfig[];
+  /** Allows callers to retry or validate a completed provider attempt. */
+  invokeModel?: typeof attemptInvoke;
   tools?: t.GraphTools;
   disableToolCalling?: boolean;
   messages: BaseMessage[];
@@ -1756,7 +1759,7 @@ export async function tryFallbackProviders({
       }
       config?.signal?.throwIfAborted();
       if (preparedRequest != null) {
-        return await attemptInvoke(
+        return await invokeModel(
           {
             request: preparedRequest,
             context,
@@ -1768,7 +1771,7 @@ export async function tryFallbackProviders({
           fbConfig
         );
       }
-      return await attemptInvoke(
+      return await invokeModel(
         {
           model: fbModel as t.ChatModel,
           messages: fallbackMessages,

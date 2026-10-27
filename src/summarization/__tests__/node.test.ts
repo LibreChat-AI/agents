@@ -1243,7 +1243,8 @@ describe('recency window — first-turn protection', () => {
     // Head (turn 1) summarized; tail (turn 2) preserved verbatim.
     expect(setSummary).toHaveBeenCalledWith(
       expect.stringContaining('Summary of older turns'),
-      expect.any(Number)
+      expect.any(Number),
+      { precedesMessages: true }
     );
     expect(capturedMessages).toEqual([
       { type: 'system', content: 'Test agent' },
@@ -1690,7 +1691,9 @@ describe('recency window — first-turn protection', () => {
       {} as RunnableConfig
     );
 
-    expect(setSummary).toHaveBeenCalledWith('summary', expect.any(Number));
+    expect(setSummary).toHaveBeenCalledWith('summary', expect.any(Number), {
+      precedesMessages: true,
+    });
     expect(agentContext.pendingOriginalToolContent).toBeUndefined();
     expect(result.messages?.[0].getType()).toBe('remove');
     expect(result.messages?.slice(1)).toEqual(messages.slice(2));
@@ -1831,7 +1834,11 @@ describe('recency window — first-turn protection', () => {
       {} as RunnableConfig
     );
 
-    expect(setSummary).toHaveBeenCalled();
+    expect(setSummary).toHaveBeenCalledTimes(1);
+    expect(setSummary).toHaveBeenCalledWith(
+      'Legacy summary',
+      expect.any(Number)
+    );
     // Legacy: remove-all only, no tail re-injection.
     expect(result.messages).toHaveLength(1);
     expect(result.messages![0]?._getType()).toBe('remove');

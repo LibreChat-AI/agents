@@ -434,15 +434,18 @@ function hasProviderCancellation(error: unknown, depth: number): boolean {
     return false;
   }
   const record = asRecord(error);
-  const text = `${record?.name ?? ''} ${record?.code ?? ''} ${record?.type ?? ''} ${extractErrorMessage(error)}`;
+  const message = record == null ? extractErrorMessage(error) : record.message;
+  const text = `${record?.name ?? ''} ${record?.code ?? ''} ${record?.type ?? ''} ${typeof message === 'string' ? message : ''}`;
   if (
     /^(?:AbortError|APIUserAbortError|CanceledError|CancelledError)$/.test(
       record?.name ?? ''
     ) ||
     /^(?:ABORT_ERR|ERR_CANCELED)$/.test(String(record?.code ?? '')) ||
-    /\bAbortError\b|\buser (?:aborted|cancelled|canceled)\b|\b(?:request|operation) (?:was )?(?:aborted|cancelled|canceled)\b/i.test(
-      text
-    )
+    /\buser (?:aborted|cancelled|canceled)\b/i.test(text) ||
+    (!/timed?[_ -]?out/i.test(text) &&
+      /\bAbortError\b|\b(?:request|operation) (?:was )?(?:aborted|cancelled|canceled)\b/i.test(
+        text
+      ))
   ) {
     return true;
   }

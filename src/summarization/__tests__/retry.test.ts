@@ -15,7 +15,70 @@ function streamLimitError(): StreamLimitExceededError {
   });
 }
 
+const timeoutErrors = [
+  [
+    'native aborted timeout',
+    new DOMException(
+      'The operation was aborted due to timeout',
+      'TimeoutError'
+    ),
+  ],
+  [
+    'provider timeout name',
+    { name: 'TimeoutError', message: 'Operation aborted' },
+  ],
+  [
+    'SDK aborted timeout',
+    { name: 'APIConnectionTimeoutError', message: 'Request was aborted' },
+  ],
+  [
+    'aborted timeout message',
+    new Error('The operation was aborted due to timeout'),
+  ],
+  [
+    'aborted timed-out request',
+    new Error('Request was aborted because it timed out'),
+  ],
+  ['timeout-qualified abort text', 'AbortError: request timed out'],
+  [
+    'wrapped native timeout',
+    new Error('Provider failed', {
+      cause: new DOMException(
+        'The operation was aborted due to timeout',
+        'TimeoutError'
+      ),
+    }),
+  ],
+  [
+    'wrapped timeout name',
+    { error: { name: 'TimeoutError', message: 'Operation aborted' } },
+  ],
+  [
+    'wrapped SDK timeout name',
+    {
+      error: {
+        name: 'APIConnectionTimeoutError',
+        message: 'Request was aborted',
+      },
+    },
+  ],
+  [
+    'nested provider timeout',
+    {
+      response: {
+        data: {
+          error: new DOMException(
+            'The operation was aborted due to timeout',
+            'TimeoutError'
+          ),
+        },
+      },
+    },
+  ],
+] as const;
+
 const transientErrors = [
+  ...timeoutErrors,
   ['reasoning-only summary', new ReasoningOnlySummaryError()],
   ['overload status', { status: 529 }],
   ['overload stream event', { error: { type: 'overloaded_error' } }],
@@ -52,6 +115,28 @@ const transientErrors = [
 
 const cancellationErrors = [
   ['user abort', new DOMException('Stopped', 'AbortError')],
+  [
+    'abort with timeout text',
+    new DOMException('Request timed out', 'AbortError'),
+  ],
+  ['abort code with timeout', { name: 'TimeoutError', code: 'ABORT_ERR' }],
+  ['cancel code with timeout', { name: 'TimeoutError', code: 'ERR_CANCELED' }],
+  [
+    'user abort with timeout',
+    new Error('The user aborted a request after a timeout'),
+  ],
+  [
+    'timeout wrapping cancellation',
+    Object.assign(
+      new DOMException(
+        'The operation was aborted due to timeout',
+        'TimeoutError'
+      ),
+      {
+        cause: { cause: { code: 'ERR_CANCELED' } },
+      }
+    ),
+  ],
   ['SDK user abort', { name: 'APIUserAbortError', status: 503 }],
   ['abort name', { name: 'AbortError' }],
   ['SDK abort name', { name: 'APIUserAbortError' }],
@@ -159,6 +244,76 @@ describe('withSummarizationRetry', () => {
 
     await expect(pending).resolves.toBe('summary');
     expect(operation).toHaveBeenCalledTimes(2);
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
+  it('retries a real provider AbortSignal.timeout reason without aborting the caller', async () => {
+    jest.useRealTimers();
+    const providerSignal = AbortSignal.timeout(0);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    jest.useFakeTimers();
+    const controller = new AbortController();
+    const operation = jest
+      .fn()
+      .mockRejectedValueOnce(providerSignal.reason)
+      .mockResolvedValue('summary');
+    const onRetry = jest.fn();
+    const pending = withSummarizationRetry(operation, {
+      signal: controller.signal,
+      onRetry,
+    });
+
+    await jest.runAllTimersAsync();
+
+    await expect(pending).resolves.toBe('summary');
+    expect(providerSignal.aborted).toBe(true);
+    expect(providerSignal.reason).toBeInstanceOf(DOMException);
+    expect(providerSignal.reason.name).toBe('TimeoutError');
+    expect(isProviderCancellation(providerSignal.reason)).toBe(false);
+    expect(classifySummarizationError(providerSignal.reason)).toBe('timeout');
+    expect(operation).toHaveBeenCalledTimes(2);
+    expect(onRetry.mock.calls).toEqual([
+      [{ attempt: 2, errorCode: 'timeout' }],
+    ]);
+    expect(controller.signal.aborted).toBe(false);
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
+  it('preserves native timeout classification after exhausting retries', async () => {
+    const error = new DOMException(
+      'The operation was aborted due to timeout',
+      'TimeoutError'
+    );
+    const operation = jest.fn().mockRejectedValue(error);
+    const onRetry = jest.fn();
+    const pending = withSummarizationRetry(operation, { onRetry });
+    const rejected = expect(pending).rejects.toBe(error);
+
+    await jest.runAllTimersAsync();
+    await rejected;
+
+    expect(operation).toHaveBeenCalledTimes(3);
+    expect(onRetry.mock.calls).toEqual([
+      [{ attempt: 2, errorCode: 'timeout' }],
+      [{ attempt: 3, errorCode: 'timeout' }],
+    ]);
+    expect(classifySummarizationError(error)).toBe('timeout');
+    expect(isProviderCancellation(error)).toBe(false);
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
+  it('does not retry a timeout when the caller signal is explicitly aborted', async () => {
+    const reason = new DOMException(
+      'The operation was aborted due to timeout',
+      'TimeoutError'
+    );
+    const signal = AbortSignal.abort(reason);
+    const operation = jest.fn();
+
+    await expect(withSummarizationRetry(operation, { signal })).rejects.toBe(
+      reason
+    );
+    expect(operation).not.toHaveBeenCalled();
     expect(jest.getTimerCount()).toBe(0);
   });
 
@@ -417,6 +572,10 @@ describe('isProviderCancellation', () => {
 });
 
 describe('classifySummarizationError', () => {
+  it.each(timeoutErrors)('classifies %s as timeout', (_label, error) => {
+    expect(classifySummarizationError(error)).toBe('timeout');
+  });
+
   it.each([
     [{ status: 529 }, 'provider_overloaded'],
     [

@@ -45,6 +45,7 @@ import {
   encodingForModel,
   encodingOfTokenCounter,
 } from '@/utils/tokens';
+import { prepareProviderRequest, resolveServingModelId } from '@/llm/prepareProviderRequest';
 import {
   Constants,
   ContentTypes,
@@ -57,13 +58,14 @@ import {
   resolveClientOptionsModel,
 } from '@/llm/request';
 import { renderCompactionSemanticIndex } from '@/summarization/semanticIndex';
+import { readSummarizationUsage, buildSummarizationStepUsage } from './usage';
 import { ProviderTextProtectionError } from '@/protection/providerText';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
-import { prepareProviderRequest } from '@/llm/prepareProviderRequest';
 import { prepareToolsForPromptCache } from '@/llm/promptCacheTools';
 import { isReasoningContentBlock } from '@/messages/reasoningTypes';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { serializeToolContentBounded } from '@/utils/toolContent';
+import { hasReasoningKwargs } from '@/llm/stream/chunkAdapters';
 import { makeIsDeferred } from '@/messages/anthropicToolCache';
 import { createRemoveAllMessage } from '@/messages/reducer';
 import { getProviderFamily } from '@/llm/providerRegistry';
@@ -668,6 +670,7 @@ async function executeSummarizationWithFallback(params: {
   shrinkInput?: boolean;
   semanticIndex: RenderedCompactionSemanticIndex;
   log: LogFn;
+  onUsage: (attempt: t.SummarizationAttemptUsage) => void;
   /** Carries the run's stream limits so the event cap covers summary streams. */
   graph?: StreamLimitState & {
     getBreakerSignal?: () => AbortSignal;
@@ -694,6 +697,7 @@ async function executeSummarizationWithFallback(params: {
     semanticIndex,
     log,
     graph,
+    onUsage,
   } = params;
 
   const priorSummaryText = agentContext.getSummaryText()?.trim() ?? '';
@@ -737,6 +741,11 @@ async function executeSummarizationWithFallback(params: {
       () =>
         summarizeWithCacheHit({
           agentContext,
+          onUsage: usage => onUsage({
+            provider: clientConfig.provider as t.ProviderName,
+            model: clientConfig.modelName ?? resolveServingModelId(summarizationModel) ?? resolveClientOptionsModel(clientConfig.clientOptions as t.ClientOptions),
+            usage,
+          }),
           shrinkInput,
           outputTokens: clientConfig.effectiveMaxSummaryTokens,
           clientOptions: clientConfig.clientOptions as t.ClientOptions,
@@ -916,11 +925,22 @@ async function executeSummarizationWithFallback(params: {
           primaryError,
           onChunk,
           streamLimitState: graph,
+          invokeModel: (params, config) => withSummarizationRetry(async () => {
+            pendingDeltas.length = 0;
+            const result = await attemptInvoke(params, config);
+            const usage = readSummarizationUsage(result.messages?.[0]);
+            if (usage != null && fallbackIdentity != null) onUsage({
+              provider: fallbackIdentity.provider as t.ProviderName, model: fallbackIdentity.model, usage,
+            });
+            config?.signal?.throwIfAborted();
+            const response = result.messages?.[0];
+            if (response != null && isReasoningOnlySummary(response)) throw new ReasoningOnlySummaryError();
+            return result;
+          }, {signal: config?.signal, onRetry: retry => log('debug', 'Retrying fallback summarization', retry)}),
         });
         const fbMsg = fbResult?.messages?.[0];
         if (fbMsg) {
-          if ('usage_metadata' in fbMsg)
-            summaryUsage = fbMsg.usage_metadata as UsageMetadata;
+          summaryUsage = readSummarizationUsage(fbMsg);
           summaryText = extractResponseText(
             fbMsg as { content: string | object }
           );
@@ -992,6 +1012,7 @@ async function dispatchCompletionEvents(params: {
   agentContext: AgentContext;
   runStep: t.RunStep;
   summaryUsage?: Partial<UsageMetadata>;
+  attemptUsage: readonly t.SummarizationAttemptUsage[];
   agentId: string;
   /**
    * Number of messages preserved verbatim by the recency window after
@@ -1009,6 +1030,7 @@ async function dispatchCompletionEvents(params: {
     agentContext,
     runStep,
     summaryUsage,
+    attemptUsage,
     agentId,
     messagesAfterCount,
   } = params;
@@ -1022,7 +1044,7 @@ async function dispatchCompletionEvents(params: {
   };
   assertNotTripped();
   runStep.summary = summaryBlock;
-  if (summaryUsage) {
+  if (summaryUsage && runStep.usage == null) {
     runStep.usage = {
       prompt_tokens: Number(summaryUsage.input_tokens) || 0,
       completion_tokens: Number(summaryUsage.output_tokens) || 0,
@@ -1046,6 +1068,7 @@ async function dispatchCompletionEvents(params: {
         id: stepId,
         agentId,
         summary: summaryBlock,
+        ...(attemptUsage.length > 0 ? {attemptUsage: [...attemptUsage]} : {}),
       } satisfies t.SummarizeCompleteEvent,
       runnableConfig
     );
@@ -1354,7 +1377,6 @@ export function createSummarizeNode({
     const {
       head: compactableHead,
       tail: messagesToRetain,
-      usedIntraTurnFallback,
     } = splitAtRecencyBoundary(windowMessages, {
       provider: agentContext.provider,
       turns:
@@ -1422,6 +1444,7 @@ export function createSummarizeNode({
       provider: clientConfig.provider,
     };
 
+    const attemptUsage: t.SummarizationAttemptUsage[] = [];
     const runStep: t.RunStep = {
       stepIndex,
       id: stepId,
@@ -1575,6 +1598,10 @@ export function createSummarizeNode({
     } = await executeSummarizationWithFallback({
       agentContext,
       messages: windowMessages,
+      onUsage: attempt => {
+        attemptUsage.push(attempt);
+        runStep.usage = buildSummarizationStepUsage(attemptUsage);
+      },
       clientConfig,
       summarizeConfig,
       stepId,
@@ -1620,6 +1647,7 @@ export function createSummarizeNode({
             agentId: request.agentId,
             error: `Summarization failed during ${preservationReason}; conversation history was preserved`,
             errorCode,
+            ...(attemptUsage.length > 0 ? {attemptUsage: [...attemptUsage]} : {}),
           } satisfies t.SummarizeCompleteEvent,
           runnableConfig
         );
@@ -1652,6 +1680,7 @@ export function createSummarizeNode({
             agentId: request.agentId,
             error: 'Summarization produced empty output',
             errorCode: 'unknown',
+            ...(attemptUsage.length > 0 ? {attemptUsage: [...attemptUsage]} : {}),
           } satisfies t.SummarizeCompleteEvent,
           runnableConfig
         );
@@ -1679,7 +1708,7 @@ export function createSummarizeNode({
     if (commitTrip != null) throw commitTrip;
     runnableConfig?.signal?.throwIfAborted();
     entryBreakerSignal?.throwIfAborted();
-    if (usedIntraTurnFallback) {
+    if (messagesToRetain.length > 0) {
       agentContext.setSummary(summaryText, tokenCount, {
         precedesMessages: true,
       });
@@ -1722,6 +1751,7 @@ export function createSummarizeNode({
       agentContext,
       runStep,
       summaryUsage,
+      attemptUsage,
       agentId: request.agentId,
       messagesAfterCount: messagesToRetain.length,
     });
@@ -1785,14 +1815,15 @@ function extractResponseText(response: { content: string | object }): string {
 }
 
 function isReasoningOnlySummary(response: BaseMessage): boolean {
-  const kwargs = response.additional_kwargs as {refusal?: string} | undefined;
+  const kwargs = response.additional_kwargs as (BaseMessage['additional_kwargs'] & {refusal?: string}) | undefined;
   if (kwargs?.refusal != null || getProviderStopReasons(response).some(
     reason => reason !== 'end_turn' && reason !== 'stop'
   )) return false;
   if ('tool_calls' in response && Array.isArray(response.tool_calls) && response.tool_calls.length > 0) return false;
   if ('invalid_tool_calls' in response && Array.isArray(response.invalid_tool_calls) && response.invalid_tool_calls.length > 0) return false;
+  let hasReasoning = kwargs != null && hasReasoningKwargs(response);
+  if (typeof response.content === 'string') return hasReasoning && response.content.trim() === '';
   if (!Array.isArray(response.content)) return false;
-  let hasReasoning = false;
   for (const block of response.content) {
     if (isReasoningContentBlock(block)) {hasReasoning = true; continue;}
     if (block.type !== 'text' || typeof block.text !== 'string' || block.text.trim() !== '') return false;
@@ -1967,6 +1998,7 @@ export function resolveBedrockCompactionCacheModel(
  */
 async function summarizeWithCacheHit({
   agentContext,
+  onUsage,
   shrinkInput,
   outputTokens,
   clientOptions,
@@ -1987,6 +2019,7 @@ async function summarizeWithCacheHit({
   log,
 }: {
   agentContext: AgentContext;
+  onUsage: (usage: Partial<UsageMetadata>) => void;
   shrinkInput?: boolean;
   outputTokens: number;
   clientOptions?: t.ClientOptions;
@@ -2081,8 +2114,10 @@ async function summarizeWithCacheHit({
         },
         signalConfig
       );
-      signalConfig?.signal?.throwIfAborted();
       const response = result.messages?.[0];
+      const usage = readSummarizationUsage(response);
+      if (usage != null) onUsage(usage);
+      signalConfig?.signal?.throwIfAborted();
       if (response != null && isReasoningOnlySummary(response)) throw new ReasoningOnlySummaryError();
       if (response != null && extractResponseText(response) !== '') {
         await flushSummarizationDeltas(pendingDeltas, config, graph);
@@ -2103,29 +2138,9 @@ async function summarizeWithCacheHit({
   const text = responseMsg
     ? extractResponseText(responseMsg as { content: string | object })
     : '';
-  let usage: Partial<UsageMetadata> | undefined;
-  let usageSource = 'none';
-  if (
-    responseMsg != null &&
-    'usage_metadata' in responseMsg &&
-    responseMsg.usage_metadata != null
-  ) {
-    usage = responseMsg.usage_metadata as Partial<UsageMetadata>;
-    usageSource = 'usage_metadata';
-  } else if (responseMsg != null) {
-    const respMeta = responseMsg.response_metadata as
-      | Record<string, unknown>
-      | undefined;
-    const raw = (respMeta?.metadata as Record<string, unknown> | undefined)
-      ?.usage as Record<string, unknown> | undefined;
-    if (raw != null) {
-      usage = {
-        input_tokens: Number(raw.inputTokens) || undefined,
-        output_tokens: Number(raw.outputTokens) || undefined,
-      } as Partial<UsageMetadata>;
-      usageSource = 'response_metadata';
-    }
-  }
+  const usage = readSummarizationUsage(responseMsg);
+  const usageSource = responseMsg != null && 'usage_metadata' in responseMsg && responseMsg.usage_metadata != null
+    ? 'usage_metadata' : 'response_metadata';
   const cacheDetails = (
     usage as
       | {
@@ -2137,7 +2152,7 @@ async function summarizeWithCacheHit({
       | undefined
   )?.input_token_details;
   log?.('debug', 'Summarization LLM usage', {
-    source: usageSource,
+    source: usage == null ? 'none' : usageSource,
     input_tokens: usage?.input_tokens,
     output_tokens: usage?.output_tokens,
     ...(cacheDetails?.cache_read != null || cacheDetails?.cache_creation != null
