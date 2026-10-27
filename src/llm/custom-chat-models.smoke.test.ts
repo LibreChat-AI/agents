@@ -26,6 +26,10 @@ import {
   OPENAI_RESPONSES_REPLAY_POSITIONS_KEY,
   projectOpenAIResponsesToolMessageContent,
 } from '@/messages/core';
+import {
+  OPENAI_RESPONSES_ORIGIN_KEY,
+  getResponsesReplayOrigin,
+} from '@/messages/responsesToolRounds';
 import { CustomChatGoogleGenerativeAI } from '@/llm/google';
 import { CustomChatBedrockConverse } from '@/llm/bedrock';
 import { ChatOpenRouter } from '@/llm/openrouter';
@@ -819,6 +823,54 @@ describe('custom chat model class smoke tests', () => {
       );
     }
   );
+
+  it('stamps a finished Responses output with the model and endpoint that produced it', async () => {
+    const stamp = async (baseURL?: string): Promise<unknown> => {
+      const model = new ChatOpenAI({
+        model: 'gpt-5',
+        apiKey: 'test-key',
+        useResponsesApi: true,
+        ...(baseURL != null && { configuration: { baseURL } }),
+      });
+      const responses = (
+        model as unknown as { responses: StreamingOpenAIResponsesDelegate }
+      ).responses;
+      responses.completionWithRetry = async () =>
+        (async function* () {
+          yield {
+            type: 'response.completed',
+            sequence_number: 0,
+            response: {
+              id: 'resp_stamp',
+              model: 'gpt-5',
+              output: [
+                {
+                  id: 'fc_1',
+                  type: 'function_call',
+                  status: 'completed',
+                  call_id: 'call_1',
+                  name: 'lookup',
+                  arguments: '{}',
+                },
+              ],
+              status: 'completed',
+              usage: null,
+            },
+          } as unknown as OpenAIClient.Responses.ResponseStreamEvent;
+        })();
+      let combined: AIMessageChunk | undefined;
+      for await (const chunk of await model.stream([new HumanMessage('go')])) {
+        combined =
+          combined == null ? chunk : (combined.concat(chunk) as AIMessageChunk);
+      }
+      return combined?.response_metadata[OPENAI_RESPONSES_ORIGIN_KEY];
+    };
+
+    expect(await stamp()).toBe(getResponsesReplayOrigin('gpt-5', ''));
+    expect(await stamp('https://proxy.example/v1')).toBe(
+      getResponsesReplayOrigin('gpt-5', 'https://proxy.example/v1')
+    );
+  });
 
   it('removes replay positions on a text-only terminal response', async () => {
     const model = new ChatOpenAI({

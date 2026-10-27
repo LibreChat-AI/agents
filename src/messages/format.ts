@@ -78,7 +78,10 @@ import {
 } from '@/common';
 import { normalizeAnthropicToolCallId } from '@/llm/anthropic/utils/message_inputs';
 import { toLangChainContent, toLangChainMessageFields } from './langchain';
-import { restoreResponsesToolRound } from './responsesToolRounds';
+import {
+  restoreResponsesToolRound,
+  alignProviderItemsWithCall,
+} from './responsesToolRounds';
 import { isReasoningContentBlock } from './reasoningTypes';
 import { flattenLegacyContent, isLegacyConvertible } from './content';
 import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
@@ -1986,6 +1989,7 @@ function formatAssistantMessage(
         const tool_call: ToolCallPart = _tool_call;
         // TODO: investigate; args as dictionary may need to be providers-or-tool-specific
         let args: any = _args;
+        let argsParsed = true;
         try {
           if (typeof _args === 'string') {
             args = JSON.parse(_args);
@@ -1993,6 +1997,7 @@ function formatAssistantMessage(
         } catch {
           if (typeof _args === 'string') {
             args = { input: _args };
+            argsParsed = false;
           }
         }
 
@@ -2000,7 +2005,13 @@ function formatAssistantMessage(
         delete tool_call.roundId;
         lastRound = { message: lastAIMessage, roundId };
         const roundItems = providerRoundItems.get(lastAIMessage) ?? [];
-        roundItems.push(tool_call.providerItems);
+        roundItems.push(
+          alignProviderItemsWithCall(tool_call.providerItems, {
+            id: tool_call.id ?? '',
+            name: tool_call.name ?? '',
+            args: argsParsed ? args : undefined,
+          })
+        );
         providerRoundItems.set(lastAIMessage, roundItems);
         delete tool_call.providerItems;
         if (

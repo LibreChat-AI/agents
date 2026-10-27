@@ -35,7 +35,7 @@ const REPLAYABLE_ITEM_TYPES: ReadonlySet<string> = new Set([
 ]);
 
 /** Largest serialized size of the items stored for one tool call. */
-export const MAX_PROVIDER_ITEMS_CHARS = 512_000;
+const MAX_PROVIDER_ITEMS_CHARS = 512_000;
 
 function isReplayableProviderItems(
   providerItems: t.ProviderOutputItems | undefined
@@ -48,13 +48,11 @@ function isReplayableProviderItems(
   ) {
     return false;
   }
-  const typed = (providerItems.items as unknown[]).every(
-    (item) =>
-      item != null &&
-      typeof item === 'object' &&
-      REPLAYABLE_ITEM_TYPES.has((item as { type?: unknown }).type as string)
+  return (
+    providerItems.items.every((item) =>
+      REPLAYABLE_ITEM_TYPES.has((item as { type?: string } | null)?.type ?? '')
+    ) && JSON.stringify(providerItems.items).length <= MAX_PROVIDER_ITEMS_CHARS
   );
-  return typed && JSON.stringify(providerItems.items).length <= MAX_PROVIDER_ITEMS_CHARS;
 }
 
 export function getResponsesReplayOrigin(
@@ -109,6 +107,44 @@ export function sliceResponsesToolRound(
   )
     ? slices
     : undefined;
+}
+
+/**
+ * A stored call part can be in a different form than the items stored with it
+ * (a host or the SDK rewrote the call after the model produced it, as the
+ * live request carried it). The part is what the live request sent, so the
+ * slice's `function_call` is rewritten to match it. Without parsed object
+ * arguments (truncated in storage) the slice is kept as the model sent it.
+ */
+export function alignProviderItemsWithCall(
+  providerItems: t.ProviderOutputItems | undefined,
+  call: { id: string; name: string; args: unknown }
+): t.ProviderOutputItems | undefined {
+  if (
+    providerItems == null ||
+    call.args == null ||
+    typeof call.args !== 'object' ||
+    Array.isArray(call.args)
+  ) {
+    return providerItems;
+  }
+  const needsRewrite = (item: OutputItem): item is OutputItem & {
+    type: 'function_call';
+  } =>
+    item.type === 'function_call' &&
+    item.call_id === call.id &&
+    item.name !== call.name;
+  if (!providerItems.items.some(needsRewrite)) {
+    return providerItems;
+  }
+  return {
+    ...providerItems,
+    items: providerItems.items.map((item) =>
+      needsRewrite(item)
+        ? { ...item, name: call.name, arguments: JSON.stringify(call.args) }
+        : item
+    ),
+  };
 }
 
 /**

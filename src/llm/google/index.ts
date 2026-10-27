@@ -16,14 +16,15 @@ import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager
 import type { BaseMessage, UsageMetadata } from '@langchain/core/messages';
 import type { GeminiApiUsageMetadata, InputTokenDetails } from './types';
 import type { GoogleClientOptions, GoogleThinkingConfig } from '@/types';
-import { smoothGenerationChunks } from '@/llm/stream/chunkAdapters';
-import { resolveStreamDelay } from '@/llm/stream/smoother';
 import {
   convertResponseContentToChatGenerationChunk,
   convertBaseMessagesToContent,
+  isGemini3PlusModel,
   dropUnsupportedModelTurnPrefill,
   mapGenerateContentResultToChatResult,
 } from './utils/common';
+import { smoothGenerationChunks } from '@/llm/stream/chunkAdapters';
+import { resolveStreamDelay } from '@/llm/stream/smoother';
 
 type GoogleToolConfigWithServerSideInvocations = ToolConfig & {
   includeServerSideToolInvocations?: boolean;
@@ -45,13 +46,14 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
   /**
    * Override to add gemini-3 model support for multimodal and function calling thought signatures
    */
+  /** Gemini 3 and later accept image, audio, video and PDF input. */
   get _isMultimodalModel(): boolean {
     return (
       this.model.startsWith('gemini-1.5') ||
       this.model.startsWith('gemini-2') ||
       (this.model.startsWith('gemma-3-') &&
         !this.model.startsWith('gemma-3-1b')) ||
-      this.model.startsWith('gemini-3')
+      isGemini3PlusModel(this.model)
     );
   }
 
