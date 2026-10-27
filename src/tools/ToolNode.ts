@@ -3451,12 +3451,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         ),
         name: call.name,
         id: toolCallId,
-        output: contentString,
-        progress: 1,
-        ...(outcome != null && { outcome }),
         ...buildCompletionRefFields(
           toolMessage.additional_kwargs as t.ToolMessageRefMetadata
         ),
+        output: contentString,
+        progress: 1,
+        ...(outcome != null && { outcome }),
       };
 
       await safeDispatchCustomEvent(
@@ -5082,10 +5082,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             args: serializeToolContentBounded(args, this.maxToolResultChars),
             name: toolName,
             id: toolCallId,
+            ...buildCompletionRefFields(refMeta),
             output,
             progress: 1,
             ...(outcome != null && { outcome }),
-            ...buildCompletionRefFields(refMeta),
           } as t.ProcessedToolCall,
           completed_at: receivedAt ?? Date.now(),
         },

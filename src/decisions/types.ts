@@ -80,6 +80,25 @@ export interface DecisionRequest {
   label?: string;
   /** Overrides the provider's timeout for this request alone. */
   timeoutMs?: number;
+  /**
+   * Called once per request the model sends, just before it goes out, so a
+   * caller can count retries and every re-send after a 401. The HTTP
+   * decision model calls it; a model that does not report requests leaves the
+   * caller to count one per `decide()`. Not awaited; a throw is ignored.
+   */
+  onRequest?: () => void;
+  /**
+   * Called once per request `onRequest` announced that ended before the
+   * deadline or the caller's abort: with the HTTP status once the host
+   * replied (a successful reply's body read in full), or `null` when the
+   * request failed without a reply or a successful reply's body could not be
+   * read, and for a reply that was not OK its
+   * `Retry-After` in milliseconds when it sent one. A request still in
+   * flight when the call is interrupted gets none, so the announced requests
+   * without one are the ones the host may still be working on. Not awaited;
+   * a throw is ignored.
+   */
+  onResponse?: (status: number | null, retryAfterMs?: number) => void;
 }
 
 export interface DecisionResult {
@@ -92,15 +111,32 @@ export interface DecisionResult {
 export interface DecisionModel {
   readonly id: string;
   readonly model: string;
+  /**
+   * True when `decide` reports every request it sends through `onRequest`
+   * and every one that ends through `onResponse`, as the HTTP decision model
+   * does, so a caller can count what was really sent: a `decide` that fails
+   * before its first `onRequest` sent nothing.
+   */
+  readonly reportsRequests?: boolean;
   decide(request: DecisionRequest): Promise<DecisionResult>;
 }
 
 export type DecisionDialect = 'port' | 'systemone';
 
-/** A bearer key, or a per-request token minter; a 401 requests one fresh token for that call. */
-export type DecisionCredential =
-  | string
-  | ((options: { refresh: boolean; signal?: AbortSignal }) => Promise<string>);
+/**
+ * Mints a bearer token; `refresh` asks for a new one after a 401. On a
+ * refresh, `refused` is the token the 401 refused (as sent, trimmed), so a
+ * caching minter can hand out a token minted since then instead of
+ * discarding it.
+ */
+export type DecisionTokenMinter = (options: {
+  refresh: boolean;
+  refused?: string;
+  signal?: AbortSignal;
+}) => Promise<string>;
+
+/** A bearer key, or a per-request token minter; a 401 requests one fresh token for that call, and a second 401 one recheck (`refresh: false`) for a token minted since. */
+export type DecisionCredential = string | DecisionTokenMinter;
 
 export interface DecisionProviderSettings {
   /** Full URL of the decision endpoint, not a base path. */
@@ -121,6 +157,8 @@ export type DecisionFailure =
   | 'aborted'
   | 'rate_limited'
   | 'unauthorized'
+  /** HTTP 402: the credential is out of credits; never retried. */
+  | 'quota'
   | 'bad_request'
   | 'server_error'
   | 'network'
@@ -133,17 +171,20 @@ export class DecisionError extends Error {
   readonly provider: string;
   readonly status?: number;
   retryAfterMs?: number;
+  /** True when a breaker refused the call without a request; see `withBreaker`. */
+  readonly circuitOpen: boolean;
 
   constructor(
     failure: DecisionFailure,
     message: string,
-    options?: { provider?: string; status?: number }
+    options?: { provider?: string; status?: number; circuitOpen?: boolean }
   ) {
     super(message);
     this.name = 'DecisionError';
     this.failure = failure;
     this.provider = options?.provider ?? 'unknown';
     this.status = options?.status;
+    this.circuitOpen = options?.circuitOpen ?? false;
   }
 }
 

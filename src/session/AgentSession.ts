@@ -1720,7 +1720,9 @@ export class AgentSession {
         options.retainRecentTurns,
         options.instructions
       ),
-      this.runConfig.tokenCounter
+      this.runConfig.tokenCounter,
+      undefined,
+      this.runConfig.toolExecution
     );
     const graph = createManualCompactGraph({
       runId: compactRunId,

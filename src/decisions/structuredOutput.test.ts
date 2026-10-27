@@ -139,6 +139,30 @@ describe.each(anthropicAdapters)(
       expect(result.usage).toEqual({ inputTokens: 8, outputTokens: 2 });
     });
 
+    it('ignores an async onAnswered that rejects, without an unhandled rejection', async () => {
+      const seen: unknown[] = [];
+      const listener = (reason: unknown): void => {
+        seen.push(reason);
+      };
+      process.on('unhandledRejection', listener);
+      try {
+        const decisionModel = createStructuredChatDecisionModel({
+          model: create(anthropicFetch({ answers }, 'functionCalling', [])),
+          modelId,
+          method: 'functionCalling',
+          onAnswered: async () => {
+            throw new Error('observability');
+          },
+        });
+        const result = await decisionModel.decide(request);
+        expect(result.answers.q).toMatchObject({ decision: true });
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      } finally {
+        process.off('unhandledRejection', listener);
+      }
+      expect(seen).toEqual([]);
+    });
+
     it('rejects native schema before binding instead of silently weakening or switching modes', async () => {
       const calls: ProviderCall[] = [];
       const model = create(anthropicFetch({ answers }, 'jsonSchema', calls));

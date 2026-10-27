@@ -1,11 +1,17 @@
 import { z } from 'zod';
 import { tool } from '@langchain/core/tools';
-import { AIMessage, ToolMessage } from '@langchain/core/messages';
+import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import { describe, it, expect, jest, afterEach } from '@jest/globals';
 import type { StructuredToolInterface } from '@langchain/core/tools';
 import type { PostToolUseHookOutput, PreToolUseHookOutput } from '@/hooks';
 import type * as t from '@/types';
-import { ToolOutputReferenceRegistry } from '../toolOutputReferences';
+import {
+  ToolOutputReferenceRegistry,
+  annotateMessagesForLLM,
+  nextReferenceTurn,
+} from '../toolOutputReferences';
+import { GraphEvents, Providers } from '@/common';
+import { Run } from '@/run';
 import * as events from '@/utils/events';
 import { HookRegistry } from '@/hooks';
 import { ToolNode } from '../ToolNode';
@@ -1705,6 +1711,183 @@ describe('ToolNode tool output references', () => {
       const c0Index = capturedArgs.findIndex((a) => a.startsWith('leak='));
       expect(c0Index).toBeGreaterThanOrEqual(0);
       expect(capturedArgs[c0Index]).not.toContain('sibling-output');
+    });
+  });
+
+  describe('labels persisted on the completed tool_call', () => {
+    const echo = (): StructuredToolInterface =>
+      tool(async (input) => (input as { command: string }).command, {
+        name: 'echo',
+        description: 'Echo test tool',
+        schema: z.object({ command: z.string() }),
+      }) as unknown as StructuredToolInterface;
+
+    const capture = (): Array<{ result: { tool_call: t.ProcessedToolCall } }> => {
+      const completions: Array<{ result: { tool_call: t.ProcessedToolCall } }> =
+        [];
+      jest
+        .spyOn(events, 'safeDispatchCustomEvent')
+        .mockImplementation(async (event, data): Promise<void> => {
+          if (event === GraphEvents.ON_RUN_STEP_COMPLETED) {
+            completions.push(data as (typeof completions)[number]);
+          } else if (event === GraphEvents.ON_TOOL_EXECUTE) {
+            const batch = data as t.ToolExecuteBatchRequest;
+            const results = batch.toolCalls.map((call) => ({
+              toolCallId: call.id,
+              status: 'success' as const,
+              content: 'out',
+            }));
+            results.forEach((result) => batch.onResult?.(result));
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            batch.resolve(results);
+          }
+        });
+      return completions;
+    };
+
+    const run = async (
+      node: ToolNode,
+      id: string,
+      command: string,
+      runId = 'run-a'
+    ): Promise<ToolMessage> => {
+      const out = (await node.invoke(
+        {
+          messages: [
+            new AIMessage({
+              content: '',
+              tool_calls: [{ id, name: 'echo', args: { command } }],
+            }),
+          ],
+        },
+        { configurable: { run_id: runId } }
+      )) as { messages: ToolMessage[] };
+      return out.messages[0];
+    };
+
+    it('carries the key and unresolved refs of each result', async () => {
+      const completions = capture();
+      const node = new ToolNode({
+        tools: [echo()],
+        toolCallStepIds: new Map([
+          ['c1', 's1'],
+          ['c2', 's2'],
+        ]),
+        toolOutputReferences: { enabled: true },
+      });
+
+      await run(node, 'c1', 'first');
+      await run(node, 'c2', 'use {{tool0turn9}}');
+
+      expect(completions[0].result.tool_call).toMatchObject({
+        ref: 'tool0turn0',
+      });
+      expect(completions[0].result.tool_call).not.toHaveProperty(
+        'unresolved_refs'
+      );
+      expect(completions[1].result.tool_call).toMatchObject({
+        ref: 'tool0turn1',
+        unresolved_refs: ['tool0turn9'],
+      });
+    });
+
+    it('carries the key on event-driven completions', async () => {
+      const completions = capture();
+      const node = new ToolNode({
+        tools: [echo()],
+        eventDrivenMode: true,
+        toolCallStepIds: new Map([['c1', 's1']]),
+        toolOutputReferences: { enabled: true },
+      });
+
+      await run(node, 'c1', 'a');
+
+      expect(completions).toHaveLength(1);
+      expect(completions[0].result.tool_call.ref).toBe('tool0turn0');
+    });
+
+    it('adds no ref fields when the feature is disabled', async () => {
+      const completions = capture();
+      const node = new ToolNode({
+        tools: [echo()],
+        toolCallStepIds: new Map([['c1', 's1']]),
+      });
+
+      await run(node, 'c1', 'first');
+
+      expect(completions[0].result.tool_call).not.toHaveProperty('ref');
+    });
+
+    it('reports a placeholder naming an earlier run key as unresolved', async () => {
+      capture();
+      const node = new ToolNode({
+        tools: [echo()],
+        toolCallStepIds: new Map([['c1', 's1']]),
+        toolOutputReferences: { enabled: true },
+      });
+      const previous = new ToolMessage({
+        content: 'x',
+        tool_call_id: 'old',
+        additional_kwargs: { _refKey: 'tool0turn0' },
+      });
+      node
+        ._unsafeGetToolOutputRegistry()!
+        .seedTurn('run-b', nextReferenceTurn([previous]));
+
+      const msg = await run(node, 'c1', 'echo {{tool0turn0}}', 'run-b');
+
+      expect(getRefKey(msg)).toBe('tool0turn1');
+      expect(getUnresolvedRefs(msg)).toEqual(['tool0turn0']);
+      expect(msg.content).toBe('echo {{tool0turn0}}');
+      const [wire] = annotateMessagesForLLM(
+        [msg],
+        node._unsafeGetToolOutputRegistry()
+      );
+      expect(wire.content).toContain('[unresolved refs: tool0turn0]');
+    });
+
+    it('seeds a run from the keys already in its input history', async () => {
+      const created = await Run.create<t.IState>({
+        runId: 'seed-run',
+        graphConfig: {
+          type: 'standard',
+          agents: [
+            {
+              agentId: 'a',
+              provider: Providers.OPENAI,
+              clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+              instructions: 'x',
+              maxContextTokens: 8000,
+            },
+          ],
+        },
+        toolOutputReferences: { enabled: true },
+        returnContent: true,
+        skipCleanup: true,
+      });
+      created.Graph?.overrideTestModel(['ok'], 10);
+
+      await created.processStream(
+        {
+          messages: [
+            new HumanMessage('q'),
+            new AIMessage({
+              content: '',
+              tool_calls: [{ id: 't1', name: 'echo', args: {} }],
+            }),
+            new ToolMessage({
+              content: 'x',
+              tool_call_id: 't1',
+              additional_kwargs: { _refKey: 'tool2turn6' },
+            }),
+            new HumanMessage('next'),
+          ],
+        },
+        { configurable: { thread_id: 'seed-thread' }, version: 'v2' }
+      );
+
+      const registry = created.Graph?.getOrCreateToolOutputRegistry();
+      expect(registry?.nextTurn('seed-run')).toBe(7);
     });
   });
 });

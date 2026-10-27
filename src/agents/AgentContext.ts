@@ -38,6 +38,7 @@ import {
 import {
   isProgrammaticRunnerAutoBound,
   isProgrammaticRunnerResolvedDirectly,
+  filterToolsByLocalAllowlist,
   resolveLocalImplementationNames,
   resolveLocalToolRegistry,
 } from '@/tools/local/resolveLocalExecutionTools';
@@ -183,7 +184,11 @@ export class AgentContext {
      * subagent) into this same array and must not mutate the host's input.
      */
     if (graphTools && graphTools.length > 0) {
-      agentContext.graphTools = [...graphTools];
+      agentContext.graphTools = [
+        ...((filterToolsByLocalAllowlist(graphTools, toolExecution) as
+          | t.GenericTool[]
+          | undefined) ?? []),
+      ] as t.GraphTools;
     }
 
     if (initialSummary?.text != null && initialSummary.text !== '') {
@@ -200,7 +205,28 @@ export class AgentContext {
       agentContext.baseIndexTokenCountMap = { ...tokenMap };
       agentContext.indexTokenCountMap = tokenMap;
 
-      if (toolSchemaTokens != null && toolSchemaTokens > 0) {
+      /** A cached total counts the host's unfiltered tools. Once the local
+       *  allowlist removed some, recount, but only when the recount can
+       *  measure every retained tool (it reads `.schema`); otherwise the
+       *  larger cached total is the safer budget. */
+      const allowlistRemovedTools =
+        (tools?.length ?? 0) !== (agentContext.tools?.length ?? 0) ||
+        (toolDefinitions?.length ?? 0) !==
+          (agentContext.toolDefinitions?.length ?? 0) ||
+        (graphTools?.length ?? 0) !== (agentContext.graphTools?.length ?? 0);
+      const recountMeasuresAll = [
+        ...((agentContext.tools as unknown[] | undefined) ?? []),
+        ...((agentContext.graphTools as unknown[] | undefined) ?? []),
+      ].every(
+        (tool) =>
+          tool != null &&
+          typeof (tool as { schema?: unknown }).schema === 'object'
+      );
+      if (
+        toolSchemaTokens != null &&
+        toolSchemaTokens > 0 &&
+        !(allowlistRemovedTools && recountMeasuresAll)
+      ) {
         /** Use pre-computed (cached) tool schema tokens — skip calculateInstructionTokens */
         agentContext.toolSchemaTokens = toolSchemaTokens;
         agentContext.tokenCalculationPromise = Promise.resolve();
@@ -537,14 +563,17 @@ export class AgentContext {
       tokenCounter != null && isTokenCounterCacheCompatible(tokenCounter)
         ? createExactTokenCountCache(tokenCounter)
         : undefined;
-    this.tools = tools;
+    this.tools = filterToolsByLocalAllowlist(tools, toolExecution);
     this.toolMap = toolMap;
     this.toolRegistry = resolveLocalToolRegistry({
       toolRegistry,
       toolExecution,
     });
     this.toolExecution = toolExecution;
-    this.toolDefinitions = toolDefinitions;
+    this.toolDefinitions = filterToolsByLocalAllowlist(
+      toolDefinitions as t.GraphTools | undefined,
+      toolExecution
+    ) as t.LCTool[] | undefined;
     this.instructions = instructions;
     this.additionalInstructions = additionalInstructions;
     if (reasoningKey) {
