@@ -282,7 +282,7 @@ describe('createSummarizeNode', () => {
       Providers.ANTHROPIC,
       expect.objectContaining({ promptCache: true })
     );
-    expect(bindTools).toHaveBeenCalledWith(projectedTools);
+    expect(bindTools).toHaveBeenCalledWith(projectedTools, { tool_choice: 'none' });
   });
 
   it('keeps cached raw history identical when semantic guidance is appended', async () => {
