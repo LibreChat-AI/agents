@@ -41,6 +41,7 @@ import {
 import {
   isProgrammaticRunnerAutoBound,
   isProgrammaticRunnerResolvedDirectly,
+  filterToolsByLocalAllowlist,
   resolveLocalImplementationNames,
   resolveLocalToolRegistry,
 } from '@/tools/local/resolveLocalExecutionTools';
@@ -83,24 +84,15 @@ type PromptCacheProvider = Providers.ANTHROPIC | Providers.OPENROUTER;
 /** Anthropic's limit of cache_control blocks per request. */
 const MAX_PROMPT_CACHE_BREAKPOINTS = 4;
 
-function countCacheControlMessages(messages: BaseMessage[]): number {
-  return messages.filter(
-    (message) =>
-      Array.isArray(message.content) &&
-      message.content.some(
-        (block) => typeof block === 'object' && 'cache_control' in block
-      )
-  ).length;
-}
-
-function countCachePointMessages(messages: BaseMessage[]): number {
-  return messages.filter(
-    (message) =>
-      Array.isArray(message.content) &&
-      message.content.some(
-        (block) => typeof block === 'object' && 'cachePoint' in block
-      )
-  ).length;
+function countMarkedBlocks(
+  messages: BaseMessage[],
+  marker: 'cache_control' | 'cachePoint'
+): number {
+  return messages
+    .flatMap((message) =>
+      Array.isArray(message.content) ? message.content : []
+    )
+    .filter((block) => typeof block === 'object' && marker in block).length;
 }
 
 type ProgrammaticToolInstructionTarget = {
@@ -211,7 +203,11 @@ export class AgentContext {
      * subagent) into this same array and must not mutate the host's input.
      */
     if (graphTools && graphTools.length > 0) {
-      agentContext.graphTools = [...graphTools];
+      agentContext.graphTools = [
+        ...((filterToolsByLocalAllowlist(graphTools, toolExecution) as
+          | t.GenericTool[]
+          | undefined) ?? []),
+      ] as t.GraphTools;
     }
 
     if (initialSummary?.text != null && initialSummary.text !== '') {
@@ -228,7 +224,28 @@ export class AgentContext {
       agentContext.baseIndexTokenCountMap = { ...tokenMap };
       agentContext.indexTokenCountMap = tokenMap;
 
-      if (toolSchemaTokens != null && toolSchemaTokens > 0) {
+      /** A cached total counts the host's unfiltered tools. Once the local
+       *  allowlist removed some, recount, but only when the recount can
+       *  measure every retained tool (it reads `.schema`); otherwise the
+       *  larger cached total is the safer budget. */
+      const allowlistRemovedTools =
+        (tools?.length ?? 0) !== (agentContext.tools?.length ?? 0) ||
+        (toolDefinitions?.length ?? 0) !==
+          (agentContext.toolDefinitions?.length ?? 0) ||
+        (graphTools?.length ?? 0) !== (agentContext.graphTools?.length ?? 0);
+      const recountMeasuresAll = [
+        ...((agentContext.tools as unknown[] | undefined) ?? []),
+        ...((agentContext.graphTools as unknown[] | undefined) ?? []),
+      ].every(
+        (tool) =>
+          tool != null &&
+          typeof (tool as { schema?: unknown }).schema === 'object'
+      );
+      if (
+        toolSchemaTokens != null &&
+        toolSchemaTokens > 0 &&
+        !(allowlistRemovedTools && recountMeasuresAll)
+      ) {
         /** Use pre-computed (cached) tool schema tokens — skip calculateInstructionTokens */
         agentContext.toolSchemaTokens = toolSchemaTokens;
         agentContext.tokenCalculationPromise = Promise.resolve();
@@ -573,14 +590,17 @@ export class AgentContext {
       tokenCounter != null && isTokenCounterCacheCompatible(tokenCounter)
         ? createExactTokenCountCache(tokenCounter)
         : undefined;
-    this.tools = tools;
+    this.tools = filterToolsByLocalAllowlist(tools, toolExecution);
     this.toolMap = toolMap;
     this.toolRegistry = resolveLocalToolRegistry({
       toolRegistry,
       toolExecution,
     });
     this.toolExecution = toolExecution;
-    this.toolDefinitions = toolDefinitions;
+    this.toolDefinitions = filterToolsByLocalAllowlist(
+      toolDefinitions as t.GraphTools | undefined,
+      toolExecution
+    ) as t.LCTool[] | undefined;
     this.instructions = instructions;
     this.additionalInstructions = additionalInstructions;
     this.conversationInstructions = conversationInstructions;
@@ -847,7 +867,7 @@ export class AgentContext {
 
     this.cachedSystemRunnable = this.buildSystemRunnable({
       stableInstructions: this.buildStableInstructionsString(),
-      conversationInstructions: this.buildConversationInstructionsString(),
+      conversationInstructions: this.conversationInstructions ?? '',
       dynamicInstructions: this.buildDynamicInstructionsString(),
     });
     this.systemRunnableStale = false;
@@ -862,7 +882,7 @@ export class AgentContext {
     if (this.systemRunnableStale || this.cachedSystemRunnable === undefined) {
       this.cachedSystemRunnable = this.buildSystemRunnable({
         stableInstructions: this.buildStableInstructionsString(),
-        conversationInstructions: this.buildConversationInstructionsString(),
+        conversationInstructions: this.conversationInstructions ?? '',
         dynamicInstructions: this.buildDynamicInstructionsString(),
       });
       this.systemRunnableStale = false;
@@ -891,14 +911,6 @@ export class AgentContext {
     }
 
     return parts.join('\n\n');
-  }
-
-  /**
-   * Builds the per-conversation block. It changes only at a conversation's
-   * start, so it keeps a fixed position right after the stable instructions.
-   */
-  private buildConversationInstructionsString(): string {
-    return this.conversationInstructions ?? '';
   }
 
   /**
@@ -1018,24 +1030,16 @@ export class AgentContext {
       (stableInstructions !== '' || conversationInstructions !== '') &&
       dynamicInstructions !== '';
     const movedBedrockTail = bedrockCache && shouldMoveDynamicInstructions;
-    const systemParts = {
-      stableInstructions,
-      conversationInstructions,
-      dynamicInstructions,
-      promptCacheProvider,
-      shouldMoveDynamicInstructions,
-    };
-    const systemMessage = this.buildSystemMessage({
-      ...systemParts,
-      markConversation: true,
-    });
-    /** Same text with three breakpoints, for bodies that carry two of their own. */
-    const systemMessageWithinBreakpointLimit =
-      (promptCacheProvider != null || bedrockCache) &&
-      stableInstructions !== '' &&
-      conversationInstructions !== ''
-        ? this.buildSystemMessage({ ...systemParts, markConversation: false })
-        : systemMessage;
+    const buildSystem = (markConversation: boolean): SystemMessage | undefined =>
+      this.buildSystemMessage({
+        stableInstructions,
+        conversationInstructions,
+        dynamicInstructions,
+        promptCacheProvider,
+        shouldMoveDynamicInstructions,
+        markConversation,
+      });
+    const systemMessage = buildSystem(true);
 
     if (this.tokenCounter) {
       this.systemMessageTokens = systemMessage
@@ -1067,13 +1071,11 @@ export class AgentContext {
           promptCacheProvider ?? (movedBedrockTail ? Providers.BEDROCK : undefined),
         shouldMoveDynamicInstructions,
       });
-      let body = movedBedrockTail
-        ? this.buildBedrockBodyWithDynamicTail(bodyWithSummary, dynamicTail)
-        : this.buildBodyWithPromptCacheDynamicTail(
-          bodyWithSummary,
-          dynamicTail,
-          promptCacheProvider
-        );
+      let body = this.buildBodyWithPromptCacheDynamicTail(
+        bodyWithSummary,
+        dynamicTail,
+        promptCacheProvider
+      );
 
       if (
         promptCacheProvider != null &&
@@ -1086,50 +1088,34 @@ export class AgentContext {
         );
       }
 
-      // Tools, stable instructions, stable history and the tail already use
-      // Anthropic's four breakpoints; the conversation block and then the
-      // summary get a breakpoint only while any are left.
-      const bedrockToolCheckpoints = supportsBedrockToolCache(
-        (this.clientOptions as { model?: string } | undefined)?.model
-      )
-        ? 1
-        : 0;
-      let room = 0;
-      if (bedrockCache) {
-        /** Counts the message checkpoints the graph already placed too: the tail and,
-         *  with a second one for the latest human message, that one. */
-        room =
-          MAX_PROMPT_CACHE_BREAKPOINTS -
-          bedrockToolCheckpoints -
-          (stableInstructions !== '' ? 1 : 0) -
-          countCachePointMessages(body);
-      } else if (promptCacheProvider != null) {
-        room =
-          MAX_PROMPT_CACHE_BREAKPOINTS -
-          1 -
-          (stableInstructions !== '' ? 1 : 0) -
-          countCacheControlMessages(body);
-      }
       if (summaryMessageFirst) {
-        const summaryRoom = room - (conversationInstructions !== '' ? 1 : 0);
-        body = [
-          this.buildSummaryMessage(
-            summaryRoom >= 1 ? promptCacheProvider : undefined
-          ),
-          ...body,
-        ];
+        body = [this.buildSummaryHumanMessage(undefined), ...body];
       }
-      const system = room >= 1 ? systemMessage : systemMessageWithinBreakpointLimit;
+      // The conversation block gets a breakpoint only while one is left after
+      // tools, the stable block and the markers already in the body.
+      const toolPoints = bedrockCache
+        ? Number(
+          supportsBedrockToolCache(
+            (this.clientOptions as { model?: string } | undefined)?.model
+          )
+        )
+        : 1;
+      const room =
+        MAX_PROMPT_CACHE_BREAKPOINTS -
+        toolPoints -
+        (stableInstructions !== '' ? 1 : 0) -
+        countMarkedBlocks(body, bedrockCache ? 'cachePoint' : 'cache_control');
+      const system = room >= 1 ? systemMessage : buildSystem(false);
       return system ? [system, ...body] : body;
     })).withConfig({ runName: 'prompt' });
   }
 
-  private buildSummaryMessage(
-    markedFor: PromptCacheProvider | undefined
+  private buildSummaryHumanMessage(
+    promptCacheProvider: PromptCacheProvider | undefined
   ): HumanMessage {
     const wrappedSummary = buildSummaryCarrierText(this.summaryText as string);
 
-    if (markedFor == null) {
+    if (promptCacheProvider !== Providers.ANTHROPIC) {
       return new HumanMessage(wrappedSummary);
     }
 
@@ -1139,21 +1125,11 @@ export class AgentContext {
           type: 'text',
           text: wrappedSummary,
           cache_control: buildAnthropicCacheControl(
-            this.getPromptCacheTtl(markedFor)
+            this.getPromptCacheTtl(Providers.ANTHROPIC)
           ),
         },
       ],
     });
-  }
-
-  private buildSummaryHumanMessage(
-    promptCacheProvider: PromptCacheProvider | undefined
-  ): HumanMessage {
-    return this.buildSummaryMessage(
-      promptCacheProvider === Providers.ANTHROPIC
-        ? Providers.ANTHROPIC
-        : undefined
-    );
   }
 
   private buildPromptCacheDynamicTail({
@@ -1197,6 +1173,16 @@ export class AgentContext {
         : this.getPromptCacheDynamicTailIndex(messages, promptCacheProvider);
     const stablePrefix = messages.slice(0, tailIndex);
     const trailingMessages = messages.slice(tailIndex);
+    if (this.hasBedrockPromptCache()) {
+      // The opening message is not an anchor, as for Anthropic.
+      const bedrockTtl = this.getBedrockPromptCacheTtl();
+      return [
+        ...stripBedrockCacheControl(stablePrefix.slice(0, 1)),
+        ...addBedrockTailCacheControl(stablePrefix.slice(1), bedrockTtl),
+        ...tail,
+        ...addBedrockTailCacheControl(trailingMessages, bedrockTtl),
+      ];
+    }
     const ttl = this.getPromptCacheTtl(promptCacheProvider);
     const cacheablePrefix = this.addStablePromptCacheMarkers(stablePrefix, ttl);
     // Mark only the conversation suffix: marking the assembled body would strip
@@ -1207,30 +1193,6 @@ export class AgentContext {
     );
 
     return [...cacheablePrefix, ...tail, ...cacheableTrailingMessages];
-  }
-
-  /**
-   * Bedrock counterpart of `buildBodyWithPromptCacheDynamicTail`: the tail goes
-   * right before the newest user message, with one checkpoint at the end of the
-   * history in front of it and one at the end of the request. The opening message
-   * is not an anchor, as for Anthropic, and loses any checkpoint the graph gave it.
-   */
-  private buildBedrockBodyWithDynamicTail(
-    messages: BaseMessage[],
-    tail: BaseMessage[]
-  ): BaseMessage[] {
-    const tailIndex =
-      this._summaryLocation === 'user_message' && this.summaryPrecedesMessages
-        ? 0
-        : this.getPromptCacheDynamicTailIndex(messages, Providers.ANTHROPIC);
-    const ttl = this.getBedrockPromptCacheTtl();
-    const stablePrefix = messages.slice(0, tailIndex);
-    return [
-      ...stripBedrockCacheControl(stablePrefix.slice(0, 1)),
-      ...addBedrockTailCacheControl(stablePrefix.slice(1), ttl),
-      ...tail,
-      ...addBedrockTailCacheControl(messages.slice(tailIndex), ttl),
-    ];
   }
 
   private getPromptCacheDynamicTailIndex(
@@ -1382,15 +1344,11 @@ export class AgentContext {
         });
       }
       if (conversationInstructions) {
-        content.push(
-          markConversation
-            ? {
-              type: 'text',
-              text: conversationInstructions,
-              cache_control: cacheControl,
-            }
-            : { type: 'text', text: conversationInstructions }
-        );
+        content.push({
+          type: 'text',
+          text: conversationInstructions,
+          ...(markConversation && { cache_control: cacheControl }),
+        });
       }
       if (systemDynamic) {
         content.push({ type: 'text', text: systemDynamic });
@@ -1404,16 +1362,16 @@ export class AgentContext {
     ) {
       const ttl = this.getBedrockPromptCacheTtl();
       const content: AgentSystemContentBlock[] = [];
-      const blocks: Array<[string, boolean]> = [
-        [stableInstructions, true],
-        [conversationInstructions, markConversation],
-      ];
-      for (const [text, marked] of blocks) {
-        if (text) {
-          content.push(
-            { type: 'text', text },
-            ...(marked ? [{ cachePoint: buildBedrockCachePoint(ttl) }] : [])
-          );
+      if (stableInstructions) {
+        content.push(
+          { type: 'text', text: stableInstructions },
+          { cachePoint: buildBedrockCachePoint(ttl) }
+        );
+      }
+      if (conversationInstructions) {
+        content.push({ type: 'text', text: conversationInstructions });
+        if (markConversation) {
+          content.push({ cachePoint: buildBedrockCachePoint(ttl) });
         }
       }
       if (systemDynamic) {

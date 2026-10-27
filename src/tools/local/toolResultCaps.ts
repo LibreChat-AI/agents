@@ -1,0 +1,60 @@
+/** Keeps the last `maxChars` characters, starting at a line boundary when one is near. */
+export function tailTruncate(text: string, maxChars: number): string {
+  if (text.length <= maxChars) {
+    return text;
+  }
+  const tail = text.slice(text.length - maxChars);
+  const newline = tail.indexOf('\n');
+  return newline >= 0 && newline < 200 && newline < tail.length - 1
+    ? tail.slice(newline + 1)
+    : tail;
+}
+
+/** Longest grep match line kept when results are capped. */
+export const CAPPED_GREP_LINE_CHARS = 300;
+
+/**
+ * Caps line-oriented results (search matches): each line is cut to
+ * `CAPPED_GREP_LINE_CHARS`, and lines stop at `maxChars` with a note naming
+ * how many were left out.
+ */
+export function capLines(
+  text: string | readonly string[],
+  maxChars: number,
+  note: (omitted: number) => string = (omitted) =>
+    `${omitted} more matching lines not shown; narrow the pattern or path`
+): string {
+  // An array is capped line by line without joining it first.
+  const lines = typeof text === 'string' ? text.split('\n') : text;
+  const lineChars = Math.max(1, Math.min(CAPPED_GREP_LINE_CHARS, maxChars));
+  const kept: string[] = [];
+  let used = 0;
+  for (const raw of lines) {
+    const line =
+      raw.length > lineChars
+        ? `${raw.slice(0, lineChars)} [line truncated]`
+        : raw;
+    if (used + line.length + 1 > maxChars && kept.length > 0) break;
+    kept.push(line);
+    used += line.length + 1;
+  }
+  const omitted = lines.length - kept.length;
+  return omitted > 0
+    ? `${kept.join('\n')}\n[${note(omitted)}]`
+    : kept.join('\n');
+}
+
+/**
+ * Caps free-form output (shell results): keeps the first 20% and the last 80%
+ * of `maxChars`, where errors and test summaries are, and says how much was
+ * left out so the model can rerun a narrower command.
+ */
+export function capHeadTail(text: string, maxChars: number): string {
+  if (text.length <= maxChars) {
+    return text;
+  }
+  const head = text.slice(0, Math.floor(maxChars * 0.2));
+  const tail = tailTruncate(text, Math.floor(maxChars * 0.8));
+  const omitted = text.length - head.length - tail.length;
+  return `${head}\n[... ${omitted} characters omitted; rerun with narrower output to see them ...]\n${tail}`;
+}

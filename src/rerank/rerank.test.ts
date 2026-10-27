@@ -46,7 +46,7 @@ describe('System One reranking', () => {
       d1: score(2),
       d2: score(2),
     });
-    const reranker = createSystemOneReranker({ model, rubric });
+    const reranker = createSystemOneReranker({ model, rubric, mode: 'batch' });
     const result = await reranker.rerank({
       query: 'query',
       documents: ['same', 'same', 'last'],
@@ -73,7 +73,7 @@ describe('System One reranking', () => {
 
   it('rejects incomplete answers instead of assigning a missing candidate score zero', async () => {
     const { model } = fixture({ d1: score(1) });
-    const reranker = createSystemOneReranker({ model, rubric });
+    const reranker = createSystemOneReranker({ model, rubric, mode: 'batch' });
     await expect(
       reranker.rerank({ query: 'query', documents: ['a', 'b'] })
     ).rejects.toMatchObject({ failure: 'malformed_response' });
@@ -194,14 +194,17 @@ describe('web-search rerank adapter', () => {
               setTimeout(
                 () =>
                   resolve({
-                    answers: {
-                      d0: {
-                        type: 'score',
-                        score: 2,
-                        confidence: null,
-                        probabilities: null,
-                      },
-                    },
+                    answers: Object.fromEntries(
+                      Object.keys(request.questions).map((id) => [
+                        id,
+                        {
+                          type: 'score',
+                          score: 2,
+                          confidence: null,
+                          probabilities: null,
+                        },
+                      ])
+                    ),
                     model: 'delayed',
                     usage: null,
                   }),

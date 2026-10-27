@@ -2807,6 +2807,22 @@ describe('Claude assistant prefill compatibility', () => {
     'global.anthropic.claude-opus-4-6-v1:0',
     'anthropic/claude-sonnet-4.6',
     'anthropic/claude-sonnet-4.12',
+    'claude-sonnet-4-6[1m]',
+    'claude-opus-5',
+    'claude-sonnet-5',
+    'claude-sonnet-5-5',
+    'claude-opus-5-5',
+    'claude-haiku-5-5',
+    'claude-haiku-5.5',
+    'claude-fable-5',
+    'claude-fable-5-1',
+    'claude-mythos-5',
+    'claude-opus-6',
+    'claude-opus-5-20260301',
+    'claude-sonnet-5-5@20260801',
+    'anthropic.claude-haiku-5-5',
+    'global.anthropic.claude-opus-5-5-v1:0',
+    'us.anthropic.claude-sonnet-5-v1:0',
   ])('detects %s as not supporting assistant prefill', (model) => {
     expect(modelDisallowsAssistantPrefill(model)).toBe(true);
   });
@@ -2815,29 +2831,41 @@ describe('Claude assistant prefill compatibility', () => {
     'claude-sonnet-4-5-20250929',
     'claude-opus-4-20250514',
     'anthropic.claude-opus-4-20250514-v1:0',
+    'claude-sonnet-4@20250514',
+    'claude-opus-4-1-20250805',
+    'claude-haiku-4-5',
+    'claude-haiku-4-5-20251001',
+    'claude-3-7-sonnet-20250219',
+    'claude-3-5-haiku-latest',
+    'anthropic.claude-3-haiku-20240307-v1:0',
     'gpt-5.4',
+    '',
+    undefined,
   ])('leaves %s prefill support unchanged', (model) => {
     expect(modelDisallowsAssistantPrefill(model)).toBe(false);
   });
 
-  test('strips trailing assistant messages for Claude 4.6+ requests', () => {
-    const request = {
-      model: 'claude-opus-4-6',
-      max_tokens: 100,
-      messages: [
-        { role: 'user' as const, content: 'What changed?' },
-        { role: 'assistant' as const, content: 'Draft prefill' },
-        { role: 'assistant' as const, content: 'Another prefill' },
-      ],
-    };
+  test.each(['claude-opus-4-6', 'claude-haiku-5-5', 'claude-fable-5-1'])(
+    'strips trailing assistant messages for %s requests',
+    (model) => {
+      const request = {
+        model,
+        max_tokens: 100,
+        messages: [
+          { role: 'user' as const, content: 'What changed?' },
+          { role: 'assistant' as const, content: 'Draft prefill' },
+          { role: 'assistant' as const, content: 'Another prefill' },
+        ],
+      };
 
-    const sanitized = stripUnsupportedAssistantPrefill(request);
+      const sanitized = stripUnsupportedAssistantPrefill(request);
 
-    expect(sanitized).not.toBe(request);
-    expect(sanitized.messages).toEqual([
-      { role: 'user', content: 'What changed?' },
-    ]);
-  });
+      expect(sanitized).not.toBe(request);
+      expect(sanitized.messages).toEqual([
+        { role: 'user', content: 'What changed?' },
+      ]);
+    }
+  );
 
   test('does not strip assistant messages for older Claude models', () => {
     const request = {

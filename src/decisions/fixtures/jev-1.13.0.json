@@ -1,0 +1,3695 @@
+{
+  "questions": {
+    "pure": {
+      "type": "noul",
+      "instructions": "Is this code free of side effects (no I/O, no mutation of outside state)?"
+    },
+    "tested": {
+      "type": "noul",
+      "instructions": "Is this code a test?"
+    },
+    "readability": {
+      "type": "score",
+      "instructions": "How readable is this code?",
+      "criteria": ["unreadable", "hard to follow", "clear", "exemplary"]
+    },
+    "risk": {
+      "type": "score",
+      "instructions": "How risky would it be to change this code?",
+      "criteria": ["trivial", "some care needed", "dangerous"]
+    },
+    "size": {
+      "type": "score",
+      "instructions": "How much logic does this code contain?",
+      "criteria": [
+        "none",
+        "a line or two",
+        "a small function",
+        "a module",
+        "a subsystem"
+      ]
+    },
+    "kind": {
+      "type": "choice",
+      "instructions": "What kind of code is this?",
+      "criteria": {
+        "util": "a small utility function",
+        "hook": "a React hook or component",
+        "route": "an HTTP route handler",
+        "test": "a test case",
+        "config": "configuration or constants"
+      }
+    },
+    "language": {
+      "type": "choice",
+      "instructions": "Which language is this?",
+      "criteria": {
+        "ts": "TypeScript or JavaScript",
+        "py": "Python",
+        "go": "Go"
+      }
+    }
+  },
+  "records": [
+    {
+      "state": "function add(a, b) { return a + b; }",
+      "model": "jev-1.13.0",
+      "answers": {
+        "pure": {
+          "type": "noul",
+          "noul": 0.98
+        },
+        "tested": {
+          "type": "noul",
+          "noul": 0.02
+        },
+        "readability": {
+          "type": "score",
+          "score": 2.49,
+          "confidence": 0.51,
+          "legend": {
+            "0": "unreadable",
+            "1": "hard to follow",
+            "2": "clear",
+            "3": "exemplary"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0,
+            "2": 0.51,
+            "3": 0.49
+          }
+        },
+        "risk": {
+          "type": "score",
+          "score": 0.07,
+          "confidence": 0.9,
+          "legend": {
+            "0": "trivial",
+            "1": "some care needed",
+            "2": "dangerous"
+          },
+          "probabilities": {
+            "0": 0.93,
+            "1": 0.07,
+            "2": 0
+          }
+        },
+        "size": {
+          "type": "score",
+          "score": 1.43,
+          "confidence": 0.62,
+          "legend": {
+            "0": "none",
+            "1": "a line or two",
+            "2": "a small function",
+            "3": "a module",
+            "4": "a subsystem"
+          },
+          "probabilities": {
+            "0": 0.01,
+            "1": 0.55,
+            "2": 0.44,
+            "3": 0,
+            "4": 0
+          }
+        },
+        "kind": {
+          "type": "choice",
+          "choice": "util",
+          "confidence": 1,
+          "probabilities": {
+            "util": 1,
+            "hook": 0,
+            "route": 0,
+            "test": 0,
+            "config": 0
+          }
+        },
+        "language": {
+          "type": "choice",
+          "choice": "ts",
+          "confidence": 1,
+          "probabilities": {
+            "ts": 1,
+            "py": 0,
+            "go": 0
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 628,
+        "output_tokens": 160
+      }
+    },
+    {
+      "state": "export const MAX_RETRIES = 3;\nexport const TIMEOUT_MS = 4000;",
+      "model": "jev-1.13.0",
+      "answers": {
+        "pure": {
+          "type": "noul",
+          "noul": 0.98
+        },
+        "tested": {
+          "type": "noul",
+          "noul": 0.03
+        },
+        "readability": {
+          "type": "score",
+          "score": 2.55,
+          "confidence": 0.55,
+          "legend": {
+            "0": "unreadable",
+            "1": "hard to follow",
+            "2": "clear",
+            "3": "exemplary"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0,
+            "2": 0.45,
+            "3": 0.55
+          }
+        },
+        "risk": {
+          "type": "score",
+          "score": 0.48,
+          "confidence": 0.27,
+          "legend": {
+            "0": "trivial",
+            "1": "some care needed",
+            "2": "dangerous"
+          },
+          "probabilities": {
+            "0": 0.52,
+            "1": 0.47,
+            "2": 0.01
+          }
+        },
+        "size": {
+          "type": "score",
+          "score": 0.58,
+          "confidence": 0.64,
+          "legend": {
+            "0": "none",
+            "1": "a line or two",
+            "2": "a small function",
+            "3": "a module",
+            "4": "a subsystem"
+          },
+          "probabilities": {
+            "0": 0.43,
+            "1": 0.57,
+            "2": 0,
+            "3": 0,
+            "4": 0
+          }
+        },
+        "kind": {
+          "type": "choice",
+          "choice": "config",
+          "confidence": 1,
+          "probabilities": {
+            "util": 0,
+            "hook": 0,
+            "route": 0,
+            "test": 0,
+            "config": 1
+          }
+        },
+        "language": {
+          "type": "choice",
+          "choice": "ts",
+          "confidence": 1,
+          "probabilities": {
+            "ts": 1,
+            "py": 0,
+            "go": 0
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 637,
+        "output_tokens": 160
+      }
+    },
+    {
+      "state": "it('adds numbers', () => { expect(add(1, 2)).toBe(3); });",
+      "model": "jev-1.13.0",
+      "answers": {
+        "pure": {
+          "type": "noul",
+          "noul": 0.93
+        },
+        "tested": {
+          "type": "noul",
+          "noul": 0.98
+        },
+        "readability": {
+          "type": "score",
+          "score": 2.43,
+          "confidence": 0.57,
+          "legend": {
+            "0": "unreadable",
+            "1": "hard to follow",
+            "2": "clear",
+            "3": "exemplary"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0,
+            "2": 0.57,
+            "3": 0.43
+          }
+        },
+        "risk": {
+          "type": "score",
+          "score": 0.05,
+          "confidence": 0.94,
+          "legend": {
+            "0": "trivial",
+            "1": "some care needed",
+            "2": "dangerous"
+          },
+          "probabilities": {
+            "0": 0.96,
+            "1": 0.04,
+            "2": 0
+          }
+        },
+        "size": {
+          "type": "score",
+          "score": 0.73,
+          "confidence": 0.77,
+          "legend": {
+            "0": "none",
+            "1": "a line or two",
+            "2": "a small function",
+            "3": "a module",
+            "4": "a subsystem"
+          },
+          "probabilities": {
+            "0": 0.28,
+            "1": 0.72,
+            "2": 0,
+            "3": 0,
+            "4": 0
+          }
+        },
+        "kind": {
+          "type": "choice",
+          "choice": "test",
+          "confidence": 1,
+          "probabilities": {
+            "util": 0,
+            "hook": 0,
+            "route": 0,
+            "test": 1,
+            "config": 0
+          }
+        },
+        "language": {
+          "type": "choice",
+          "choice": "ts",
+          "confidence": 1,
+          "probabilities": {
+            "ts": 1,
+            "py": 0,
+            "go": 0
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 637,
+        "output_tokens": 160
+      }
+    },
+    {
+      "state": "app.get('/users/:id', async (req, res) => { const user = await db.users.findById(req.params.id); res.json(user); });",
+      "model": "jev-1.13.0",
+      "answers": {
+        "pure": {
+          "type": "noul",
+          "noul": 0.02
+        },
+        "tested": {
+          "type": "noul",
+          "noul": 0.02
+        },
+        "readability": {
+          "type": "score",
+          "score": 1.93,
+          "confidence": 0.87,
+          "legend": {
+            "0": "unreadable",
+            "1": "hard to follow",
+            "2": "clear",
+            "3": "exemplary"
+          },
+          "probabilities": {
+            "0": 0.02,
+            "1": 0.06,
+            "2": 0.89,
+            "3": 0.03
+          }
+        },
+        "risk": {
+          "type": "score",
+          "score": 0.72,
+          "confidence": 0.49,
+          "legend": {
+            "0": "trivial",
+            "1": "some care needed",
+            "2": "dangerous"
+          },
+          "probabilities": {
+            "0": 0.31,
+            "1": 0.66,
+            "2": 0.03
+          }
+        },
+        "size": {
+          "type": "score",
+          "score": 1.19,
+          "confidence": 0.84,
+          "legend": {
+            "0": "none",
+            "1": "a line or two",
+            "2": "a small function",
+            "3": "a module",
+            "4": "a subsystem"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0.81,
+            "2": 0.19,
+            "3": 0,
+            "4": 0
+          }
+        },
+        "kind": {
+          "type": "choice",
+          "choice": "route",
+          "confidence": 1,
+          "probabilities": {
+            "util": 0,
+            "hook": 0,
+            "route": 1,
+            "test": 0,
+            "config": 0
+          }
+        },
+        "language": {
+          "type": "choice",
+          "choice": "ts",
+          "confidence": 1,
+          "probabilities": {
+            "ts": 1,
+            "py": 0,
+            "go": 0
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 648,
+        "output_tokens": 160
+      }
+    },
+    {
+      "state": "export function useCounter() { const [n, setN] = useState(0); return { n, inc: () => setN(n + 1) }; }",
+      "model": "jev-1.13.0",
+      "answers": {
+        "pure": {
+          "type": "noul",
+          "noul": 0.47
+        },
+        "tested": {
+          "type": "noul",
+          "noul": 0.02
+        },
+        "readability": {
+          "type": "score",
+          "score": 2.01,
+          "confidence": 0.9,
+          "legend": {
+            "0": "unreadable",
+            "1": "hard to follow",
+            "2": "clear",
+            "3": "exemplary"
+          },
+          "probabilities": {
+            "0": 0.01,
+            "1": 0.03,
+            "2": 0.91,
+            "3": 0.05
+          }
+        },
+        "risk": {
+          "type": "score",
+          "score": 0.49,
+          "confidence": 0.28,
+          "legend": {
+            "0": "trivial",
+            "1": "some care needed",
+            "2": "dangerous"
+          },
+          "probabilities": {
+            "0": 0.55,
+            "1": 0.42,
+            "2": 0.03
+          }
+        },
+        "size": {
+          "type": "score",
+          "score": 1.54,
+          "confidence": 0.62,
+          "legend": {
+            "0": "none",
+            "1": "a line or two",
+            "2": "a small function",
+            "3": "a module",
+            "4": "a subsystem"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0.45,
+            "2": 0.55,
+            "3": 0,
+            "4": 0
+          }
+        },
+        "kind": {
+          "type": "choice",
+          "choice": "hook",
+          "confidence": 1,
+          "probabilities": {
+            "util": 0,
+            "hook": 1,
+            "route": 0,
+            "test": 0,
+            "config": 0
+          }
+        },
+        "language": {
+          "type": "choice",
+          "choice": "ts",
+          "confidence": 1,
+          "probabilities": {
+            "ts": 1,
+            "py": 0,
+            "go": 0
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 652,
+        "output_tokens": 160
+      }
+    },
+    {
+      "state": "def mean(xs):\n    return sum(xs) / len(xs)",
+      "model": "jev-1.13.0",
+      "answers": {
+        "pure": {
+          "type": "noul",
+          "noul": 0.97
+        },
+        "tested": {
+          "type": "noul",
+          "noul": 0.03
+        },
+        "readability": {
+          "type": "score",
+          "score": 2.26,
+          "confidence": 0.74,
+          "legend": {
+            "0": "unreadable",
+            "1": "hard to follow",
+            "2": "clear",
+            "3": "exemplary"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0,
+            "2": 0.74,
+            "3": 0.26
+          }
+        },
+        "risk": {
+          "type": "score",
+          "score": 0.45,
+          "confidence": 0.34,
+          "legend": {
+            "0": "trivial",
+            "1": "some care needed",
+            "2": "dangerous"
+          },
+          "probabilities": {
+            "0": 0.5700000000000001,
+            "1": 0.42,
+            "2": 0.01
+          }
+        },
+        "size": {
+          "type": "score",
+          "score": 1.17,
+          "confidence": 0.86,
+          "legend": {
+            "0": "none",
+            "1": "a line or two",
+            "2": "a small function",
+            "3": "a module",
+            "4": "a subsystem"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0.83,
+            "2": 0.17,
+            "3": 0,
+            "4": 0
+          }
+        },
+        "kind": {
+          "type": "choice",
+          "choice": "util",
+          "confidence": 1,
+          "probabilities": {
+            "util": 1,
+            "hook": 0,
+            "route": 0,
+            "test": 0,
+            "config": 0
+          }
+        },
+        "language": {
+          "type": "choice",
+          "choice": "py",
+          "confidence": 1,
+          "probabilities": {
+            "ts": 0,
+            "py": 1,
+            "go": 0
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 628,
+        "output_tokens": 160
+      }
+    },
+    {
+      "state": "func Max(a, b int) int {\n\tif a > b {\n\t\treturn a\n\t}\n\treturn b\n}",
+      "model": "jev-1.13.0",
+      "answers": {
+        "pure": {
+          "type": "noul",
+          "noul": 0.99
+        },
+        "tested": {
+          "type": "noul",
+          "noul": 0.02
+        },
+        "readability": {
+          "type": "score",
+          "score": 2.39,
+          "confidence": 0.6,
+          "legend": {
+            "0": "unreadable",
+            "1": "hard to follow",
+            "2": "clear",
+            "3": "exemplary"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0,
+            "2": 0.6,
+            "3": 0.4
+          }
+        },
+        "risk": {
+          "type": "score",
+          "score": 0.04,
+          "confidence": 0.95,
+          "legend": {
+            "0": "trivial",
+            "1": "some care needed",
+            "2": "dangerous"
+          },
+          "probabilities": {
+            "0": 0.97,
+            "1": 0.03,
+            "2": 0
+          }
+        },
+        "size": {
+          "type": "score",
+          "score": 1.7,
+          "confidence": 0.75,
+          "legend": {
+            "0": "none",
+            "1": "a line or two",
+            "2": "a small function",
+            "3": "a module",
+            "4": "a subsystem"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0.3,
+            "2": 0.7,
+            "3": 0,
+            "4": 0
+          }
+        },
+        "kind": {
+          "type": "choice",
+          "choice": "util",
+          "confidence": 1,
+          "probabilities": {
+            "util": 1,
+            "hook": 0,
+            "route": 0,
+            "test": 0,
+            "config": 0
+          }
+        },
+        "language": {
+          "type": "choice",
+          "choice": "go",
+          "confidence": 1,
+          "probabilities": {
+            "ts": 0,
+            "py": 0,
+            "go": 1
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 639,
+        "output_tokens": 160
+      }
+    },
+    {
+      "state": "let cache = {};\nfunction get(k) { if (!cache[k]) cache[k] = fetchSync(k); return cache[k]; }",
+      "model": "jev-1.13.0",
+      "answers": {
+        "pure": {
+          "type": "noul",
+          "noul": 0.02
+        },
+        "tested": {
+          "type": "noul",
+          "noul": 0.03
+        },
+        "readability": {
+          "type": "score",
+          "score": 1.94,
+          "confidence": 0.92,
+          "legend": {
+            "0": "unreadable",
+            "1": "hard to follow",
+            "2": "clear",
+            "3": "exemplary"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0.07,
+            "2": 0.92,
+            "3": 0.01
+          }
+        },
+        "risk": {
+          "type": "score",
+          "score": 1.1,
+          "confidence": 0.58,
+          "legend": {
+            "0": "trivial",
+            "1": "some care needed",
+            "2": "dangerous"
+          },
+          "probabilities": {
+            "0": 0.09,
+            "1": 0.72,
+            "2": 0.19
+          }
+        },
+        "size": {
+          "type": "score",
+          "score": 1.67,
+          "confidence": 0.72,
+          "legend": {
+            "0": "none",
+            "1": "a line or two",
+            "2": "a small function",
+            "3": "a module",
+            "4": "a subsystem"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0.33,
+            "2": 0.67,
+            "3": 0,
+            "4": 0
+          }
+        },
+        "kind": {
+          "type": "choice",
+          "choice": "util",
+          "confidence": 1,
+          "probabilities": {
+            "util": 1,
+            "hook": 0,
+            "route": 0,
+            "test": 0,
+            "config": 0
+          }
+        },
+        "language": {
+          "type": "choice",
+          "choice": "ts",
+          "confidence": 1,
+          "probabilities": {
+            "ts": 1,
+            "py": 0,
+            "go": 0
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 644,
+        "output_tokens": 160
+      }
+    },
+    {
+      "state": "const x=a?b?c:d:e?f:g;let q=x&&y||z??w;",
+      "model": "jev-1.13.0",
+      "answers": {
+        "pure": {
+          "type": "noul",
+          "noul": 0.82
+        },
+        "tested": {
+          "type": "noul",
+          "noul": 0.11
+        },
+        "readability": {
+          "type": "score",
+          "score": 0.72,
+          "confidence": 0.72,
+          "legend": {
+            "0": "unreadable",
+            "1": "hard to follow",
+            "2": "clear",
+            "3": "exemplary"
+          },
+          "probabilities": {
+            "0": 0.28,
+            "1": 0.72,
+            "2": 0,
+            "3": 0
+          }
+        },
+        "risk": {
+          "type": "score",
+          "score": 1.55,
+          "confidence": 0.34,
+          "legend": {
+            "0": "trivial",
+            "1": "some care needed",
+            "2": "dangerous"
+          },
+          "probabilities": {
+            "0": 0.02,
+            "1": 0.4,
+            "2": 0.58
+          }
+        },
+        "size": {
+          "type": "score",
+          "score": 0.99,
+          "confidence": 0.99,
+          "legend": {
+            "0": "none",
+            "1": "a line or two",
+            "2": "a small function",
+            "3": "a module",
+            "4": "a subsystem"
+          },
+          "probabilities": {
+            "0": 0.01,
+            "1": 0.99,
+            "2": 0,
+            "3": 0,
+            "4": 0
+          }
+        },
+        "kind": {
+          "type": "choice",
+          "choice": "config",
+          "confidence": 0.47,
+          "probabilities": {
+            "util": 0.25,
+            "hook": 0.01,
+            "route": 0,
+            "test": 0.16,
+            "config": 0.58
+          }
+        },
+        "language": {
+          "type": "choice",
+          "choice": "ts",
+          "confidence": 1,
+          "probabilities": {
+            "ts": 1,
+            "py": 0,
+            "go": 0
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 638,
+        "output_tokens": 160
+      }
+    },
+    {
+      "state": "export async function migrate(db) { await db.collection(\"users\").updateMany({}, { $set: { role: \"USER\" } }); }",
+      "model": "jev-1.13.0",
+      "answers": {
+        "pure": {
+          "type": "noul",
+          "noul": 0.01
+        },
+        "tested": {
+          "type": "noul",
+          "noul": 0.03
+        },
+        "readability": {
+          "type": "score",
+          "score": 1.91,
+          "confidence": 0.86,
+          "legend": {
+            "0": "unreadable",
+            "1": "hard to follow",
+            "2": "clear",
+            "3": "exemplary"
+          },
+          "probabilities": {
+            "0": 0.02,
+            "1": 0.08,
+            "2": 0.88,
+            "3": 0.02
+          }
+        },
+        "risk": {
+          "type": "score",
+          "score": 1.83,
+          "confidence": 0.74,
+          "legend": {
+            "0": "trivial",
+            "1": "some care needed",
+            "2": "dangerous"
+          },
+          "probabilities": {
+            "0": 0.04,
+            "1": 0.09,
+            "2": 0.87
+          }
+        },
+        "size": {
+          "type": "score",
+          "score": 1.54,
+          "confidence": 0.62,
+          "legend": {
+            "0": "none",
+            "1": "a line or two",
+            "2": "a small function",
+            "3": "a module",
+            "4": "a subsystem"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0.45,
+            "2": 0.55,
+            "3": 0,
+            "4": 0
+          }
+        },
+        "kind": {
+          "type": "choice",
+          "choice": "util",
+          "confidence": 1,
+          "probabilities": {
+            "util": 1,
+            "hook": 0,
+            "route": 0,
+            "test": 0,
+            "config": 0
+          }
+        },
+        "language": {
+          "type": "choice",
+          "choice": "ts",
+          "confidence": 1,
+          "probabilities": {
+            "ts": 1,
+            "py": 0,
+            "go": 0
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 645,
+        "output_tokens": 160
+      }
+    },
+    {
+      "state": "import os\nprint(os.environ['HOME'])",
+      "model": "jev-1.13.0",
+      "answers": {
+        "pure": {
+          "type": "noul",
+          "noul": 0.02
+        },
+        "tested": {
+          "type": "noul",
+          "noul": 0.06
+        },
+        "readability": {
+          "type": "score",
+          "score": 2.08,
+          "confidence": 0.91,
+          "legend": {
+            "0": "unreadable",
+            "1": "hard to follow",
+            "2": "clear",
+            "3": "exemplary"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0,
+            "2": 0.91,
+            "3": 0.09
+          }
+        },
+        "risk": {
+          "type": "score",
+          "score": 0.16,
+          "confidence": 0.76,
+          "legend": {
+            "0": "trivial",
+            "1": "some care needed",
+            "2": "dangerous"
+          },
+          "probabilities": {
+            "0": 0.85,
+            "1": 0.14,
+            "2": 0.01
+          }
+        },
+        "size": {
+          "type": "score",
+          "score": 0.88,
+          "confidence": 0.9,
+          "legend": {
+            "0": "none",
+            "1": "a line or two",
+            "2": "a small function",
+            "3": "a module",
+            "4": "a subsystem"
+          },
+          "probabilities": {
+            "0": 0.12,
+            "1": 0.88,
+            "2": 0,
+            "3": 0,
+            "4": 0
+          }
+        },
+        "kind": {
+          "type": "choice",
+          "choice": "util",
+          "confidence": 0.84,
+          "probabilities": {
+            "util": 0.87,
+            "hook": 0,
+            "route": 0,
+            "test": 0.01,
+            "config": 0.12
+          }
+        },
+        "language": {
+          "type": "choice",
+          "choice": "py",
+          "confidence": 1,
+          "probabilities": {
+            "ts": 0,
+            "py": 1,
+            "go": 0
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 624,
+        "output_tokens": 160
+      }
+    },
+    {
+      "state": "describe('Router', () => { it('rejects unknown routes', async () => { await expect(route('/nope')).rejects.toThrow(); }); });",
+      "model": "jev-1.13.0",
+      "answers": {
+        "pure": {
+          "type": "noul",
+          "noul": 0.56
+        },
+        "tested": {
+          "type": "noul",
+          "noul": 0.98
+        },
+        "readability": {
+          "type": "score",
+          "score": 2.22,
+          "confidence": 0.77,
+          "legend": {
+            "0": "unreadable",
+            "1": "hard to follow",
+            "2": "clear",
+            "3": "exemplary"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0.01,
+            "2": 0.77,
+            "3": 0.22
+          }
+        },
+        "risk": {
+          "type": "score",
+          "score": 0.15,
+          "confidence": 0.76,
+          "legend": {
+            "0": "trivial",
+            "1": "some care needed",
+            "2": "dangerous"
+          },
+          "probabilities": {
+            "0": 0.85,
+            "1": 0.14,
+            "2": 0.01
+          }
+        },
+        "size": {
+          "type": "score",
+          "score": 0.96,
+          "confidence": 0.93,
+          "legend": {
+            "0": "none",
+            "1": "a line or two",
+            "2": "a small function",
+            "3": "a module",
+            "4": "a subsystem"
+          },
+          "probabilities": {
+            "0": 0.06,
+            "1": 0.92,
+            "2": 0.02,
+            "3": 0,
+            "4": 0
+          }
+        },
+        "kind": {
+          "type": "choice",
+          "choice": "test",
+          "confidence": 1,
+          "probabilities": {
+            "util": 0,
+            "hook": 0,
+            "route": 0,
+            "test": 1,
+            "config": 0
+          }
+        },
+        "language": {
+          "type": "choice",
+          "choice": "ts",
+          "confidence": 1,
+          "probabilities": {
+            "ts": 1,
+            "py": 0,
+            "go": 0
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 650,
+        "output_tokens": 160
+      }
+    },
+    {
+      "state": "function slugify(s) { return s.toLowerCase().trim().replace(/[^a-z0-9]+/g, \"-\").replace(/^-|-$/g, \"\"); }",
+      "model": "jev-1.13.0",
+      "answers": {
+        "pure": {
+          "type": "noul",
+          "noul": 0.97
+        },
+        "tested": {
+          "type": "noul",
+          "noul": 0.02
+        },
+        "readability": {
+          "type": "score",
+          "score": 1.9,
+          "confidence": 0.83,
+          "legend": {
+            "0": "unreadable",
+            "1": "hard to follow",
+            "2": "clear",
+            "3": "exemplary"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0.13,
+            "2": 0.83,
+            "3": 0.04
+          }
+        },
+        "risk": {
+          "type": "score",
+          "score": 0.55,
+          "confidence": 0.29,
+          "legend": {
+            "0": "trivial",
+            "1": "some care needed",
+            "2": "dangerous"
+          },
+          "probabilities": {
+            "0": 0.46,
+            "1": 0.53,
+            "2": 0.01
+          }
+        },
+        "size": {
+          "type": "score",
+          "score": 1.63,
+          "confidence": 0.69,
+          "legend": {
+            "0": "none",
+            "1": "a line or two",
+            "2": "a small function",
+            "3": "a module",
+            "4": "a subsystem"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0.37,
+            "2": 0.63,
+            "3": 0,
+            "4": 0
+          }
+        },
+        "kind": {
+          "type": "choice",
+          "choice": "util",
+          "confidence": 1,
+          "probabilities": {
+            "util": 1,
+            "hook": 0,
+            "route": 0,
+            "test": 0,
+            "config": 0
+          }
+        },
+        "language": {
+          "type": "choice",
+          "choice": "ts",
+          "confidence": 1,
+          "probabilities": {
+            "ts": 1,
+            "py": 0,
+            "go": 0
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 655,
+        "output_tokens": 160
+      }
+    },
+    {
+      "state": "export default { port: 3080, host: \"localhost\", logLevel: \"info\" };",
+      "model": "jev-1.13.0",
+      "answers": {
+        "pure": {
+          "type": "noul",
+          "noul": 0.92
+        },
+        "tested": {
+          "type": "noul",
+          "noul": 0.04
+        },
+        "readability": {
+          "type": "score",
+          "score": 2.4,
+          "confidence": 0.6,
+          "legend": {
+            "0": "unreadable",
+            "1": "hard to follow",
+            "2": "clear",
+            "3": "exemplary"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0,
+            "2": 0.6,
+            "3": 0.4
+          }
+        },
+        "risk": {
+          "type": "score",
+          "score": 0.39,
+          "confidence": 0.4,
+          "legend": {
+            "0": "trivial",
+            "1": "some care needed",
+            "2": "dangerous"
+          },
+          "probabilities": {
+            "0": 0.61,
+            "1": 0.38,
+            "2": 0.01
+          }
+        },
+        "size": {
+          "type": "score",
+          "score": 0.59,
+          "confidence": 0.51,
+          "legend": {
+            "0": "none",
+            "1": "a line or two",
+            "2": "a small function",
+            "3": "a module",
+            "4": "a subsystem"
+          },
+          "probabilities": {
+            "0": 0.55,
+            "1": 0.38,
+            "2": 0,
+            "3": 0.07,
+            "4": 0
+          }
+        },
+        "kind": {
+          "type": "choice",
+          "choice": "config",
+          "confidence": 1,
+          "probabilities": {
+            "util": 0,
+            "hook": 0,
+            "route": 0,
+            "test": 0,
+            "config": 1
+          }
+        },
+        "language": {
+          "type": "choice",
+          "choice": "ts",
+          "confidence": 1,
+          "probabilities": {
+            "ts": 1,
+            "py": 0,
+            "go": 0
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 639,
+        "output_tokens": 160
+      }
+    },
+    {
+      "state": "class LRU { constructor(n) { this.n = n; this.m = new Map(); } get(k) { const v = this.m.get(k); if (v !== undefined) { this.m.delete(k); this.m.set(k, v); } return v; } set(k, v) { this.m.delete(k); this.m.set(k, v); if (this.m.size > this.n) this.m.delete(this.m.keys().next().value); } }",
+      "model": "jev-1.13.0",
+      "answers": {
+        "pure": {
+          "type": "noul",
+          "noul": 0.38
+        },
+        "tested": {
+          "type": "noul",
+          "noul": 0.02
+        },
+        "readability": {
+          "type": "score",
+          "score": 1.79,
+          "confidence": 0.78,
+          "legend": {
+            "0": "unreadable",
+            "1": "hard to follow",
+            "2": "clear",
+            "3": "exemplary"
+          },
+          "probabilities": {
+            "0": 0.01,
+            "1": 0.2,
+            "2": 0.79,
+            "3": 0
+          }
+        },
+        "risk": {
+          "type": "score",
+          "score": 0.93,
+          "confidence": 0.62,
+          "legend": {
+            "0": "trivial",
+            "1": "some care needed",
+            "2": "dangerous"
+          },
+          "probabilities": {
+            "0": 0.16,
+            "1": 0.75,
+            "2": 0.09
+          }
+        },
+        "size": {
+          "type": "score",
+          "score": 2.03,
+          "confidence": 0.88,
+          "legend": {
+            "0": "none",
+            "1": "a line or two",
+            "2": "a small function",
+            "3": "a module",
+            "4": "a subsystem"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0.06,
+            "2": 0.85,
+            "3": 0.09,
+            "4": 0
+          }
+        },
+        "kind": {
+          "type": "choice",
+          "choice": "util",
+          "confidence": 1,
+          "probabilities": {
+            "util": 1,
+            "hook": 0,
+            "route": 0,
+            "test": 0,
+            "config": 0
+          }
+        },
+        "language": {
+          "type": "choice",
+          "choice": "ts",
+          "confidence": 1,
+          "probabilities": {
+            "ts": 1,
+            "py": 0,
+            "go": 0
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 711,
+        "output_tokens": 160
+      }
+    },
+    {
+      "state": "router.post('/login', (req, res) => { if (req.body.password === 'admin') { req.session.admin = true; } res.redirect('/'); });",
+      "model": "jev-1.13.0",
+      "answers": {
+        "pure": {
+          "type": "noul",
+          "noul": 0.01
+        },
+        "tested": {
+          "type": "noul",
+          "noul": 0.02
+        },
+        "readability": {
+          "type": "score",
+          "score": 1.66,
+          "confidence": 0.67,
+          "legend": {
+            "0": "unreadable",
+            "1": "hard to follow",
+            "2": "clear",
+            "3": "exemplary"
+          },
+          "probabilities": {
+            "0": 0.04,
+            "1": 0.25,
+            "2": 0.71,
+            "3": 0
+          }
+        },
+        "risk": {
+          "type": "score",
+          "score": 1.73,
+          "confidence": 0.59,
+          "legend": {
+            "0": "trivial",
+            "1": "some care needed",
+            "2": "dangerous"
+          },
+          "probabilities": {
+            "0": 0.08,
+            "1": 0.11,
+            "2": 0.81
+          }
+        },
+        "size": {
+          "type": "score",
+          "score": 1.26,
+          "confidence": 0.79,
+          "legend": {
+            "0": "none",
+            "1": "a line or two",
+            "2": "a small function",
+            "3": "a module",
+            "4": "a subsystem"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0.75,
+            "2": 0.25,
+            "3": 0,
+            "4": 0
+          }
+        },
+        "kind": {
+          "type": "choice",
+          "choice": "route",
+          "confidence": 1,
+          "probabilities": {
+            "util": 0,
+            "hook": 0,
+            "route": 1,
+            "test": 0,
+            "config": 0
+          }
+        },
+        "language": {
+          "type": "choice",
+          "choice": "ts",
+          "confidence": 1,
+          "probabilities": {
+            "ts": 1,
+            "py": 0,
+            "go": 0
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 649,
+        "output_tokens": 160
+      }
+    },
+    {
+      "state": "function Button({ label, onClick }) { return <button onClick={onClick}>{label}</button>; }",
+      "model": "jev-1.13.0",
+      "answers": {
+        "pure": {
+          "type": "noul",
+          "noul": 0.82
+        },
+        "tested": {
+          "type": "noul",
+          "noul": 0.02
+        },
+        "readability": {
+          "type": "score",
+          "score": 2.39,
+          "confidence": 0.6,
+          "legend": {
+            "0": "unreadable",
+            "1": "hard to follow",
+            "2": "clear",
+            "3": "exemplary"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0,
+            "2": 0.6,
+            "3": 0.4
+          }
+        },
+        "risk": {
+          "type": "score",
+          "score": 0.13,
+          "confidence": 0.8,
+          "legend": {
+            "0": "trivial",
+            "1": "some care needed",
+            "2": "dangerous"
+          },
+          "probabilities": {
+            "0": 0.87,
+            "1": 0.13,
+            "2": 0
+          }
+        },
+        "size": {
+          "type": "score",
+          "score": 1.22,
+          "confidence": 0.73,
+          "legend": {
+            "0": "none",
+            "1": "a line or two",
+            "2": "a small function",
+            "3": "a module",
+            "4": "a subsystem"
+          },
+          "probabilities": {
+            "0": 0.05,
+            "1": 0.68,
+            "2": 0.27,
+            "3": 0,
+            "4": 0
+          }
+        },
+        "kind": {
+          "type": "choice",
+          "choice": "hook",
+          "confidence": 0.99,
+          "probabilities": {
+            "util": 0.01,
+            "hook": 0.99,
+            "route": 0,
+            "test": 0,
+            "config": 0
+          }
+        },
+        "language": {
+          "type": "choice",
+          "choice": "ts",
+          "confidence": 1,
+          "probabilities": {
+            "ts": 1,
+            "py": 0,
+            "go": 0
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 641,
+        "output_tokens": 160
+      }
+    },
+    {
+      "state": "for i in range(10):\n    print(i * i)",
+      "model": "jev-1.13.0",
+      "answers": {
+        "pure": {
+          "type": "noul",
+          "noul": 0.01
+        },
+        "tested": {
+          "type": "noul",
+          "noul": 0.08
+        },
+        "readability": {
+          "type": "score",
+          "score": 2.24,
+          "confidence": 0.76,
+          "legend": {
+            "0": "unreadable",
+            "1": "hard to follow",
+            "2": "clear",
+            "3": "exemplary"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0,
+            "2": 0.76,
+            "3": 0.24
+          }
+        },
+        "risk": {
+          "type": "score",
+          "score": 0.03,
+          "confidence": 0.95,
+          "legend": {
+            "0": "trivial",
+            "1": "some care needed",
+            "2": "dangerous"
+          },
+          "probabilities": {
+            "0": 0.97,
+            "1": 0.03,
+            "2": 0
+          }
+        },
+        "size": {
+          "type": "score",
+          "score": 1.01,
+          "confidence": 0.98,
+          "legend": {
+            "0": "none",
+            "1": "a line or two",
+            "2": "a small function",
+            "3": "a module",
+            "4": "a subsystem"
+          },
+          "probabilities": {
+            "0": 0.01,
+            "1": 0.98,
+            "2": 0.01,
+            "3": 0,
+            "4": 0
+          }
+        },
+        "kind": {
+          "type": "choice",
+          "choice": "util",
+          "confidence": 0.84,
+          "probabilities": {
+            "util": 0.87,
+            "hook": 0,
+            "route": 0,
+            "test": 0.13,
+            "config": 0
+          }
+        },
+        "language": {
+          "type": "choice",
+          "choice": "py",
+          "confidence": 1,
+          "probabilities": {
+            "ts": 0,
+            "py": 1,
+            "go": 0
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 629,
+        "output_tokens": 160
+      }
+    },
+    {
+      "state": "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(\"hello\")\n}",
+      "model": "jev-1.13.0",
+      "answers": {
+        "pure": {
+          "type": "noul",
+          "noul": 0.01
+        },
+        "tested": {
+          "type": "noul",
+          "noul": 0.03
+        },
+        "readability": {
+          "type": "score",
+          "score": 2.43,
+          "confidence": 0.57,
+          "legend": {
+            "0": "unreadable",
+            "1": "hard to follow",
+            "2": "clear",
+            "3": "exemplary"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0,
+            "2": 0.5700000000000001,
+            "3": 0.43
+          }
+        },
+        "risk": {
+          "type": "score",
+          "score": 0,
+          "confidence": 1,
+          "legend": {
+            "0": "trivial",
+            "1": "some care needed",
+            "2": "dangerous"
+          },
+          "probabilities": {
+            "0": 1,
+            "1": 0,
+            "2": 0
+          }
+        },
+        "size": {
+          "type": "score",
+          "score": 0.98,
+          "confidence": 0.77,
+          "legend": {
+            "0": "none",
+            "1": "a line or two",
+            "2": "a small function",
+            "3": "a module",
+            "4": "a subsystem"
+          },
+          "probabilities": {
+            "0": 0.15,
+            "1": 0.72,
+            "2": 0.13,
+            "3": 0,
+            "4": 0
+          }
+        },
+        "kind": {
+          "type": "choice",
+          "choice": "util",
+          "confidence": 0.97,
+          "probabilities": {
+            "util": 0.98,
+            "hook": 0,
+            "route": 0,
+            "test": 0.02,
+            "config": 0
+          }
+        },
+        "language": {
+          "type": "choice",
+          "choice": "go",
+          "confidence": 1,
+          "probabilities": {
+            "ts": 0,
+            "py": 0,
+            "go": 1
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 633,
+        "output_tokens": 160
+      }
+    },
+    {
+      "state": "const sleep = (ms) => new Promise((r) => setTimeout(r, ms));",
+      "model": "jev-1.13.0",
+      "answers": {
+        "pure": {
+          "type": "noul",
+          "noul": 0.32
+        },
+        "tested": {
+          "type": "noul",
+          "noul": 0.05
+        },
+        "readability": {
+          "type": "score",
+          "score": 2.25,
+          "confidence": 0.74,
+          "legend": {
+            "0": "unreadable",
+            "1": "hard to follow",
+            "2": "clear",
+            "3": "exemplary"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0,
+            "2": 0.74,
+            "3": 0.26
+          }
+        },
+        "risk": {
+          "type": "score",
+          "score": 0.15,
+          "confidence": 0.79,
+          "legend": {
+            "0": "trivial",
+            "1": "some care needed",
+            "2": "dangerous"
+          },
+          "probabilities": {
+            "0": 0.86,
+            "1": 0.14,
+            "2": 0
+          }
+        },
+        "size": {
+          "type": "score",
+          "score": 1.51,
+          "confidence": 0.58,
+          "legend": {
+            "0": "none",
+            "1": "a line or two",
+            "2": "a small function",
+            "3": "a module",
+            "4": "a subsystem"
+          },
+          "probabilities": {
+            "0": 0.01,
+            "1": 0.48,
+            "2": 0.51,
+            "3": 0,
+            "4": 0
+          }
+        },
+        "kind": {
+          "type": "choice",
+          "choice": "util",
+          "confidence": 1,
+          "probabilities": {
+            "util": 1,
+            "hook": 0,
+            "route": 0,
+            "test": 0,
+            "config": 0
+          }
+        },
+        "language": {
+          "type": "choice",
+          "choice": "ts",
+          "confidence": 1,
+          "probabilities": {
+            "ts": 1,
+            "py": 0,
+            "go": 0
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 635,
+        "output_tokens": 160
+      }
+    },
+    {
+      "state": "export function parseDuration(s) { const m = /^(\\d+)(ms|s|m)$/.exec(s); if (!m) return null; const n = Number(m[1]); return m[2] === \"ms\" ? n : m[2] === \"s\" ? n * 1000 : n * 60000; }",
+      "model": "jev-1.13.0",
+      "answers": {
+        "pure": {
+          "type": "noul",
+          "noul": 0.97
+        },
+        "tested": {
+          "type": "noul",
+          "noul": 0.02
+        },
+        "readability": {
+          "type": "score",
+          "score": 1.71,
+          "confidence": 0.71,
+          "legend": {
+            "0": "unreadable",
+            "1": "hard to follow",
+            "2": "clear",
+            "3": "exemplary"
+          },
+          "probabilities": {
+            "0": 0.01,
+            "1": 0.27,
+            "2": 0.72,
+            "3": 0
+          }
+        },
+        "risk": {
+          "type": "score",
+          "score": 0.77,
+          "confidence": 0.62,
+          "legend": {
+            "0": "trivial",
+            "1": "some care needed",
+            "2": "dangerous"
+          },
+          "probabilities": {
+            "0": 0.24,
+            "1": 0.75,
+            "2": 0.01
+          }
+        },
+        "size": {
+          "type": "score",
+          "score": 1.88,
+          "confidence": 0.9,
+          "legend": {
+            "0": "none",
+            "1": "a line or two",
+            "2": "a small function",
+            "3": "a module",
+            "4": "a subsystem"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0.12,
+            "2": 0.88,
+            "3": 0,
+            "4": 0
+          }
+        },
+        "kind": {
+          "type": "choice",
+          "choice": "util",
+          "confidence": 1,
+          "probabilities": {
+            "util": 1,
+            "hook": 0,
+            "route": 0,
+            "test": 0,
+            "config": 0
+          }
+        },
+        "language": {
+          "type": "choice",
+          "choice": "ts",
+          "confidence": 1,
+          "probabilities": {
+            "ts": 1,
+            "py": 0,
+            "go": 0
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 695,
+        "output_tokens": 160
+      }
+    },
+    {
+      "state": "global.counter++;",
+      "model": "jev-1.13.0",
+      "answers": {
+        "pure": {
+          "type": "noul",
+          "noul": 0.02
+        },
+        "tested": {
+          "type": "noul",
+          "noul": 0.07
+        },
+        "readability": {
+          "type": "score",
+          "score": 2.02,
+          "confidence": 0.9,
+          "legend": {
+            "0": "unreadable",
+            "1": "hard to follow",
+            "2": "clear",
+            "3": "exemplary"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0.04,
+            "2": 0.9,
+            "3": 0.06
+          }
+        },
+        "risk": {
+          "type": "score",
+          "score": 0.88,
+          "confidence": 0.38,
+          "legend": {
+            "0": "trivial",
+            "1": "some care needed",
+            "2": "dangerous"
+          },
+          "probabilities": {
+            "0": 0.26,
+            "1": 0.59,
+            "2": 0.15
+          }
+        },
+        "size": {
+          "type": "score",
+          "score": 0.87,
+          "confidence": 0.89,
+          "legend": {
+            "0": "none",
+            "1": "a line or two",
+            "2": "a small function",
+            "3": "a module",
+            "4": "a subsystem"
+          },
+          "probabilities": {
+            "0": 0.13,
+            "1": 0.87,
+            "2": 0,
+            "3": 0,
+            "4": 0
+          }
+        },
+        "kind": {
+          "type": "choice",
+          "choice": "util",
+          "confidence": 0.59,
+          "probabilities": {
+            "util": 0.67,
+            "hook": 0.01,
+            "route": 0.01,
+            "test": 0.08,
+            "config": 0.23
+          }
+        },
+        "language": {
+          "type": "choice",
+          "choice": "ts",
+          "confidence": 1,
+          "probabilities": {
+            "ts": 1,
+            "py": 0,
+            "go": 0
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 618,
+        "output_tokens": 160
+      }
+    },
+    {
+      "state": "test(\"sleep resolves\", async () => { jest.useFakeTimers(); const p = sleep(10); jest.advanceTimersByTime(10); await p; });",
+      "model": "jev-1.13.0",
+      "answers": {
+        "pure": {
+          "type": "noul",
+          "noul": 0.16
+        },
+        "tested": {
+          "type": "noul",
+          "noul": 0.97
+        },
+        "readability": {
+          "type": "score",
+          "score": 1.66,
+          "confidence": 0.62,
+          "legend": {
+            "0": "unreadable",
+            "1": "hard to follow",
+            "2": "clear",
+            "3": "exemplary"
+          },
+          "probabilities": {
+            "0": 0.05,
+            "1": 0.27,
+            "2": 0.67,
+            "3": 0.01
+          }
+        },
+        "risk": {
+          "type": "score",
+          "score": 0.54,
+          "confidence": 0.19,
+          "legend": {
+            "0": "trivial",
+            "1": "some care needed",
+            "2": "dangerous"
+          },
+          "probabilities": {
+            "0": 0.49,
+            "1": 0.48,
+            "2": 0.03
+          }
+        },
+        "size": {
+          "type": "score",
+          "score": 0.98,
+          "confidence": 0.97,
+          "legend": {
+            "0": "none",
+            "1": "a line or two",
+            "2": "a small function",
+            "3": "a module",
+            "4": "a subsystem"
+          },
+          "probabilities": {
+            "0": 0.03,
+            "1": 0.96,
+            "2": 0.01,
+            "3": 0,
+            "4": 0
+          }
+        },
+        "kind": {
+          "type": "choice",
+          "choice": "test",
+          "confidence": 1,
+          "probabilities": {
+            "util": 0,
+            "hook": 0,
+            "route": 0,
+            "test": 1,
+            "config": 0
+          }
+        },
+        "language": {
+          "type": "choice",
+          "choice": "ts",
+          "confidence": 1,
+          "probabilities": {
+            "ts": 1,
+            "py": 0,
+            "go": 0
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 653,
+        "output_tokens": 160
+      }
+    },
+    {
+      "state": "export function useDebounce(value, ms) { const [v, setV] = useState(value); useEffect(() => { const t = setTimeout(() => setV(value), ms); return () => clearTimeout(t); }, [value, ms]); return v; }",
+      "model": "jev-1.13.0",
+      "answers": {
+        "pure": {
+          "type": "noul",
+          "noul": 0.3
+        },
+        "tested": {
+          "type": "noul",
+          "noul": 0.02
+        },
+        "readability": {
+          "type": "score",
+          "score": 1.9,
+          "confidence": 0.82,
+          "legend": {
+            "0": "unreadable",
+            "1": "hard to follow",
+            "2": "clear",
+            "3": "exemplary"
+          },
+          "probabilities": {
+            "0": 0.02,
+            "1": 0.1,
+            "2": 0.84,
+            "3": 0.04
+          }
+        },
+        "risk": {
+          "type": "score",
+          "score": 0.86,
+          "confidence": 0.67,
+          "legend": {
+            "0": "trivial",
+            "1": "some care needed",
+            "2": "dangerous"
+          },
+          "probabilities": {
+            "0": 0.18,
+            "1": 0.78,
+            "2": 0.04
+          }
+        },
+        "size": {
+          "type": "score",
+          "score": 1.88,
+          "confidence": 0.9,
+          "legend": {
+            "0": "none",
+            "1": "a line or two",
+            "2": "a small function",
+            "3": "a module",
+            "4": "a subsystem"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0.12,
+            "2": 0.88,
+            "3": 0,
+            "4": 0
+          }
+        },
+        "kind": {
+          "type": "choice",
+          "choice": "hook",
+          "confidence": 1,
+          "probabilities": {
+            "util": 0,
+            "hook": 1,
+            "route": 0,
+            "test": 0,
+            "config": 0
+          }
+        },
+        "language": {
+          "type": "choice",
+          "choice": "ts",
+          "confidence": 1,
+          "probabilities": {
+            "ts": 1,
+            "py": 0,
+            "go": 0
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 676,
+        "output_tokens": 160
+      }
+    },
+    {
+      "state": "def handler(event, context):\n    body = json.loads(event[\"body\"])\n    table.put_item(Item=body)\n    return {\"statusCode\": 200}",
+      "model": "jev-1.13.0",
+      "answers": {
+        "pure": {
+          "type": "noul",
+          "noul": 0.01
+        },
+        "tested": {
+          "type": "noul",
+          "noul": 0.02
+        },
+        "readability": {
+          "type": "score",
+          "score": 1.97,
+          "confidence": 0.97,
+          "legend": {
+            "0": "unreadable",
+            "1": "hard to follow",
+            "2": "clear",
+            "3": "exemplary"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0.03,
+            "2": 0.97,
+            "3": 0
+          }
+        },
+        "risk": {
+          "type": "score",
+          "score": 1.19,
+          "confidence": 0.44,
+          "legend": {
+            "0": "trivial",
+            "1": "some care needed",
+            "2": "dangerous"
+          },
+          "probabilities": {
+            "0": 0.09,
+            "1": 0.63,
+            "2": 0.28
+          }
+        },
+        "size": {
+          "type": "score",
+          "score": 1.76,
+          "confidence": 0.81,
+          "legend": {
+            "0": "none",
+            "1": "a line or two",
+            "2": "a small function",
+            "3": "a module",
+            "4": "a subsystem"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0.23,
+            "2": 0.77,
+            "3": 0,
+            "4": 0
+          }
+        },
+        "kind": {
+          "type": "choice",
+          "choice": "route",
+          "confidence": 1,
+          "probabilities": {
+            "util": 0,
+            "hook": 0,
+            "route": 1,
+            "test": 0,
+            "config": 0
+          }
+        },
+        "language": {
+          "type": "choice",
+          "choice": "py",
+          "confidence": 1,
+          "probabilities": {
+            "ts": 0,
+            "py": 1,
+            "go": 0
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 650,
+        "output_tokens": 160
+      }
+    },
+    {
+      "state": "function f(a){var b=[];for(var i=0;i<a.length;i++){if(a[i]%2){b.push(a[i]*3+1)}else{b.push(a[i]/2)}}return b}",
+      "model": "jev-1.13.0",
+      "answers": {
+        "pure": {
+          "type": "noul",
+          "noul": 0.93
+        },
+        "tested": {
+          "type": "noul",
+          "noul": 0.03
+        },
+        "readability": {
+          "type": "score",
+          "score": 1.82,
+          "confidence": 0.81,
+          "legend": {
+            "0": "unreadable",
+            "1": "hard to follow",
+            "2": "clear",
+            "3": "exemplary"
+          },
+          "probabilities": {
+            "0": 0.01,
+            "1": 0.17,
+            "2": 0.82,
+            "3": 0
+          }
+        },
+        "risk": {
+          "type": "score",
+          "score": 0.49,
+          "confidence": 0.27,
+          "legend": {
+            "0": "trivial",
+            "1": "some care needed",
+            "2": "dangerous"
+          },
+          "probabilities": {
+            "0": 0.52,
+            "1": 0.47,
+            "2": 0.01
+          }
+        },
+        "size": {
+          "type": "score",
+          "score": 1.97,
+          "confidence": 0.97,
+          "legend": {
+            "0": "none",
+            "1": "a line or two",
+            "2": "a small function",
+            "3": "a module",
+            "4": "a subsystem"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0.03,
+            "2": 0.97,
+            "3": 0,
+            "4": 0
+          }
+        },
+        "kind": {
+          "type": "choice",
+          "choice": "util",
+          "confidence": 1,
+          "probabilities": {
+            "util": 1,
+            "hook": 0,
+            "route": 0,
+            "test": 0,
+            "config": 0
+          }
+        },
+        "language": {
+          "type": "choice",
+          "choice": "ts",
+          "confidence": 1,
+          "probabilities": {
+            "ts": 1,
+            "py": 0,
+            "go": 0
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 660,
+        "output_tokens": 160
+      }
+    },
+    {
+      "state": "export const routes = [{ path: \"/\", component: Home }, { path: \"/about\", component: About }];",
+      "model": "jev-1.13.0",
+      "answers": {
+        "pure": {
+          "type": "noul",
+          "noul": 0.92
+        },
+        "tested": {
+          "type": "noul",
+          "noul": 0.02
+        },
+        "readability": {
+          "type": "score",
+          "score": 2.13,
+          "confidence": 0.87,
+          "legend": {
+            "0": "unreadable",
+            "1": "hard to follow",
+            "2": "clear",
+            "3": "exemplary"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0,
+            "2": 0.87,
+            "3": 0.13
+          }
+        },
+        "risk": {
+          "type": "score",
+          "score": 0.3,
+          "confidence": 0.56,
+          "legend": {
+            "0": "trivial",
+            "1": "some care needed",
+            "2": "dangerous"
+          },
+          "probabilities": {
+            "0": 0.71,
+            "1": 0.29,
+            "2": 0
+          }
+        },
+        "size": {
+          "type": "score",
+          "score": 0.76,
+          "confidence": 0.6,
+          "legend": {
+            "0": "none",
+            "1": "a line or two",
+            "2": "a small function",
+            "3": "a module",
+            "4": "a subsystem"
+          },
+          "probabilities": {
+            "0": 0.36,
+            "1": 0.58,
+            "2": 0,
+            "3": 0.06,
+            "4": 0
+          }
+        },
+        "kind": {
+          "type": "choice",
+          "choice": "config",
+          "confidence": 0.86,
+          "probabilities": {
+            "util": 0,
+            "hook": 0,
+            "route": 0.11,
+            "test": 0,
+            "config": 0.89
+          }
+        },
+        "language": {
+          "type": "choice",
+          "choice": "ts",
+          "confidence": 1,
+          "probabilities": {
+            "ts": 1,
+            "py": 0,
+            "go": 0
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 638,
+        "output_tokens": 160
+      }
+    },
+    {
+      "state": "async function retry(fn, n) { for (let i = 0; i <= n; i++) { try { return await fn(); } catch (e) { if (i === n) throw e; await sleep(2 ** i * 100); } } }",
+      "model": "jev-1.13.0",
+      "answers": {
+        "pure": {
+          "type": "noul",
+          "noul": 0.22
+        },
+        "tested": {
+          "type": "noul",
+          "noul": 0.04
+        },
+        "readability": {
+          "type": "score",
+          "score": 1.81,
+          "confidence": 0.81,
+          "legend": {
+            "0": "unreadable",
+            "1": "hard to follow",
+            "2": "clear",
+            "3": "exemplary"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0.19,
+            "2": 0.81,
+            "3": 0
+          }
+        },
+        "risk": {
+          "type": "score",
+          "score": 0.99,
+          "confidence": 0.8,
+          "legend": {
+            "0": "trivial",
+            "1": "some care needed",
+            "2": "dangerous"
+          },
+          "probabilities": {
+            "0": 0.07,
+            "1": 0.87,
+            "2": 0.06
+          }
+        },
+        "size": {
+          "type": "score",
+          "score": 1.87,
+          "confidence": 0.89,
+          "legend": {
+            "0": "none",
+            "1": "a line or two",
+            "2": "a small function",
+            "3": "a module",
+            "4": "a subsystem"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0.13,
+            "2": 0.87,
+            "3": 0,
+            "4": 0
+          }
+        },
+        "kind": {
+          "type": "choice",
+          "choice": "util",
+          "confidence": 1,
+          "probabilities": {
+            "util": 1,
+            "hook": 0,
+            "route": 0,
+            "test": 0,
+            "config": 0
+          }
+        },
+        "language": {
+          "type": "choice",
+          "choice": "ts",
+          "confidence": 1,
+          "probabilities": {
+            "ts": 1,
+            "py": 0,
+            "go": 0
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 674,
+        "output_tokens": 160
+      }
+    },
+    {
+      "state": "type Point = { x: number; y: number };\nexport const distance = (a: Point, b: Point): number => Math.hypot(a.x - b.x, a.y - b.y);",
+      "model": "jev-1.13.0",
+      "answers": {
+        "pure": {
+          "type": "noul",
+          "noul": 0.99
+        },
+        "tested": {
+          "type": "noul",
+          "noul": 0.02
+        },
+        "readability": {
+          "type": "score",
+          "score": 2.42,
+          "confidence": 0.58,
+          "legend": {
+            "0": "unreadable",
+            "1": "hard to follow",
+            "2": "clear",
+            "3": "exemplary"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0,
+            "2": 0.58,
+            "3": 0.42
+          }
+        },
+        "risk": {
+          "type": "score",
+          "score": 0.08,
+          "confidence": 0.88,
+          "legend": {
+            "0": "trivial",
+            "1": "some care needed",
+            "2": "dangerous"
+          },
+          "probabilities": {
+            "0": 0.92,
+            "1": 0.08,
+            "2": 0
+          }
+        },
+        "size": {
+          "type": "score",
+          "score": 1.4,
+          "confidence": 0.67,
+          "legend": {
+            "0": "none",
+            "1": "a line or two",
+            "2": "a small function",
+            "3": "a module",
+            "4": "a subsystem"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0.6,
+            "2": 0.4,
+            "3": 0,
+            "4": 0
+          }
+        },
+        "kind": {
+          "type": "choice",
+          "choice": "util",
+          "confidence": 1,
+          "probabilities": {
+            "util": 1,
+            "hook": 0,
+            "route": 0,
+            "test": 0,
+            "config": 0
+          }
+        },
+        "language": {
+          "type": "choice",
+          "choice": "ts",
+          "confidence": 1,
+          "probabilities": {
+            "ts": 1,
+            "py": 0,
+            "go": 0
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 658,
+        "output_tokens": 160
+      }
+    },
+    {
+      "state": "rm -rf /tmp/build && mkdir -p /tmp/build",
+      "model": "jev-1.13.0",
+      "answers": {
+        "pure": {
+          "type": "noul",
+          "noul": 0.01
+        },
+        "tested": {
+          "type": "noul",
+          "noul": 0.03
+        },
+        "readability": {
+          "type": "score",
+          "score": 2.08,
+          "confidence": 0.91,
+          "legend": {
+            "0": "unreadable",
+            "1": "hard to follow",
+            "2": "clear",
+            "3": "exemplary"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0.01,
+            "2": 0.91,
+            "3": 0.08
+          }
+        },
+        "risk": {
+          "type": "score",
+          "score": 1.12,
+          "confidence": 0.19,
+          "legend": {
+            "0": "trivial",
+            "1": "some care needed",
+            "2": "dangerous"
+          },
+          "probabilities": {
+            "0": 0.21,
+            "1": 0.46,
+            "2": 0.33
+          }
+        },
+        "size": {
+          "type": "score",
+          "score": 0.85,
+          "confidence": 0.88,
+          "legend": {
+            "0": "none",
+            "1": "a line or two",
+            "2": "a small function",
+            "3": "a module",
+            "4": "a subsystem"
+          },
+          "probabilities": {
+            "0": 0.15,
+            "1": 0.85,
+            "2": 0,
+            "3": 0,
+            "4": 0
+          }
+        },
+        "kind": {
+          "type": "choice",
+          "choice": "util",
+          "confidence": 0.82,
+          "probabilities": {
+            "util": 0.86,
+            "hook": 0,
+            "route": 0,
+            "test": 0,
+            "config": 0.14
+          }
+        },
+        "language": {
+          "type": "choice",
+          "choice": "py",
+          "confidence": 0.25,
+          "probabilities": {
+            "ts": 0.26,
+            "py": 0.5,
+            "go": 0.24
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 628,
+        "output_tokens": 160
+      }
+    },
+    {
+      "state": "func handler(w http.ResponseWriter, r *http.Request) {\n\tw.WriteHeader(http.StatusNoContent)\n}",
+      "model": "jev-1.13.0",
+      "answers": {
+        "pure": {
+          "type": "noul",
+          "noul": 0.03
+        },
+        "tested": {
+          "type": "noul",
+          "noul": 0.04
+        },
+        "readability": {
+          "type": "score",
+          "score": 2.13,
+          "confidence": 0.86,
+          "legend": {
+            "0": "unreadable",
+            "1": "hard to follow",
+            "2": "clear",
+            "3": "exemplary"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0,
+            "2": 0.86,
+            "3": 0.14
+          }
+        },
+        "risk": {
+          "type": "score",
+          "score": 0.39,
+          "confidence": 0.4,
+          "legend": {
+            "0": "trivial",
+            "1": "some care needed",
+            "2": "dangerous"
+          },
+          "probabilities": {
+            "0": 0.64,
+            "1": 0.32,
+            "2": 0.04
+          }
+        },
+        "size": {
+          "type": "score",
+          "score": 1.07,
+          "confidence": 0.93,
+          "legend": {
+            "0": "none",
+            "1": "a line or two",
+            "2": "a small function",
+            "3": "a module",
+            "4": "a subsystem"
+          },
+          "probabilities": {
+            "0": 0.01,
+            "1": 0.91,
+            "2": 0.08,
+            "3": 0,
+            "4": 0
+          }
+        },
+        "kind": {
+          "type": "choice",
+          "choice": "route",
+          "confidence": 1,
+          "probabilities": {
+            "util": 0,
+            "hook": 0,
+            "route": 1,
+            "test": 0,
+            "config": 0
+          }
+        },
+        "language": {
+          "type": "choice",
+          "choice": "go",
+          "confidence": 1,
+          "probabilities": {
+            "ts": 0,
+            "py": 0,
+            "go": 1
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 643,
+        "output_tokens": 160
+      }
+    },
+    {
+      "state": "class TestMean(unittest.TestCase):\n    def test_mean(self):\n        self.assertEqual(mean([1, 2, 3]), 2)",
+      "model": "jev-1.13.0",
+      "answers": {
+        "pure": {
+          "type": "noul",
+          "noul": 0.91
+        },
+        "tested": {
+          "type": "noul",
+          "noul": 0.97
+        },
+        "readability": {
+          "type": "score",
+          "score": 2.16,
+          "confidence": 0.84,
+          "legend": {
+            "0": "unreadable",
+            "1": "hard to follow",
+            "2": "clear",
+            "3": "exemplary"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0,
+            "2": 0.84,
+            "3": 0.16
+          }
+        },
+        "risk": {
+          "type": "score",
+          "score": 0.2,
+          "confidence": 0.7,
+          "legend": {
+            "0": "trivial",
+            "1": "some care needed",
+            "2": "dangerous"
+          },
+          "probabilities": {
+            "0": 0.81,
+            "1": 0.18,
+            "2": 0.01
+          }
+        },
+        "size": {
+          "type": "score",
+          "score": 1.09,
+          "confidence": 0.83,
+          "legend": {
+            "0": "none",
+            "1": "a line or two",
+            "2": "a small function",
+            "3": "a module",
+            "4": "a subsystem"
+          },
+          "probabilities": {
+            "0": 0.06,
+            "1": 0.8,
+            "2": 0.14,
+            "3": 0,
+            "4": 0
+          }
+        },
+        "kind": {
+          "type": "choice",
+          "choice": "test",
+          "confidence": 1,
+          "probabilities": {
+            "util": 0,
+            "hook": 0,
+            "route": 0,
+            "test": 1,
+            "config": 0
+          }
+        },
+        "language": {
+          "type": "choice",
+          "choice": "py",
+          "confidence": 0.98,
+          "probabilities": {
+            "ts": 0,
+            "py": 0.99,
+            "go": 0.01
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 649,
+        "output_tokens": 160
+      }
+    },
+    {
+      "state": "export function chunk<T>(xs: T[], n: number): T[][] { const out: T[][] = []; for (let i = 0; i < xs.length; i += n) out.push(xs.slice(i, i + n)); return out; }",
+      "model": "jev-1.13.0",
+      "answers": {
+        "pure": {
+          "type": "noul",
+          "noul": 0.92
+        },
+        "tested": {
+          "type": "noul",
+          "noul": 0.02
+        },
+        "readability": {
+          "type": "score",
+          "score": 2.05,
+          "confidence": 0.9,
+          "legend": {
+            "0": "unreadable",
+            "1": "hard to follow",
+            "2": "clear",
+            "3": "exemplary"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0.02,
+            "2": 0.9,
+            "3": 0.08
+          }
+        },
+        "risk": {
+          "type": "score",
+          "score": 0.33,
+          "confidence": 0.52,
+          "legend": {
+            "0": "trivial",
+            "1": "some care needed",
+            "2": "dangerous"
+          },
+          "probabilities": {
+            "0": 0.68,
+            "1": 0.32,
+            "2": 0
+          }
+        },
+        "size": {
+          "type": "score",
+          "score": 1.81,
+          "confidence": 0.84,
+          "legend": {
+            "0": "none",
+            "1": "a line or two",
+            "2": "a small function",
+            "3": "a module",
+            "4": "a subsystem"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0.19,
+            "2": 0.81,
+            "3": 0,
+            "4": 0
+          }
+        },
+        "kind": {
+          "type": "choice",
+          "choice": "util",
+          "confidence": 1,
+          "probabilities": {
+            "util": 1,
+            "hook": 0,
+            "route": 0,
+            "test": 0,
+            "config": 0
+          }
+        },
+        "language": {
+          "type": "choice",
+          "choice": "ts",
+          "confidence": 1,
+          "probabilities": {
+            "ts": 1,
+            "py": 0,
+            "go": 0
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 669,
+        "output_tokens": 160
+      }
+    },
+    {
+      "state": "localStorage.setItem(\"token\", response.token); window.location.reload();",
+      "model": "jev-1.13.0",
+      "answers": {
+        "pure": {
+          "type": "noul",
+          "noul": 0.01
+        },
+        "tested": {
+          "type": "noul",
+          "noul": 0.03
+        },
+        "readability": {
+          "type": "score",
+          "score": 1.9,
+          "confidence": 0.88,
+          "legend": {
+            "0": "unreadable",
+            "1": "hard to follow",
+            "2": "clear",
+            "3": "exemplary"
+          },
+          "probabilities": {
+            "0": 0.01,
+            "1": 0.09,
+            "2": 0.89,
+            "3": 0.01
+          }
+        },
+        "risk": {
+          "type": "score",
+          "score": 0.93,
+          "confidence": 0.53,
+          "legend": {
+            "0": "trivial",
+            "1": "some care needed",
+            "2": "dangerous"
+          },
+          "probabilities": {
+            "0": 0.19,
+            "1": 0.69,
+            "2": 0.12
+          }
+        },
+        "size": {
+          "type": "score",
+          "score": 0.99,
+          "confidence": 0.99,
+          "legend": {
+            "0": "none",
+            "1": "a line or two",
+            "2": "a small function",
+            "3": "a module",
+            "4": "a subsystem"
+          },
+          "probabilities": {
+            "0": 0.01,
+            "1": 0.99,
+            "2": 0,
+            "3": 0,
+            "4": 0
+          }
+        },
+        "kind": {
+          "type": "choice",
+          "choice": "util",
+          "confidence": 0.62,
+          "probabilities": {
+            "util": 0.7,
+            "hook": 0.13,
+            "route": 0.16,
+            "test": 0,
+            "config": 0.01
+          }
+        },
+        "language": {
+          "type": "choice",
+          "choice": "ts",
+          "confidence": 1,
+          "probabilities": {
+            "ts": 1,
+            "py": 0,
+            "go": 0
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 633,
+        "output_tokens": 160
+      }
+    },
+    {
+      "state": "const enum Color { Red, Green, Blue }",
+      "model": "jev-1.13.0",
+      "answers": {
+        "pure": {
+          "type": "noul",
+          "noul": 0.98
+        },
+        "tested": {
+          "type": "noul",
+          "noul": 0.04
+        },
+        "readability": {
+          "type": "score",
+          "score": 2.19,
+          "confidence": 0.81,
+          "legend": {
+            "0": "unreadable",
+            "1": "hard to follow",
+            "2": "clear",
+            "3": "exemplary"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0,
+            "2": 0.81,
+            "3": 0.19
+          }
+        },
+        "risk": {
+          "type": "score",
+          "score": 0.61,
+          "confidence": 0.25,
+          "legend": {
+            "0": "trivial",
+            "1": "some care needed",
+            "2": "dangerous"
+          },
+          "probabilities": {
+            "0": 0.45,
+            "1": 0.5,
+            "2": 0.05
+          }
+        },
+        "size": {
+          "type": "score",
+          "score": 0.33,
+          "confidence": 0.72,
+          "legend": {
+            "0": "none",
+            "1": "a line or two",
+            "2": "a small function",
+            "3": "a module",
+            "4": "a subsystem"
+          },
+          "probabilities": {
+            "0": 0.67,
+            "1": 0.33,
+            "2": 0,
+            "3": 0,
+            "4": 0
+          }
+        },
+        "kind": {
+          "type": "choice",
+          "choice": "config",
+          "confidence": 1,
+          "probabilities": {
+            "util": 0,
+            "hook": 0,
+            "route": 0,
+            "test": 0,
+            "config": 1
+          }
+        },
+        "language": {
+          "type": "choice",
+          "choice": "ts",
+          "confidence": 1,
+          "probabilities": {
+            "ts": 1,
+            "py": 0,
+            "go": 0
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 625,
+        "output_tokens": 160
+      }
+    },
+    {
+      "state": "function Modal({ open, children }) { if (!open) return null; return createPortal(<div role=\"dialog\">{children}</div>, document.body); }",
+      "model": "jev-1.13.0",
+      "answers": {
+        "pure": {
+          "type": "noul",
+          "noul": 0.18
+        },
+        "tested": {
+          "type": "noul",
+          "noul": 0.02
+        },
+        "readability": {
+          "type": "score",
+          "score": 2.1,
+          "confidence": 0.87,
+          "legend": {
+            "0": "unreadable",
+            "1": "hard to follow",
+            "2": "clear",
+            "3": "exemplary"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0.01,
+            "2": 0.87,
+            "3": 0.12
+          }
+        },
+        "risk": {
+          "type": "score",
+          "score": 0.83,
+          "confidence": 0.69,
+          "legend": {
+            "0": "trivial",
+            "1": "some care needed",
+            "2": "dangerous"
+          },
+          "probabilities": {
+            "0": 0.19,
+            "1": 0.79,
+            "2": 0.02
+          }
+        },
+        "size": {
+          "type": "score",
+          "score": 1.73,
+          "confidence": 0.77,
+          "legend": {
+            "0": "none",
+            "1": "a line or two",
+            "2": "a small function",
+            "3": "a module",
+            "4": "a subsystem"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0.27,
+            "2": 0.73,
+            "3": 0,
+            "4": 0
+          }
+        },
+        "kind": {
+          "type": "choice",
+          "choice": "hook",
+          "confidence": 1,
+          "probabilities": {
+            "util": 0,
+            "hook": 1,
+            "route": 0,
+            "test": 0,
+            "config": 0
+          }
+        },
+        "language": {
+          "type": "choice",
+          "choice": "ts",
+          "confidence": 1,
+          "probabilities": {
+            "ts": 1,
+            "py": 0,
+            "go": 0
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 649,
+        "output_tokens": 160
+      }
+    },
+    {
+      "state": "SELECT id, name FROM users WHERE created_at > now() - interval 1 day;",
+      "model": "jev-1.13.0",
+      "answers": {
+        "pure": {
+          "type": "noul",
+          "noul": 0.54
+        },
+        "tested": {
+          "type": "noul",
+          "noul": 0.05
+        },
+        "readability": {
+          "type": "score",
+          "score": 2.29,
+          "confidence": 0.71,
+          "legend": {
+            "0": "unreadable",
+            "1": "hard to follow",
+            "2": "clear",
+            "3": "exemplary"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0,
+            "2": 0.71,
+            "3": 0.29
+          }
+        },
+        "risk": {
+          "type": "score",
+          "score": 0.35,
+          "confidence": 0.49,
+          "legend": {
+            "0": "trivial",
+            "1": "some care needed",
+            "2": "dangerous"
+          },
+          "probabilities": {
+            "0": 0.67,
+            "1": 0.32,
+            "2": 0.01
+          }
+        },
+        "size": {
+          "type": "score",
+          "score": 0.93,
+          "confidence": 0.94,
+          "legend": {
+            "0": "none",
+            "1": "a line or two",
+            "2": "a small function",
+            "3": "a module",
+            "4": "a subsystem"
+          },
+          "probabilities": {
+            "0": 0.07,
+            "1": 0.93,
+            "2": 0,
+            "3": 0,
+            "4": 0
+          }
+        },
+        "kind": {
+          "type": "choice",
+          "choice": "util",
+          "confidence": 0.79,
+          "probabilities": {
+            "util": 0.83,
+            "hook": 0,
+            "route": 0.07,
+            "test": 0.06,
+            "config": 0.04
+          }
+        },
+        "language": {
+          "type": "choice",
+          "choice": "py",
+          "confidence": 0.34,
+          "probabilities": {
+            "ts": 0.32,
+            "py": 0.56,
+            "go": 0.12
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 633,
+        "output_tokens": 160
+      }
+    },
+    {
+      "state": "export async function DELETE(req) { const { id } = await req.json(); await prisma.post.delete({ where: { id } }); return new Response(null, { status: 204 }); }",
+      "model": "jev-1.13.0",
+      "answers": {
+        "pure": {
+          "type": "noul",
+          "noul": 0.01
+        },
+        "tested": {
+          "type": "noul",
+          "noul": 0.02
+        },
+        "readability": {
+          "type": "score",
+          "score": 1.96,
+          "confidence": 0.88,
+          "legend": {
+            "0": "unreadable",
+            "1": "hard to follow",
+            "2": "clear",
+            "3": "exemplary"
+          },
+          "probabilities": {
+            "0": 0.02,
+            "1": 0.04,
+            "2": 0.9,
+            "3": 0.04
+          }
+        },
+        "risk": {
+          "type": "score",
+          "score": 1.12,
+          "confidence": 0.64,
+          "legend": {
+            "0": "trivial",
+            "1": "some care needed",
+            "2": "dangerous"
+          },
+          "probabilities": {
+            "0": 0.06,
+            "1": 0.76,
+            "2": 0.18
+          }
+        },
+        "size": {
+          "type": "score",
+          "score": 1.71,
+          "confidence": 0.76,
+          "legend": {
+            "0": "none",
+            "1": "a line or two",
+            "2": "a small function",
+            "3": "a module",
+            "4": "a subsystem"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0.29,
+            "2": 0.71,
+            "3": 0,
+            "4": 0
+          }
+        },
+        "kind": {
+          "type": "choice",
+          "choice": "route",
+          "confidence": 1,
+          "probabilities": {
+            "util": 0,
+            "hook": 0,
+            "route": 1,
+            "test": 0,
+            "config": 0
+          }
+        },
+        "language": {
+          "type": "choice",
+          "choice": "ts",
+          "confidence": 1,
+          "probabilities": {
+            "ts": 1,
+            "py": 0,
+            "go": 0
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 657,
+        "output_tokens": 160
+      }
+    },
+    {
+      "state": "x = [i for i in range(100) if i % 3 == 0 and i % 5 != 0]",
+      "model": "jev-1.13.0",
+      "answers": {
+        "pure": {
+          "type": "noul",
+          "noul": 0.97
+        },
+        "tested": {
+          "type": "noul",
+          "noul": 0.05
+        },
+        "readability": {
+          "type": "score",
+          "score": 2.04,
+          "confidence": 0.92,
+          "legend": {
+            "0": "unreadable",
+            "1": "hard to follow",
+            "2": "clear",
+            "3": "exemplary"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0.02,
+            "2": 0.92,
+            "3": 0.06
+          }
+        },
+        "risk": {
+          "type": "score",
+          "score": 0.14,
+          "confidence": 0.78,
+          "legend": {
+            "0": "trivial",
+            "1": "some care needed",
+            "2": "dangerous"
+          },
+          "probabilities": {
+            "0": 0.86,
+            "1": 0.13,
+            "2": 0.01
+          }
+        },
+        "size": {
+          "type": "score",
+          "score": 1,
+          "confidence": 0.99,
+          "legend": {
+            "0": "none",
+            "1": "a line or two",
+            "2": "a small function",
+            "3": "a module",
+            "4": "a subsystem"
+          },
+          "probabilities": {
+            "0": 0.01,
+            "1": 0.99,
+            "2": 0,
+            "3": 0,
+            "4": 0
+          }
+        },
+        "kind": {
+          "type": "choice",
+          "choice": "config",
+          "confidence": 0.41,
+          "probabilities": {
+            "util": 0.44,
+            "hook": 0,
+            "route": 0,
+            "test": 0.03,
+            "config": 0.53
+          }
+        },
+        "language": {
+          "type": "choice",
+          "choice": "py",
+          "confidence": 1,
+          "probabilities": {
+            "ts": 0,
+            "py": 1,
+            "go": 0
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 645,
+        "output_tokens": 160
+      }
+    },
+    {
+      "state": "export const isEven = (n: number): boolean => n % 2 === 0;",
+      "model": "jev-1.13.0",
+      "answers": {
+        "pure": {
+          "type": "noul",
+          "noul": 0.99
+        },
+        "tested": {
+          "type": "noul",
+          "noul": 0.03
+        },
+        "readability": {
+          "type": "score",
+          "score": 2.67,
+          "confidence": 0.67,
+          "legend": {
+            "0": "unreadable",
+            "1": "hard to follow",
+            "2": "clear",
+            "3": "exemplary"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0,
+            "2": 0.33,
+            "3": 0.67
+          }
+        },
+        "risk": {
+          "type": "score",
+          "score": 0.03,
+          "confidence": 0.97,
+          "legend": {
+            "0": "trivial",
+            "1": "some care needed",
+            "2": "dangerous"
+          },
+          "probabilities": {
+            "0": 0.98,
+            "1": 0.02,
+            "2": 0
+          }
+        },
+        "size": {
+          "type": "score",
+          "score": 1.26,
+          "confidence": 0.78,
+          "legend": {
+            "0": "none",
+            "1": "a line or two",
+            "2": "a small function",
+            "3": "a module",
+            "4": "a subsystem"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0.74,
+            "2": 0.26,
+            "3": 0,
+            "4": 0
+          }
+        },
+        "kind": {
+          "type": "choice",
+          "choice": "util",
+          "confidence": 1,
+          "probabilities": {
+            "util": 1,
+            "hook": 0,
+            "route": 0,
+            "test": 0,
+            "config": 0
+          }
+        },
+        "language": {
+          "type": "choice",
+          "choice": "ts",
+          "confidence": 1,
+          "probabilities": {
+            "ts": 1,
+            "py": 0,
+            "go": 0
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 636,
+        "output_tokens": 160
+      }
+    }
+  ]
+}

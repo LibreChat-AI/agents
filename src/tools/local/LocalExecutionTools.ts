@@ -13,6 +13,7 @@ import {
   BashExecutionToolSchema,
   BashToolOutputReferencesGuide,
 } from '@/tools/BashExecutor';
+import { capHeadTail } from './toolResultCaps';
 import {
   CodeExecutionToolName,
   CodeExecutionToolSchema,
@@ -127,6 +128,25 @@ export function createLocalCodeExecutionTool(
   );
 }
 
+/**
+ * Applies `toolResultMaxChars` to stdout and stderr before formatting, so
+ * the status lines (`exit_code`, `timed_out`, `killed`) are always kept.
+ * stderr gets at most half of the budget.
+ */
+function capStreams<T extends { stdout: string; stderr: string }>(
+  result: T,
+  config: t.LocalExecutionConfig
+): T {
+  const maxChars = config.toolResultMaxChars;
+  if (maxChars == null || maxChars <= 0) return result;
+  const stderrBudget = Math.min(result.stderr.length, Math.floor(maxChars / 2));
+  return {
+    ...result,
+    stdout: capHeadTail(result.stdout, maxChars - stderrBudget),
+    stderr: capHeadTail(result.stderr, Math.max(stderrBudget, 1)),
+  };
+}
+
 export function createLocalBashExecutionTool(options?: {
   config?: t.LocalExecutionConfig;
   enableToolOutputReferences?: boolean;
@@ -147,7 +167,7 @@ export function createLocalBashExecutionTool(options?: {
           ? await executeLocalBashWithArgs(input.command, input.args, config)
           : await executeLocalBash(input.command, config);
       return [
-        formatLocalOutput(result, cwd),
+        formatLocalOutput(capStreams(result, config), cwd),
         {
           session_id: getLocalSessionId(config),
           files: [],

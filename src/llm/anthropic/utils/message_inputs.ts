@@ -38,8 +38,8 @@ import {
   cloneToolMessageWithContent,
   serializeStructuredValueBounded,
 } from '@/utils/toolContent';
-import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
 import { isReasoningContentBlock } from '@/messages/reasoningTypes';
+import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
 import { Constants } from '@/common';
 
 type StandardTextBlock = Data.StandardTextBlock;
@@ -56,10 +56,14 @@ type GoogleFunctionCallBlock = MessageContentComplex & {
 };
 
 const ANTHROPIC_EMPTY_TEXT_PLACEHOLDER = '_';
-const CLAUDE_4_RELEASE_DATE_MODEL_PATTERN =
-  /claude-(?:opus|sonnet|haiku)-4-\d{8}(?:[-.@]|$)/i;
-const CLAUDE_4_MINOR_MODEL_PATTERN =
-  /claude-(?:opus|sonnet|haiku)-4[-.](\d+)(?:[-.@]|$)/i;
+/**
+ * Name-first Claude ids (`claude-sonnet-4-6`, `claude-haiku-5.5`, Bedrock and
+ * Vertex forms included). The minor is one or two digits so an 8-digit release
+ * date (`claude-opus-4-20250514`) reads as major only. Number-first ids
+ * (`claude-3-5-sonnet`) predate 4.6 and never match.
+ */
+const CLAUDE_FAMILY_VERSION_PATTERN =
+  /claude-(?:opus|sonnet|haiku|fable|mythos)-(\d+)(?:[-.](\d{1,2}))?(?!\d)/i;
 
 function _formatImage(imageUrl: string) {
   const parsed = parseBase64DataUrl({ dataUrl: imageUrl });
@@ -299,6 +303,27 @@ function unwrapToolMessageResultContent(content: ToolMessage['content']): {
   }
 }
 
+/**
+ * A lone plain text block is the same tool result as its string, which is
+ * how restored history carries it; the tail cache marker turns a string into
+ * that block, so collapsing it keeps the bytes stable when the marker moves.
+ */
+function toPlainTextResult(
+  content: string | MessageContentComplex[]
+): string | MessageContentComplex[] {
+  if (!Array.isArray(content) || content.length !== 1) {
+    return content;
+  }
+  const [block] = content;
+  const isPlainText =
+    typeof block === 'object' &&
+    block.type === 'text' &&
+    typeof block.text === 'string' &&
+    block.text !== '' &&
+    Object.keys(block).every((key) => key === 'type' || key === 'text');
+  return isPlainText ? (block.text as string) : content;
+}
+
 function _ensureMessageContents(
   messages: BaseMessage[]
 ): (SystemMessage | HumanMessage | AIMessage)[] {
@@ -362,12 +387,14 @@ function _ensureMessageContents(
             ? hoistToolResultCacheControl(formattedContent)
             : { content: undefined, cacheControl: undefined };
         const cacheControl = unwrapped.cacheControl ?? innerCacheControl;
+        const resultContent =
+          hoistedContent != null ? toPlainTextResult(hoistedContent) : undefined;
         updatedMsgs.push(
           new HumanMessage({
             content: [
               {
                 type: 'tool_result',
-                ...(hoistedContent != null ? { content: hoistedContent } : {}),
+                ...(resultContent != null ? { content: resultContent } : {}),
                 ...(unwrapped.isError != null
                   ? { is_error: unwrapped.isError }
                   : {}),
@@ -1047,10 +1074,7 @@ function _formatContent(message: BaseMessage) {
           name: correspondingToolCall.name,
           input: functionCallPart.functionCall.args,
         };
-      } else if (
-        isAIMessage(message) &&
-        isReasoningContentBlock(contentPart)
-      ) {
+      } else if (isAIMessage(message) && isReasoningContentBlock(contentPart)) {
         // Foreign reasoning on an ASSISTANT turn (Bedrock `reasoning_content`,
         // Google `reasoning`, LibreChat `think`) carries provider-specific
         // signatures Anthropic cannot validate; drop it so a cross-provider
@@ -1217,17 +1241,16 @@ export function _convertMessagesToAnthropicPayload(
   } as AnthropicMessageCreateParams;
 }
 
+/** Claude 4.6 and every later release (5.x, Fable, Mythos) reject a trailing assistant prefill. */
 export function modelDisallowsAssistantPrefill(model?: string): boolean {
-  const modelId = model ?? '';
-  if (CLAUDE_4_RELEASE_DATE_MODEL_PATTERN.test(modelId)) {
-    return false;
-  }
-
-  const match = CLAUDE_4_MINOR_MODEL_PATTERN.exec(modelId);
+  const match = CLAUDE_FAMILY_VERSION_PATTERN.exec(model ?? '');
   if (!match) {
     return false;
   }
-  return Number(match[1]) >= 6;
+  const [, majorText, minorText = '0'] = match;
+  const major = Number(majorText);
+  const minor = Number(minorText);
+  return major > 4 || (major === 4 && minor >= 6);
 }
 
 function messagesHaveCacheControl(

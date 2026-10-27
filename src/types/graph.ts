@@ -1083,8 +1083,9 @@ interface AgentInputFields {
    */
   compactionSemanticIndex?: CompactionSemanticIndex;
   /** Cross-run summary from a previous run, forwarded from formatAgentMessages.
-   *  Rendered in the system message after `conversation_instructions`, where
-   *  the run that created it placed it. */
+   *  With `conversation_instructions` set it is sent as its own user message
+   *  right after the system message, where the run that created it placed it;
+   *  without it, it is injected into the dynamic system tail. */
   initialSummary?: { text: string; tokenCount: number };
   contextPruningConfig?: ContextPruningConfig;
   maxToolResultChars?: number;
