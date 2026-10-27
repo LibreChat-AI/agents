@@ -238,6 +238,10 @@ export type ProcessedToolCall = {
   name: string;
   args: string | Record<string, unknown>;
   id: string;
+  /** Output reference key (`tool<i>turn<n>`), see `ToolMessageRefMetadata._refKey`. */
+  ref?: string;
+  /** Placeholder keys that did not resolve for this call. */
+  unresolved_refs?: string[];
   output: string;
   progress: number;
   /**
@@ -490,6 +494,13 @@ export type ToolCallPart = {
   id?: string;
   /** If provided, the output of the tool call */
   output?: ToolResultContent['content'];
+  /**
+   * Output reference key and unresolved placeholders (see
+   * `ProcessedToolCall.ref`), persisted so a restored history re-creates
+   * the same `[ref: …]` labels the live run showed the model.
+   */
+  ref?: string;
+  unresolved_refs?: string[];
   /**
    * Tool-authored settled label for the call (see `ProcessedToolCall.outcome`),
    * preserved through aggregation so it survives persistence/reload.

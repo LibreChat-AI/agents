@@ -1865,6 +1865,8 @@ function formatAssistantMessage(
 
         // Note: `tool_calls` list is defined when constructed by `AIMessage` class, and outputs should be excluded from it
         const {
+          ref,
+          unresolved_refs,
           output,
           args: _args,
           ..._tool_call
@@ -1988,6 +1990,14 @@ function formatAssistantMessage(
           withMessageRole(
             new ToolMessage({
               tool_call_id: tool_call.id ?? '',
+              ...((ref != null || unresolved_refs != null) && {
+                additional_kwargs: {
+                  ...(ref != null && { _refKey: ref }),
+                  ...(unresolved_refs != null && {
+                    _unresolvedRefs: unresolved_refs,
+                  }),
+                },
+              }),
               name: tool_call.name,
               content: formatToolCallOutput(output),
             }),

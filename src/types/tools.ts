@@ -334,6 +334,8 @@ export type ToolEndEvent = {
     output?: string;
     progress?: number;
     outcome?: string;
+    ref?: string;
+    unresolved_refs?: string[];
   };
   /** The content index of the tool call */
   index: number;

@@ -2628,6 +2628,11 @@ export function createContentAggregator(): t.ContentAggregatorResult {
       if (finalUpdate) {
         newToolCall.progress = 1;
         newToolCall.output = contentPart.tool_call.output;
+        const { ref, unresolved_refs } = contentPart.tool_call as t.ToolCallPart;
+        Object.assign(newToolCall, {
+          ...(ref != null && { ref }),
+          ...(unresolved_refs != null && { unresolved_refs }),
+        });
         const outcome = (contentPart.tool_call as t.ToolCallPart).outcome;
         if (outcome != null) {
           newToolCall.outcome = outcome;
