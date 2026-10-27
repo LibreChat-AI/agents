@@ -18,7 +18,8 @@ const MAX_ERROR_DEPTH = 4;
 export function withSummarizationRetryOwner<T extends object>(provider: t.ProviderName, clientOptions: T): T & {maxRetries: number} {
   const options = {...clientOptions, maxRetries: 0};
   const family = getProviderFamily(provider);
-  if (provider === Providers.OPENAI || provider === Providers.AZURE || provider === Providers.OPENROUTER || family === 'openai') {
+  // Moonshot keeps generic request shaping but uses the OpenAI transport.
+  if (provider === Providers.OPENAI || provider === Providers.AZURE || provider === Providers.OPENROUTER || provider === Providers.MOONSHOT || family === 'openai') {
     const openai = clientOptions as Partial<t.OpenAIClientOptions>;
     return {...options, configuration: {...openai.configuration, maxRetries: 0}};
   }

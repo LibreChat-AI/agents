@@ -11,10 +11,13 @@ const count = (message: BaseMessage): number => Math.ceil(JSON.stringify(message
 
 afterEach(() => jest.restoreAllMocks());
 
-it.each([false, true])('limits actual HTTP attempts across primary and fallback transports (fallback=%s)', async hasFallback => {
+it.each([
+  [Providers.OPENAI, false], [Providers.OPENAI, true],
+  [Providers.MOONSHOT, false], [Providers.MOONSHOT, true],
+] as const)('limits actual HTTP attempts for %s across primary/fallback transports (fallback=%s)', async (provider, hasFallback) => {
   const calls: string[] = [];
-  const primary = 'gpt-4.1-mini';
-  const fallback = 'gpt-4.1-mini-fallback';
+  const primary = provider === Providers.MOONSHOT ? 'moonshot-v1-8k' : 'gpt-4.1-mini';
+  const fallback = `${primary}-fallback`;
   const fetch = jest.fn<ReturnType<typeof globalThis.fetch>, Parameters<typeof globalThis.fetch>>(async (_input, init) => {
     if (typeof init?.body !== 'string') throw new Error('Expected a JSON request body');
     const {model} = JSON.parse(init.body) as {model: string};
@@ -25,10 +28,10 @@ it.each([false, true])('limits actual HTTP attempts across primary and fallback 
     });
   });
   const options = {apiKey: 'offline-test', model: primary, useResponsesApi: false, maxRetries: 6, configuration: {fetch, maxRetries: 6}};
-  const clientOptions = {...options, fallbacks: hasFallback ? [{provider: Providers.OPENAI,
+  const clientOptions = {...options, fallbacks: hasFallback ? [{provider,
     clientOptions: {...options, model: fallback},
   }] : []};
-  const context = AgentContext.fromConfig({agentId: 'agent', provider: Providers.OPENAI,
+  const context = AgentContext.fromConfig({agentId: 'agent', provider,
     clientOptions, instructions: 'Checkpoint.', maxContextTokens: 4096, summarizationEnabled: true,
     summarizationConfig: {prompt: 'Checkpoint.', maxSummaryTokens: 128, retainRecent: {turns: 0}},
   }, count);
@@ -55,6 +58,7 @@ it.each([false, true])('limits actual HTTP attempts across primary and fallback 
 it('disables nested default retries without mutating caller-owned options', () => {
   const openai = {maxRetries: 6, configuration: {maxRetries: 8, baseURL: 'https://offline.invalid'}};
   expect(withSummarizationRetryOwner(Providers.OPENAI, openai)).toEqual({maxRetries: 0, configuration: {...openai.configuration, maxRetries: 0}});
+  expect(withSummarizationRetryOwner(Providers.MOONSHOT, openai)).toEqual({maxRetries: 0, configuration: {...openai.configuration, maxRetries: 0}});
   const anthropic = {maxRetries: 6, clientOptions: {maxRetries: 8}};
   expect(withSummarizationRetryOwner(Providers.ANTHROPIC, anthropic)).toEqual({maxRetries: 0, clientOptions: {maxRetries: 0}});
   const bedrock = {maxRetries: 6, clientOptions: {maxAttempts: 8}};
