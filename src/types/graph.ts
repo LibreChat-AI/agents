@@ -36,7 +36,7 @@ import type {
   ToolEndEvent,
   GenericTool,
   LCTool,
-  ToolDispatchConfig,
+  ToolDispatchOptions,
   ToolExecutionConfig,
   ToolExecuteBatchRequest,
 } from '@/types/tools';
@@ -1023,22 +1023,8 @@ interface AgentInputFields {
   maxContextTokens?: number;
   /** Per-agent Langfuse tracing configuration. */
   langfuse?: LangfuseConfig;
-  /**
-   * Per-turn volatile context appended after the other instructions without
-   * provider cache markers. With Anthropic or OpenRouter prompt caching it
-   * travels as a user message ahead of the newest human message, so a change
-   * every turn leaves the cached history intact.
-   */
+  /** Dynamic system tail appended after stable instructions without provider cache markers. */
   additional_instructions?: string;
-  /**
-   * Per-conversation context that stays the same for a whole conversation
-   * (for example its start time, memory, attached file lists). Kept in the
-   * system message right after `instructions`, never moved, with its own
-   * prompt-cache breakpoint where the provider supports one, so each request
-   * of the conversation extends the previous one while `instructions` stays
-   * shared across conversations. The compaction summary follows it.
-   */
-  conversation_instructions?: string;
   reasoningKey?: 'reasoning_content' | 'reasoning';
   /** Format content blocks as strings (for legacy compatibility i.e. Ollama/Azure Serverless) */
   useLegacyContent?: boolean;
@@ -1055,13 +1041,13 @@ interface AgentInputFields {
    */
   toolDefinitions?: LCTool[];
   /**
-   * Binds a fixed dispatcher tool from the first turn. Deferred
-   * `toolRegistry` entries (`defer_loading: true`) become callable through it
-   * and are never bound, even after discovery, so the `tools` parameter stays
-   * byte-identical while the host announces new tools in the history. The
-   * SDK unwraps dispatcher calls before hooks, approval, and execution.
+   * Binds a fixed `call_tool` dispatcher from the first turn. Deferred tools
+   * (`defer_loading: true`) are called through it with `{ name, arguments }`
+   * and the SDK unwraps the call before hooks, approval, and execution, so a
+   * host can make a tool available mid-conversation without changing the
+   * provider's `tools` parameter (and its prompt cache).
    */
-  toolDispatch?: true | ToolDispatchConfig;
+  toolDispatch?: boolean | ToolDispatchOptions;
   /**
    * Tool names discovered from previous conversation history.
    * These tools will be pre-marked as discovered so they're included
@@ -1092,8 +1078,7 @@ interface AgentInputFields {
    */
   compactionSemanticIndex?: CompactionSemanticIndex;
   /** Cross-run summary from a previous run, forwarded from formatAgentMessages.
-   *  Rendered in the system message after `conversation_instructions`, where
-   *  the run that created it placed it. */
+   *  Injected into the dynamic system tail via AgentContext. */
   initialSummary?: { text: string; tokenCount: number };
   contextPruningConfig?: ContextPruningConfig;
   maxToolResultChars?: number;

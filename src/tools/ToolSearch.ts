@@ -832,10 +832,6 @@ function parseSearchResults(stdout: string): t.ToolSearchResponse {
 /** Found tools stay out of the tool list; the model calls them through the dispatcher. */
 type SearchDispatch = { name: string; toolRegistry: t.LCToolRegistry };
 
-function dispatchGuidance(dispatcher: string): string {
-  return `These tools are not in your tool list. Call one with ${dispatcher}: "name" is the tool name, "arguments" its arguments as a JSON object string following "parameters".`;
-}
-
 function formatSearchResults(
   searchResponse: t.ToolSearchResponse,
   nameFormat: t.McpNameFormat = 'full',
@@ -864,7 +860,9 @@ function formatSearchResults(
     query: pattern_used,
     ...(notes.length > 0 ? { notes } : {}),
     ...(dispatch != null &&
-      tool_references.length > 0 && { call_with: dispatchGuidance(dispatch.name) }),
+      tool_references.length > 0 && {
+      call_with: `These tools are not in your tool list. Call one with ${dispatch.name}: "name" is the tool name, "arguments" its arguments as a JSON object string following "parameters".`,
+    }),
   };
 
   return JSON.stringify(output, null, 2);
@@ -1111,12 +1109,9 @@ ${mcpNote}${toolsListSection}
         toolRegistry: paramToolRegistry,
         onlyDeferred: paramOnlyDeferred,
         mcpServer: paramMcpServer,
-        toolDispatch: paramToolDispatch,
       } = config.toolCall ?? {};
 
       const toolRegistry = paramToolRegistry ?? initParams.toolRegistry;
-      const dispatcher: string | undefined =
-        paramToolDispatch ?? initParams.toolDispatch;
       const onlyDeferred =
         paramOnlyDeferred !== undefined
           ? paramOnlyDeferred
@@ -1301,7 +1296,7 @@ ${mcpNote}${toolsListSection}
           activeServers,
           mcpNameFormat,
           filterNotes,
-          dispatcher
+          initParams.toolDispatch
         );
 
         return [
@@ -1319,7 +1314,9 @@ ${mcpNote}${toolsListSection}
       }
 
       const dispatch =
-        dispatcher == null ? undefined : { name: dispatcher, toolRegistry };
+        initParams.toolDispatch == null
+          ? undefined
+          : { name: initParams.toolDispatch, toolRegistry };
 
       if (mode === 'local') {
         const searchResponse = performLocalSearch(

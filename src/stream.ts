@@ -42,6 +42,7 @@ import {
   coerceRecordArgs,
   normalizeError,
 } from '@/tools/eagerEventExecution';
+import { TOOL_DISPATCHER_NAME } from '@/tools/toolDispatch';
 import {
   serializeStructuredValueBounded,
   serializeToolContentBounded,
@@ -190,11 +191,12 @@ function isEagerExecutionExcludedTool(
   const toolDef =
     agentContext?.toolRegistry?.get(name) ??
     agentContext?.toolDefinitions?.find((def) => def.name === name);
-  const dispatcher = agentContext?.toolDispatch?.name;
+  const dispatch =
+    agentContext?.toolDispatch != null && agentContext.toolDispatch !== false;
   if (
-    name === dispatcher ||
+    (dispatch && name === TOOL_DISPATCHER_NAME) ||
     toolDef?.disabled != null ||
-    (dispatcher != null && toolDef?.defer_loading === true)
+    (dispatch && toolDef?.defer_loading === true)
   ) {
     return true;
   }
@@ -2621,14 +2623,12 @@ export function createContentAggregator(): t.ContentAggregatorResult {
         toolCallContentIndexMap.delete(existingToolCallId);
       }
 
-      const newToolCall: ToolCall &
-        t.PartMetadata &
-        Pick<t.ToolCallPart, 'outcome' | 'dispatched'> = {
-          id,
-          name,
-          args,
-          type: ToolCallTypes.TOOL_CALL,
-        };
+      const newToolCall: ToolCall & t.PartMetadata & { outcome?: string } = {
+        id,
+        name,
+        args,
+        type: ToolCallTypes.TOOL_CALL,
+      };
 
       const auth =
         contentPart.tool_call.auth ?? existingContent?.tool_call?.auth;
@@ -2647,15 +2647,15 @@ export function createContentAggregator(): t.ContentAggregatorResult {
         if (outcome != null) {
           newToolCall.outcome = outcome;
         }
-        const dispatched = (contentPart.tool_call as t.ToolCallPart).dispatched;
-        if (dispatched != null) {
-          newToolCall.dispatched = dispatched;
-        }
       }
 
+      const dispatched = finalUpdate
+        ? (contentPart.tool_call as t.ToolCallPart).dispatched
+        : undefined;
       contentParts[index] = {
         type: ContentTypes.TOOL_CALL,
-        tool_call: newToolCall,
+        tool_call:
+          dispatched != null ? { ...newToolCall, dispatched } : newToolCall,
       };
       indexContentPart(index, contentParts[index]);
       indexedContentLength = Math.max(indexedContentLength, index + 1);

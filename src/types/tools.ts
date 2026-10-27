@@ -147,8 +147,8 @@ export type ToolNodeOptions = {
   toolRegistry?: LCToolRegistry;
   /** Returns the owning agent's currently discovered deferred tool names. */
   getDiscoveredToolNames?: () => readonly string[];
-  /** Enabled dispatcher tool; its calls are unwrapped to their target before anything else reads them. */
-  toolDispatch?: { name: string; canDispatch?: (toolName: string) => boolean };
+  /** The agent binds the dispatcher tool; its calls are unwrapped to their target before anything else reads them. */
+  toolDispatch?: boolean | ToolDispatchOptions;
   /** Reference to Graph's sessions map for automatic session injection */
   sessions?: ToolSessionMap;
   /** Partition within `sessions` used by this agent's code tools. */
@@ -594,24 +594,6 @@ export type LCTool = {
   disabled?: { reason?: string };
 };
 
-/**
- * Opt-in fixed dispatcher tool (see `AgentInputs.toolDispatch`). Deferred
- * registry tools are reached through it instead of being bound, so making a
- * tool available mid-conversation never changes the provider's `tools`.
- */
-export type ToolDispatchConfig = {
-  /** Dispatcher tool name. Defaults to `call_tool`. */
-  name?: string;
-  /** Replaces the default dispatcher description. */
-  description?: string;
-  /**
-   * Narrows the tools the dispatcher may call. A deferred tool is dispatchable
-   * only when this returns true, so a host reaches only the tools it declared
-   * to the model. Without it every deferred registry tool is dispatchable.
-   */
-  canDispatch?: (toolName: string) => boolean;
-};
-
 /** Single tool call within a batch request for event-driven execution */
 export type ToolCallRequest = {
   /** Tool call ID from the LLM */
@@ -640,12 +622,6 @@ export type ToolCallRequest = {
    * continuity): the hint identifies the durable server-side runtime session.
    */
   runtimeSessionHint?: string;
-  /**
-   * Set when the model reached this tool through the dispatcher tool: the
-   * dispatcher's name. `name`/`args` are the target's; `id` is the
-   * dispatcher call's id, which the result answers in the history.
-   */
-  dispatcher?: string;
 };
 
 /**
@@ -1010,6 +986,22 @@ export type LocalExecutionConfig = {
    */
   includeCodingTools?: boolean;
   /**
+   * Allowlist of auto-bound local coding tool names (for example
+   * `['read_file', 'edit_file', 'grep_search', 'bash_tool']`). Omit to bind
+   * the whole suite. Fewer tool schemas means a smaller prompt on every
+   * request.
+   */
+  codingToolNames?: readonly string[];
+  /**
+   * Opt-in cap, in characters, on the results the model reads most:
+   * `read_file` keeps whole lines up to the cap (and its `limit`, when
+   * given) with an `offset` hint to continue, `grep_search` cuts long match lines and stops
+   * at the cap with a count of omitted lines, and `bash_tool` keeps the head
+   * and tail of long stdout and stderr with the status lines intact. Unset
+   * keeps the existing limits.
+   */
+  toolResultMaxChars?: number;
+  /**
    * Override the process launcher. When set, replaces
    * `child_process.spawn` for every local tool invocation, allowing
    * SSH/container delegation. Default: native spawn.
@@ -1324,7 +1316,7 @@ export type ToolSearchParams = {
   /**
    * Dispatcher tool name when the agent uses `toolDispatch`: results carry
    * full names and parameter schemas and tell the model to call found tools
-   * through the dispatcher. ToolNode passes it at runtime for in-graph search.
+   * through the dispatcher.
    */
   toolDispatch?: string;
 };
@@ -1539,3 +1531,9 @@ export type ToolSessionContext = CodeSessionContext;
  * Keys are tool constants (e.g., Constants.EXECUTE_CODE, Constants.PROGRAMMATIC_TOOL_CALLING).
  */
 export type ToolSessionMap = Map<string, ToolSessionContext>;
+
+/** Host policy for the `call_tool` dispatcher. */
+export type ToolDispatchOptions = {
+  /** Deferred tools the dispatcher may reach; a rejected target is answered with an error before hooks and execution. All when unset. */
+  canDispatch?: (toolName: string) => boolean;
+};

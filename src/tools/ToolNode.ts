@@ -129,13 +129,15 @@ import {
   resolveLocalExecutionTools,
 } from '@/tools/local';
 import { stripCodeSessionFileSummary } from '@/tools/CodeSessionFileSummary';
-import {
-  ToolDispatchTracker,
-  rewriteDispatchedToolCalls,
-} from '@/tools/toolDispatch';
 import { Constants, GraphEvents, CODE_EXECUTION_TOOLS } from '@/common';
 import { ProviderTextProtectionError } from '@/protection/providerText';
 import { formatToolErrorContent } from '@/tools/toolErrorContent';
+import {
+  resolveDispatchedCall,
+  resolveToolDispatch,
+  rewriteDispatchedToolCalls,
+} from '@/tools/toolDispatch';
+import type { ModelToolCall } from '@/tools/toolDispatch';
 import { PreparedSubagentError } from '@/tools/preparedSubagents';
 import { attachRunStepResumeState } from '@/tools/runStepResume';
 import { isBackgroundDenyMode } from '@/types/hitl';
@@ -887,7 +889,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   private localImplementationNames = new Set<string>();
   /** Reads deferred-tool discovery state from the owning agent context. */
   private getDiscoveredToolNames?: () => readonly string[];
-  private dispatchTracker: ToolDispatchTracker;
+  /** Whether the agent binds the dispatcher tool (`AgentInputs.toolDispatch`). */
+  private toolDispatch: false | t.ToolDispatchOptions;
+  /** Dispatcher calls by id: everything inside the node sees the target, results leave under this call. */
+  private dispatcherCalls = new Map<string, ModelToolCall>();
   /** Reference to Graph's sessions map for automatic session injection */
   private sessions?: t.ToolSessionMap;
   /** Partition within `sessions` owned by this agent's execution profile. */
@@ -1273,12 +1278,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         : undefined;
     this.maxToolResultChars =
       maxToolResultChars ?? calculateMaxToolResultChars(maxContextTokens);
-    this.dispatchTracker = new ToolDispatchTracker(
-      (toolName) =>
-        this.toolDefinitions?.get(toolName) ?? this.toolRegistry?.get(toolName),
-      this.maxToolResultChars,
-      toolDispatch
-    );
+    this.toolDispatch = resolveToolDispatch(toolDispatch);
     this.hookRegistry = hookRegistry;
     this.humanInTheLoop = humanInTheLoop;
     this.toolExecution = toolExecution;
@@ -1504,7 +1504,42 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   clearDirectPathTurns(): void {
     this.directPathTurns.clear();
     this.settledDirectResultsByBatch.clear();
-    this.dispatchTracker.clear();
+    this.dispatcherCalls.clear();
+  }
+
+  /**
+   * Replaces dispatched calls with their targets. A call that cannot be
+   * resolved stays as is and its error is recorded in `refused`; `rewrites`
+   * collects direct calls to deferred tools with the dispatcher call that
+   * replaces each in the history.
+   */
+  private unwrapDispatcherCalls(
+    calls: ToolCall[],
+    refused: Map<string, string>,
+    rewrites: Map<string, ModelToolCall>
+  ): ToolCall[] {
+    return calls.map((call) => {
+      if (call.id == null) {
+        return call;
+      }
+      const resolved = resolveDispatchedCall(
+        call,
+        (name) =>
+          this.toolDefinitions?.get(name) ?? this.toolRegistry?.get(name),
+        this.toolDispatch
+      );
+      if ('error' in resolved) {
+        refused.set(call.id, resolved.error);
+        return call;
+      }
+      if (resolved.modelCall != null) {
+        this.dispatcherCalls.set(call.id, resolved.modelCall);
+        if (resolved.rewritten === true) {
+          rewrites.set(call.id, resolved.modelCall);
+        }
+      }
+      return resolved.call;
+    });
   }
 
   private createRefusedToolMessage(call: ToolCall, error: string): ToolMessage {
@@ -1514,6 +1549,30 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       name: call.name,
       tool_call_id: call.id!,
     });
+  }
+
+  private toModelToolCall(toolCall: t.ProcessedToolCall): t.ProcessedToolCall {
+    const call = this.dispatcherCalls.get(toolCall.id);
+    return call == null
+      ? toolCall
+      : {
+        ...toolCall,
+        name: call.name,
+        args: serializeToolContentBounded(call.args, this.maxToolResultChars),
+        dispatched: { name: toolCall.name, args: toolCall.args },
+      };
+  }
+
+  private toModelMessages(
+    outputs: (BaseMessage | Command)[]
+  ): (BaseMessage | Command)[] {
+    for (const output of outputs) {
+      if (ToolMessage.isInstance(output)) {
+        output.name =
+          this.dispatcherCalls.get(output.tool_call_id)?.name ?? output.name;
+      }
+    }
+    return outputs;
   }
 
   /** Returns the live caller projection used by direct and event execution. */
@@ -1995,7 +2054,6 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         invokeParams = {
           ...invokeParams,
           toolRegistry: this.toolRegistry,
-          toolDispatch: this.dispatchTracker.dispatcher,
         };
       }
 
@@ -2175,7 +2233,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       ) {
         throw e;
       }
-      if (this.errorHandler && !this.dispatchTracker.has(call.id)) {
+      // The handler would complete a dispatched call under the target's name;
+      // the completion loop reports it under the dispatcher call instead.
+      if (this.errorHandler && !this.dispatcherCalls.has(call.id ?? '')) {
         try {
           const dispatched = await this.errorHandler(
             {
@@ -3459,7 +3519,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         readOutcomeFields(toolMessage.artifact),
         { isError: toolMessage.status === 'error' }
       );
-      const tool_call = this.dispatchTracker.toModelToolCall({
+      const tool_call: t.ProcessedToolCall = {
         args: serializeToolContentBounded(
           (effectiveArgs as unknown) ?? {},
           this.maxToolResultChars
@@ -3469,7 +3529,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         output: contentString,
         progress: 1,
         ...(outcome != null && { outcome }),
-      });
+      };
 
       await safeDispatchCustomEvent(
         GraphEvents.ON_RUN_STEP_COMPLETED,
@@ -3478,7 +3538,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             id: stepId,
             index: turn,
             type: 'tool_call' as const,
-            tool_call,
+            tool_call: this.toModelToolCall(tool_call),
             completed_at: Date.now(),
           },
         },
@@ -4306,9 +4366,6 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       const requestMap = new Map(plan.allRequests.map((r) => [r.id, r]));
       for (const request of plan.allRequests) {
         request.codeSessionBaselineId = request.codeSessionContext?.session_id;
-        if (this.dispatchTracker.has(request.id)) {
-          request.dispatcher = this.dispatchTracker.dispatcher;
-        }
       }
       const codeSessionBaselineByRequestId = new Map<
         string,
@@ -5070,14 +5127,14 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           id: stepId,
           index: turn ?? this.toolUsageCount.get(toolName) ?? 0,
           type: 'tool_call' as const,
-          tool_call: this.dispatchTracker.toModelToolCall({
+          tool_call: this.toModelToolCall({
             args: serializeToolContentBounded(args, this.maxToolResultChars),
             name: toolName,
             id: toolCallId,
             output,
             progress: 1,
             ...(outcome != null && { outcome }),
-          }),
+          } as t.ProcessedToolCall),
           completed_at: receivedAt ?? Date.now(),
         },
       },
@@ -5455,7 +5512,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       config,
       batchContext
     );
-    const outputs = this.dispatchTracker.toModelMessages([
+    const outputs = this.toModelMessages([
       ...toolMessages,
       ...injected,
     ]);
@@ -5554,11 +5611,19 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     let invalidCallResults: ToolMessage[] = [];
 
     if (this.isSendInput(input)) {
-      const {
-        calls: [sendCall],
-        refused: sendRefused,
-      } = this.dispatchTracker.canonicalize([input.lg_tool_call]);
-      const sendRefusal = sendRefused.get(sendCall.id ?? '');
+      const sendRefusals = new Map<string, string>();
+      const sendRewrites = new Map<string, ModelToolCall>();
+      const [sendCall] = this.unwrapDispatcherCalls(
+        [input.lg_tool_call],
+        sendRefusals,
+        sendRewrites
+      );
+      // A Send carries no assistant message to rewrite, so a direct call to a
+      // deferred tool keeps the target's name in its result.
+      for (const id of sendRewrites.keys()) {
+        this.dispatcherCalls.delete(id);
+      }
+      const sendRefusal = sendRefusals.get(sendCall.id ?? '');
       if (sendRefusal != null) {
         const refusedOutput = this.createRefusedToolMessage(
           sendCall,
@@ -5679,24 +5744,26 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             getToolBatchReplayScope(config)
           );
 
-      const {
-        calls: canonicalCalls,
-        refused,
-        rewrites,
-      } = this.dispatchTracker.canonicalize(aiMessage.tool_calls ?? []);
+      const refusedDispatches = new Map<string, string>();
+      const rewrittenDispatches = new Map<string, ModelToolCall>();
+      const toolCalls = this.unwrapDispatcherCalls(
+        aiMessage.tool_calls ?? [],
+        refusedDispatches,
+        rewrittenDispatches
+      );
 
       if (this.loadRuntimeTools) {
-        const { tools, toolMap } = this.loadRuntimeTools(canonicalCalls);
+        const { tools, toolMap } = this.loadRuntimeTools(toolCalls);
         this.toolMap =
           toolMap ?? new Map(tools.map((tool) => [tool.name, tool]));
         this.applyToolExecutionOverrides();
       }
 
       const replayCallPositions = new Map(
-        canonicalCalls.map((call, i) => [call, i])
+        toolCalls.map((call, i) => [call, i])
       );
       const pendingCalls =
-        canonicalCalls.filter((call) => {
+        toolCalls.filter((call) => {
           /**
            * Filter out:
            * 1. Already processed tool calls (present in toolMessageIds)
@@ -5714,12 +5781,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           );
         });
       const filteredCalls = pendingCalls.filter(
-        (call) => !refused.has(call.id ?? '')
-      );
-      const refusedCalls = new Map(
-        pendingCalls
-          .filter((call) => refused.has(call.id ?? ''))
-          .map((call) => [call.id!, call])
+        (call) => !refusedDispatches.has(call.id ?? '')
       );
 
       /**
@@ -5773,11 +5835,13 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             tool_call_id: call.id!,
           })
       );
-      /** Refused calls (see `ToolDispatchTracker`) answer like invalid ones. */
-      for (const [id, call] of refusedCalls) {
-        invalidCallResults.push(
-          this.createRefusedToolMessage(call, refused.get(id)!)
-        );
+      const refusedCalls = new Map<string, ToolCall>();
+      for (const call of pendingCalls) {
+        const error = refusedDispatches.get(call.id ?? '');
+        if (error != null) {
+          refusedCalls.set(call.id!, call);
+          invalidCallResults.push(this.createRefusedToolMessage(call, error));
+        }
       }
 
       /**
@@ -5820,10 +5884,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             ),
           })
           : undefined;
-      if (rewrites.size > 0 && canPromoteInvalidCalls) {
+      if (rewrittenDispatches.size > 0 && canPromoteInvalidCalls) {
         promotedAiMessage = rewriteDispatchedToolCalls(
           promotedAiMessage ?? aiMessage,
-          rewrites
+          rewrittenDispatches
         );
       }
 
@@ -6110,7 +6174,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       }
     }
 
-    outputs = this.dispatchTracker.toModelMessages(outputs);
+    outputs = this.toModelMessages(outputs);
 
     if (!outputs.some(isCommand)) {
       if (replayBatchKey != null) {

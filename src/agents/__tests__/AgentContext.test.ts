@@ -1,6 +1,5 @@
 // src/agents/__tests__/AgentContext.test.ts
 import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
-import type { BaseMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
 import { markTokenCounterCacheCompatible } from '@/llm/tokenCounterCacheCompatibility';
 import { buildSummaryCarrierText } from '@/summarization/shared';
@@ -68,6 +67,21 @@ describe('AgentContext', () => {
        *  array later — that must never mutate the host's input. */
       (ctx.graphTools as t.GenericTool[]).push(createMockTool('subagent'));
       expect(hostGraphTools).toHaveLength(1);
+    });
+
+    it('drops graphTools outside the local coding allowlist', () => {
+      const runner = createMockTool('run_tools_with_code');
+      const askTool = createMockTool('ask_user_question');
+      const ctx = createBasicContext({
+        agentConfig: { graphTools: [runner, askTool] },
+        toolExecution: {
+          engine: 'local',
+          local: { codingToolNames: ['read_file'] },
+        },
+      });
+      expect(
+        (ctx.graphTools as t.GenericTool[]).map((tool) => tool.name)
+      ).toEqual(['ask_user_question']);
     });
 
     it('leaves graphTools undefined when the host supplies none (or an empty list)', () => {
@@ -315,7 +329,7 @@ describe('AgentContext', () => {
       );
     });
 
-    it('moves the dynamic Bedrock text out of the system message', async () => {
+    it('places the Bedrock cache point before dynamic system text', async () => {
       const ctx = createBasicContext({
         agentConfig: {
           provider: Providers.BEDROCK,
@@ -333,196 +347,8 @@ describe('AgentContext', () => {
       expect(content).toEqual([
         { type: 'text', text: 'Stable instructions' },
         { cachePoint: { type: 'default', ttl: '1h' } },
+        { type: 'text', text: 'Dynamic instructions' },
       ]);
-      expect(result[1].content).toBe('Dynamic instructions');
-    });
-
-    it('keeps the Bedrock history in front of the moved tail and marks both ends of it', async () => {
-      const build = (dynamic: string): AgentContext =>
-        createBasicContext({
-          agentConfig: {
-            provider: Providers.BEDROCK,
-            clientOptions: {
-              model: 'anthropic.claude-sonnet-4-5-20250929-v1:0',
-              promptCache: true,
-            },
-            instructions: 'Stable instructions',
-            additional_instructions: dynamic,
-          },
-        });
-      const history = (): BaseMessage[] => [
-        new HumanMessage('Q1'),
-        new AIMessage('A1'),
-        new HumanMessage('Q2'),
-        new AIMessage('A2'),
-        new HumanMessage('Q3'),
-      ];
-      const first = await build('Tail one').systemRunnable!.invoke(history());
-      const second = await build('Tail two').systemRunnable!.invoke(history());
-
-      /** system, Q1, A1, Q2, A2, tail, Q3 */
-      expect(first.map((message) => message.content)).toEqual([
-        [
-          { type: 'text', text: 'Stable instructions' },
-          { cachePoint: { type: 'default', ttl: '1h' } },
-        ],
-        'Q1',
-        'A1',
-        'Q2',
-        [
-          { type: 'text', text: 'A2' },
-          { cachePoint: { type: 'default', ttl: '1h' } },
-        ],
-        'Tail one',
-        [
-          { type: 'text', text: 'Q3' },
-          { cachePoint: { type: 'default', ttl: '1h' } },
-        ],
-      ]);
-      expect(JSON.stringify(second.slice(0, 5))).toBe(
-        JSON.stringify(first.slice(0, 5))
-      );
-      expect(second[5].content).toBe('Tail two');
-    });
-
-    it('leaves one Bedrock checkpoint for the tools and never exceeds the limit of four', async () => {
-      const ctx = createBasicContext({
-        agentConfig: {
-          provider: Providers.BEDROCK,
-          clientOptions: {
-            model: 'anthropic.claude-sonnet-4-5-20250929-v1:0',
-            promptCache: true,
-          },
-          instructions: 'Stable instructions',
-          conversation_instructions: 'Conversation context',
-          additional_instructions: 'Dynamic instructions',
-        },
-      });
-      const result = await ctx.systemRunnable!.invoke([
-        new HumanMessage('Q1'),
-        new AIMessage('A1'),
-        new HumanMessage('Q2'),
-        new AIMessage('A2'),
-        new HumanMessage('Q3'),
-      ]);
-      const checkpoints = JSON.stringify(result).match(/"cachePoint"/g) ?? [];
-
-      /** Tools (added when the request is built) + stable + history + request end. */
-      expect(checkpoints).toHaveLength(3);
-      expect(JSON.stringify(result[0].content)).not.toContain(
-        'Conversation context","cachePoint'
-      );
-    });
-
-    it('gives the Bedrock conversation block its checkpoint while there is room', async () => {
-      const ctx = createBasicContext({
-        agentConfig: {
-          provider: Providers.BEDROCK,
-          clientOptions: {
-            model: 'anthropic.claude-sonnet-4-5-20250929-v1:0',
-            promptCache: true,
-          },
-          instructions: 'Stable instructions',
-          conversation_instructions: 'Conversation context',
-          additional_instructions: 'Dynamic instructions',
-        },
-      });
-      const result = await ctx.systemRunnable!.invoke([new HumanMessage('Q1')]);
-      const content = result[0].content as TestSystemContentBlock[];
-
-      expect(content.map((block) => ('text' in block ? block.text : 'cachePoint'))).toEqual([
-        'Stable instructions',
-        'cachePoint',
-        'Conversation context',
-        'cachePoint',
-      ]);
-      expect(result[1].content).toBe('Dynamic instructions');
-    });
-
-    it.each([
-      ['one message checkpoint', 1, true],
-      ['two message checkpoints', 2, false],
-    ])(
-      'keeps the Bedrock request at four checkpoints when the graph placed %s and there is no tail',
-      async (_name, marked, conversationMarked) => {
-        const ctx = createBasicContext({
-          agentConfig: {
-            provider: Providers.BEDROCK,
-            clientOptions: {
-              model: 'anthropic.claude-sonnet-4-5-20250929-v1:0',
-              promptCache: true,
-            },
-            instructions: 'Stable instructions',
-            conversation_instructions: 'Conversation context',
-          },
-        });
-        const cp = { cachePoint: { type: 'default', ttl: '1h' } };
-        const history = [
-          new HumanMessage({
-            content: [{ type: 'text', text: 'Q1' }, ...(marked === 2 ? [cp] : [])] as never,
-          }),
-          new AIMessage('A1'),
-          new HumanMessage({ content: [{ type: 'text', text: 'Q2' }, cp] as never }),
-        ];
-        const result = await ctx.systemRunnable!.invoke(history);
-        const system = result[0].content as TestSystemContentBlock[];
-        const points = JSON.stringify(result).match(/"cachePoint"/g) ?? [];
-
-        expect(system.some((block) => 'text' in block && block.text === 'Conversation context' )).toBe(true);
-        expect(system.filter((block) => 'cachePoint' in block)).toHaveLength(
-          conversationMarked ? 2 : 1
-        );
-        /** Plus the tool list checkpoint added when the request is built. */
-        expect(points.length + 1).toBeLessThanOrEqual(4);
-      }
-    );
-
-    it('never marks the moved Bedrock tail message', async () => {
-      const ctx = createBasicContext({
-        agentConfig: {
-          provider: Providers.BEDROCK,
-          clientOptions: {
-            model: 'anthropic.claude-sonnet-4-5-20250929-v1:0',
-            promptCache: true,
-          },
-          instructions: 'Stable instructions',
-          additional_instructions: 'Dynamic instructions',
-        },
-      });
-      const cp = { cachePoint: { type: 'default', ttl: '1h' } };
-      const result = await ctx.systemRunnable!.invoke([
-        new HumanMessage({ content: [{ type: 'text', text: 'Q1' }, cp] as never }),
-        new AIMessage('A1'),
-        new HumanMessage({ content: [{ type: 'text', text: 'Q2' }, cp] as never }),
-        new AIMessage({
-          content: '',
-          tool_calls: [{ id: 'call_1', name: 'calculator', args: {} }],
-        }),
-        new ToolMessage({ content: '4', tool_call_id: 'call_1' }),
-      ]);
-      const tail = result.find((message) => message.content === 'Dynamic instructions');
-
-      expect(tail).toBeDefined();
-      expect(JSON.stringify(tail)).not.toContain('cachePoint');
-      expect(result.indexOf(tail!)).toBe(result.findIndex((m) => m.getType() === 'human' && JSON.stringify(m.content).includes('Q2')) - 1);
-      /** Tools take one, the system block one: the opening message keeps none. */
-      expect(JSON.stringify(result).match(/"cachePoint"/g)?.length).toBeLessThanOrEqual(3);
-      expect(JSON.stringify(result[1])).not.toContain('cachePoint');
-    });
-
-    it('keeps the Bedrock tail in the system message without prompt caching', async () => {
-      const ctx = createBasicContext({
-        agentConfig: {
-          provider: Providers.BEDROCK,
-          clientOptions: { model: 'anthropic.claude-sonnet-4-5-20250929-v1:0' },
-          instructions: 'Stable instructions',
-          additional_instructions: 'Dynamic instructions',
-        },
-      });
-      const result = await ctx.systemRunnable!.invoke([new HumanMessage('Q1')]);
-
-      expect(result[0].content).toBe('Stable instructions\n\nDynamic instructions');
-      expect(result).toHaveLength(2);
     });
 
     it('uses plain Bedrock system text when only dynamic system text exists', async () => {
@@ -596,247 +422,6 @@ describe('AgentContext', () => {
           cache_control: { type: 'ephemeral', ttl: '1h' },
         },
       ]);
-    });
-
-    describe('conversation_instructions', () => {
-      const breakpoint = { type: 'ephemeral', ttl: '1h' };
-      const createConversationContext = (
-        agentConfig: Partial<t.AgentInputs>
-      ): AgentContext =>
-        createBasicContext({
-          agentConfig: {
-            instructions: 'Stable instructions',
-            conversation_instructions: 'Conversation context',
-            ...agentConfig,
-          },
-        });
-      const markerCount = (messages: unknown[]): number =>
-        JSON.stringify(messages).match(/"cache_control"/g)?.length ?? 0;
-      const anthropicOptions = { model: 'claude-sonnet-4-5', promptCache: true };
-
-      it.each([Providers.ANTHROPIC, Providers.OPENROUTER])(
-        'keeps the %s conversation block after the stable block with its own breakpoint',
-        async (provider) => {
-          const ctx = createConversationContext({
-            provider,
-            clientOptions: anthropicOptions,
-          });
-
-          const result = await ctx.systemRunnable!.invoke([
-            new HumanMessage('Hello'),
-          ]);
-
-          expect(result[0].content).toEqual([
-            { type: 'text', text: 'Stable instructions', cache_control: breakpoint },
-            { type: 'text', text: 'Conversation context', cache_control: breakpoint },
-          ]);
-          expect(result[1].content).toBe('Hello');
-        }
-      );
-
-      it.each([Providers.ANTHROPIC, Providers.OPENROUTER])(
-        'moves only %s additional_instructions and keeps the summary out of the system message',
-        async (provider) => {
-          const ctx = createConversationContext({
-            provider,
-            clientOptions: anthropicOptions,
-            additional_instructions: 'Per-turn context',
-          });
-          ctx.setInitialSummary('Prior summary', 13);
-
-          const result = await ctx.systemRunnable!.invoke([
-            new HumanMessage('First'),
-            new AIMessage('First answer'),
-            new HumanMessage('Second'),
-          ]);
-
-          expect(result[0].content).toEqual([
-            { type: 'text', text: 'Stable instructions', cache_control: breakpoint },
-            { type: 'text', text: 'Conversation context' },
-          ]);
-          expect(result.slice(1).map((message) => message.text)).toEqual([
-            buildSummaryCarrierText('Prior summary'),
-            'First',
-            'First answer',
-            'Per-turn context',
-            'Second',
-          ]);
-          expect(markerCount(result)).toBe(4 - 1);
-        }
-      );
-
-      it.each([Providers.ANTHROPIC, Providers.OPENROUTER])(
-        'gives the %s summary its own breakpoint while one is left',
-        async (provider) => {
-          const ctx = createConversationContext({
-            provider,
-            clientOptions: anthropicOptions,
-          });
-          ctx.setSummary('Checkpoint', 13);
-
-          const result = await ctx.systemRunnable!.invoke([]);
-
-          expect(result[0].content).toEqual([
-            { type: 'text', text: 'Stable instructions', cache_control: breakpoint },
-            { type: 'text', text: 'Conversation context', cache_control: breakpoint },
-          ]);
-          expect(result[1].content).toEqual([
-            {
-              type: 'text',
-              text: buildSummaryCarrierText('Checkpoint'),
-              cache_control: breakpoint,
-            },
-          ]);
-          expect(markerCount(result)).toBe(3);
-        }
-      );
-
-      it('places a Bedrock cache point after the stable and the conversation block', async () => {
-        const ctx = createConversationContext({
-          provider: Providers.BEDROCK,
-          clientOptions: {
-            model: 'anthropic.claude-sonnet-4-5-20250929-v1:0',
-            promptCache: true,
-          },
-          additional_instructions: 'Per-turn context',
-        });
-
-        const result = await ctx.systemRunnable!.invoke([]);
-        const content = result[0].content as TestSystemContentBlock[];
-
-        expect(content.map((block) => ('text' in block ? block.text : 'cachePoint'))).toEqual([
-          'Stable instructions',
-          'cachePoint',
-          'Conversation context',
-          'cachePoint',
-        ]);
-        expect(result[1].content).toBe('Per-turn context');
-      });
-
-      it('joins the blocks in order and sends the summary as the first message', async () => {
-        const ctx = createConversationContext({
-          additional_instructions: 'Per-turn context',
-        });
-        ctx.setInitialSummary('Prior summary', 13);
-
-        const result = await ctx.systemRunnable!.invoke([
-          new HumanMessage('Latest'),
-        ]);
-
-        expect(result[0].content).toBe(
-          'Stable instructions\n\nConversation context\n\nPer-turn context'
-        );
-        expect(result.slice(1).map((message) => message.content)).toEqual([
-          buildSummaryCarrierText('Prior summary'),
-          'Latest',
-        ]);
-      });
-
-      it('counts the conversation block as system tokens, not as a moved tail', () => {
-        const ctx = createBasicContext({
-          agentConfig: {
-            provider: Providers.ANTHROPIC,
-            clientOptions: anthropicOptions,
-            instructions: 'Stable instructions',
-            conversation_instructions: 'Conversation context',
-          },
-          tokenCounter: (message) => JSON.stringify(message.content).length,
-        });
-        ctx.initializeSystemRunnable();
-
-        expect(ctx.dynamicInstructionTokens).toBe(0);
-        expect(ctx.instructionTokens).toBe(ctx.systemMessageTokens);
-      });
-
-      it('counts the summary message as instruction overhead for both summary kinds', () => {
-        const tokenCounter = (message: { content: unknown }): number =>
-          JSON.stringify(message.content).length;
-        const build = (): AgentContext =>
-          createBasicContext({
-            agentConfig: {
-              instructions: 'Stable instructions',
-              conversation_instructions: 'Conversation context',
-            },
-            tokenCounter,
-          });
-        const live = build();
-        const restored = build();
-        void live.systemRunnable;
-        void restored.systemRunnable;
-        const base = live.instructionTokens;
-
-        live.setSummary('Checkpoint', 50);
-        restored.setInitialSummary('Checkpoint', 50);
-
-        expect(live.instructionTokens).toBe(base + 50);
-        expect(restored.instructionTokens).toBe(base + 50);
-      });
-
-      /** A summary is created in one run and restored from `initialSummary` in
-       *  the next; both must render the same request or the next run loses the
-       *  prompt cache of the requests made after the compaction. */
-      it.each([
-        ['openAI', Providers.OPENAI, {}],
-        ['anthropic promptCache', Providers.ANTHROPIC, { promptCache: true }],
-        ['openrouter promptCache', Providers.OPENROUTER, { promptCache: true }],
-        ['bedrock promptCache', Providers.BEDROCK, { promptCache: true }],
-      ])(
-        'renders a summary from this run like the same summary restored next run (%s)',
-        async (_name, provider, cacheOptions) => {
-          const build = (): AgentContext =>
-            createConversationContext({
-              provider,
-              clientOptions: { model: 'claude-sonnet-4-5', ...cacheOptions },
-              additional_instructions: 'Per-turn context',
-            });
-          const live = build();
-          live.setSummary('Checkpoint', 10);
-          const restored = build();
-          restored.setInitialSummary('Checkpoint', 10);
-
-          for (const messages of [
-            [],
-            [new HumanMessage('Task')],
-            [
-              new AIMessage({
-                content: '',
-                tool_calls: [{ id: 'call_1', name: 'calculator', args: {} }],
-              }),
-              new ToolMessage({ content: '4', tool_call_id: 'call_1' }),
-            ],
-          ]) {
-            const [fromRun, fromRestore] = await Promise.all([
-              live.systemRunnable!.invoke(messages),
-              restored.systemRunnable!.invoke(messages),
-            ]);
-            expect(fromRun).toEqual(fromRestore);
-            expect(JSON.stringify(fromRun[1].content)).toContain('Checkpoint');
-          }
-        }
-      );
-
-      it('keeps the earlier placement for a host that passes no conversation_instructions', async () => {
-        const ctx = createBasicContext({
-          agentConfig: { instructions: 'Stable instructions' },
-        });
-        ctx.setInitialSummary('Prior summary', 13);
-
-        const [restored] = await ctx.systemRunnable!.invoke([]);
-        expect(restored.content).toBe(
-          'Stable instructions\n\n## Conversation Summary\n\nPrior summary'
-        );
-        expect(ctx.instructionTokens).toBe(ctx.systemMessageTokens);
-
-        ctx.setSummary('Checkpoint', 7);
-        const result = await ctx.systemRunnable!.invoke([
-          new HumanMessage('Latest'),
-        ]);
-        expect(result[0].content).toBe('Stable instructions');
-        expect(result.slice(1).map((message) => message.content)).toEqual([
-          buildSummaryCarrierText('Checkpoint'),
-          'Latest',
-        ]);
-      });
     });
 
     it('keeps dynamic-only OpenRouter instructions as system text', async () => {
@@ -1445,6 +1030,7 @@ describe('AgentContext', () => {
       expect(finalMessages[0].content).toEqual([
         { type: 'text', text: 'Stable instructions' },
         { cachePoint: { type: 'default', ttl: '1h' } },
+        { type: 'text', text: 'Dynamic instructions' },
       ]);
     });
   });
@@ -2221,6 +1807,51 @@ describe('AgentContext', () => {
       void ctx.systemRunnable;
 
       expect(ctx.instructionTokens).toBeGreaterThan(initialTokens);
+    });
+
+    it('ignores a cached toolSchemaTokens total once the local allowlist removes tools', async () => {
+      const defs: t.LCTool[] = ['read_file', 'bash_tool'].map((name) => ({
+        name,
+        description: name,
+        parameters: { type: 'object', properties: {} },
+      }));
+      const toolExecution: t.ToolExecutionConfig = {
+        engine: 'local',
+        local: { codingToolNames: ['read_file'] },
+      };
+      const filtered = createBasicContext({
+        agentConfig: { toolDefinitions: defs, toolSchemaTokens: 99999 },
+        tokenCounter: mockTokenCounter,
+        toolExecution,
+      });
+      const unfiltered = createBasicContext({
+        agentConfig: { toolDefinitions: defs, toolSchemaTokens: 99999 },
+        tokenCounter: mockTokenCounter,
+      });
+      await filtered.tokenCalculationPromise;
+      await unfiltered.tokenCalculationPromise;
+      expect(filtered.toolSchemaTokens).not.toBe(99999);
+      expect(unfiltered.toolSchemaTokens).toBe(99999);
+    });
+
+    it('keeps the cached total when a retained tool is a native schema the recount cannot measure', async () => {
+      const nativeSearch = {
+        type: 'function',
+        function: { name: 'web_search', parameters: {} },
+      } as unknown as t.GenericTool;
+      const ctx = createBasicContext({
+        agentConfig: {
+          tools: [createMockTool('bash_tool'), nativeSearch],
+          toolSchemaTokens: 99999,
+        },
+        tokenCounter: mockTokenCounter,
+        toolExecution: {
+          engine: 'local',
+          local: { codingToolNames: ['read_file'] },
+        },
+      });
+      await ctx.tokenCalculationPromise;
+      expect(ctx.toolSchemaTokens).toBe(99999);
     });
 
     it('excludes deferred-undiscovered toolDefinitions from toolSchemaTokens', async () => {
@@ -3622,6 +3253,57 @@ describe('AgentContext', () => {
       ctx.projectContextUsage([new HumanMessage('hi') as unknown as AIMessage]);
 
       expect(ctx.systemMessageTokens).toBeGreaterThan(systemBefore);
+    });
+  });
+
+  describe('toolDispatch', () => {
+    const boundNames = (ctx: AgentContext): string[] =>
+      (ctx.getToolsForBinding() ?? []).map((tool) =>
+        'name' in tool ? String(tool.name) : ''
+      );
+    const toolDefinitions: t.LCTool[] = [
+      { name: 'bound_tool' },
+      { name: 'late_tool', defer_loading: true },
+    ];
+
+    it('binds call_tool after the other tools and leaves deferred tools unbound', () => {
+      const ctx = createBasicContext({
+        agentConfig: { toolDefinitions, toolDispatch: true },
+      });
+      expect(boundNames(ctx)).toEqual(['bound_tool', 'call_tool']);
+    });
+
+    it('keeps a discovered deferred tool unbound with the dispatcher, bound without it', () => {
+      const bound = (toolDispatch: boolean): string[] => {
+        const ctx = createBasicContext({
+          agentConfig: { toolDefinitions, toolDispatch: toolDispatch || undefined },
+        });
+        ctx.markToolsAsDiscovered(['late_tool']);
+        return boundNames(ctx);
+      };
+      expect(bound(true)).toEqual(['bound_tool', 'call_tool']);
+      expect(bound(false)).toEqual(['bound_tool', 'late_tool']);
+    });
+
+    it('binds no dispatcher unless the host opts in', () => {
+      const ctx = createBasicContext({ agentConfig: { toolDefinitions } });
+      expect(boundNames(ctx)).toEqual(['bound_tool']);
+    });
+
+    it('counts the dispatcher schema with the other tool schemas', async () => {
+      const tokenCounter = (message: { content: unknown }): number =>
+        String(message.content).includes('call_tool') ? 100 : 1;
+      const toolTokens = async (toolDispatch?: boolean): Promise<number> => {
+        const ctx = createBasicContext({
+          agentConfig: { toolDefinitions, toolDispatch },
+        });
+        await ctx.calculateInstructionTokens(
+          tokenCounter as unknown as t.TokenCounter
+        );
+        return ctx.toolSchemaTokens;
+      };
+
+      expect((await toolTokens(true)) - (await toolTokens())).toBeGreaterThanOrEqual(100);
     });
   });
 });

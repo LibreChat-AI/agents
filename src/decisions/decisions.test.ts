@@ -12,6 +12,7 @@ import {
   toWireQuestion,
   readAnswer,
   parseEnvelope,
+  failureForStatus,
 } from './index';
 
 type FetchCall = {
@@ -359,6 +360,38 @@ describe('decision dialect', () => {
 });
 
 describe('HTTP decisionModel', () => {
+  it('reports a 2xx whose body broke off as no reply, so its retry is not read as answered', async () => {
+    let sent = 0;
+    const fetch: DecisionFetch = async () => {
+      sent += 1;
+      if (sent > 1) {
+        return new Response(measured, { status: 200 });
+      }
+      const body = new ReadableStream<Uint8Array>({
+        start(controller): void {
+          controller.enqueue(new TextEncoder().encode('{"model":'));
+          controller.error(new TypeError('terminated'));
+        },
+      });
+      return new Response(body, { status: 200 });
+    };
+    const ended: Array<number | null> = [];
+    await createHttpDecisionModel({
+      endpoint: 'https://s1.example/v1/systemone',
+      apiKey: 'k',
+      model: 'jev-1.13.0',
+      dialect: 'systemone',
+      maxRetries: 1,
+      sleep: () => Promise.resolve(),
+      fetch,
+    }).decide({
+      state: {},
+      questions: { q: booleanQuestion('q?') },
+      onResponse: (status) => ended.push(status),
+    });
+    expect(ended).toEqual([null, 200]);
+  });
+
   it('posts Jev-shaped questions and keeps only measured answer probabilities', async () => {
     const { fetch, calls } = fakeFetch([
       {
@@ -805,14 +838,20 @@ describe('HTTP decisionModel', () => {
     });
     expect(limited.calls).toHaveLength(2);
 
-    const seen: boolean[] = [];
+    const seen: Array<{ refresh: boolean; refused?: string }> = [];
     const expiring = fakeFetch([
       { status: 401, body: 'expired' },
       { status: 200, body: measured },
     ]);
-    const credential = async ({ refresh }: { refresh: boolean }) => {
-      seen.push(refresh);
-      return refresh ? 'new' : 'old';
+    const credential = async ({
+      refresh,
+      refused,
+    }: {
+      refresh: boolean;
+      refused?: string;
+    }) => {
+      seen.push(refused === undefined ? { refresh } : { refresh, refused });
+      return refresh ? ' new ' : ' old ';
     };
     await createHttpDecisionModel({
       endpoint: 'https://s1.example',
@@ -825,7 +864,37 @@ describe('HTTP decisionModel', () => {
       'Bearer old',
       'Bearer new',
     ]);
-    expect(seen).toEqual([false, true]);
+    /** The refused key is the one sent, trimmed, not the minter's raw return. */
+    expect(seen).toEqual([
+      { refresh: false },
+      { refresh: true, refused: 'old' },
+    ]);
+  });
+
+  it('maps HTTP 402 to a quota failure that is never retried', async () => {
+    const outOfCredits = fakeFetch([
+      { status: 402, body: 'private echoed content: insufficient credits' },
+    ]);
+    const sleep = jest.fn(async () => {});
+    const error: unknown = await createHttpDecisionModel({
+      endpoint: 'https://s1.example',
+      apiKey: 'k',
+      dialect: 'systemone',
+      maxRetries: 3,
+      fetch: outOfCredits.fetch,
+      sleep,
+    })
+      .decide({ state: {}, questions: { q: booleanQuestion('?') } })
+      .catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(DecisionError);
+    expect(error).toMatchObject({
+      failure: 'quota',
+      status: 402,
+      message: 'decision model returned HTTP 402',
+    });
+    expect(failureForStatus(402)).toBe('quota');
+    expect(outOfCredits.calls).toHaveLength(1);
+    expect(sleep).not.toHaveBeenCalled();
   });
 
   it('mints one token per call and retains a refreshed token across subsequent retries', async () => {
@@ -946,12 +1015,71 @@ describe('HTTP decisionModel', () => {
     ).rejects.toMatchObject({ failure: 'timeout' });
   });
 
+  it.each(['timeout', 'aborted'] as const)(
+    'cancels a non-cooperative fetch body delivered after %s without late hooks or retries',
+    async (failure) => {
+      let reply: ((response: Response) => void) | undefined;
+      let sent: (() => void) | undefined;
+      const started = new Promise<void>((resolve) => {
+        sent = resolve;
+      });
+      let signal: AbortSignal | undefined;
+      const fetch: DecisionFetch = jest.fn(async (_url, init) => {
+        signal = init.signal;
+        sent?.();
+        return new Promise<Response>((resolve) => {
+          reply = resolve;
+        });
+      });
+      const onRequest = jest.fn();
+      const onResponse = jest.fn();
+      const onAnswered = jest.fn();
+      const caller = new AbortController();
+      const model = createHttpDecisionModel({
+        endpoint: 'https://s1.example',
+        requiresAuth: false,
+        fetch,
+        timeoutMs: failure === 'timeout' ? 25 : 1000,
+        onAnswered,
+      });
+      const pending = model.decide({
+        state: {},
+        questions: { q: booleanQuestion('?') },
+        signal: caller.signal,
+        onRequest,
+        onResponse,
+      });
+      const rejected = expect(pending).rejects.toMatchObject({ failure });
+      await started;
+      if (failure === 'aborted') {
+        caller.abort();
+      }
+      await rejected;
+      const cancel = jest.fn();
+      reply?.(
+        new Response(new ReadableStream<Uint8Array>({ cancel }), {
+          status: 200,
+        })
+      );
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(signal?.aborted).toBe(true);
+      expect(cancel).toHaveBeenCalledTimes(1);
+      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(onRequest).toHaveBeenCalledTimes(1);
+      expect(onResponse).not.toHaveBeenCalled();
+      expect(onAnswered).not.toHaveBeenCalled();
+    }
+  );
+
   it('aborts the fetch signal when the monotonic deadline expires before the timer runs', async () => {
     let seenSignal: AbortSignal | undefined;
+    const cancel = jest.fn();
     const fetch: DecisionFetch = async (_url, init) => {
       seenSignal = init.signal;
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 15);
-      return new Response(measured, { status: 200 });
+      return new Response(new ReadableStream<Uint8Array>({ cancel }), {
+        status: 200,
+      });
     };
     const decisionModel = createHttpDecisionModel({
       endpoint: 'https://s1.example',
@@ -966,6 +1094,8 @@ describe('HTTP decisionModel', () => {
       })
     ).rejects.toMatchObject({ failure: 'timeout' });
     expect(seenSignal?.aborted).toBe(true);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(cancel).toHaveBeenCalledTimes(1);
   });
 
   it('bounds synchronous request preparation even when a state getter throws', async () => {
@@ -1065,6 +1195,31 @@ describe('HTTP decisionModel', () => {
     });
     expect(onAnswered).toHaveBeenCalledTimes(1);
     expect(onAnswered).toHaveBeenCalledWith('gate', expect.any(Number));
+  });
+
+  it('ignores an async onAnswered that rejects, without an unhandled rejection', async () => {
+    const seen: unknown[] = [];
+    const listener = (reason: unknown): void => {
+      seen.push(reason);
+    };
+    process.on('unhandledRejection', listener);
+    try {
+      const ok = fakeFetch([{ status: 200, body: measured }]);
+      const result = await createHttpDecisionModel({
+        endpoint: 'https://s1.example',
+        apiKey: 'k',
+        dialect: 'systemone',
+        fetch: ok.fetch,
+        onAnswered: async () => {
+          throw new Error('observability');
+        },
+      }).decide({ state: {}, questions: { q: booleanQuestion('?') } });
+      expect(result.answers.q).toMatchObject({ type: 'boolean' });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    } finally {
+      process.off('unhandledRejection', listener);
+    }
+    expect(seen).toEqual([]);
   });
 
   it('keeps concurrent credential refreshes and request signals independent', async () => {

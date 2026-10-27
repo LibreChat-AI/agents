@@ -148,10 +148,6 @@ If masking + fit-to-budget still produce an **empty context** (no messages fit a
 
 Messages that get pruned are **gone** — no summary captures them. The model loses context of what it did in earlier turns. This is acceptable for simpler conversations but problematic for long agentic runs with many tool calls.
 
-### Hosts That Pass `conversation_instructions`
-
-The placement above is unchanged unless the host passes `conversation_instructions`. With it, a summary created in the run and the same summary restored as `initialSummary` render as one message right after the system message, as the carrier its token count was measured on (`buildSummaryCarrierText`). The message is stable until the next compaction and carries its own cache breakpoint where the provider supports one and the request still has a breakpoint left. It counts toward `instructionTokens`. The requests after a compaction and the next run therefore share their prefix, so a compaction costs one prefix rebuild, not two.
-
 ---
 
 ## Summary Injection Locations
