@@ -2,6 +2,7 @@ import { AIMessageChunk } from '@langchain/core/messages';
 import { ChatGenerationChunk } from '@langchain/core/outputs';
 import {
   toGenerationSmoothItem,
+  hasReasoningKwargs,
   getReasoningKwargsText,
   cloneGenerationChunkPiece,
 } from './chunkAdapters';
@@ -21,6 +22,26 @@ function textChunk(
     message: new AIMessageChunk({ content: text, ...extra }),
   });
 }
+
+describe('hasReasoningKwargs', () => {
+  it.each([
+    {reasoning: ''}, {reasoning: ' \n\t'},
+    {reasoning_content: ''}, {reasoning_content: ' \n\t'},
+    {reasoning_details: []},
+  ])('rejects empty reasoning evidence: %j', additional_kwargs => {
+    expect(hasReasoningKwargs(new AIMessageChunk({content: '', additional_kwargs}))).toBe(false);
+    expect(toGenerationSmoothItem(textChunk('visible output', {additional_kwargs})).atomic).not.toBe(true);
+  });
+
+  it.each([
+    {reasoning: 'thought'}, {reasoning_content: 'thought'},
+    {reasoning: {summary: [{text: 'thought'}]}},
+    {reasoning: {encrypted_content: 'opaque'}},
+    {reasoning_details: [{type: 'reasoning.encrypted', data: 'opaque'}]},
+  ])('retains genuine reasoning evidence: %j', additional_kwargs => {
+    expect(hasReasoningKwargs(new AIMessageChunk({content: '', additional_kwargs}))).toBe(true);
+  });
+});
 
 describe('toGenerationSmoothItem classification', () => {
   it('splits plain string-content text chunks', () => {

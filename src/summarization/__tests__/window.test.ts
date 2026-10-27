@@ -1,3 +1,4 @@
+import { FinishReason } from '@google/generative-ai';
 import { ChatGenerationChunk } from '@langchain/core/outputs';
 import {
   AIMessage,
@@ -8,6 +9,7 @@ import {
 import type {ConverseStreamCommandOutput, ConverseCommandOutput, ConverseStreamOutput} from '@aws-sdk/client-bedrock-runtime';
 import type { BaseMessage, UsageMetadata } from '@langchain/core/messages';
 import type * as t from '@/types';
+import { convertResponseContentToChatGenerationChunk } from '@/llm/google/utils/common';
 import { createSummarizeNode } from '@/summarization/node';
 import { resolveClientOptionsModel } from '@/llm/request';
 import { CustomChatBedrockConverse } from '@/llm/bedrock';
@@ -1505,6 +1507,31 @@ describe('compaction request windows', () => {
     expect(modelEnds).toHaveLength(2);
     expect(completions).toHaveLength(1);
     expect(completions[0].attemptUsage?.map(entry => entry.usage)).toEqual(modelEnds);
+  });
+
+  it.each(['', ' \n\t'])('preserves empty Google thought output without retrying: %j', async text => {
+    const thoughtPart = {thought: true, text};
+    const response: Parameters<typeof convertResponseContentToChatGenerationChunk>[0] = {
+      text: () => '', functionCall: () => undefined, functionCalls: () => undefined,
+      candidates: [{index: 0, content: {role: 'model', parts: [thoughtPart]},
+        finishReason: FinishReason.STOP, safetyRatings: [],
+      }],
+    };
+    const chunk = convertResponseContentToChatGenerationChunk(response, {index: 0});
+    if (!(chunk?.message instanceof AIMessageChunk)) throw new Error('Expected a Google message chunk');
+    expect(chunk.message.content).toBe('');
+    expect(chunk.message.additional_kwargs.reasoning).toBe(text);
+    const model = new ReasoningOnlyModel(3, undefined, chunk.message);
+    const {node, agentContext, emitted} = harness({model, provider: Providers.GOOGLE});
+    const messages = history(6);
+    const before = JSON.stringify(messages);
+    const result = await node({messages, summarizationRequest: {agentId: 'agent', remainingContextTokens: 0, windowMessages: messages}}, {});
+    expect(model.calls).toHaveLength(1);
+    expect(result.messages).toBeUndefined();
+    expect(JSON.stringify(messages)).toBe(before);
+    expect(agentContext.getSummaryText()).toBeUndefined();
+    expect(emitted.filter(({event}) => event === GraphEvents.ON_SUMMARIZE_DELTA)).toHaveLength(0);
+    expect(emitted.filter(({event}) => event === GraphEvents.ON_SUMMARIZE_COMPLETE)).toHaveLength(1);
   });
 
   const cancellations = [

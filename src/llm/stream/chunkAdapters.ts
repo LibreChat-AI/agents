@@ -163,7 +163,7 @@ export function hasReasoningKwargs(message: Pick<AIMessageChunk, 'additional_kwa
   const kwargs = message.additional_kwargs;
   if (
     typeof kwargs.reasoning_content === 'string' &&
-    kwargs.reasoning_content !== ''
+    kwargs.reasoning_content.trim() !== ''
   ) {
     return true;
   }
@@ -173,7 +173,9 @@ export function hasReasoningKwargs(message: Pick<AIMessageChunk, 'additional_kwa
   ) {
     return true;
   }
-  return kwargs.reasoning != null;
+  return typeof kwargs.reasoning === 'string'
+    ? kwargs.reasoning.trim() !== ''
+    : kwargs.reasoning != null;
 }
 
 /**
