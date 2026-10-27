@@ -1534,6 +1534,122 @@ describe('compaction request windows', () => {
     expect(emitted.filter(({event}) => event === GraphEvents.ON_SUMMARIZE_COMPLETE)).toHaveLength(1);
   });
 
+  it.each([
+    {provider: Providers.GOOGLE, options: {thinkingConfig: {thinkingBudget: 8192}}, expected: 12288},
+    {provider: Providers.VERTEXAI, options: {thinkingBudget: 8192}, expected: 12288},
+    {provider: Providers.VERTEXAI, options: {thinkingConfig: {thinkingBudget: 8192}}, expected: 12288},
+    {provider: Providers.GOOGLE, options: {thinkingConfig: {thinkingBudget: -1}}, expected: 4096},
+    {provider: Providers.VERTEXAI, options: {thinkingConfig: {thinkingBudget: 8192, thinkingLevel: 'HIGH' as const}}, expected: 4096},
+    {provider: Providers.GOOGLE, options: {thinkingConfig: {thinkingBudget: 8192}, maxOutputTokens: 1024}, expected: 1024},
+  ])('reserves the serving Google fixed thinking budget without overriding explicit caps: %j', async ({provider, options, expected}) => {
+    const {node, model} = harness({provider, maxContextTokens: 100_000, clientOptions: options, summarizationConfig: {}});
+    const messages = history(6);
+    await node({messages, summarizationRequest: {agentId: 'agent', remainingContextTokens: 0, windowMessages: messages}}, {});
+    expect(init.initializeModel).toHaveBeenCalledWith(expect.objectContaining({clientOptions: expect.objectContaining({maxOutputTokens: expected})}));
+    expect(model.calls).toHaveLength(1);
+  });
+
+  const emptyReasoningBlocks = [
+    {type: 'thinking', thinking: ''}, {type: 'thinking', thinking: ' \n\t'},
+    {type: 'reasoning_content', reasoningText: {text: ''}},
+    {type: 'reasoning_content', reasoningText: {text: ' \n\t'}},
+    {type: 'redacted_thinking', data: ''},
+    {type: 'reasoning_content', redactedContent: ''},
+  ];
+  it.each(emptyReasoningBlocks)('does not retry an empty native reasoning block: %j', async block => {
+    const model = new ReasoningOnlyModel(3, undefined, new AIMessageChunk({content: [block], response_metadata: {stopReason: 'end_turn'}}));
+    const {node, emitted, agentContext} = harness({model});
+    const messages = history(6);
+    const result = await node({messages, summarizationRequest: {agentId: 'agent', remainingContextTokens: 0, windowMessages: messages}}, {});
+    expect(model.calls).toHaveLength(1);
+    expect(result.messages).toBeUndefined();
+    expect(agentContext.getSummaryText()).toBeUndefined();
+    expect(emitted.filter(({event}) => event === GraphEvents.ON_SUMMARIZE_DELTA)).toHaveLength(0);
+  });
+
+  it.each([
+    {type: 'redacted_thinking', data: 'OPAQUE_REASONING'},
+    {type: 'reasoning_content', redactedContent: 'OPAQUE_REASONING'},
+    {type: 'reasoning_content', reasoningText: {signature: 'OPAQUE_REASONING'}},
+    {type: 'reasoning', encrypted_content: 'OPAQUE_REASONING', summary: []},
+  ])('retains recovery for genuine opaque reasoning: %j', async block => {
+    jest.useFakeTimers();
+    const model = new ReasoningOnlyModel(1, undefined, new AIMessageChunk({content: [block]}));
+    const {node, emitted, agentContext} = harness({model});
+    const messages = history(6);
+    const pending = node({messages, summarizationRequest: {agentId: 'agent', remainingContextTokens: 0, windowMessages: messages}}, {});
+    await jest.runAllTimersAsync(); await pending;
+    expect(model.calls).toHaveLength(2);
+    expect(agentContext.getSummaryText()).toBe('CLEAN_SUMMARY');
+    expect(JSON.stringify(emitted.filter(({event}) => event === GraphEvents.ON_SUMMARIZE_DELTA || event === GraphEvents.ON_SUMMARIZE_COMPLETE))).not.toContain('OPAQUE_REASONING');
+  });
+
+  it.each(['stream', 'invoke'] as const)('accounts completed %s usage even when terminal tool validation rejects the response', async mode => {
+    const model = new SummaryModel();
+    const response = new AIMessageChunk({content: '', tool_calls: [{id: 'truncated', name: 'search', args: {}}],
+      response_metadata: {stopReason: 'max_tokens'}, usage_metadata: {input_tokens: 100, output_tokens: 50, total_tokens: 150},
+    });
+    let calls = 0;
+    if (mode === 'invoke') {
+      Object.defineProperty(model, 'stream', {value: undefined});
+      jest.spyOn(model, 'invoke').mockImplementation(async () => {calls++; return response;});
+    } else {
+      jest.spyOn(model, '_streamResponseChunks').mockImplementation(async function* () {
+        calls++; yield new ChatGenerationChunk({text: '', message: response});
+      });
+    }
+    const {node, emitted, graph, agentContext} = harness({model, provider: Providers.BEDROCK, clientOptions: {model: 'bedrock-summary'}});
+    const messages = history(6);
+    const before = JSON.stringify(messages);
+    const result = await node({messages, summarizationRequest: {agentId: 'agent', remainingContextTokens: 0, windowMessages: messages}}, {});
+    expect(calls).toBe(1);
+    expect(result.messages).toBeUndefined(); expect(JSON.stringify(messages)).toBe(before);
+    expect(agentContext.getSummaryText()).toBeUndefined();
+    expect(graph.dispatchRunStep.mock.calls[0][0].usage).toEqual({prompt_tokens: 100, completion_tokens: 50, total_tokens: 150});
+    const completed = emitted.find(({event}) => event === GraphEvents.ON_SUMMARIZE_COMPLETE)?.data as t.SummarizeCompleteEvent;
+    expect(completed.attemptUsage).toEqual([{provider: Providers.BEDROCK, model: 'bedrock-summary', usage: response.usage_metadata}]);
+    expect(emitted.filter(({event}) => event === GraphEvents.ON_SUMMARIZE_DELTA)).toHaveLength(0);
+  });
+
+  it('reserves the configured Google thinking allowance in the request input budget', async () => {
+    const {node, model} = harness({provider: Providers.GOOGLE, maxContextTokens: 20_000,
+      clientOptions: {thinkingConfig: {thinkingBudget: 8192}}, summarizationConfig: {},
+    });
+    const messages = history(200);
+    await node({messages, summarizationRequest: {agentId: 'agent', remainingContextTokens: 0, windowMessages: messages}}, {});
+    expect(model.calls).toHaveLength(1);
+    expect(model.calls[0].length).toBeLessThan(messages.length);
+    expect(model.calls[0].reduce((total, message) => total + count(message), 10192)).toBeLessThanOrEqual(20_000);
+    expect(init.initializeModel).toHaveBeenCalledWith(expect.objectContaining({clientOptions: expect.objectContaining({maxOutputTokens: 10192})}));
+  });
+
+  it('preserves rejected fallback usage before a later provider succeeds', async () => {
+    const primary = new SummaryModel(); primary.failure = () => new Error('Primary failed');
+    const truncated = new SummaryModel();
+    Object.defineProperty(truncated, 'stream', {value: undefined});
+    jest.spyOn(truncated, 'invoke').mockResolvedValue(new AIMessageChunk({content: '',
+      tool_calls: [{id: 'truncated', name: 'search', args: {}}], response_metadata: {stopReason: 'max_tokens'},
+      usage_metadata: {input_tokens: 100, output_tokens: 50, total_tokens: 150},
+    }));
+    const successful = new SummaryModel(); successful.summaryUsage = {input_tokens: 321, output_tokens: 45, total_tokens: 366};
+    const {node, emitted, graph} = harness({model: primary, clientOptions: {fallbacks: [
+      {provider: Providers.BEDROCK, clientOptions: {model: 'truncated'}},
+      {provider: Providers.ANTHROPIC, clientOptions: {model: 'successful'}},
+    ]}});
+    jest.spyOn(init, 'initializeModel').mockImplementation(({provider}) => {
+      if (provider === Providers.BEDROCK) return truncated;
+      return provider === Providers.ANTHROPIC ? successful : primary;
+    });
+    const messages = history(6);
+    await node({messages, summarizationRequest: {agentId: 'agent', remainingContextTokens: 0, windowMessages: messages}}, {});
+    const completed = emitted.find(({event}) => event === GraphEvents.ON_SUMMARIZE_COMPLETE)?.data as t.SummarizeCompleteEvent;
+    expect(completed.summary).toMatchObject({provider: Providers.ANTHROPIC, model: 'successful'});
+    expect(completed.attemptUsage?.map(entry => [entry.provider, entry.model, entry.usage.total_tokens])).toEqual([
+      [Providers.BEDROCK, 'truncated', 150], [Providers.ANTHROPIC, 'successful', 366],
+    ]);
+    expect(graph.dispatchRunStep.mock.calls[0][0].usage).toMatchObject({prompt_tokens: 421, completion_tokens: 95, total_tokens: 516});
+  });
+
   const cancellations = [
     Object.assign(new Error('SDK failure'), { name: 'CancelledError' }),
     Object.assign(new Error('SDK failure'), { name: 'CanceledError' }),

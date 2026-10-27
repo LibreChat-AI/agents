@@ -40,6 +40,7 @@ import {
   DEFAULT_RETAIN_RECENT_TOKENS,
 } from './input';
 import { classifySummarizationError, withSummarizationRetry, ReasoningOnlySummaryError } from './retry';
+import { isReasoningContentBlock, hasMeaningfulReasoningContentBlock } from '@/messages/reasoningTypes';
 import {
   createTokenCounter,
   encodingForModel,
@@ -62,7 +63,6 @@ import { readSummarizationUsage, buildSummarizationStepUsage } from './usage';
 import { ProviderTextProtectionError } from '@/protection/providerText';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { prepareToolsForPromptCache } from '@/llm/promptCacheTools';
-import { isReasoningContentBlock } from '@/messages/reasoningTypes';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { serializeToolContentBounded } from '@/utils/toolContent';
 import { hasReasoningKwargs } from '@/llm/stream/chunkAdapters';
@@ -230,6 +230,12 @@ function resolveSummaryOutputTokens(
       reasoningOptions.thinkingBudget ??
       reasoningOptions.additionalModelRequestFields?.thinkingBudget ??
       0;
+  }
+  if (provider === Providers.GOOGLE || provider === Providers.VERTEXAI || getProviderFamily(provider) === 'google') {
+    const google = clientOptions as t.GoogleThinkingConfig & Pick<t.VertexAIClientOptions, 'thinkingConfig'>;
+    const fixedBudget = provider === Providers.VERTEXAI && google.thinkingConfig?.thinkingLevel != null
+      ? 0 : google.thinkingConfig?.thinkingBudget ?? google.thinkingBudget;
+    if (fixedBudget != null && Number.isFinite(fixedBudget) && fixedBudget > 0) thinkingBudget = fixedBudget;
   }
   const defaultOutputTokens =
     thinkingBudget +
@@ -927,11 +933,13 @@ async function executeSummarizationWithFallback(params: {
           streamLimitState: graph,
           invokeModel: (params, config) => withSummarizationRetry(async () => {
             pendingDeltas.length = 0;
-            const result = await attemptInvoke(params, config);
-            const usage = readSummarizationUsage(result.messages?.[0]);
-            if (usage != null && fallbackIdentity != null) onUsage({
-              provider: fallbackIdentity.provider as t.ProviderName, model: fallbackIdentity.model, usage,
-            });
+            const result = await attemptInvoke({...params, onModelComplete: response => {
+              params.onModelComplete?.(response);
+              const usage = readSummarizationUsage(response);
+              if (usage != null && fallbackIdentity != null) onUsage({
+                provider: fallbackIdentity.provider as t.ProviderName, model: fallbackIdentity.model, usage,
+              });
+            }}, config);
             config?.signal?.throwIfAborted();
             const response = result.messages?.[0];
             if (response != null && isReasoningOnlySummary(response)) throw new ReasoningOnlySummaryError();
@@ -1825,7 +1833,10 @@ function isReasoningOnlySummary(response: BaseMessage): boolean {
   if (typeof response.content === 'string') return hasReasoning && response.content.trim() === '';
   if (!Array.isArray(response.content)) return false;
   for (const block of response.content) {
-    if (isReasoningContentBlock(block)) {hasReasoning = true; continue;}
+    if (isReasoningContentBlock(block)) {
+      hasReasoning ||= hasMeaningfulReasoningContentBlock(block);
+      continue;
+    }
     if (block.type !== 'text' || typeof block.text !== 'string' || block.text.trim() !== '') return false;
   }
   return hasReasoning;
@@ -2102,6 +2113,10 @@ async function summarizeWithCacheHit({
           model,
           messages: [...cachedHistory, new HumanMessage(instruction)],
           provider,
+          onModelComplete: response => {
+            const usage = readSummarizationUsage(response);
+            if (usage != null) onUsage(usage);
+          },
           onChunk: createSummarizationChunkHandler({
             stepId,
             config: traceConfig(config, 'cache_hit_compaction'),
@@ -2115,8 +2130,6 @@ async function summarizeWithCacheHit({
         signalConfig
       );
       const response = result.messages?.[0];
-      const usage = readSummarizationUsage(response);
-      if (usage != null) onUsage(usage);
       signalConfig?.signal?.throwIfAborted();
       if (response != null && isReasoningOnlySummary(response)) throw new ReasoningOnlySummaryError();
       if (response != null && extractResponseText(response) !== '') {

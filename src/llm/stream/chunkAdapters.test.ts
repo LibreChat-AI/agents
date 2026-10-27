@@ -25,21 +25,59 @@ function textChunk(
 
 describe('hasReasoningKwargs', () => {
   it.each([
-    {reasoning: ''}, {reasoning: ' \n\t'},
-    {reasoning_content: ''}, {reasoning_content: ' \n\t'},
-    {reasoning_details: []},
-  ])('rejects empty reasoning evidence: %j', additional_kwargs => {
-    expect(hasReasoningKwargs(new AIMessageChunk({content: '', additional_kwargs}))).toBe(false);
-    expect(toGenerationSmoothItem(textChunk('visible output', {additional_kwargs})).atomic).not.toBe(true);
+    { reasoning: '' },
+    { reasoning: ' \n\t' },
+    { reasoning_content: '' },
+    { reasoning_content: ' \n\t' },
+    { reasoning_details: [] },
+    { reasoning: {} },
+    { reasoning: { id: 'rs_1', status: 'completed' } },
+    { reasoning: { summary: [] } },
+    { reasoning: { summary: [{ type: 'summary_text', text: ' \n' }] } },
+    { reasoning: { summary: [null, {}, { type: 'summary_text' }] } },
+    { reasoning: { content: [{ type: 'reasoning_text', text: '' }] } },
+    { reasoning: { encrypted_content: '' } },
+    { reasoning: { encrypted_content: ' ' } },
+    { reasoning: { effort: 'high', metadata: { text: 'not a payload' } } },
+    { reasoning: false },
+    { reasoning: 5 },
+    { reasoning_details: [null, {}] },
+    { reasoning_details: [{ type: 'reasoning.text', text: ' ' }] },
+    { reasoning_details: [{ type: 'reasoning.summary', summary: '' }] },
+    { reasoning_details: [{ type: 'reasoning.encrypted', id: 'rs_1' }] },
+    { reasoning_details: [{ type: 'reasoning.encrypted', data: '' }] },
+    { reasoning_details: [{ type: 'reasoning.encrypted', data: ' ' }] },
+  ])('rejects empty reasoning evidence: %j', (additional_kwargs) => {
+    expect(
+      hasReasoningKwargs(new AIMessageChunk({ content: '', additional_kwargs }))
+    ).toBe(false);
+    expect(
+      toGenerationSmoothItem(textChunk('visible output', { additional_kwargs }))
+        .atomic
+    ).not.toBe(true);
   });
 
   it.each([
-    {reasoning: 'thought'}, {reasoning_content: 'thought'},
-    {reasoning: {summary: [{text: 'thought'}]}},
-    {reasoning: {encrypted_content: 'opaque'}},
-    {reasoning_details: [{type: 'reasoning.encrypted', data: 'opaque'}]},
-  ])('retains genuine reasoning evidence: %j', additional_kwargs => {
-    expect(hasReasoningKwargs(new AIMessageChunk({content: '', additional_kwargs}))).toBe(true);
+    { reasoning: 'thought' },
+    { reasoning_content: 'thought' },
+    { reasoning: { summary: [{ text: 'thought' }] } },
+    { reasoning: { summary: [{ text: ' ' }, { text: 'later thought' }] } },
+    { reasoning: { content: [{ type: 'reasoning_text', text: 'thought' }] } },
+    { reasoning: { encrypted_content: 'opaque' } },
+    { reasoning: { summary: [], encrypted_content: 'opaque' } },
+    { reasoning_details: [{ type: 'reasoning.text', text: 'thought' }] },
+    { reasoning_details: [{ type: 'reasoning.encrypted', data: 'opaque' }] },
+    {
+      reasoning_details: [{}, { type: 'reasoning.encrypted', data: 'opaque' }],
+    },
+  ])('retains genuine reasoning evidence: %j', (additional_kwargs) => {
+    expect(
+      hasReasoningKwargs(new AIMessageChunk({ content: '', additional_kwargs }))
+    ).toBe(true);
+    expect(
+      toGenerationSmoothItem(textChunk('visible output', { additional_kwargs }))
+        .atomic
+    ).toBe(true);
   });
 });
 

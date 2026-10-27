@@ -633,6 +633,8 @@ interface AttemptInvokeCommonParams {
   context?: InvokeContext;
   providerTextProtection?: ProviderTextProtection;
   onChunk?: OnChunk;
+  /** Observes completed model output synchronously, before terminal validation. */
+  onModelComplete?: (message: BaseMessage) => void;
   /**
    * The agent lane this attempt belongs to, as the model node names it. Only
    * read to record a discarded turn, which the node cannot otherwise detect —
@@ -804,6 +806,7 @@ export async function attemptInvoke(
         request,
         context: params.context,
         onChunk: params.onChunk,
+        onModelComplete: params.onModelComplete,
         preemptAgentId: params.preemptAgentId,
         providerTextProtection: policy,
       },
@@ -846,11 +849,16 @@ async function attemptInvokeBody(
     request,
     context,
     onChunk,
+    onModelComplete,
     preemptAgentId,
     providerTextProtection,
   }: Pick<
     AttemptInvokeCommonParams,
-    'context' | 'onChunk' | 'preemptAgentId' | 'providerTextProtection'
+    | 'context'
+    | 'onChunk'
+    | 'onModelComplete'
+    | 'preemptAgentId'
+    | 'providerTextProtection'
   > & {
     request: PreparedProviderRequest;
   },
@@ -1521,6 +1529,9 @@ async function attemptInvokeBody(
       throw new Error(EMPTY_PROVIDER_RESPONSE_MESSAGE);
     }
 
+    if (preemptAction === 'none') {
+      onModelComplete?.(snapshotValidatedModelChunk(finalChunk));
+    }
     detachValidatedModelToolCalls(finalChunk);
     if ((finalChunk.tool_calls?.length ?? 0) > 0) {
       finalChunk.tool_calls = finalChunk.tool_calls?.filter(
@@ -1536,6 +1547,7 @@ async function attemptInvokeBody(
     await model.invoke(messagesForProvider, invocationConfig),
     false
   );
+  onModelComplete?.(finalMessage);
   if ((finalMessage.tool_calls?.length ?? 0) > 0) {
     finalMessage.tool_calls = finalMessage.tool_calls?.filter(
       (tool_call: ToolCall) => !!tool_call.name
