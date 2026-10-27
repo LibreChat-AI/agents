@@ -1,4 +1,5 @@
 import type { SummarizationErrorCode } from '@/types/summarize';
+import type * as t from '@/types';
 import {
   extractErrorMessage,
   isContextOverflowError,
@@ -6,10 +7,31 @@ import {
 } from '@/utils/errors';
 import { ProviderTextProtectionError } from '@/protection/providerText';
 import { StreamLimitExceededError } from '@/llm/streamLimits';
+import { getProviderFamily } from '@/llm/providerRegistry';
+import { Providers } from '@/common';
 
 const MAX_ATTEMPTS = 3;
 const BACKOFF_MS = 250;
 const MAX_ERROR_DEPTH = 4;
+
+/** Compaction owns retries; model/transport defaults must not multiply attempts. */
+export function withSummarizationRetryOwner<T extends object>(provider: t.ProviderName, clientOptions: T): T & {maxRetries: number} {
+  const options = {...clientOptions, maxRetries: 0};
+  const family = getProviderFamily(provider);
+  if (provider === Providers.OPENAI || provider === Providers.AZURE || provider === Providers.OPENROUTER || family === 'openai') {
+    const openai = clientOptions as Partial<t.OpenAIClientOptions>;
+    return {...options, configuration: {...openai.configuration, maxRetries: 0}};
+  }
+  if (provider === Providers.ANTHROPIC || family === 'anthropic') {
+    const anthropic = clientOptions as Partial<t.AnthropicClientOptions>;
+    return {...options, clientOptions: {...anthropic.clientOptions, maxRetries: 0}};
+  }
+  if (provider === Providers.BEDROCK || family === 'bedrock') {
+    const bedrock = clientOptions as Partial<t.BedrockAnthropicInput>;
+    return {...options, clientOptions: {...bedrock.clientOptions, maxAttempts: 1}};
+  }
+  return options;
+}
 
 export class ReasoningOnlySummaryError extends Error {
   constructor() {

@@ -104,8 +104,12 @@ describe('hasMeaningfulReasoningPayload', () => {
     '',
     ' \n',
     { text: {} },
-    { summary: 'text' },
+    { summary: ' \n' },
   ])('rejects empty or malformed payloads: %j', (payload) => {
     expect(hasMeaningfulReasoningPayload(payload)).toBe(false);
   });
+});
+
+it.each(['', ' \n\t', 'meaningful reasoning'])('classifies string-form reasoning summaries: %j', summary => {
+  expect(hasMeaningfulReasoningPayload({type: 'reasoning.summary', summary})).toBe(summary.trim() !== '');
 });

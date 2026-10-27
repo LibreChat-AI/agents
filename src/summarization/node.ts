@@ -29,6 +29,7 @@ import {
   STREAM_LIMIT_EPOCH_KEY,
   STREAM_LIMIT_ATTEMPT_KEY,
 } from '@/llm/streamLimits';
+import { classifySummarizationError, withSummarizationRetry, withSummarizationRetryOwner, ReasoningOnlySummaryError } from './retry';
 import {
   DEFAULT_RETAIN_RECENT_TURNS,
   resolveIntraTurnRetainTokens,
@@ -39,7 +40,6 @@ import {
   DEFAULT_SUMMARY_OUTPUT_TOKENS,
   DEFAULT_RETAIN_RECENT_TOKENS,
 } from './input';
-import { classifySummarizationError, withSummarizationRetry, ReasoningOnlySummaryError } from './retry';
 import { isReasoningContentBlock, hasMeaningfulReasoningContentBlock } from '@/messages/reasoningTypes';
 import {
   createTokenCounter,
@@ -179,10 +179,10 @@ function buildSummarizationClientConfig(
       ? { ...agentContext.clientOptions }
       : {};
 
-  const clientOptions: Record<string, unknown> = {
+  const clientOptions: Record<string, unknown> = withSummarizationRetryOwner(provider, {
     ...baseOptions,
     ...llmParams,
-  };
+  });
 
   if (modelName != null && modelName !== '') {
     clientOptions.model = modelName;
@@ -855,7 +855,7 @@ async function executeSummarizationWithFallback(params: {
         const boundedFallbacks = fallbacks.map((fallback) => {
           const maxContextTokens =
             fallback.maxContextTokens ?? agentContext.maxContextTokens;
-          const clientOptions = {
+          const clientOptions = withSummarizationRetryOwner(fallback.provider, {
             ...fallback.clientOptions,
             [getMaxOutputTokensKey(fallback.provider)]:
               resolveSummaryOutputTokens(
@@ -863,7 +863,7 @@ async function executeSummarizationWithFallback(params: {
                 { ...fallback.clientOptions },
                 maxContextTokens
               ),
-          };
+          });
           return {
             ...fallback,
             clientOptions,
@@ -913,8 +913,13 @@ async function executeSummarizationWithFallback(params: {
               budget,
               provider,
             });
-            const history =
-              system == null ? bounded : await system.invoke(bounded, config);
+            const bedrock = clientOptions as t.BedrockAnthropicInput | undefined;
+            const windowWithCache = provider === Providers.BEDROCK
+              ? applySummarizationHistoryCache({messages: bounded, provider,
+                enabled: bedrock?.promptCache === true,
+                promptCacheTtl: bedrock?.promptCacheTtl, bedrockModelId: resolveClientOptionsModel(clientOptions),
+              }) : bounded;
+            const history = system == null ? windowWithCache : await system.invoke(windowWithCache, config);
             const request = prepareProviderRequest({
               model,
               messages: [...history, new HumanMessage(instruction)],
@@ -2092,12 +2097,12 @@ async function summarizeWithCacheHit({
       provider,
       shrink: attempt > 0 || shrinkInput === true,
     });
-    const history =
-      system == null
-        ? boundedHistory
-        : await system.invoke(boundedHistory, config);
+    const windowWithCache = provider === Providers.BEDROCK
+      ? applySummarizationHistoryCache({messages: boundedHistory, provider, enabled: usePromptCache === true, promptCacheTtl, bedrockModelId})
+      : boundedHistory;
+    const history = system == null ? windowWithCache : await system.invoke(windowWithCache, config);
     const cachedHistory =
-      system != null
+      system != null || provider === Providers.BEDROCK
         ? history
         : applySummarizationHistoryCache({
           messages: history,

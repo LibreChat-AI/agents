@@ -35,8 +35,8 @@ type ReasoningPayload = Partial<
     Pick<ReasoningContentText, 'think'> &
     Pick<GoogleReasoningContentText, 'reasoning'> &
     Omit<MessageContentReasoningBlock, 'type'> &
-    Pick<ResponseReasoningItem, 'summary' | 'content' | 'encrypted_content'>
-> & { text?: string; data?: string };
+    Pick<ResponseReasoningItem, 'content' | 'encrypted_content'>
+> & { text?: string; data?: string; summary?: ResponseReasoningItem['summary'] | string };
 
 function hasMeaningfulText(value: unknown): boolean {
   return typeof value === 'string' && value.trim() !== '';
@@ -75,6 +75,7 @@ export function hasMeaningfulReasoningPayload(value: unknown): boolean {
     hasMeaningfulText(payload.signature) ||
     hasMeaningfulText(payload.data) ||
     hasMeaningfulText(payload.encrypted_content) ||
+    hasMeaningfulText(payload.summary) ||
     hasMeaningfulOpaqueData(payload.redactedContent) ||
     hasMeaningfulText(payload.reasoningText?.text) ||
     hasMeaningfulText(payload.reasoningText?.signature) ||

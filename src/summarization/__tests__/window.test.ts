@@ -1261,6 +1261,7 @@ describe('compaction request windows', () => {
     {reasoning: {summary: [{text: 'PRIVATE_REASONING_ONLY'}]}},
     {reasoning_details: [{type: 'reasoning.text', text: 'PRIVATE_REASONING_ONLY'}]},
     {reasoning_details: [{type: 'reasoning.encrypted', data: 'PRIVATE_REASONING_ONLY'}]},
+    {reasoning_details: [{type: 'reasoning.summary', summary: 'PRIVATE_REASONING_ONLY'}]},
   ];
   it.each(reasoningKwargs.flatMap(kwargs => ['stream', 'invoke'].map(mode => ({kwargs, mode}))))(
     'recovers kwargs-borne reasoning without exposing it: %j', async ({kwargs, mode}) => {

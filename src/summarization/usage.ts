@@ -15,19 +15,32 @@ function tokenCount(value: number | undefined): number | undefined {
     : undefined;
 }
 
+function normalizeBedrockInputUsage(
+  usage: Partial<UsageMetadata>,
+  raw: BedrockSummarizationUsage | undefined
+): Partial<UsageMetadata> {
+  const input = tokenCount(usage.input_tokens);
+  if (input == null || input !== tokenCount(raw?.inputTokens)) return usage;
+
+  const cached = (tokenCount(raw?.cacheReadInputTokens) ?? 0) +
+    (tokenCount(raw?.cacheWriteInputTokens) ?? 0);
+  return cached === 0 ? usage : { ...usage, input_tokens: input + cached };
+}
+
 export function readSummarizationUsage(
   response: BaseMessage | undefined
 ): Partial<UsageMetadata> | undefined {
   if (response == null) return undefined;
-  if ('usage_metadata' in response && response.usage_metadata != null) {
-    return response.usage_metadata as Partial<UsageMetadata>;
-  }
-
   const metadata = response.response_metadata as {
     usage?: BedrockSummarizationUsage;
     metadata?: { usage?: BedrockSummarizationUsage };
   } | undefined;
   const raw = metadata?.metadata?.usage ?? metadata?.usage;
+  if ('usage_metadata' in response && response.usage_metadata != null) {
+    return normalizeBedrockInputUsage(
+      response.usage_metadata as Partial<UsageMetadata>, raw
+    );
+  }
   if (raw == null) return undefined;
 
   const input_tokens = tokenCount(raw.inputTokens);
@@ -43,7 +56,7 @@ export function readSummarizationUsage(
     cache_creation == null
   ) return undefined;
 
-  return {
+  return normalizeBedrockInputUsage({
     ...(input_tokens == null ? {} : { input_tokens }),
     ...(output_tokens == null ? {} : { output_tokens }),
     ...(total_tokens == null ? {} : { total_tokens }),
@@ -55,7 +68,7 @@ export function readSummarizationUsage(
           ...(cache_creation == null ? {} : { cache_creation }),
         },
       }),
-  };
+  }, raw);
 }
 
 export function buildSummarizationStepUsage(

@@ -2,6 +2,10 @@ import { AIMessage } from '@langchain/core/messages';
 import type { UsageMetadata, BaseMessage } from '@langchain/core/messages';
 import type { SummarizationAttemptUsage } from '@/types/summarize';
 import {
+  convertConverseMessageToLangChainMessage,
+  handleConverseStreamMetadata,
+} from '@/llm/bedrock/utils/message_outputs';
+import {
   buildSummarizationStepUsage,
   readSummarizationUsage,
 } from '@/summarization/usage';
@@ -51,7 +55,7 @@ describe('readSummarizationUsage', () => {
     });
 
     expect(readSummarizationUsage(response)).toEqual({
-      input_tokens: 10,
+      input_tokens: 30,
       output_tokens: 5,
       total_tokens: 35,
       input_token_details: { cache_read: 12, cache_creation: 8 },
@@ -74,7 +78,7 @@ describe('readSummarizationUsage', () => {
     });
 
     expect(readSummarizationUsage(response)).toEqual({
-      input_tokens: 10,
+      input_tokens: 30,
       output_tokens: 5,
       total_tokens: 35,
       input_token_details: { cache_read: 12, cache_creation: 8 },
@@ -273,5 +277,159 @@ describe('buildSummarizationStepUsage', () => {
         { provider: 'anthropic', usage: { output_tokens: 7 } },
       ],
     });
+  });
+});
+
+describe('Bedrock summarization cache accounting', () => {
+  const raw = {
+    inputTokens: 10,
+    outputTokens: 5,
+    totalTokens: 35,
+    cacheReadInputTokens: 12,
+    cacheWriteInputTokens: 8,
+  };
+  const reported: UsageMetadata = {
+    input_tokens: 10,
+    output_tokens: 5,
+    total_tokens: 35,
+    input_token_details: { cache_read: 12, cache_creation: 8 },
+    output_token_details: { reasoning: 4, text: 1 },
+  };
+  const normalized = {
+    ...reported,
+    input_tokens: 30,
+  };
+
+  const responses = [
+    ['native invoke', convertConverseMessageToLangChainMessage(
+      { role: 'assistant', content: [{ text: PRIVATE_CONTENT }] },
+      { usage: raw, stopReason: 'end_turn', metrics: { latencyMs: 1 } }
+    )],
+    ['native stream', handleConverseStreamMetadata(
+      { usage: raw, metrics: { latencyMs: 1 } }, { streamUsage: true }
+    ).message],
+    ['direct metadata', new AIMessage({
+      content: PRIVATE_CONTENT,
+      response_metadata: { usage: raw },
+    })],
+    ['nested metadata', new AIMessage({
+      content: PRIVATE_CONTENT,
+      response_metadata: { metadata: { usage: raw } },
+    })],
+  ] as const;
+
+  it.each(responses)('includes cache input from %s in a mixed-provider ledger', (_name, response) => {
+    const usage = readSummarizationUsage(response);
+    expect(usage).toEqual({
+      input_tokens: 30,
+      output_tokens: 5,
+      total_tokens: 35,
+      input_token_details: { cache_read: 12, cache_creation: 8 },
+    });
+    const attempts: SummarizationAttemptUsage[] = [
+      { provider: 'bedrock', model: 'cached-model', usage: usage! },
+      { provider: 'openAI', model: 'shared-model', usage: normalized },
+      { provider: 'anthropic', model: 'shared-model', usage: normalized },
+    ];
+    expect(buildSummarizationStepUsage(attempts)).toEqual({
+      prompt_tokens: 90,
+      completion_tokens: 15,
+      total_tokens: 105,
+      attemptUsage: attempts,
+    });
+    expect(JSON.stringify(usage)).not.toContain(PRIVATE_CONTENT);
+    if ('usage_metadata' in response && response.usage_metadata != null) {
+      expect((response as AIMessage).usage_metadata?.input_tokens).toBe(10);
+    }
+  });
+
+  it.each(['direct', 'nested'] as const)('does not double-count already-normalized input with %s metadata', (location) => {
+    const response = new AIMessage({
+      content: '',
+      usage_metadata: normalized,
+      response_metadata: location === 'direct'
+        ? { usage: raw }
+        : { metadata: { usage: raw } },
+    });
+    const usage = readSummarizationUsage(response);
+    expect(usage).toBe(response.usage_metadata);
+    expect(usage).toEqual(normalized);
+    expect(buildSummarizationStepUsage([{ provider: 'bedrock', usage: usage! }])).toEqual({
+      prompt_tokens: 30, completion_tokens: 5, total_tokens: 35,
+    });
+  });
+
+  it.each(['direct', 'nested'] as const)('retains reported totals and details with %s metadata without mutating the response', (location) => {
+    const response = new AIMessage({
+      content: '',
+      usage_metadata: reported,
+      response_metadata: location === 'direct'
+        ? { usage: raw }
+        : { metadata: { usage: raw } },
+    });
+    const usage = readSummarizationUsage(response);
+    expect(usage).toEqual(normalized);
+    expect(response.usage_metadata).toEqual(reported);
+    expect(response.response_metadata).toEqual(location === 'direct'
+      ? { usage: raw }
+      : { metadata: { usage: raw } });
+  });
+
+  it.each(['bedrock', 'openAI', 'anthropic'] as const)('does not infer normalization for %s without raw metadata', (provider) => {
+    const response = new AIMessage({ content: '', usage_metadata: normalized });
+    const usage = readSummarizationUsage(response);
+    expect(buildSummarizationStepUsage([{ provider, usage: usage! }])).toEqual({
+      prompt_tokens: 30, completion_tokens: 5, total_tokens: 35,
+    });
+  });
+
+  it.each([undefined, 0, 15, 34, NaN])('uses raw metadata, not the reported total (%s), to corroborate normalization', (total) => {
+    const usage = readSummarizationUsage(new AIMessage({
+      content: '',
+      usage_metadata: { ...reported, total_tokens: total } as UsageMetadata,
+      response_metadata: { metadata: { usage: raw } },
+    }));
+    expect(usage).toEqual({ ...normalized, total_tokens: total });
+    expect(buildSummarizationStepUsage([{ provider: 'bedrock', usage: usage! }])).toEqual({
+      prompt_tokens: 30,
+      completion_tokens: 5,
+      total_tokens: total == null || Number.isNaN(total) ? 35 : total,
+    });
+  });
+
+  it.each(['direct', 'nested'] as const)('includes known cache input when raw %s metadata omits totals', (location) => {
+    const withoutTotal = { ...raw, totalTokens: undefined };
+    const usage = readSummarizationUsage(new AIMessage({
+      content: '',
+      response_metadata: location === 'direct'
+        ? { usage: withoutTotal }
+        : { metadata: { usage: withoutTotal } },
+    }));
+    expect(usage?.total_tokens).toBeUndefined();
+    expect(buildSummarizationStepUsage([{ provider: 'bedrock', usage: usage! }])).toEqual({
+      prompt_tokens: 30, completion_tokens: 5, total_tokens: 35,
+    });
+  });
+
+  it.each([undefined, 15, 35])('does not guess cache exclusivity without raw metadata from total %s', (total) => {
+    const usage = readSummarizationUsage(new AIMessage({
+      content: '', usage_metadata: { ...reported, total_tokens: total } as UsageMetadata,
+    }));
+    expect(usage?.input_tokens).toBe(10);
+  });
+
+  it.each([
+    { inputTokens: 11 },
+    { inputTokens: NaN },
+    { inputTokens: -1 },
+    { inputTokens: undefined },
+    { inputTokens: 10, cacheReadInputTokens: NaN, cacheWriteInputTokens: -1 },
+  ])('does not normalize uncorroborated or invalid raw counts: %#', (overrides) => {
+    const response = new AIMessage({
+      content: '',
+      usage_metadata: reported,
+      response_metadata: { usage: { ...raw, ...overrides } },
+    });
+    expect(readSummarizationUsage(response)).toBe(response.usage_metadata);
   });
 });
