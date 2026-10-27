@@ -567,7 +567,7 @@ describe('createSummarizeNode', () => {
     );
   });
 
-  it('produces metadata stub when all LLM attempts fail', async () => {
+  it('preserves history when every LLM attempt fails on an ordinary trigger', async () => {
     const events = captureEvents();
 
     jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
@@ -580,25 +580,29 @@ describe('createSummarizeNode', () => {
       } as never
     );
 
-    const setSummary = jest.fn();
-    const agentContext = createAgentContext({ setSummary } as never);
-    const graph = mockGraph((_stepId, result) => {
-      if (result.type === 'summary') {
-        events.push({
-          event: GraphEvents.ON_SUMMARIZE_COMPLETE,
-          data: { summary: result.summary },
-        });
-      }
-    });
+    const agentContext = createAgentContext();
+    agentContext.setInitialSummary('Existing summary', 3);
+    const priorSummaryVersion = agentContext.summaryVersion;
+    const setSummary = jest.spyOn(agentContext, 'setSummary');
+    const graph = mockGraph();
     const node = createSummarizeNode({
       agentContext,
       graph,
       generateStepId,
     });
 
+    const originalMessages = [
+      new HumanMessage('Test'),
+      new AIMessage('Earlier answer'),
+      new HumanMessage('Follow-up'),
+    ];
+    const originalMessageJson = originalMessages.map((message) =>
+      message.toJSON()
+    );
+
     const result = await node(
       {
-        messages: [new HumanMessage('Test')],
+        messages: originalMessages,
         summarizationRequest: {
           remainingContextTokens: 1000,
           agentId: 'agent_0',
@@ -608,27 +612,32 @@ describe('createSummarizeNode', () => {
     );
 
     expect(result.summarizationRequest).toBeUndefined();
-    // After summarization, REMOVE_ALL + surviving context is returned
-    expect(result.messages).toBeDefined();
-    expect(result.messages!.length).toBeGreaterThanOrEqual(1);
-    expect(result.messages![0]._getType()).toBe('remove');
-
-    // Tier 3 fallback: metadata stub is used as summary text
-    const completeEvent = events.find(
-      (e) => e.event === GraphEvents.ON_SUMMARIZE_COMPLETE
+    expect(result.messages).toBeUndefined();
+    expect(setSummary).not.toHaveBeenCalled();
+    expect(agentContext.getSummaryText()).toBe('Existing summary');
+    expect(agentContext.summaryVersion).toBe(priorSummaryVersion);
+    expect(agentContext.summarizationFailures).toBe(1);
+    expect(agentContext.shouldSkipSummarization(originalMessages.length)).toBe(
+      true
     );
+    expect(originalMessages.map((message) => message.toJSON())).toEqual(
+      originalMessageJson
+    );
+
+    const completeEvent = events.find(
+      (e) =>
+        e.event === GraphEvents.ON_SUMMARIZE_COMPLETE &&
+        (e.data as t.SummarizeCompleteEvent).error != null
+    );
+    expect(completeEvent?.data).toMatchObject({
+      error: expect.stringContaining('prune-triggered compaction'),
+    });
     expect(
-      (
-        (completeEvent?.data as t.SummarizeCompleteEvent).summary!
-          .content?.[0] as { text: string } | undefined
-      )?.text
-    ).toMatch(/^\[Metadata summary:/);
-    expect(
-      (completeEvent?.data as t.SummarizeCompleteEvent).error
+      (completeEvent?.data as t.SummarizeCompleteEvent | undefined)?.summary
     ).toBeUndefined();
   });
 
-  it('catches model initialization errors and falls back to metadata stub', async () => {
+  it('preserves history when model initialization fails', async () => {
     captureEvents();
 
     /**
@@ -664,13 +673,12 @@ describe('createSummarizeNode', () => {
       )
     ).resolves.not.toThrow();
 
-    expect(setSummary).toHaveBeenCalledWith(
-      expect.stringContaining('[Metadata summary:'),
-      expect.any(Number)
-    );
+    expect(setSummary).not.toHaveBeenCalled();
+    expect(agentContext.hasSummary()).toBe(false);
+    expect(agentContext.summarizationFailures).toBe(1);
   });
 
-  it('falls back to metadata stub when primary LLM call fails', async () => {
+  it('preserves history when the primary LLM call fails', async () => {
     captureEvents();
 
     jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
@@ -703,10 +711,9 @@ describe('createSummarizeNode', () => {
       {} as RunnableConfig
     );
 
-    expect(setSummary).toHaveBeenCalledWith(
-      expect.stringContaining('[Metadata summary:'),
-      expect.any(Number)
-    );
+    expect(setSummary).not.toHaveBeenCalled();
+    expect(agentContext.hasSummary()).toBe(false);
+    expect(agentContext.summarizationFailures).toBe(1);
   });
 
   it('calls setSummary with the final text', async () => {
@@ -2029,38 +2036,6 @@ describe('createSummarizeNode — overflow recovery', () => {
     expect(result.messages).toBeUndefined();
   });
 
-  it('still commits a stub for a configured trigger, preserving prior behavior', async () => {
-    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
-      class {
-        constructor() {
-          return {
-            invoke: (): never => {
-              throw new Error('upstream unavailable');
-            },
-            stream: (): never => {
-              throw new Error('upstream unavailable');
-            },
-          };
-        }
-      } as never
-    );
-    const agentContext = createAgentContext();
-    const graph = mockGraph(() => {});
-    const node = createSummarizeNode({ agentContext, graph, generateStepId });
-
-    await node(
-      {
-        messages: [new HumanMessage('Hello'), new HumanMessage('World')],
-        summarizationRequest: {
-          remainingContextTokens: 0,
-          agentId: 'agent_0',
-        },
-      },
-      {} as RunnableConfig
-    );
-
-    expect(agentContext.hasSummary()).toBe(true);
-  });
 });
 
 describe('createSummarizeNode — empty summarizer output', () => {
