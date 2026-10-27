@@ -116,7 +116,8 @@ export function buildSummarizationInstruction(
   promptText: string,
   updatePromptText: string | undefined,
   priorSummaryText?: string,
-  semanticIndexAppendix = ''
+  semanticIndexAppendix = '',
+  priorSummaryInPrefix = false
 ): string {
   const prior = priorSummaryText?.trim() ?? '';
   const effectivePrompt = prior ? (updatePromptText ?? promptText) : promptText;
@@ -124,7 +125,9 @@ export function buildSummarizationInstruction(
     ? [semanticIndexAppendix, '\n\n', effectivePrompt]
     : [effectivePrompt];
   if (prior) {
-    parts.push(`\n\n<previous-summary>\n${prior}\n</previous-summary>`);
+    parts.push(priorSummaryInPrefix
+      ? '\n\n<previous-summary>The prior checkpoint is already present in the request prefix above; update that checkpoint using the conversation above.</previous-summary>'
+      : `\n\n<previous-summary>\n${prior}\n</previous-summary>`);
   }
   return parts.join('');
 }

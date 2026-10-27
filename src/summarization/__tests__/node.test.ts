@@ -844,9 +844,10 @@ describe('createSummarizeNode', () => {
     const lastMsg = capturedMessages[capturedMessages.length - 1];
     expect(lastMsg.type).toBe('human');
     expect(lastMsg.content).toContain('Merge the new messages');
-    // Should include the prior summary
+    // The cached prefix already carries the prior checkpoint.
     expect(lastMsg.content).toContain('<previous-summary>');
-    expect(lastMsg.content).toContain('Prior summary content');
+    expect(lastMsg.content).not.toContain('Prior summary content');
+    expect(capturedMessages.slice(0, -1).map(msg => msg.content).join('')).toContain('Prior summary content');
   });
 });
 

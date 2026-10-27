@@ -2407,6 +2407,7 @@ describe('Tight context with oversized tool results (no API keys)', () => {
     // Override _streamResponseChunks (not _generate) because FakeListChatModel
     // has its own _streamResponseChunks that bypasses _generate during streaming.
     const capturedInstructions: string[] = [];
+    const capturedPrefixes: string[] = [];
     getChatModelClassSpy.mockRestore();
     getChatModelClassSpy = jest
       .spyOn(providers, 'getChatModelClass')
@@ -2425,6 +2426,9 @@ describe('Tight context with oversized tool results (no API keys)', () => {
               capturedInstructions.push(
                 typeof content === 'string' ? content : JSON.stringify(content)
               );
+              capturedPrefixes.push(messages.slice(0, -1).map(message =>
+                typeof message.content === 'string' ? message.content : JSON.stringify(message.content)
+              ).join(''));
               yield* super._streamResponseChunks(messages, options, runManager);
             }
           } as any;
@@ -2534,6 +2538,7 @@ describe('Tight context with oversized tool results (no API keys)', () => {
     };
     expect(capturedInstructions).toContain(LOCAL_SUMMARY_CONFIG.prompt);
     capturedInstructions.length = 0;
+    capturedPrefixes.length = 0;
 
     // --- Step 2: Build more conversation with initialSummary, trigger SECOND summarization ---
     // Since initialSummary is set, the summarize node should use the update prompt.
@@ -2578,8 +2583,11 @@ describe('Tight context with oversized tool results (no API keys)', () => {
     for (const instruction of capturedInstructions) {
       expect(instruction.startsWith(LOCAL_SUMMARY_CONFIG.updatePrompt)).toBe(true);
       expect(instruction).toContain('<previous-summary>');
-      expect(instruction).toContain(priorSummary.text);
+      expect(instruction).not.toContain(priorSummary.text);
+      expect(instruction).toContain('already present in the request prefix');
     }
+    expect(capturedPrefixes).toHaveLength(capturedInstructions.length);
+    for (const prefix of capturedPrefixes) expect(prefix).toContain(priorSummary.text);
   });
 
   test('empty pruning context after summarization preserves latest user turn', async () => {

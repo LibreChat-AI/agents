@@ -10,6 +10,9 @@ import type {ConverseStreamCommandOutput, ConverseCommandOutput, ConverseStreamO
 import type { BaseMessage, UsageMetadata } from '@langchain/core/messages';
 import type * as t from '@/types';
 import { convertResponseContentToChatGenerationChunk } from '@/llm/google/utils/common';
+import { countSummarizationToolTokens } from '@/summarization/toolBudget';
+import { prepareProviderRequest } from '@/llm/prepareProviderRequest';
+import { addBedrockTailCacheControl } from '@/messages/cache';
 import { createSummarizeNode } from '@/summarization/node';
 import { resolveClientOptionsModel } from '@/llm/request';
 import { CustomChatBedrockConverse } from '@/llm/bedrock';
@@ -116,6 +119,7 @@ function harness({
   model = new SummaryModel(),
   provider = Providers.OPENAI,
   clientOptions,
+  tools,
   tokenCounter = count,
   summarizationConfig = { maxSummaryTokens: 128 },
 }: {
@@ -124,6 +128,7 @@ function harness({
   provider?: Providers;
   clientOptions?: t.ClientOptions & Pick<t.BuiltInLLMConfig, 'fallbacks'>;
   tokenCounter?: t.TokenCounter;
+  tools?: t.GraphTools;
   summarizationConfig?: t.SummarizationConfig;
 } = {}) {
   const agentContext = AgentContext.fromConfig(
@@ -131,6 +136,7 @@ function harness({
       agentId: 'agent',
       provider,
       clientOptions,
+      tools,
       instructions: 'The turn system prompt',
       maxContextTokens,
       summarizationEnabled: true,
@@ -1649,6 +1655,99 @@ describe('compaction request windows', () => {
       [Providers.BEDROCK, 'truncated', 150], [Providers.ANTHROPIC, 'successful', 366],
     ]);
     expect(graph.dispatchRunStep.mock.calls[0][0].usage).toMatchObject({prompt_tokens: 421, completion_tokens: 95, total_tokens: 516});
+  });
+
+  it.each([
+    [Providers.OPENAI, 'initial'], [Providers.OPENAI, 'mid-run'],
+    [Providers.ANTHROPIC, 'initial'], [Providers.ANTHROPIC, 'mid-run'],
+    [Providers.OPENROUTER, 'initial'], [Providers.OPENROUTER, 'mid-run'],
+    [Providers.BEDROCK, 'initial'], [Providers.BEDROCK, 'mid-run'],
+  ] as const)('sends the prior checkpoint only once for %s %s self-compaction', async (provider, location) => {
+    const {node, model, agentContext} = harness({provider,
+      clientOptions: {promptCache: true, model: 'claude-sonnet-4-5'},
+      summarizationConfig: {maxSummaryTokens: 128},
+    });
+    const prior = 'UNIQUE_PREVIOUS_CHECKPOINT ' + 'verified context '.repeat(150);
+    if (location === 'initial') agentContext.setInitialSummary(prior, count(new HumanMessage(prior)));
+    else agentContext.setSummary(prior, count(new HumanMessage(prior)), {precedesMessages: true});
+    const messages = history(6);
+    const cachedWindow = provider === Providers.BEDROCK ? addBedrockTailCacheControl(messages, '1h') : messages;
+    const prefix = await agentContext.systemRunnable!.invoke(cachedWindow);
+    const projectedPrior = JSON.stringify(prefix);
+    expect(projectedPrior).toContain('UNIQUE_PREVIOUS_CHECKPOINT');
+    await node({messages, summarizationRequest: {agentId: 'agent', remainingContextTokens: 0, windowMessages: messages}}, {});
+    expect(model.calls).toHaveLength(1);
+    expect(model.calls[0].slice(0, -1)).toEqual(prepareProviderRequest({model, messages: prefix, provider}).messages);
+    expect(JSON.stringify(model.calls[0]).split('UNIQUE_PREVIOUS_CHECKPOINT')).toHaveLength(2);
+    expect(model.calls[0].at(-1)?.content).toContain('Hold on again, update your checkpoint');
+    expect(model.calls[0].at(-1)?.content).toContain('already present in the request prefix');
+  });
+
+  it.each(['dedicated', 'fallback'] as const)('still supplies the prior checkpoint once when the %s omits the agent system prefix', async mode => {
+    const primary = new SummaryModel();
+    const secondary = new SummaryModel();
+    if (mode === 'fallback') primary.failure = () => new Error('Primary failed');
+    const {node, agentContext} = harness({model: primary, clientOptions: {fallbacks: mode === 'fallback' ? [
+      {provider: Providers.ANTHROPIC, clientOptions: {model: 'secondary'}},
+    ] : []}, summarizationConfig: {provider: mode === 'dedicated' ? Providers.ANTHROPIC : undefined, maxSummaryTokens: 128}});
+    agentContext.setInitialSummary('UNIQUE_PREVIOUS_CHECKPOINT', 20);
+    jest.spyOn(init, 'initializeModel').mockImplementation(({provider}) => provider === Providers.ANTHROPIC ? secondary : primary);
+    const messages = history(6);
+    await node({messages, summarizationRequest: {agentId: 'agent', remainingContextTokens: 0, windowMessages: messages}}, {});
+    expect(secondary.calls).toHaveLength(1);
+    expect(secondary.calls[0].some(message => message.getType() === 'system')).toBe(false);
+    expect(JSON.stringify(secondary.calls[0]).split('UNIQUE_PREVIOUS_CHECKPOINT')).toHaveLength(2);
+    expect(secondary.calls[0].at(-1)?.content).toContain('<previous-summary>\nUNIQUE_PREVIOUS_CHECKPOINT');
+  });
+
+  it.each(['one-user-turn', 'retained-recent-turns'] as const)('skips overflow compaction with no removable history: %s', async scenario => {
+    const {node, model, agentContext, emitted, graph} = harness();
+    const prior = 'EXISTING_CHECKPOINT';
+    agentContext.setInitialSummary(prior, 20);
+    const version = agentContext.summaryVersion;
+    const messages = scenario === 'one-user-turn' ? [new HumanMessage('large payload '.repeat(100))] : history(2);
+    const before = JSON.stringify(messages);
+    const result = await node({messages, summarizationRequest: {agentId: 'agent', remainingContextTokens: 0, reason: 'overflow', allowSummarization: true, windowMessages: messages}}, {});
+    expect(model.calls).toHaveLength(0);
+    expect(graph.dispatchRunStep).not.toHaveBeenCalled();
+    expect(result.messages).toBeUndefined();
+    expect(JSON.stringify(messages)).toBe(before);
+    expect(agentContext.getSummaryText()).toBe(prior);
+    expect(agentContext.summaryVersion).toBe(version);
+    expect(emitted.filter(({event}) => event === GraphEvents.ON_SUMMARIZE_COMPLETE)).toHaveLength(0);
+  });
+
+  it.each(['dedicated', 'fallback'] as const)('measures the actual bound inventory with the %s serving tokenizer', async mode => {
+    const countOpenAI = await createTokenCounter('o200k_base');
+    const countClaude = await createTokenCounter('claude');
+    const tools: t.GraphTools = Array.from({length: 6}, (_, i) => ({type: 'function', function: {
+      name: `inspect_${i}`, description: '사용자가 인증 미들웨어를 리팩터링하여 토큰 검증을 요청했습니다. '.repeat(12),
+      parameters: {type: 'object', properties: {query: {type: 'string', description: '조회할 사용자 인증 정보와 필요한 검증 결과를 자세히 기록합니다.'.repeat(8)}}},
+    }}));
+    const toolTokens = countSummarizationToolTokens({tools, provider: Providers.ANTHROPIC, clientOptions: {model: 'production'}, count: countClaude});
+    expect(toolTokens).toBeGreaterThan(countSummarizationToolTokens({tools, provider: Providers.OPENAI, clientOptions: {model: 'gpt-4o'}, count: countOpenAI}));
+    const maxContextTokens = toolTokens + 1_000;
+    const primary = new SummaryModel();
+    const secondary = new SummaryModel();
+    if (mode === 'fallback') primary.failure = () => new Error('Primary failed');
+    secondary.failure = sent => sent.reduce((total, message) => total + countClaude(message), toolTokens + 128) > maxContextTokens
+      ? new Error('maximum context length exceeded') : undefined;
+    const {node, agentContext} = harness({model: primary, tools, tokenCounter: countOpenAI, maxContextTokens,
+      clientOptions: {model: 'gpt-4o', fallbacks: mode === 'fallback' ? [{provider: Providers.ANTHROPIC,
+        maxContextTokens, clientOptions: {model: 'production', maxTokens: 128},
+      }] : []},
+      summarizationConfig: {provider: mode === 'dedicated' ? Providers.ANTHROPIC : undefined,
+        prompt: 'Checkpoint.', maxSummaryTokens: 128, retainRecent: {turns: 0}},
+    });
+    await agentContext.tokenCalculationPromise;
+    jest.spyOn(init, 'initializeModel').mockImplementation(({provider}) => provider === Providers.ANTHROPIC ? secondary : primary);
+    const messages = history(150);
+    await node({messages, summarizationRequest: {agentId: 'agent', remainingContextTokens: 0, windowMessages: messages}}, {});
+    expect(secondary.calls).toHaveLength(1);
+    expect(secondary.calls[0].length).toBeLessThan(messages.length);
+    expect(secondary.calls[0].reduce((total, message) => total + countClaude(message), toolTokens + 128)).toBeLessThanOrEqual(maxContextTokens);
+    expect(init.initializeModel).toHaveBeenCalledWith(expect.objectContaining({provider: Providers.ANTHROPIC, tools}));
+    expect(agentContext.getSummaryText()).toBe('CLEAN_SUMMARY');
   });
 
   const cancellations = [

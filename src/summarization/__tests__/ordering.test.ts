@@ -183,7 +183,9 @@ describe.each([Providers.ANTHROPIC, Providers.OPENROUTER] as const)(
       });
 
       expect(stream).toHaveBeenCalledTimes(1);
-      expect(stream.mock.calls[0][0].at(-1)?.text).toContain(priorSummary);
+      expect(stream.mock.calls[0][0].at(-1)?.text).not.toContain(priorSummary);
+      expect(stream.mock.calls[0][0].at(-1)?.text).toContain('already present in the request prefix');
+      expect(stream.mock.calls[0][0].slice(0, -1).map(message => message.text).join('')).toContain(priorSummary);
       expect(agentContext.getSummaryText()).toBe(checkpoint);
       const retained = messagesStateReducer(messages, result.messages!);
       expect(retained).toEqual(messages.slice(4));

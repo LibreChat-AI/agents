@@ -96,6 +96,13 @@ describe('summarization primitives', () => {
       );
     });
 
+    it('references a prior checkpoint already carried by the cached prefix', () => {
+      const result = buildSummarizationInstruction('fresh', 'update', 'earlier checkpoint', '<index/>', true);
+      expect(result).toContain('<index/>\n\nupdate');
+      expect(result).toContain('already present in the request prefix');
+      expect(result).not.toContain('earlier checkpoint');
+    });
+
     it('omits the appendix separator when no index was rendered', () => {
       expect(buildSummarizationInstruction('fresh', 'update', '', '')).toBe(
         'fresh'

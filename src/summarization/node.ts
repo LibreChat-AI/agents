@@ -67,6 +67,7 @@ import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { serializeToolContentBounded } from '@/utils/toolContent';
 import { hasReasoningKwargs } from '@/llm/stream/chunkAdapters';
 import { makeIsDeferred } from '@/messages/anthropicToolCache';
+import { countSummarizationToolTokens } from './toolBudget';
 import { createRemoveAllMessage } from '@/messages/reducer';
 import { getProviderFamily } from '@/llm/providerRegistry';
 import { getProviderStopReasons } from '@/llm/truncation';
@@ -366,6 +367,7 @@ async function prepareSummarizationBudget({
   maxContextTokens,
   outputTokens,
   instruction,
+  tools,
   config,
 }: {
   agentContext: AgentContext;
@@ -374,6 +376,7 @@ async function prepareSummarizationBudget({
   maxContextTokens?: number;
   outputTokens: number;
   instruction: string;
+  tools?: t.GraphTools;
   config?: RunnableConfig;
 }): Promise<{
   count: t.TokenCounter;
@@ -396,7 +399,9 @@ async function prepareSummarizationBudget({
     provider === agentContext.provider
       ? agentContext.systemRunnable
       : undefined;
-  let overhead = agentContext.toolSchemaTokens;
+  const toolTokens = usesAgentCounter ? agentContext.toolSchemaTokens :
+    countSummarizationToolTokens({tools, provider, clientOptions, count});
+  let overhead = toolTokens;
   if (system != null) {
     overhead = usesAgentCounter
       ? agentContext.instructionTokens
@@ -756,6 +761,7 @@ async function executeSummarizationWithFallback(params: {
           outputTokens: clientConfig.effectiveMaxSummaryTokens,
           clientOptions: clientConfig.clientOptions as t.ClientOptions,
           model: summarizationModel,
+          tools: summarizationTools,
           messages,
           promptText: clientConfig.promptText,
           updatePromptText: clientConfig.updatePromptText,
@@ -846,12 +852,6 @@ async function executeSummarizationWithFallback(params: {
     const fallbacks = Array.isArray(rawFallbacks) ? rawFallbacks : [];
     if (fallbacks.length > 0) {
       try {
-        const instruction = buildSummarizationInstruction(
-          clientConfig.promptText,
-          clientConfig.updatePromptText,
-          priorSummaryText,
-          semanticIndex.appendix
-        );
         const boundedFallbacks = fallbacks.map((fallback) => {
           const maxContextTokens =
             fallback.maxContextTokens ?? agentContext.maxContextTokens;
@@ -880,10 +880,11 @@ async function executeSummarizationWithFallback(params: {
           reasoningKey: agentContext.reasoningKey,
           graph,
         });
+        const fallbackTools = agentContext.getToolsForBinding();
         const fbResult = await tryFallbackProviders({
           fallbacks: boundedFallbacks,
           disableToolCalling: true,
-          tools: agentContext.getToolsForBinding(),
+          tools: fallbackTools,
           messages,
           prepareProviderRequest: async ({
             model,
@@ -894,6 +895,11 @@ async function executeSummarizationWithFallback(params: {
           }) => {
             config?.signal?.throwIfAborted();
             pendingDeltas.length = 0;
+            const instruction = buildSummarizationInstruction(
+              clientConfig.promptText, clientConfig.updatePromptText, priorSummaryText,
+              semanticIndex.appendix,
+              provider === agentContext.provider && agentContext.systemRunnable != null,
+            );
             const { count, system, budget } = await prepareSummarizationBudget({
               agentContext,
               provider,
@@ -905,6 +911,7 @@ async function executeSummarizationWithFallback(params: {
                 maxContextTokens
               ),
               instruction,
+              tools: fallbackTools,
               config,
             });
             const bounded = boundSummarizationInput({
@@ -1342,7 +1349,7 @@ export function createSummarizeNode({
     const instructionOverhead = usesAgentInstructions
       ? agentContext.instructionTokens
       : agentContext.toolSchemaTokens;
-    if (maxCtx > 0 && instructionOverhead >= maxCtx) {
+    if (usesAgentInstructions && maxCtx > 0 && instructionOverhead >= maxCtx) {
       if (request.reason === 'manual') {
         throw new ManualSummarizationSkippedError(
           'instructions_exceed_budget',
@@ -1406,8 +1413,7 @@ export function createSummarizeNode({
 
     const hasPrunedHistory =
       windowMessages.length > 0 &&
-      (windowMessages.length < state.messages.length ||
-        request.reason === 'overflow');
+      windowMessages.length < state.messages.length;
     const messagesToRefine =
       compactableHead.length > 0 || !hasPrunedHistory
         ? compactableHead
@@ -2019,6 +2025,7 @@ async function summarizeWithCacheHit({
   outputTokens,
   clientOptions,
   model,
+  tools,
   messages,
   promptText,
   updatePromptText,
@@ -2040,6 +2047,7 @@ async function summarizeWithCacheHit({
   outputTokens: number;
   clientOptions?: t.ClientOptions;
   model: t.ChatModel;
+  tools?: t.GraphTools;
   messages: BaseMessage[];
   promptText: string;
   updatePromptText?: string;
@@ -2059,7 +2067,8 @@ async function summarizeWithCacheHit({
     promptText,
     updatePromptText,
     priorSummaryText,
-    semanticIndexAppendix
+    semanticIndexAppendix,
+    provider === agentContext.provider && agentContext.systemRunnable != null
   );
 
   const { count, system, budget } = await prepareSummarizationBudget({
@@ -2069,6 +2078,7 @@ async function summarizeWithCacheHit({
     maxContextTokens: agentContext.maxContextTokens,
     outputTokens,
     instruction,
+    tools,
     config,
   });
   const scales =

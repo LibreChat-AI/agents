@@ -1,6 +1,10 @@
 import type { Runnable } from '@langchain/core/runnables';
 import type * as t from '@/types';
-import { isOpenAILike, isLibreChatOpenAIModel, constructorChainHasLcName } from '@/utils';
+import {
+  isOpenAILike,
+  isLibreChatOpenAIModel,
+  constructorChainHasLcName,
+} from '@/utils';
 import { getProviderFamily } from '@/llm/providerRegistry';
 import { getChatModelClass } from '@/llm/providers';
 import { Providers } from '@/common';
@@ -93,7 +97,12 @@ export function initializeModel<P extends t.ProviderName>({
   }
 
   const family = getProviderFamily(provider);
-  const canDisableTools = family === 'openai' || family === 'anthropic' || family === 'google';
-  if (disableToolCalling !== true || !canDisableTools) return model.bindTools(tools);
-  return model.bindTools(tools, {tool_choice: 'none'});
+  const canDisableTools =
+    family === 'openai' ||
+    family === 'anthropic' ||
+    family === 'google' ||
+    provider === Providers.MOONSHOT;
+  if (disableToolCalling !== true || !canDisableTools)
+    return model.bindTools(tools);
+  return model.bindTools(tools, { tool_choice: 'none' });
 }
