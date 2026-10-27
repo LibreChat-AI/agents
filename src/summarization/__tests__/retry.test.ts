@@ -4,6 +4,7 @@ import {
 } from '@/summarization/retry';
 import { ProviderTextProtectionError } from '@/protection/providerText';
 import { StreamLimitExceededError } from '@/llm/streamLimits';
+import { isProviderCancellation } from '@/utils/errors';
 
 function streamLimitError(): StreamLimitExceededError {
   return new StreamLimitExceededError({
@@ -47,18 +48,46 @@ const transientErrors = [
   ['fetch failure', new TypeError('fetch failed')],
 ] as const;
 
+const cancellationErrors = [
+  ['user abort', new DOMException('Stopped', 'AbortError')],
+  ['SDK user abort', { name: 'APIUserAbortError', status: 503 }],
+  ['abort name', { name: 'AbortError' }],
+  ['SDK abort name', { name: 'APIUserAbortError' }],
+  ['canceled name', { name: 'CanceledError' }],
+  ['cancelled name', { name: 'CancelledError' }],
+  ['abort code only', { code: 'ABORT_ERR' }],
+  ['cancellation code only', { code: 'ERR_CANCELED' }],
+  ['abort code', { code: 'ABORT_ERR', message: 'connection reset' }],
+  ['cancellation code', { code: 'ERR_CANCELED', status: 503 }],
+  ['user abort message', new Error('The user aborted a request.')],
+  ['user canceled message', new Error('The user canceled the call.')],
+  ['user cancelled message', new Error('The user cancelled the call.')],
+  ['request abort message', new Error('Request was aborted')],
+  ['request canceled message', new Error('Request canceled')],
+  ['request cancelled message', new Error('Request was cancelled')],
+  ['operation abort message', new Error('Operation aborted')],
+  ['operation canceled message', new Error('Operation was canceled')],
+  ['operation cancelled message', new Error('Operation cancelled')],
+  ['bare abort message', new Error('AbortError')],
+  ['abort text', 'AbortError'],
+  ['cancellation text', 'REQUEST WAS CANCELED'],
+  ['nested cause', { cause: { cause: { code: 'ERR_CANCELED' } } }],
+  [
+    'rate-limited cancellation',
+    { status: 429, cause: { name: 'CancelledError' } },
+  ],
+  [
+    'overloaded cancellation',
+    { error: { type: 'overloaded_error' }, cause: { code: 'ERR_CANCELED' } },
+  ],
+] as const;
+
 const fatalErrors = [
   ['stream limit', streamLimitError()],
   ['protection timeout', new ProviderTextProtectionError('timeout')],
   ['protection unavailable', new ProviderTextProtectionError('unavailable')],
   ['protection blocked', new ProviderTextProtectionError('blocked')],
-  ['user abort', new DOMException('Stopped', 'AbortError')],
-  ['SDK user abort', { name: 'APIUserAbortError', status: 503 }],
-  ['abort code', { code: 'ABORT_ERR', message: 'connection reset' }],
-  ['cancellation code', { code: 'ERR_CANCELED', status: 503 }],
-  ['user abort message', new Error('The user aborted a request.')],
-  ['request abort message', new Error('Request was aborted')],
-  ['bare abort message', new Error('AbortError')],
+  ...cancellationErrors,
   ['wrapped breaker', { status: 503, cause: streamLimitError() }],
   [
     'wrapped protection',
@@ -304,6 +333,84 @@ describe('withSummarizationRetry', () => {
     expect(onRetry.mock.calls).toEqual([
       [{ attempt: 2, errorCode: 'provider_overloaded' }],
     ]);
+  });
+});
+
+describe('isProviderCancellation', () => {
+  it.each(cancellationErrors)(
+    'recognizes %s despite transient wrappers',
+    (_label, error) => {
+      for (const failure of [
+        error,
+        { status: 429, cause: error },
+        { error: { type: 'overloaded_error' }, cause: error },
+      ]) {
+        expect(isProviderCancellation(failure)).toBe(true);
+        expect(classifySummarizationError(failure)).toBe('unknown');
+      }
+    }
+  );
+
+  it.each(['cause', 'error', 'body', 'data', 'response', '$metadata'])(
+    'recognizes cancellation nested under %s',
+    (key) => {
+      const error = { status: 503, [key]: { code: 'ERR_CANCELED' } };
+
+      expect(isProviderCancellation(error)).toBe(true);
+      expect(classifySummarizationError(error)).toBe('unknown');
+    }
+  );
+
+  it.each(transientErrors)(
+    'does not treat %s as cancellation',
+    (_label, error) => {
+      expect(isProviderCancellation(error)).toBe(false);
+    }
+  );
+
+  it.each([
+    ['stream limit', streamLimitError()],
+    ['protection timeout', new ProviderTextProtectionError('timeout')],
+    ['protection unavailable', new ProviderTextProtectionError('unavailable')],
+    ['protection blocked', new ProviderTextProtectionError('blocked')],
+    ['wrapped stream limit', { cause: streamLimitError() }],
+    [
+      'wrapped protection',
+      { cause: new ProviderTextProtectionError('blocked') },
+    ],
+    ['duplicate stream limit class', { name: 'StreamLimitExceededError' }],
+    ['duplicate protection class', { name: 'ProviderTextProtectionError' }],
+    ['provider busy', new Error('Provider is busy')],
+    ['deadline timeout', new DOMException('Deadline elapsed', 'TimeoutError')],
+    ['context overflow', { code: 'context_length_exceeded' }],
+    ['local input budget', { name: 'SummarizationInputTooLargeError' }],
+    ['unrelated failure', new Error('Unexpected summary format')],
+    ['null', null],
+    ['undefined', undefined],
+    ['number', 17],
+    ['symbol', Symbol('failure')],
+  ])('does not treat %s as cancellation', (_label, error) => {
+    expect(isProviderCancellation(error)).toBe(false);
+  });
+
+  it('bounds inspection of cyclic causes', () => {
+    const error = new Error('Provider is busy');
+    error.cause = error;
+
+    expect(isProviderCancellation(error)).toBe(false);
+
+    error.cause = { cause: error, code: 'ERR_CANCELED' };
+    expect(isProviderCancellation(error)).toBe(true);
+  });
+
+  it('recognizes code-only cancellation through depth four, but not deeper', () => {
+    const error = {
+      cause: { cause: { cause: { cause: { code: 'ERR_CANCELED' } } } },
+    };
+
+    expect(isProviderCancellation(error)).toBe(true);
+    expect(classifySummarizationError(error)).toBe('unknown');
+    expect(isProviderCancellation({ cause: error })).toBe(false);
   });
 });
 

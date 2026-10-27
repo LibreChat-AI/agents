@@ -11,6 +11,7 @@ import { createSummarizeNode } from '@/summarization/node';
 import { resolveClientOptionsModel } from '@/llm/request';
 import { resolveStreamLimits } from '@/llm/streamLimits';
 import { AgentContext } from '@/agents/AgentContext';
+import { createTokenCounter } from '@/utils/tokens';
 import { GraphEvents, Providers } from '@/common';
 import { ChatModelStreamHandler } from '@/stream';
 import { FakeChatModel } from '@/llm/fake';
@@ -174,7 +175,9 @@ describe('compaction request windows', () => {
       expect(model.calls[0]).toContain(windowMessages.at(-1));
       expect(result.messages?.slice(1)).toEqual(windowMessages.slice(-4));
       expect(agentContext.getSummaryText()).toBe('CLEAN_SUMMARY');
-      expect(init.initializeModel).toHaveBeenCalledWith(expect.objectContaining({disableToolCalling: true}));
+      expect(init.initializeModel).toHaveBeenCalledWith(
+        expect.objectContaining({ disableToolCalling: true })
+      );
     }
   );
 
@@ -549,7 +552,9 @@ describe('compaction request windows', () => {
     jest
       .spyOn(init, 'initializeModel')
       .mockImplementation(({ clientOptions }) =>
-        resolveClientOptionsModel(clientOptions) === 'fallback' ? fallback : primary
+        resolveClientOptionsModel(clientOptions) === 'fallback'
+          ? fallback
+          : primary
       );
     const newest = new HumanMessage('q'.repeat(7_000));
     const messages = [
@@ -600,7 +605,7 @@ describe('compaction request windows', () => {
           },
           {
             provider: Providers.ANTHROPIC,
-            maxContextTokens: 3_000,
+            maxContextTokens: 6_000,
             clientOptions: { model: 'large', maxTokens: 128 },
           },
         ],
@@ -615,7 +620,9 @@ describe('compaction request windows', () => {
       .spyOn(init, 'initializeModel')
       .mockImplementation(({ clientOptions }) => {
         if (resolveClientOptionsModel(clientOptions) === 'small') return small;
-        return resolveClientOptionsModel(clientOptions) === 'large' ? large : primary;
+        return resolveClientOptionsModel(clientOptions) === 'large'
+          ? large
+          : primary;
       });
     const messages = [new HumanMessage('q'.repeat(7_000))];
     const before = JSON.stringify(messages);
@@ -638,6 +645,387 @@ describe('compaction request windows', () => {
     expect(JSON.stringify(messages)).toBe(before);
     expect(agentContext.getSummaryText()).toBe('CLEAN_SUMMARY');
   });
+
+  it('publishes only the successful fallback’s deltas before completion', async () => {
+    const primary = new SummaryModel();
+    const failed = new SummaryModel();
+    const successful = new SummaryModel();
+    primary.failure = () => new Error('Primary failed');
+    failed.failure = () => new Error('Fallback failed');
+    const { node, emitted } = harness({
+      model: primary,
+      clientOptions: {
+        fallbacks: [
+          { provider: Providers.OPENAI, clientOptions: { model: 'failed' } },
+          {
+            provider: Providers.ANTHROPIC,
+            clientOptions: { model: 'successful' },
+          },
+        ],
+      },
+    });
+    jest
+      .spyOn(init, 'initializeModel')
+      .mockImplementation(({ clientOptions }) => {
+        const name = resolveClientOptionsModel(clientOptions);
+        if (name === 'failed') return failed;
+        return name === 'successful' ? successful : primary;
+      });
+    const messages = history(6);
+    await node(
+      {
+        messages,
+        summarizationRequest: {
+          agentId: 'agent',
+          remainingContextTokens: 0,
+          windowMessages: messages,
+        },
+      },
+      {}
+    );
+    expect(primary.calls).toHaveLength(1);
+    expect(failed.calls).toHaveLength(1);
+    expect(successful.calls).toHaveLength(1);
+    const deltas = emitted.filter(
+      ({ event }) => event === GraphEvents.ON_SUMMARIZE_DELTA
+    );
+    expect(deltas).toHaveLength(2);
+    expect(JSON.stringify(deltas)).not.toContain('FAILED_ONLY');
+    expect(deltas.map(({ data }) => data)).toEqual([
+      expect.objectContaining({
+        delta: {
+          summary: expect.objectContaining({
+            provider: Providers.ANTHROPIC,
+            model: 'successful',
+            content: [{ type: 'text', text: 'CLEAN_' }],
+          }),
+        },
+      }),
+      expect.objectContaining({
+        delta: {
+          summary: expect.objectContaining({
+            provider: Providers.ANTHROPIC,
+            model: 'successful',
+            content: [{ type: 'text', text: 'SUMMARY' }],
+          }),
+        },
+      }),
+    ]);
+    expect(
+      emitted.findIndex(
+        ({ event }) => event === GraphEvents.ON_SUMMARIZE_COMPLETE
+      )
+    ).toBeGreaterThan(
+      emitted
+        .map(({ event }) => event)
+        .lastIndexOf(GraphEvents.ON_SUMMARIZE_DELTA)
+    );
+  });
+
+  it('does not flush failed fallback chunks when a later non-streaming fallback succeeds', async () => {
+    const primary = new SummaryModel();
+    const failed = new SummaryModel();
+    primary.failure = () => new Error('Primary failed');
+    failed.failure = () => new Error('Fallback failed');
+    const { node, emitted, agentContext } = harness({
+      model: primary,
+      clientOptions: {
+        fallbacks: [
+          { provider: Providers.OPENAI, clientOptions: { model: 'failed' } },
+          {
+            provider: Providers.OPENAI,
+            clientOptions: { model: 'invoke-only' },
+          },
+        ],
+      },
+    });
+    const invokeOnly = new SummaryModel();
+    Object.defineProperty(invokeOnly, 'stream', {value: undefined});
+    jest.spyOn(invokeOnly, 'invoke').mockResolvedValue(new AIMessageChunk('CLEAN_SUMMARY'));
+    jest
+      .spyOn(init, 'initializeModel')
+      .mockImplementation(({ clientOptions }) => {
+        const name = resolveClientOptionsModel(clientOptions);
+        if (name === 'failed') return failed;
+        return name === 'invoke-only' ? (invokeOnly) : primary;
+      });
+    const messages = history(6);
+    await node(
+      {
+        messages,
+        summarizationRequest: {
+          agentId: 'agent',
+          remainingContextTokens: 0,
+          windowMessages: messages,
+        },
+      },
+      {}
+    );
+    expect(agentContext.getSummaryText()).toBe('CLEAN_SUMMARY');
+    expect(
+      emitted.filter(({ event }) => event === GraphEvents.ON_SUMMARIZE_DELTA)
+    ).toHaveLength(0);
+    expect(
+      JSON.stringify(
+        emitted.filter(
+          ({ event }) => event === GraphEvents.ON_SUMMARIZE_COMPLETE
+        )
+      )
+    ).not.toContain('FAILED_ONLY');
+  });
+
+  it.each([
+    { provider: Providers.ANTHROPIC, options: { model: 'production' } },
+    {
+      provider: Providers.OPENROUTER,
+      options: { modelName: 'anthropic/claude-sonnet-4' },
+    },
+  ])(
+    'bounds CJK input using the serving fallback tokenizer: %j',
+    async ({ provider, options }) => {
+      const openaiCount = await createTokenCounter('o200k_base');
+      const claudeCount = await createTokenCounter('claude');
+      const primary = new SummaryModel();
+      const fallback = new SummaryModel();
+      primary.failure = () => new Error('Primary failed');
+      fallback.failure = (sent) =>
+        sent.reduce((total, message) => total + claudeCount(message), 64) > 512
+          ? new Error('maximum context length exceeded')
+          : undefined;
+      const { node, agentContext } = harness({
+        model: primary,
+        maxContextTokens: 512,
+        tokenCounter: openaiCount,
+        clientOptions: {
+          model: 'gpt-4o',
+          fallbacks: [
+            {
+              provider,
+              maxContextTokens: 512,
+              clientOptions: { ...options, maxTokens: 64 },
+            },
+          ],
+        },
+        summarizationConfig: {
+          prompt: 'Write a checkpoint.',
+          maxSummaryTokens: 64,
+          retainRecent: { turns: 0 },
+        },
+      });
+      jest
+        .spyOn(init, 'initializeModel')
+        .mockImplementation(({ provider: serving }) =>
+          serving === provider ? fallback : primary
+        );
+      const text =
+        '사용자가 인증 미들웨어를 리팩터링하여 속도 제한 전에 토큰 검증이 이루어지도록 요청했습니다.';
+      const messages: BaseMessage[] = [];
+      for (let i = 0; i < 12; i++)
+        messages.push(new HumanMessage(text), new AIMessage(text));
+      const newest = new HumanMessage('Continue.');
+      messages.push(newest);
+      expect(claudeCount(messages[0])).toBeGreaterThan(
+        openaiCount(messages[0])
+      );
+      await node(
+        {
+          messages,
+          summarizationRequest: {
+            agentId: 'agent',
+            remainingContextTokens: 0,
+            windowMessages: messages,
+          },
+        },
+        {}
+      );
+      expect(fallback.calls).toHaveLength(1);
+      expect(fallback.calls[0]).toContain(newest);
+      expect(
+        fallback.calls[0].reduce(
+          (total, message) => total + claudeCount(message),
+          64
+        )
+      ).toBeLessThanOrEqual(512);
+      expect(agentContext.getSummaryText()).toBe('CLEAN_SUMMARY');
+    }
+  );
+
+  it('reserves no unsent system or prior-summary overhead for a dedicated provider', async () => {
+    const { node, model, agentContext } = harness({
+      maxContextTokens: 2_000,
+      summarizationConfig: {
+        provider: Providers.ANTHROPIC,
+        model: 'production',
+        prompt: 'Checkpoint.',
+        updatePrompt: 'Update checkpoint.',
+        maxSummaryTokens: 128,
+        retainRecent: { turns: 0 },
+      },
+    });
+    agentContext.systemMessageTokens = 3_000;
+    agentContext.setInitialSummary('Prior checkpoint.', 1_000);
+    const messages = history(4);
+    await node(
+      {
+        messages,
+        summarizationRequest: {
+          agentId: 'agent',
+          remainingContextTokens: 0,
+          reason: 'manual',
+          windowMessages: messages,
+        },
+      },
+      {}
+    );
+    expect(model.calls).toHaveLength(1);
+    expect(
+      model.calls[0].some((message) => message.getType() === 'system')
+    ).toBe(false);
+    expect(model.calls[0].at(-1)?.content).toContain('Prior checkpoint.');
+    const claudeCount = await createTokenCounter('claude');
+    expect(
+      model.calls[0].reduce(
+        (total, message) => total + claudeCount(message),
+        128
+      )
+    ).toBeLessThanOrEqual(2_000);
+    expect(agentContext.getSummaryText()).toBe('CLEAN_SUMMARY');
+  });
+
+  const cancellations = [
+    Object.assign(new Error('SDK failure'), { name: 'CancelledError' }),
+    Object.assign(new Error('SDK failure'), { name: 'CanceledError' }),
+    Object.assign(new Error('SDK failure'), { name: 'APIUserAbortError' }),
+    Object.assign(new Error('SDK failure'), { code: 'ERR_CANCELED' }),
+    Object.assign(new Error('SDK failure'), { code: 'ABORT_ERR' }),
+    new Error('Request was cancelled'),
+    new Error('Gateway failure', { cause: { code: 'ERR_CANCELED' } }),
+  ];
+  it.each(
+    cancellations.flatMap((error) =>
+      ['primary', 'fallback'].map((phase) => ({ phase, error }))
+    )
+  )(
+    'does not recover from an SDK cancellation without an aborted signal: %j',
+    async ({ phase, error }) => {
+      const primary = new SummaryModel();
+      const fallback = new SummaryModel();
+      const unused = new SummaryModel();
+      primary.failure = () =>
+        phase === 'primary' ? error : new Error('Primary failed');
+      fallback.failure = () => error;
+      const { node, emitted, agentContext } = harness({
+        model: primary,
+        clientOptions: {
+          fallbacks: [
+            {
+              provider: Providers.OPENAI,
+              clientOptions: { model: 'fallback' },
+            },
+            { provider: Providers.OPENAI, clientOptions: { model: 'unused' } },
+          ],
+        },
+      });
+      jest
+        .spyOn(init, 'initializeModel')
+        .mockImplementation(({ clientOptions }) => {
+          const name = resolveClientOptionsModel(clientOptions);
+          if (name === 'fallback') return fallback;
+          return name === 'unused' ? unused : primary;
+        });
+      const messages = history(6);
+      const before = JSON.stringify(messages);
+      const signal = new AbortController().signal;
+      await expect(
+        node(
+          {
+            messages,
+            summarizationRequest: {
+              agentId: 'agent',
+              remainingContextTokens: 0,
+              windowMessages: messages,
+            },
+          },
+          { signal }
+        )
+      ).rejects.toBe(error);
+      expect(signal.aborted).toBe(false);
+      expect(primary.calls).toHaveLength(1);
+      expect(fallback.calls).toHaveLength(phase === 'fallback' ? 1 : 0);
+      expect(unused.calls).toHaveLength(0);
+      expect(JSON.stringify(messages)).toBe(before);
+      expect(agentContext.getSummaryText()).toBeUndefined();
+      expect(
+        emitted.filter(
+          ({ event }) =>
+            event === GraphEvents.ON_SUMMARIZE_COMPLETE ||
+            event === GraphEvents.ON_SUMMARIZE_DELTA
+        )
+      ).toHaveLength(0);
+    }
+  );
+
+  it.each(['failure', 'empty'] as const)(
+    'discards all fallback deltas after %s',
+    async (outcome) => {
+      const primary = new SummaryModel();
+      const failed = new SummaryModel();
+      primary.failure = () => new Error('Primary failed');
+      failed.failure = () => new Error('Fallback failed');
+      const empty = new SummaryModel();
+      Object.defineProperty(empty, 'stream', {value: undefined});
+      jest.spyOn(empty, 'invoke').mockResolvedValue(new AIMessageChunk(''));
+      const { node, emitted, agentContext } = harness({
+        model: primary,
+        clientOptions: {
+          fallbacks: [
+            { provider: Providers.OPENAI, clientOptions: { model: 'failed' } },
+            ...(outcome === 'empty'
+              ? [
+                {
+                  provider: Providers.OPENAI,
+                  clientOptions: { model: 'empty' },
+                },
+              ]
+              : []),
+          ],
+        },
+      });
+      jest
+        .spyOn(init, 'initializeModel')
+        .mockImplementation(({ clientOptions }) => {
+          const name = resolveClientOptionsModel(clientOptions);
+          if (name === 'failed') return failed;
+          return name === 'empty' ? (empty) : primary;
+        });
+      const messages = history(6);
+      const before = JSON.stringify(messages);
+      const result = await node(
+        {
+          messages,
+          summarizationRequest: {
+            agentId: 'agent',
+            remainingContextTokens: 0,
+            windowMessages: messages,
+          },
+        },
+        {}
+      );
+      expect(result.messages).toBeUndefined();
+      expect(JSON.stringify(messages)).toBe(before);
+      expect(agentContext.getSummaryText()).toBeUndefined();
+      expect(
+        emitted.filter(({ event }) => event === GraphEvents.ON_SUMMARIZE_DELTA)
+      ).toHaveLength(0);
+      expect(
+        JSON.stringify(
+          emitted.filter(
+            ({ event }) => event === GraphEvents.ON_SUMMARIZE_COMPLETE
+          )
+        )
+      ).not.toContain('FAILED_ONLY');
+    }
+  );
 
   it('preserves automatic history and reports a safe code after retry exhaustion', async () => {
     jest.useFakeTimers();

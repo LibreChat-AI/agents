@@ -242,6 +242,7 @@ const CONTEXT_OVERFLOW_HINT_RE =
 const MAX_CAUSE_DEPTH = 4;
 
 interface NestedErrorShape {
+  name?: string;
   message?: unknown;
   code?: unknown;
   type?: unknown;
@@ -249,6 +250,7 @@ interface NestedErrorShape {
   reason?: unknown;
   error?: unknown;
   cause?: unknown;
+  $metadata?: unknown;
   body?: unknown;
   response?: unknown;
   /** gaxios-style clients (Vertex AI) put the API error document here. */
@@ -425,6 +427,46 @@ export function extractErrorMessage(error: unknown): string {
   } catch {
     return String(error);
   }
+}
+
+function hasProviderCancellation(error: unknown, depth: number): boolean {
+  if (error == null || depth > MAX_CAUSE_DEPTH) {
+    return false;
+  }
+  const record = asRecord(error);
+  const text = `${record?.name ?? ''} ${record?.code ?? ''} ${record?.type ?? ''} ${extractErrorMessage(error)}`;
+  if (
+    /^(?:AbortError|APIUserAbortError|CanceledError|CancelledError)$/.test(
+      record?.name ?? ''
+    ) ||
+    /^(?:ABORT_ERR|ERR_CANCELED)$/.test(String(record?.code ?? '')) ||
+    /\bAbortError\b|\buser (?:aborted|cancelled|canceled)\b|\b(?:request|operation) (?:was )?(?:aborted|cancelled|canceled)\b/i.test(
+      text
+    )
+  ) {
+    return true;
+  }
+  if (record == null) {
+    return false;
+  }
+  for (const nested of [
+    record.cause,
+    record.error,
+    record.body,
+    record.data,
+    record.response,
+    record.$metadata,
+  ]) {
+    if (hasProviderCancellation(nested, depth + 1)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Recognizes cancellation names, codes, and messages in bounded error chains. */
+export function isProviderCancellation(error: unknown): boolean {
+  return hasProviderCancellation(error, 0);
 }
 
 /**

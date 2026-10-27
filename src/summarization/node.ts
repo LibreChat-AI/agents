@@ -27,6 +27,7 @@ import {
   enforceStreamLimitsForWireChunk,
   StreamLimitExceededError,
   STREAM_LIMIT_EPOCH_KEY,
+  STREAM_LIMIT_ATTEMPT_KEY,
 } from '@/llm/streamLimits';
 import {
   DEFAULT_RETAIN_RECENT_TURNS,
@@ -65,6 +66,7 @@ import { serializeToolContentBounded } from '@/utils/toolContent';
 import { makeIsDeferred } from '@/messages/anthropicToolCache';
 import { createRemoveAllMessage } from '@/messages/reducer';
 import { getProviderFamily } from '@/llm/providerRegistry';
+import { isProviderCancellation } from '@/utils/errors';
 import { initializeModel } from '@/llm/init';
 import { getChunkContent } from '@/stream';
 import { executeHooks } from '@/hooks';
@@ -327,14 +329,105 @@ async function computeSummaryTokenCount(
  * the same rule that rejects another agent's counter.
  */
 function encodingForReceivingAgent(agentContext: AgentContext): EncodingName {
-  const model = resolveClientOptionsModel(agentContext.clientOptions);
+  return encodingForSummarizationModel(
+    agentContext.provider,
+    agentContext.clientOptions
+  );
+}
+
+function encodingForSummarizationModel(
+  provider: t.ProviderName,
+  clientOptions?: t.ClientOptions
+): EncodingName {
+  const model = resolveClientOptionsModel(clientOptions);
   if (model != null && encodingForModel(model) === 'claude') {
     return 'claude';
   }
-  return agentContext.provider === Providers.ANTHROPIC ||
-    getProviderFamily(agentContext.provider) === 'anthropic'
+  return provider === Providers.ANTHROPIC ||
+    getProviderFamily(provider) === 'anthropic'
     ? 'claude'
     : 'o200k_base';
+}
+
+async function prepareSummarizationBudget({
+  agentContext,
+  provider,
+  clientOptions,
+  maxContextTokens,
+  outputTokens,
+  instruction,
+  config,
+}: {
+  agentContext: AgentContext;
+  provider: t.ProviderName;
+  clientOptions?: t.ClientOptions;
+  maxContextTokens?: number;
+  outputTokens: number;
+  instruction: string;
+  config?: RunnableConfig;
+}): Promise<{
+  count: t.TokenCounter;
+  system: AgentContext['systemRunnable'];
+  budget: number;
+}> {
+  const encoding = encodingForSummarizationModel(provider, clientOptions);
+  const hostCounter = agentContext.tokenCounter;
+  const hostEncoding =
+    hostCounter == null ? undefined : encodingOfTokenCounter(hostCounter);
+  const usesAgentCounter =
+    provider === agentContext.provider &&
+    encoding === encodingForReceivingAgent(agentContext) &&
+    hostCounter != null &&
+    (hostEncoding == null || hostEncoding === encoding);
+  const count = usesAgentCounter
+    ? (agentContext.contextPressureTokenCounts?.count ?? hostCounter)
+    : await createTokenCounter(encoding);
+  const system =
+    provider === agentContext.provider
+      ? agentContext.systemRunnable
+      : undefined;
+  let overhead = agentContext.toolSchemaTokens;
+  if (system != null) {
+    overhead = usesAgentCounter
+      ? agentContext.instructionTokens
+      : (await system.invoke([], config)).reduce(
+        (total, message) => total + count(message),
+        overhead
+      );
+  }
+  const ratio = usesAgentCounter
+    ? Math.max(1, agentContext.calibrationRatio)
+    : 1;
+  const budget =
+    maxContextTokens == null
+      ? Number.MAX_SAFE_INTEGER
+      : Math.floor(
+        (maxContextTokens -
+            overhead -
+            outputTokens -
+            count(new HumanMessage(instruction))) /
+            ratio
+      );
+  return { count, system, budget };
+}
+
+async function flushSummarizationDeltas(
+  deltas: t.SummarizeDeltaEvent[],
+  config?: RunnableConfig,
+  graph?: { getBreakerSignal?: () => AbortSignal }
+): Promise<void> {
+  const signal = withBreakerSignal(config, graph)?.signal;
+  signal?.throwIfAborted();
+  for (const delta of deltas) {
+    signal?.throwIfAborted();
+    if (config != null)
+      await safeDispatchCustomEvent(
+        GraphEvents.ON_SUMMARIZE_DELTA,
+        delta,
+        config
+      );
+  }
+  signal?.throwIfAborted();
 }
 
 /**
@@ -640,6 +733,7 @@ async function executeSummarizationWithFallback(params: {
           agentContext,
           shrinkInput,
           outputTokens: clientConfig.effectiveMaxSummaryTokens,
+          clientOptions: clientConfig.clientOptions as t.ClientOptions,
           model: summarizationModel,
           messages,
           promptText: clientConfig.promptText,
@@ -693,10 +787,7 @@ async function executeSummarizationWithFallback(params: {
     if (
       primaryError instanceof StreamLimitExceededError ||
       primaryError instanceof ProviderTextProtectionError ||
-      (primaryError instanceof Error &&
-        /^(AbortError|APIUserAbortError|CanceledError)$/.test(
-          primaryError.name
-        ))
+      isProviderCancellation(primaryError)
     ) {
       throw primaryError;
     }
@@ -734,10 +825,6 @@ async function executeSummarizationWithFallback(params: {
     const fallbacks = Array.isArray(rawFallbacks) ? rawFallbacks : [];
     if (fallbacks.length > 0) {
       try {
-        const counter =
-          agentContext.contextPressureTokenCounts?.count ??
-          agentContext.tokenCounter ??
-          (await createTokenCounter(encodingForReceivingAgent(agentContext)));
         const instruction = buildSummarizationInstruction(
           clientConfig.promptText,
           clientConfig.updatePromptText,
@@ -784,32 +871,23 @@ async function executeSummarizationWithFallback(params: {
             config,
           }) => {
             config?.signal?.throwIfAborted();
-            const system =
-              provider === agentContext.provider
-                ? agentContext.systemRunnable
-                : undefined;
-            const overhead =
-              system == null
-                ? agentContext.toolSchemaTokens
-                : agentContext.instructionTokens;
-            const outputTokens = resolveSummaryOutputTokens(
+            pendingDeltas.length = 0;
+            const { count, system, budget } = await prepareSummarizationBudget({
+              agentContext,
               provider,
-              { ...clientOptions },
-              maxContextTokens
-            );
-            const budget =
-              maxContextTokens == null
-                ? Number.MAX_SAFE_INTEGER
-                : Math.floor(
-                  (maxContextTokens -
-                      overhead -
-                      outputTokens -
-                      counter(new HumanMessage(instruction))) /
-                      Math.max(1, agentContext.calibrationRatio)
-                );
+              clientOptions,
+              maxContextTokens,
+              outputTokens: resolveSummaryOutputTokens(
+                provider,
+                { ...clientOptions },
+                maxContextTokens
+              ),
+              instruction,
+              config,
+            });
             const bounded = boundSummarizationInput({
               messages,
-              tokenCounter: counter,
+              tokenCounter: count,
               budget,
               provider,
             });
@@ -837,6 +915,12 @@ async function executeSummarizationWithFallback(params: {
           summaryText = extractResponseText(
             fbMsg as { content: string | object }
           );
+          if (summaryText !== '')
+            await flushSummarizationDeltas(
+              pendingDeltas,
+              summarizeConfig,
+              graph
+            );
         }
       } catch (fbErr) {
         const trip = findStreamLimitAbortReason(
@@ -846,7 +930,8 @@ async function executeSummarizationWithFallback(params: {
         if (trip != null) throw trip;
         if (
           fbErr instanceof StreamLimitExceededError ||
-          fbErr instanceof ProviderTextProtectionError
+          fbErr instanceof ProviderTextProtectionError ||
+          isProviderCancellation(fbErr)
         ) {
           throw fbErr;
         }
@@ -1200,7 +1285,13 @@ export function createSummarizeNode({
     }
 
     const maxCtx = agentContext.maxContextTokens ?? 0;
-    if (maxCtx > 0 && agentContext.instructionTokens >= maxCtx) {
+    const usesAgentInstructions =
+      (agentContext.summarizationConfig?.provider ?? agentContext.provider) ===
+      agentContext.provider;
+    const instructionOverhead = usesAgentInstructions
+      ? agentContext.instructionTokens
+      : agentContext.toolSchemaTokens;
+    if (maxCtx > 0 && instructionOverhead >= maxCtx) {
       if (request.reason === 'manual') {
         throw new ManualSummarizationSkippedError(
           'instructions_exceed_budget',
@@ -1696,7 +1787,15 @@ export function createSummarizationChunkHandler({
     return undefined;
   }
   const limitMetadata = config.metadata as Record<string, unknown> | undefined;
+  let bufferedAttempt: unknown;
   return (chunk, attemptMetadata) => {
+    if (
+      pendingDeltas != null &&
+      bufferedAttempt !== attemptMetadata?.[STREAM_LIMIT_ATTEMPT_KEY]
+    ) {
+      pendingDeltas.length = 0;
+      bufferedAttempt = attemptMetadata?.[STREAM_LIMIT_ATTEMPT_KEY];
+    }
     /**
      * Charged as `producer` so it PAIRS with the run's registered stream
      * handler: inside a live run the provider callbacks route each chunk
@@ -1737,7 +1836,15 @@ export function createSummarizationChunkHandler({
     );
     if (protectionTrip != null) throw protectionTrip;
     const chunkAny = chunk as Parameters<typeof getChunkContent>[0]['chunk'];
-    const raw = getChunkContent({ chunk: chunkAny, provider, reasoningKey });
+    const servingProvider =
+      (attemptMetadata?.[Constants.INVOKED_PROVIDER] as
+        | t.ProviderName
+        | undefined) ?? provider;
+    const raw = getChunkContent({
+      chunk: chunkAny,
+      provider: servingProvider,
+      reasoningKey,
+    });
     if (raw == null || (typeof raw === 'string' && !raw)) {
       return;
     }
@@ -1752,8 +1859,14 @@ export function createSummarizationChunkHandler({
         summary: {
           type: ContentTypes.SUMMARY,
           content: contentBlocks,
-          provider: String(config.metadata?.summarization_provider ?? ''),
-          model: String(config.metadata?.summarization_model ?? ''),
+          provider: String(
+            servingProvider ?? config.metadata?.summarization_provider ?? ''
+          ),
+          model: String(
+            attemptMetadata?.[Constants.INVOKED_MODEL] ??
+              config.metadata?.summarization_model ??
+              ''
+          ),
         },
       },
     };
@@ -1823,6 +1936,7 @@ async function summarizeWithCacheHit({
   agentContext,
   shrinkInput,
   outputTokens,
+  clientOptions,
   model,
   messages,
   promptText,
@@ -1842,6 +1956,7 @@ async function summarizeWithCacheHit({
   agentContext: AgentContext;
   shrinkInput?: boolean;
   outputTokens: number;
+  clientOptions?: t.ClientOptions;
   model: t.ChatModel;
   messages: BaseMessage[];
   promptText: string;
@@ -1865,24 +1980,15 @@ async function summarizeWithCacheHit({
     semanticIndexAppendix
   );
 
-  const count =
-    agentContext.contextPressureTokenCounts?.count ??
-    agentContext.tokenCounter ??
-    (await createTokenCounter(encodingForReceivingAgent(agentContext)));
-  const system =
-    provider === agentContext.provider
-      ? agentContext.systemRunnable
-      : undefined;
-  const budget =
-    agentContext.maxContextTokens == null
-      ? Number.MAX_SAFE_INTEGER
-      : Math.floor(
-        (agentContext.maxContextTokens -
-            agentContext.instructionTokens -
-            outputTokens -
-            count(new HumanMessage(instruction))) /
-            Math.max(1, agentContext.calibrationRatio)
-      );
+  const { count, system, budget } = await prepareSummarizationBudget({
+    agentContext,
+    provider,
+    clientOptions,
+    maxContextTokens: agentContext.maxContextTokens,
+    outputTokens,
+    instruction,
+    config,
+  });
   const scales =
     shrinkInput === true ? [0.85, 0.65, 0.45, 0.3] : [1, 0.85, 0.65, 0.45, 0.3];
   let result: Partial<t.BaseGraphState> | undefined;
@@ -1943,13 +2049,9 @@ async function summarizeWithCacheHit({
         signalConfig
       );
       signalConfig?.signal?.throwIfAborted();
-      for (const delta of pendingDeltas) {
-        if (config != null)
-          await safeDispatchCustomEvent(
-            GraphEvents.ON_SUMMARIZE_DELTA,
-            delta,
-            config
-          );
+      const response = result.messages?.[0];
+      if (response != null && extractResponseText(response) !== '') {
+        await flushSummarizationDeltas(pendingDeltas, config, graph);
       }
       break;
     } catch (error) {

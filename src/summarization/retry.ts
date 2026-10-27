@@ -1,5 +1,9 @@
 import type { SummarizationErrorCode } from '@/types/summarize';
-import { extractErrorMessage, isContextOverflowError } from '@/utils/errors';
+import {
+  extractErrorMessage,
+  isContextOverflowError,
+  isProviderCancellation,
+} from '@/utils/errors';
 import { ProviderTextProtectionError } from '@/protection/providerText';
 import { StreamLimitExceededError } from '@/llm/streamLimits';
 
@@ -56,6 +60,9 @@ function describeFailure(error: unknown): {
   errorCode: SummarizationErrorCode;
   retryable: boolean;
 } {
+  if (isProviderCancellation(error)) {
+    return { errorCode: 'unknown', retryable: false };
+  }
   let errorCode: SummarizationErrorCode = isContextOverflowError(error)
     ? 'context_exceeded'
     : 'unknown';
@@ -68,12 +75,8 @@ function describeFailure(error: unknown): {
     if (
       cause instanceof StreamLimitExceededError ||
       cause instanceof ProviderTextProtectionError ||
-      /^(?:StreamLimitExceededError|ProviderTextProtectionError|AbortError|APIUserAbortError|CanceledError|CancelledError)$/.test(
+      /^(?:StreamLimitExceededError|ProviderTextProtectionError)$/.test(
         record.name ?? ''
-      ) ||
-      /^(?:ABORT_ERR|ERR_CANCELED)$/.test(String(record.code ?? '')) ||
-      /\bAbortError\b|\buser (?:aborted|cancelled|canceled)\b|\b(?:request|operation) (?:was )?(?:aborted|cancelled|canceled)\b/i.test(
-        text
       )
     ) {
       return { errorCode: 'unknown', retryable: false };

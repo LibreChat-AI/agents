@@ -61,6 +61,7 @@ import {
   getProviderFamily,
   providerUsesManualToolStream,
 } from '@/llm/providers';
+import { getContextOverflowInfo, isProviderCancellation } from '@/utils/errors';
 import { ChatModelStreamHandler, dispatchesChatModelStream } from '@/stream';
 import { Constants, ContentTypes, GraphEvents, Providers } from '@/common';
 import { withProviderTextBoundary } from '@/llm/providerTextBoundary';
@@ -68,7 +69,6 @@ import { PreparedSubagentError } from '@/tools/preparedSubagents';
 import { assertNotTruncatedToolCall } from '@/llm/truncation';
 import { resolveClientOptionsModel } from '@/llm/request';
 import { safeDispatchCustomEvent } from '@/utils/events';
-import { getContextOverflowInfo } from '@/utils/errors';
 import { appendCallbacks } from '@/utils/callbacks';
 import { composeAbortSignals } from '@/utils/misc';
 import { initializeModel } from '@/llm/init';
@@ -1669,7 +1669,8 @@ export async function tryFallbackProviders({
     config?: RunnableConfig;
   }) => BaseMessage[] | Promise<BaseMessage[]>;
 }): Promise<Partial<t.BaseGraphState> | undefined> {
-  if (primaryError instanceof ProviderTextProtectionError) throw primaryError;
+  if (primaryError instanceof ProviderTextProtectionError || isProviderCancellation(primaryError)) throw primaryError;
+  config?.signal?.throwIfAborted();
   const isOverflow = (
     error: unknown,
     contextOverride = overflowContext
@@ -1687,6 +1688,7 @@ export async function tryFallbackProviders({
     : undefined;
   for (const fb of fallbacks) {
     try {
+      config?.signal?.throwIfAborted();
       const fbModel = initializeModel({
         provider: fb.provider,
         clientOptions: fb.clientOptions,
@@ -1752,6 +1754,7 @@ export async function tryFallbackProviders({
       ) {
         throw config.signal.reason;
       }
+      config?.signal?.throwIfAborted();
       if (preparedRequest != null) {
         return await attemptInvoke(
           {
@@ -1788,7 +1791,8 @@ export async function tryFallbackProviders({
         e instanceof StreamLimitExceededError ||
         e instanceof PreparedSubagentError ||
         e instanceof InvalidModelToolCallError ||
-        e instanceof ProviderTextProtectionError
+        e instanceof ProviderTextProtectionError ||
+        isProviderCancellation(e)
       ) {
         throw e;
       }
@@ -1804,6 +1808,7 @@ export async function tryFallbackProviders({
       ) {
         throw config.signal.reason;
       }
+      config?.signal?.throwIfAborted();
       lastError = e;
       const fallbackOverflowContext: ContextOverflowContext = {
         provider: fb.provider,
