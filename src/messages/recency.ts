@@ -413,3 +413,45 @@ export function splitAtRecencyBoundary(
     usedIntraTurnFallback: false,
   };
 }
+
+/** Safe suffix starts, including closed intra-turn tool exchanges. */
+export function getPairingBalancedSuffixStarts(
+  messages: BaseMessage[],
+  provider?: ProviderName
+): number[] {
+  const lastIndexBySourceId = new Map<string, number>();
+  const sourceIds = messages.map((message, index) => {
+    const ids = getCoverageSourceIds(message);
+    for (const id of ids) lastIndexBySourceId.set(id, index);
+    return ids;
+  });
+  const calls: ProviderToolCallIndex = new Map();
+  const straddling = new Set<string>();
+  const starts = [0];
+  let newestExchangeStart = 0;
+  for (let i = 0; i < messages.length; i++) {
+    const beforeIsBalanced = calls.size === 0 && straddling.size === 0;
+    const pairing = inspectMessagePairing(messages[i], calls, provider);
+    if (beforeIsBalanced && Number(calls.size) > 0) newestExchangeStart = i;
+    if (pairing.userMessage && !pairing.trustedHumanToolResult) {
+      newestExchangeStart = i;
+      if (i > 0 && beforeIsBalanced && starts[starts.length - 1] !== i) {
+        starts.push(i);
+      }
+    }
+    for (const id of sourceIds[i]) {
+      if (lastIndexBySourceId.get(id) === i) straddling.delete(id);
+      else straddling.add(id);
+    }
+    if (
+      i + 1 < messages.length &&
+      pairing.completedToolCalls > 0 &&
+      calls.size === 0 &&
+      straddling.size === 0
+    ) {
+      starts.push(i + 1);
+    }
+  }
+  while (starts[starts.length - 1] > newestExchangeStart) starts.pop();
+  return starts;
+}

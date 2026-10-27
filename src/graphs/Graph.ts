@@ -3133,6 +3133,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     config,
     originalToolContent,
     estimatedPromptTokens,
+    windowMessages,
   }: {
     recovery: OverflowRecoveryPlan;
     agentContext: AgentContext;
@@ -3142,6 +3143,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     originalToolContent?: Map<number, string>;
     /** Size of the rejected prompt, recorded to detect a correction that changed nothing. */
     estimatedPromptTokens?: number;
+    windowMessages: BaseMessage[];
   }): Partial<t.AgentSubgraphState> {
     const previousBudget = agentContext.maxContextTokens;
     /**
@@ -3189,6 +3191,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         remainingContextTokens: 0,
         agentId: agentId || agentContext.agentId,
         reason: 'overflow',
+        windowMessages,
         allowSummarization,
       },
     };
@@ -3225,12 +3228,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     agentContext,
     agentId,
     messageCount,
+    windowMessages,
     contextUsage,
     config,
   }: {
     agentContext: AgentContext;
     agentId: string;
     messageCount: number;
+    windowMessages: BaseMessage[];
     contextUsage: t.ContextUsageEvent | null;
     config: RunnableConfig;
   }): Promise<Partial<t.AgentSubgraphState> | null> {
@@ -3262,6 +3267,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           remainingContextTokens: contextUsage?.remainingContextTokens ?? 0,
           agentId: agentId || agentContext.agentId,
           reason: 'manual',
+          windowMessages,
         },
         /** A checkpointed thread may still hold the previous compaction's
          *  summary; only the one this run produces may be reported. */
@@ -3484,6 +3490,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           agentContext,
           agentId,
           messageCount: messages.length,
+          windowMessages: context,
           contextUsage,
           config,
         });
@@ -3541,6 +3548,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             return {
               summarizationRequest: {
                 remainingContextTokens: remainingContextTokens ?? 0,
+                windowMessages: context,
                 agentId: agentId || agentContext.agentId,
               },
             };
@@ -3570,6 +3578,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           agentContext,
           agentId,
           messageCount: messages.length,
+          windowMessages: messagesToUse,
           contextUsage: null,
           config,
         });
@@ -4596,6 +4605,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             agentId,
             config,
             originalToolContent: prunedOriginalToolContent,
+            windowMessages: messagesToUse,
             estimatedPromptTokens: recoveryPromptEstimate,
           });
         }
@@ -4830,6 +4840,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             agentId,
             config,
             originalToolContent: prunedOriginalToolContent,
+            windowMessages: messagesToUse,
             estimatedPromptTokens: fallbackRecoveryPromptEstimate,
           });
         }

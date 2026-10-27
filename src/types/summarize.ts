@@ -1,3 +1,4 @@
+import type { BaseMessage } from '@langchain/core/messages';
 import type { SummaryContentBlock } from '@/types/stream';
 import type { ProviderName } from '@/types/llm';
 
@@ -118,6 +119,8 @@ export interface SummarizeResult {
 export interface SummarizationNodeInput {
   remainingContextTokens: number;
   agentId: string;
+  /** Pruned, masked provider history from the turn requesting compaction. */
+  windowMessages?: BaseMessage[];
   /**
    * Why the detour was requested.
    *
@@ -128,8 +131,7 @@ export interface SummarizationNodeInput {
    *   variant performs no model call — the corrected budget alone is what the
    *   retry needs.
    * - `manual`: the host asked for a summary outright (a summarize-only run).
-   *   The recency window is not applied unless the host configured
-   *   `retainRecent` explicitly, so the summary replaces the whole history.
+   *   Uses the same bounded recent-tail policy as automatic compaction.
    */
   reason?: 'trigger' | 'overflow' | 'manual';
   /**
@@ -165,9 +167,17 @@ export interface SummarizeDeltaEvent {
   };
 }
 
+export type SummarizationErrorCode =
+  | 'provider_overloaded'
+  | 'rate_limited'
+  | 'context_exceeded'
+  | 'timeout'
+  | 'unknown';
+
 export interface SummarizeCompleteEvent {
   id: string;
   agentId: string;
   summary?: SummaryContentBlock;
   error?: string;
+  errorCode?: SummarizationErrorCode;
 }
