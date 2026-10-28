@@ -185,4 +185,85 @@ describe('CustomChatBedrockConverse assistant prefill', () => {
       'assistant',
     ]);
   });
+
+  describe('retry without signed reasoning', () => {
+    const signedHistory = [
+      new HumanMessage('Hello'),
+      new AIMessage({
+        content: [
+          {
+            type: 'reasoning_content',
+            reasoningText: { text: 'Thinking.', signature: 'SIG' },
+          },
+          { type: 'text', text: 'Hello back' },
+        ],
+      }),
+      new HumanMessage('Continue'),
+    ];
+    const rejection = (message = 'thinking signature is not valid'): Error =>
+      Object.assign(new Error(message), { name: 'ValidationException' });
+    const retrying = (model: string, send: jest.Mock, retry = true) =>
+      new CustomChatBedrockConverse({
+        region: 'us-east-1',
+        credentials,
+        model,
+        client: { send } as unknown as BedrockRuntimeClient,
+        retryWithoutReasoningOnRejection: retry,
+        _lc_stream_delay: 0,
+      });
+    const sentMessages = (send: jest.Mock): string[] =>
+      send.mock.calls.map(([command]) =>
+        JSON.stringify(
+          (command as ConverseCommand | ConverseStreamCommand).input.messages
+        )
+      );
+
+    test.each([
+      ['the local converter', 'global.anthropic.claude-haiku-5-5'],
+      ['the parent converter', 'anthropic.claude-haiku-4-5-20251001-v1:0'],
+    ])('retries once on invoke through %s', async (_path, model) => {
+      const send = jest
+        .fn()
+        .mockRejectedValueOnce(rejection())
+        .mockResolvedValueOnce(converseResponse);
+
+      await retrying(model, send).invoke(signedHistory);
+
+      const sent = sentMessages(send);
+      expect(sent).toHaveLength(2);
+      expect(sent[0]).toContain('SIG');
+      expect(sent[1]).not.toContain('SIG');
+    });
+
+    test('retries once on stream when nothing was emitted yet', async () => {
+      const send = jest
+        .fn()
+        .mockRejectedValueOnce(rejection())
+        .mockResolvedValueOnce(streamResponse());
+
+      const model = retrying('anthropic.claude-haiku-4-5-20251001-v1:0', send);
+      for await (const _chunk of await model.stream(signedHistory)) {
+        // drain
+      }
+
+      const sent = sentMessages(send);
+      expect(sent).toHaveLength(2);
+      expect(sent[1]).not.toContain('SIG');
+    });
+
+    test('does not retry without the option or for other errors', async () => {
+      const model = 'anthropic.claude-haiku-4-5-20251001-v1:0';
+      const optedOut = jest.fn().mockRejectedValue(rejection());
+      const unrelated = jest.fn().mockRejectedValue(rejection('throttled'));
+
+      await expect(
+        retrying(model, optedOut, false).invoke(signedHistory)
+      ).rejects.toThrow('signature');
+      await expect(
+        retrying(model, unrelated).invoke(signedHistory)
+      ).rejects.toThrow('throttled');
+      expect(optedOut).toHaveBeenCalledTimes(1);
+      expect(unrelated).toHaveBeenCalledTimes(1);
+    });
+  });
 });

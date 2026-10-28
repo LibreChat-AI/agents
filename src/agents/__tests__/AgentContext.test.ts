@@ -52,6 +52,44 @@ describe('AgentContext', () => {
       schema: { type: 'object', properties: {} },
     }) as unknown as t.GenericTool;
 
+  describe('fromConfig — providerReasoningReplay', () => {
+    const replayContext = (
+      provider: Providers,
+      providerReasoningReplay?: boolean
+    ): AgentContext =>
+      createBasicContext({
+        agentConfig: {
+          provider,
+          providerReasoningReplay,
+          clientOptions: { model: 'test-model' } as t.ClientOptions,
+        },
+      });
+
+    it('asks Anthropic to drop mismatched thinking blocks and Bedrock to retry without reasoning', () => {
+      const anthropic = replayContext(Providers.ANTHROPIC, true);
+      const bedrock = replayContext(Providers.BEDROCK, true);
+
+      expect(anthropic.providerReasoningReplay).toBe(true);
+      expect(anthropic.clientOptions).toMatchObject({
+        model: 'test-model',
+        dropMismatchedThinkingBlocks: true,
+      });
+      expect(bedrock.clientOptions).toMatchObject({
+        retryWithoutReasoningOnRejection: true,
+      });
+    });
+
+    it('leaves client options alone without the option or for other providers', () => {
+      expect(replayContext(Providers.ANTHROPIC).providerReasoningReplay).toBe(false);
+      expect(replayContext(Providers.ANTHROPIC).clientOptions).toEqual({
+        model: 'test-model',
+      });
+      expect(replayContext(Providers.OPENAI, true).clientOptions).toEqual({
+        model: 'test-model',
+      });
+    });
+  });
+
   describe('fromConfig — host-supplied graphTools', () => {
     it('copies graphTools onto the context without aliasing the host array', () => {
       const askTool = createMockTool('ask_user_question');

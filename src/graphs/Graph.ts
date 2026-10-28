@@ -14,6 +14,7 @@ import {
 import type {
   UsageMetadata,
   BaseMessage,
+  AIMessage,
   MessageContent,
 } from '@langchain/core/messages';
 import type { BaseChannel, OverwriteValue } from '@langchain/langgraph';
@@ -73,6 +74,7 @@ import {
   appendPredecessorHandoffCue,
   appendInstructionlessHandoffCue,
   stampSyntheticProviderMessage,
+  sliceResponsesToolRound,
 } from '@/messages';
 import {
   Constants,
@@ -200,7 +202,8 @@ import { AgentContext } from '@/agents/AgentContext';
 import { createFakeStreamingLLM } from '@/llm/fake';
 import { handoffStateAnnotation } from './handoff';
 import { handleToolCalls } from '@/tools/handlers';
-import { isThinkingEnabled } from '@/llm/request';
+import { isThinkingEnabled, resolveClientOptionsModel } from '@/llm/request';
+import { stripSignedReasoning } from '@/llm/bedrock/reasoningRetry';
 import { resolveMaxSeals } from '@/llm/preempt';
 import { initializeModel } from '@/llm/init';
 import { HandlerRegistry } from '@/events';
@@ -808,6 +811,8 @@ export abstract class Graph<
   stepKeyIds: Map<string, string[]> = new Map<string, string[]>();
   contentIndexMap: Map<string, number> = new Map();
   toolCallStepIds: Map<string, string> = new Map();
+  /** Model-call step base key -> round id stamped on its tool-calls steps. */
+  toolRoundIds: Map<string, string> = new Map();
   /** Step ID -> tool call IDs whose completions have not yet arrived. */
   pendingToolCallsByStep: Map<string, Set<string>> = new Map();
   /**
@@ -942,6 +947,7 @@ export abstract class Graph<
     this.streamSegment = 0;
     this.contentIndexMap = new Map();
     this.stepKeyIds = new Map();
+    this.toolRoundIds = new Map();
     this.toolCallStepIds.clear();
     this.pendingToolCallsByStep.clear();
     this.latestCompletionByStep.clear();
@@ -1705,6 +1711,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       this.contentIndexMap = resetIfNotEmpty(this.contentIndexMap, new Map());
     }
     this.stepKeyIds = resetIfNotEmpty(this.stepKeyIds, new Map());
+    this.toolRoundIds = resetIfNotEmpty(this.toolRoundIds, new Map());
     /**
      * Clear in-place instead of replacing with a new Map to preserve the
      * shared reference held by ToolNode (passed at construction time).
@@ -2516,6 +2523,49 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     return joinKeys(keyList);
   }
 
+  /** Hands a finished tool round's provider items to the content aggregator. */
+  private async dispatchProviderOutputItems(
+    message: AIMessage,
+    metadata?: Record<string, unknown>
+  ): Promise<void> {
+    const handler = this.handlerRegistry?.getHandler(
+      GraphEvents.ON_PROVIDER_OUTPUT_ITEMS
+    );
+    const toolCalls = handler != null ? sliceResponsesToolRound(message) : undefined;
+    if (handler == null || toolCalls == null) {
+      return;
+    }
+    await handler.handle(
+      GraphEvents.ON_PROVIDER_OUTPUT_ITEMS,
+      { tool_calls: toolCalls },
+      metadata,
+      this
+    );
+  }
+
+  /**
+   * Parallel calls of one model response share a round id; the next model
+   * call starts a new one, so restored history can keep sequential rounds
+   * apart.
+   */
+  private getToolRoundId(
+    metadata: Record<string, unknown>,
+    stepId: string
+  ): string | undefined {
+    let baseKey: string;
+    try {
+      baseKey = this.getStepBaseKey(metadata);
+    } catch {
+      return undefined;
+    }
+    const existing = this.toolRoundIds.get(baseKey);
+    if (existing != null) {
+      return existing;
+    }
+    this.toolRoundIds.set(baseKey, stepId);
+    return stepId;
+  }
+
   getStepIdByKey(stepKey: string, index?: number): string {
     const stepIds = this.stepKeyIds.get(stepKey);
     if (!stepIds) {
@@ -2557,7 +2607,13 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       agentContext.currentTokenType === ContentTypes.THINK ||
       agentContext.currentTokenType === 'think_and_text'
     ) {
-      keyList.push('reasoning');
+      // Reasoning resumed after text keeps its own part, so replayed blocks stay in order
+      keyList.push(
+        agentContext.providerReasoningReplay &&
+          agentContext.reasoningTransitionCount > 0
+          ? `reasoning-${agentContext.reasoningTransitionCount}`
+          : 'reasoning'
+      );
     } else if (agentContext.tokenTypeSwitch === 'content') {
       keyList.push(`post-reasoning-${agentContext.reasoningTransitionCount}`);
     }
@@ -4661,12 +4717,26 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                       contextBudget: fallbackContextBudget,
                       forceRawRecount: true,
                     });
+                  /** Restored signed reasoning is bound to the primary model. */
+                  const replaySafeMessages =
+                    agentContext.providerReasoningReplay &&
+                    (fallbackProvider !== agentContext.provider ||
+                      resolveClientOptionsModel(fallbackClientOptions) !==
+                        resolveClientOptionsModel(agentContext.clientOptions))
+                      ? trackProviderMessageOrigins(
+                        fallbackMessages,
+                        stripSignedReasoning(
+                          fallbackMessages,
+                          agentContext.provider
+                        )
+                      )
+                      : fallbackMessages;
                   const source = agentContext.useLegacyContent
                     ? trackProviderMessageOrigins(
-                      fallbackMessages,
-                      formatContentStrings(fallbackMessages)
+                      replaySafeMessages,
+                      formatContentStrings(replaySafeMessages)
                     )
-                    : fallbackMessages;
+                    : replaySafeMessages;
                   const boundedSource = trackProviderMessageOrigins(
                     source,
                     projectToolMessagesForProvider(
@@ -4930,6 +5000,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         }
 
         await handleToolCalls(toolCalls as ToolCall[], metadata, this);
+        await this.dispatchProviderOutputItems(
+          responseMessage as AIMessage,
+          metadata
+        );
       }
 
       /**
@@ -6019,6 +6093,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     const runId = this.runId ?? '';
     if (runId) {
       runStep.runId = runId;
+    }
+
+    const roundId =
+      stepDetails.type === StepTypes.TOOL_CALLS && metadata != null
+        ? this.getToolRoundId(metadata, stepId)
+        : undefined;
+    if (roundId != null) {
+      runStep.roundId = roundId;
     }
 
     /**

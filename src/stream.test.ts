@@ -72,6 +72,44 @@ describe('getChunkContent', () => {
     expect(result).toBe('Regular content');
   });
 
+  it('preserves structured Bedrock reasoning when additional kwargs duplicate its text', () => {
+    const content = [
+      {
+        type: 'reasoning_content',
+        reasoningText: { text: 'Reasoning summary text' },
+      },
+    ];
+    const chunk: Partial<AIMessageChunk> = {
+      content,
+      additional_kwargs: {
+        reasoning_content: 'Reasoning summary text',
+      },
+    };
+
+    const result = getChunkContent({
+      chunk,
+      provider: Providers.BEDROCK,
+      reasoningKey: 'reasoning_content',
+    });
+
+    expect(result).toBe(content);
+  });
+
+  it('uses Bedrock reasoning kwargs when structured content is empty', () => {
+    const result = getChunkContent({
+      chunk: {
+        content: [],
+        additional_kwargs: {
+          reasoning_content: 'Reasoning summary text',
+        },
+      },
+      provider: Providers.BEDROCK,
+      reasoningKey: 'reasoning_content',
+    });
+
+    expect(result).toBe('Reasoning summary text');
+  });
+
   it('should prefer visible OpenRouter content over reasoning_content on the same chunk', () => {
     const chunk: Partial<AIMessageChunk> = {
       content: 'Regular content',

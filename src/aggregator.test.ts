@@ -2,6 +2,9 @@ import type * as t from '@/types';
 import { GraphEvents, StepTypes, ContentTypes } from '@/common';
 import { createContentAggregator } from './stream';
 
+const bedrockModel = 'anthropic.claude-sonnet-5-v1:0';
+const anthropicModel = 'claude-sonnet-5';
+
 const createRunStep = (id: string): t.RunStep => ({
   id,
   stepIndex: 0,
@@ -63,6 +66,79 @@ describe('ContentAggregator empty deltas', () => {
     } finally {
       warnSpy.mockRestore();
     }
+  });
+});
+
+describe('ContentAggregator provider reasoning replay', () => {
+  const anthropic = (block: t.AnthropicReasoningReplayBlock) => ({
+    anthropic: { model: anthropicModel, blocks: [block] },
+  });
+  const bedrock = (block: t.BedrockReasoningReplayBlock) => ({
+    bedrock: { model: bedrockModel, blocks: [block] },
+  });
+  const aggregate = (replays: t.ProviderReasoningReplay[]) => {
+    const { contentParts, aggregateContent } = createContentAggregator();
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP,
+      data: createRunStep('step_reasoning'),
+    });
+    for (const provider_replay of replays) {
+      aggregateContent({
+        event: GraphEvents.ON_REASONING_DELTA,
+        data: {
+          id: 'step_reasoning',
+          delta: {
+            content: [{ type: ContentTypes.THINK, think: '', provider_replay }],
+          },
+        },
+      });
+    }
+    return contentParts[0] as t.ReasoningContentText;
+  };
+
+  it('merges streamed Anthropic thinking and signature into one block and keeps redacted blocks', () => {
+    const part = aggregate([
+      anthropic({ type: ContentTypes.THINKING, thinking: 'first ' }),
+      anthropic({ type: ContentTypes.THINKING, thinking: 'second' }),
+      anthropic({ type: ContentTypes.THINKING, signature: 'sig-abc' }),
+      anthropic({ type: 'redacted_thinking', data: 'opaque' }),
+    ]);
+
+    expect(part.provider_replay?.anthropic?.blocks).toEqual([
+      { type: ContentTypes.THINKING, thinking: 'first second', signature: 'sig-abc' },
+      { type: 'redacted_thinking', data: 'opaque' },
+    ]);
+  });
+
+  it('merges streamed Bedrock reasoning text and signature into one block', () => {
+    const part = aggregate([
+      bedrock({ type: ContentTypes.REASONING_CONTENT, reasoningText: { text: 'first ' } }),
+      bedrock({ type: ContentTypes.REASONING_CONTENT, reasoningText: { text: 'second' } }),
+      bedrock({ type: ContentTypes.REASONING_CONTENT, reasoningText: { signature: 'sig-abc' } }),
+    ]);
+
+    expect(part.provider_replay?.bedrock?.blocks).toEqual([
+      {
+        type: ContentTypes.REASONING_CONTENT,
+        reasoningText: { text: 'first second', signature: 'sig-abc' },
+      },
+    ]);
+  });
+
+  it('keeps consecutive blocks apart when only their signatures stream', () => {
+    const anthropicPart = aggregate(
+      ['sig-first', 'sig-second'].map((signature) =>
+        anthropic({ type: ContentTypes.THINKING, signature })
+      )
+    );
+    const bedrockPart = aggregate(
+      ['sig-first', 'sig-second'].map((signature) =>
+        bedrock({ type: ContentTypes.REASONING_CONTENT, reasoningText: { signature } })
+      )
+    );
+
+    expect(anthropicPart.provider_replay?.anthropic?.blocks).toHaveLength(2);
+    expect(bedrockPart.provider_replay?.bedrock?.blocks).toHaveLength(2);
   });
 });
 
