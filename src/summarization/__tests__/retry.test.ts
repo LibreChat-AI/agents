@@ -273,7 +273,7 @@ describe('withSummarizationRetry', () => {
     expect(classifySummarizationError(providerSignal.reason)).toBe('timeout');
     expect(operation).toHaveBeenCalledTimes(2);
     expect(onRetry.mock.calls).toEqual([
-      [{ attempt: 2, errorCode: 'timeout' }],
+      [{ attempt: 2, errorCode: 'timeout', delayMs: 375 }],
     ]);
     expect(controller.signal.aborted).toBe(false);
     expect(jest.getTimerCount()).toBe(0);
@@ -294,8 +294,8 @@ describe('withSummarizationRetry', () => {
 
     expect(operation).toHaveBeenCalledTimes(3);
     expect(onRetry.mock.calls).toEqual([
-      [{ attempt: 2, errorCode: 'timeout' }],
-      [{ attempt: 3, errorCode: 'timeout' }],
+      [{ attempt: 2, errorCode: 'timeout', delayMs: 375 }],
+      [{ attempt: 3, errorCode: 'timeout', delayMs: 750 }],
     ]);
     expect(classifySummarizationError(error)).toBe('timeout');
     expect(isProviderCancellation(error)).toBe(false);
@@ -344,6 +344,34 @@ describe('withSummarizationRetry', () => {
 
     await jest.advanceTimersByTimeAsync(0);
     expect(operation).toHaveBeenCalledTimes(1);
+    await jest.advanceTimersByTimeAsync(2499);
+    expect(operation).toHaveBeenCalledTimes(1);
+    await jest.advanceTimersByTimeAsync(1);
+    expect(operation).toHaveBeenCalledTimes(2);
+    await jest.advanceTimersByTimeAsync(4999);
+    expect(operation).toHaveBeenCalledTimes(2);
+    await jest.advanceTimersByTimeAsync(1);
+    await rejected;
+
+    expect(operation).toHaveBeenCalledTimes(3);
+    expect(onRetry.mock.calls).toEqual([
+      [{ attempt: 2, errorCode: 'provider_overloaded', delayMs: 2500 }],
+      [{ attempt: 3, errorCode: 'rate_limited', delayMs: 5000 }],
+    ]);
+    expect(Math.random).toHaveBeenCalledTimes(2);
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
+  it.each([
+    ['timeout', { status: 408 }],
+    ['server error', { status: 503 }],
+    ['reasoning-only summary', new ReasoningOnlySummaryError()],
+  ])('retains short exponential backoff for %s', async (_label, error) => {
+    const operation = jest.fn().mockRejectedValue(error);
+    const onRetry = jest.fn();
+    const pending = withSummarizationRetry(operation, { onRetry });
+    const rejected = expect(pending).rejects.toBe(error);
+
     await jest.advanceTimersByTimeAsync(374);
     expect(operation).toHaveBeenCalledTimes(1);
     await jest.advanceTimersByTimeAsync(1);
@@ -354,12 +382,230 @@ describe('withSummarizationRetry', () => {
     await rejected;
 
     expect(operation).toHaveBeenCalledTimes(3);
-    expect(onRetry.mock.calls).toEqual([
-      [{ attempt: 2, errorCode: 'provider_overloaded' }],
-      [{ attempt: 3, errorCode: 'rate_limited' }],
+    expect(onRetry.mock.calls.map(([retry]) => retry.delayMs)).toEqual([
+      375, 750,
     ]);
-    expect(Math.random).toHaveBeenCalledTimes(2);
     expect(jest.getTimerCount()).toBe(0);
+  });
+
+  it.each([0, 0.5, 0.999])(
+    'jitters backpressure delays in seconds (random=%s)',
+    async (random) => {
+      jest.mocked(Math.random).mockReturnValue(random);
+      const operation = jest.fn().mockRejectedValue({ status: 429 });
+      const onRetry = jest.fn();
+      const pending = withSummarizationRetry(operation, { onRetry });
+      const rejected = expect(pending).rejects.toEqual({ status: 429 });
+
+      await jest.runAllTimersAsync();
+      await rejected;
+
+      const delays = onRetry.mock.calls.map(([retry]) => retry.delayMs);
+      expect(delays).toEqual([
+        Math.floor(2000 * (1 + random * 0.5)),
+        Math.floor(4000 * (1 + random * 0.5)),
+      ]);
+      expect(operation).toHaveBeenCalledTimes(3);
+    }
+  );
+
+  const now = new Date('2026-10-28T11:00:00.125Z');
+  const headerCases = [
+    ['numeric seconds', { status: 429, headers: { 'retry-after': '8' } }, 8000],
+    [
+      'fractional seconds',
+      { status: 529, headers: { 'retry-after': '4.0001' } },
+      4001,
+    ],
+    [
+      'numeric record value',
+      { status: 429, headers: { 'Retry-After': 7 } },
+      7000,
+    ],
+    [
+      'HTTP date',
+      {
+        status: 429,
+        headers: { 'Retry-After': 'Wed, 28 Oct 2026 11:00:08 GMT' },
+      },
+      7875,
+    ],
+    [
+      'milliseconds',
+      { status: 429, headers: { 'retry-after-ms': '6100.1' } },
+      6101,
+    ],
+    [
+      'Headers instance',
+      { status: 529, headers: new Headers({ 'Retry-After': '9' }) },
+      9000,
+    ],
+    [
+      'Headers milliseconds',
+      { status: 503, headers: new Headers({ 'retry-after-ms': '1250' }) },
+      1250,
+    ],
+    [
+      'nested response headers',
+      {
+        response: { status: 429, headers: new Headers({ 'retry-after': '8' }) },
+      },
+      8000,
+    ],
+    [
+      'nested cause headers',
+      {
+        status: 429,
+        cause: { response: { headers: { 'RETRY-AFTER-MS': '7000' } } },
+      },
+      7000,
+    ],
+    [
+      'longest hint across headers',
+      {
+        status: 429,
+        headers: { 'retry-after': '8', 'retry-after-ms': '9000' },
+      },
+      9000,
+    ],
+    [
+      'longest nested hint',
+      {
+        status: 429,
+        headers: { 'retry-after': '4' },
+        response: { headers: { 'retry-after-ms': '8000' } },
+      },
+      8000,
+    ],
+    [
+      'seconds cap',
+      { status: 429, headers: { 'retry-after': '3600' } },
+      60_000,
+    ],
+    [
+      'milliseconds cap',
+      { status: 429, headers: { 'retry-after-ms': 3_600_000 } },
+      60_000,
+    ],
+    [
+      'HTTP date cap',
+      {
+        status: 429,
+        headers: { 'retry-after': 'Thu, 28 Oct 2027 11:00:00 GMT' },
+      },
+      60_000,
+    ],
+    [
+      'short hint retains baseline',
+      { status: 429, headers: { 'retry-after': '1' } },
+      2500,
+    ],
+    [
+      'zero retains baseline',
+      { status: 429, headers: { 'retry-after': '0' } },
+      2500,
+    ],
+    [
+      'zero retains short baseline',
+      { status: 503, headers: { 'retry-after': '0' } },
+      375,
+    ],
+    [
+      'past date retains baseline',
+      {
+        status: 429,
+        headers: { 'retry-after': 'Tue, 27 Oct 2026 11:00:00 GMT' },
+      },
+      2500,
+    ],
+  ] as const;
+
+  it.each(headerCases)(
+    'honors %s without undersleeping',
+    async (_label, error, delayMs) => {
+      jest.setSystemTime(now);
+      const operation = jest
+        .fn()
+        .mockRejectedValueOnce(error)
+        .mockResolvedValue('summary');
+      const onRetry = jest.fn();
+      const pending = withSummarizationRetry(operation, { onRetry });
+
+      await jest.advanceTimersByTimeAsync(delayMs - 1);
+      expect(operation).toHaveBeenCalledTimes(1);
+      expect(onRetry).toHaveBeenCalledWith({
+        attempt: 2,
+        errorCode: classifySummarizationError(error),
+        delayMs,
+      });
+      await jest.advanceTimersByTimeAsync(1);
+      await expect(pending).resolves.toBe('summary');
+      expect(operation).toHaveBeenCalledTimes(2);
+      expect(jest.getTimerCount()).toBe(0);
+    }
+  );
+
+  it.each([
+    '',
+    ' ',
+    'invalid',
+    '-1',
+    '-9999',
+    'Infinity',
+    'NaN',
+    '1e309',
+    '0x10',
+    '12 seconds',
+    Number.POSITIVE_INFINITY,
+    Number.NaN,
+    [],
+    {},
+  ])('ignores malformed retry hints %p', async (value) => {
+    jest.setSystemTime(now);
+    const operation = jest
+      .fn()
+      .mockRejectedValueOnce({
+        status: 429,
+        headers: { 'retry-after': value, 'retry-after-ms': value },
+      })
+      .mockResolvedValue('summary');
+    const onRetry = jest.fn();
+    const pending = withSummarizationRetry(operation, { onRetry });
+
+    await jest.advanceTimersByTimeAsync(2499);
+    expect(operation).toHaveBeenCalledTimes(1);
+    await jest.advanceTimersByTimeAsync(1);
+    await expect(pending).resolves.toBe('summary');
+    expect(onRetry).toHaveBeenCalledWith({
+      attempt: 2,
+      errorCode: 'rate_limited',
+      delayMs: 2500,
+    });
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
+  it('bounds cyclic header inspection and honors headers through depth four', async () => {
+    const error = { status: 429, cause: {} };
+    error.cause = error;
+    const operation = jest
+      .fn()
+      .mockRejectedValueOnce(error)
+      .mockRejectedValueOnce({
+        status: 429,
+        cause: {
+          cause: { cause: { cause: { headers: { 'retry-after': '10' } } } },
+        },
+      })
+      .mockResolvedValue('summary');
+    const onRetry = jest.fn();
+    const pending = withSummarizationRetry(operation, { onRetry });
+
+    await jest.runAllTimersAsync();
+    await expect(pending).resolves.toBe('summary');
+    expect(operation).toHaveBeenCalledTimes(3);
+    expect(onRetry.mock.calls.map(([retry]) => retry.delayMs)).toEqual([
+      2500, 10_000,
+    ]);
   });
 
   it('does not start a call for an already aborted signal', async () => {
@@ -403,13 +649,20 @@ describe('withSummarizationRetry', () => {
         controller.signal,
         'removeEventListener'
       );
-      const operation = jest.fn().mockRejectedValue({ status: 503 });
+      const operation = jest
+        .fn()
+        .mockRejectedValue({
+          status: 429,
+          response: { headers: new Headers({ 'retry-after': '120' }) },
+        });
       const pending = withSummarizationRetry(operation, {
         signal: controller.signal,
       });
       const rejected = expect(pending).rejects.toBe(reason);
       await jest.advanceTimersByTimeAsync(0);
       expect(jest.getTimerCount()).toBe(1);
+      await jest.advanceTimersByTimeAsync(30_000);
+      expect(operation).toHaveBeenCalledTimes(1);
 
       controller.abort(reason);
       await rejected;
@@ -459,7 +712,7 @@ describe('withSummarizationRetry', () => {
     const removeListener = jest.spyOn(controller.signal, 'removeEventListener');
     const operation = jest
       .fn()
-      .mockRejectedValueOnce({ status: 503 })
+      .mockRejectedValueOnce({ status: 429, headers: { 'retry-after': '8' } })
       .mockResolvedValue('summary');
     const pending = withSummarizationRetry(operation, {
       signal: controller.signal,
@@ -479,7 +732,11 @@ describe('withSummarizationRetry', () => {
   it('does not send provider text to onRetry', async () => {
     const operation = jest
       .fn()
-      .mockRejectedValueOnce(new Error('Overloaded: secret provider body'))
+      .mockRejectedValueOnce(
+        Object.assign(new Error('Overloaded: secret provider body'), {
+          headers: { authorization: 'secret header', 'retry-after': '4' },
+        })
+      )
       .mockResolvedValue('summary');
     const onRetry = jest.fn();
     const pending = withSummarizationRetry(operation, { onRetry });
@@ -488,7 +745,7 @@ describe('withSummarizationRetry', () => {
     await pending;
 
     expect(onRetry.mock.calls).toEqual([
-      [{ attempt: 2, errorCode: 'provider_overloaded' }],
+      [{ attempt: 2, errorCode: 'provider_overloaded', delayMs: 4000 }],
     ]);
   });
 });

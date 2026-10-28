@@ -101,6 +101,8 @@ async function createCompactingRun(
       summarizationEnabled: true,
       summarizationConfig: {
         provider: Providers.OPENAI,
+        prompt: 'Write a checkpoint.',
+        maxSummaryTokens: 128,
         retainRecent,
       },
     },

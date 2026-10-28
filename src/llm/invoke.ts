@@ -1672,6 +1672,7 @@ export async function tryFallbackProviders({
     provider: t.ProviderName;
     clientOptions?: t.ClientOptions;
     maxContextTokens?: number;
+    contextBudgetMode?: t.ContextBudgetMode;
     config?: RunnableConfig;
   }) => PreparedProviderRequest | Promise<PreparedProviderRequest>;
   /** @deprecated Return a `PreparedProviderRequest` instead. */
@@ -1681,6 +1682,7 @@ export async function tryFallbackProviders({
     provider: t.ProviderName;
     clientOptions?: t.ClientOptions;
     maxContextTokens?: number;
+    contextBudgetMode?: t.ContextBudgetMode;
     config?: RunnableConfig;
   }) => BaseMessage[] | Promise<BaseMessage[]>;
 }): Promise<Partial<t.BaseGraphState> | undefined> {
@@ -1734,6 +1736,7 @@ export async function tryFallbackProviders({
         provider: fb.provider,
         clientOptions: fb.clientOptions,
         maxContextTokens: fb.maxContextTokens,
+        contextBudgetMode: fb.contextBudgetMode,
         config: fbConfig,
       };
       const preparedRequest = await prepareFallbackRequest?.(preparationInput);

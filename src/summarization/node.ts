@@ -190,6 +190,8 @@ function buildSummarizationClientConfig(
     clientOptions.modelName = modelName;
   }
 
+  // Agent output limits belong to ordinary turns, not checkpoint generation.
+  if (llmParams[getMaxOutputTokensKey(provider)] == null) delete clientOptions[getMaxOutputTokensKey(provider)];
   const effectiveMaxSummaryTokens =
     paramMaxSummaryTokens ??
     summarizationConfig?.maxSummaryTokens ??
@@ -366,6 +368,7 @@ async function prepareSummarizationBudget({
   clientOptions,
   maxContextTokens,
   outputTokens,
+  contextBudgetMode = 'input',
   instruction,
   tools,
   config,
@@ -375,6 +378,7 @@ async function prepareSummarizationBudget({
   clientOptions?: t.ClientOptions;
   maxContextTokens?: number;
   outputTokens: number;
+  contextBudgetMode?: t.ContextBudgetMode;
   instruction: string;
   tools?: t.GraphTools;
   config?: RunnableConfig;
@@ -419,7 +423,7 @@ async function prepareSummarizationBudget({
       : Math.floor(
         (maxContextTokens -
             overhead -
-            outputTokens -
+            (contextBudgetMode === 'window' ? outputTokens : 0) -
             count(new HumanMessage(instruction))) /
             ratio
       );
@@ -674,6 +678,7 @@ function describeFallbackError(
 async function executeSummarizationWithFallback(params: {
   agentContext: AgentContext;
   messages: BaseMessage[];
+  requiredHeadLength: number;
   clientConfig: SummarizationClientConfig;
   summarizeConfig?: RunnableConfig;
   stepId: string;
@@ -700,6 +705,7 @@ async function executeSummarizationWithFallback(params: {
   const {
     agentContext,
     messages,
+    requiredHeadLength,
     clientConfig,
     summarizeConfig,
     stepId,
@@ -763,6 +769,7 @@ async function executeSummarizationWithFallback(params: {
           model: summarizationModel,
           tools: summarizationTools,
           messages,
+          requiredHeadLength,
           promptText: clientConfig.promptText,
           updatePromptText: clientConfig.updatePromptText,
           priorSummaryText,
@@ -868,6 +875,8 @@ async function executeSummarizationWithFallback(params: {
             ...fallback,
             clientOptions,
             maxContextTokens,
+            contextBudgetMode: fallback.contextBudgetMode ?? (fallback.maxContextTokens == null
+              ? agentContext.summarizationConfig?.contextBudgetMode ?? 'input' : 'window'),
           } as t.FallbackConfig;
         });
         let fallbackIdentity: {provider: string; model?: string} | undefined;
@@ -891,6 +900,7 @@ async function executeSummarizationWithFallback(params: {
             provider,
             clientOptions,
             maxContextTokens,
+            contextBudgetMode,
             config,
           }) => {
             config?.signal?.throwIfAborted();
@@ -905,17 +915,15 @@ async function executeSummarizationWithFallback(params: {
               provider,
               clientOptions,
               maxContextTokens,
-              outputTokens: resolveSummaryOutputTokens(
-                provider,
-                { ...clientOptions },
-                maxContextTokens
-              ),
+              contextBudgetMode,
+              outputTokens: resolveSummaryOutputTokens(provider, {...clientOptions}, maxContextTokens),
               instruction,
               tools: fallbackTools,
               config,
             });
             const bounded = boundSummarizationInput({
               messages,
+              requiredHeadLength,
               tokenCounter: count,
               budget,
               provider,
@@ -954,7 +962,7 @@ async function executeSummarizationWithFallback(params: {
             }}, config);
             config?.signal?.throwIfAborted();
             const response = result.messages?.[0];
-            if (response != null && isReasoningOnlySummary(response)) throw new ReasoningOnlySummaryError();
+            validateSummaryResponse(response);
             return result;
           }, {signal: config?.signal, onRetry: retry => log('debug', 'Retrying fallback summarization', retry)}),
         });
@@ -1411,13 +1419,7 @@ export function createSummarizeNode({
       }),
     });
 
-    const hasPrunedHistory =
-      windowMessages.length > 0 &&
-      windowMessages.length < state.messages.length;
-    const messagesToRefine =
-      compactableHead.length > 0 || !hasPrunedHistory
-        ? compactableHead
-        : windowMessages;
+    const messagesToRefine = compactableHead;
 
     if (messagesToRefine.length === 0) {
       if (request.reason === 'manual') {
@@ -1617,6 +1619,7 @@ export function createSummarizeNode({
     } = await executeSummarizationWithFallback({
       agentContext,
       messages: windowMessages,
+      requiredHeadLength: messagesToRefine.length,
       onUsage: attempt => {
         attemptUsage.push(attempt);
         runStep.usage = buildSummarizationStepUsage(attemptUsage);
@@ -1833,6 +1836,26 @@ function extractResponseText(response: { content: string | object }): string {
   return parts.join('').trim();
 }
 
+class ToolOnlySummaryError extends ReasoningOnlySummaryError {
+  constructor() {
+    super();
+    this.name = 'ToolOnlySummaryError';
+    this.message = 'The summarizer requested tools instead of summary text';
+  }
+}
+
+function validateSummaryResponse(response: BaseMessage | undefined): void {
+  if (response == null) return;
+  if (isReasoningOnlySummary(response)) throw new ReasoningOnlySummaryError();
+  if (extractResponseText(response) === '' && 'tool_calls' in response && Array.isArray(response.tool_calls) && response.tool_calls.length > 0) {
+    const kwargs = response.additional_kwargs as {refusal?: string} | undefined;
+    if (kwargs?.refusal != null || getProviderStopReasons(response).some(reason =>
+      reason !== 'end_turn' && reason !== 'stop' && reason !== 'tool_use' && reason !== 'tool_calls'
+    )) return;
+    throw new ToolOnlySummaryError();
+  }
+}
+
 function isReasoningOnlySummary(response: BaseMessage): boolean {
   const kwargs = response.additional_kwargs as (BaseMessage['additional_kwargs'] & {refusal?: string}) | undefined;
   if (kwargs?.refusal != null || getProviderStopReasons(response).some(
@@ -2027,6 +2050,7 @@ async function summarizeWithCacheHit({
   model,
   tools,
   messages,
+  requiredHeadLength,
   promptText,
   updatePromptText,
   priorSummaryText,
@@ -2049,6 +2073,7 @@ async function summarizeWithCacheHit({
   model: t.ChatModel;
   tools?: t.GraphTools;
   messages: BaseMessage[];
+  requiredHeadLength: number;
   promptText: string;
   updatePromptText?: string;
   priorSummaryText: string;
@@ -2077,6 +2102,7 @@ async function summarizeWithCacheHit({
     clientOptions,
     maxContextTokens: agentContext.maxContextTokens,
     outputTokens,
+    contextBudgetMode: agentContext.summarizationConfig?.contextBudgetMode,
     instruction,
     tools,
     config,
@@ -2097,6 +2123,7 @@ async function summarizeWithCacheHit({
     signalConfig?.signal?.throwIfAborted();
     const boundedHistory = boundSummarizationInput({
       messages,
+      requiredHeadLength,
       tokenCounter: count,
       budget: Math.floor(
         Math.min(
@@ -2146,7 +2173,7 @@ async function summarizeWithCacheHit({
       );
       const response = result.messages?.[0];
       signalConfig?.signal?.throwIfAborted();
-      if (response != null && isReasoningOnlySummary(response)) throw new ReasoningOnlySummaryError();
+      validateSummaryResponse(response);
       if (response != null && extractResponseText(response) !== '') {
         await flushSummarizationDeltas(pendingDeltas, config, graph);
       }

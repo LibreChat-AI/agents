@@ -229,30 +229,23 @@ describe('compaction request windows', () => {
     }
   );
 
-  it.each(['manual', 'trigger', 'overflow'] as const)(
-    'does not skip %s when pruning leaves only the retained recent turn',
-    async (reason) => {
-      const { node, model, agentContext } = harness();
-      const messages = history(360);
-      const windowMessages = messages.slice(reason === 'overflow' ? -4 : -2);
-      const result = await node(
-        {
-          messages,
-          summarizationRequest: {
-            agentId: 'agent',
-            remainingContextTokens: 0,
-            reason,
-            allowSummarization: true,
-            windowMessages,
-          },
-        },
-        {}
-      );
-      expect(model.calls).toHaveLength(1);
-      expect(agentContext.getSummaryText()).toBe('CLEAN_SUMMARY');
-      expect(result.messages?.slice(1)).toEqual(windowMessages);
-    }
-  );
+  it.each(['trigger', 'overflow'] as const)('skips %s when the entire visible window would be retained', async reason => {
+    const {node, model, agentContext} = harness();
+    const messages = history(360);
+    const windowMessages = messages.slice(-2);
+    const result = await node({messages, summarizationRequest: {agentId: 'agent', remainingContextTokens: 0, reason, allowSummarization: true, windowMessages}}, {});
+    expect(model.calls).toHaveLength(0);
+    expect(agentContext.getSummaryText()).toBeUndefined();
+    expect(result.messages).toBeUndefined();
+  });
+
+  it('reports nothing to compact rather than duplicating an entirely retained visible window', async () => {
+    const {node, model} = harness();
+    const messages = history(360);
+    await expect(node({messages, summarizationRequest: {agentId: 'agent', remainingContextTokens: 0, reason: 'manual', windowMessages: messages.slice(-2)}}, {}))
+      .rejects.toMatchObject({reason: 'nothing_to_summarize'});
+    expect(model.calls).toHaveLength(0);
+  });
 
   it.each(['manual', 'trigger', 'overflow'] as const)(
     'keeps paired recent tool results when the %s window starts mid-turn',
@@ -317,8 +310,8 @@ describe('compaction request windows', () => {
   });
 
   it('reserves instruction and output space without splitting parallel tool calls', async () => {
-    const { node, model, agentContext } = harness({ maxContextTokens: 2_000 });
-    const messages = history(30);
+    const { node, model, agentContext } = harness({ maxContextTokens: 2_000, summarizationConfig: {maxSummaryTokens: 128, contextBudgetMode: 'window'} });
+    const messages = history(15);
     messages.push(new HumanMessage('newest exchange'));
     messages.push(
       new AIMessage({
@@ -366,32 +359,17 @@ describe('compaction request windows', () => {
     ).toBe(true);
   });
 
-  it('shrinks an overflow window before sending it and retries context rejections smaller', async () => {
-    const { node, model } = harness();
+  it('preserves the visible head when context rejections cannot fit it without dropping messages', async () => {
+    const {node, model, agentContext} = harness();
     const messages = history(30);
-    model.failure = (sent) =>
-      sent.length > 24
-        ? new Error('maximum context length exceeded')
-        : undefined;
-    const result = await node(
-      {
-        messages,
-        summarizationRequest: {
-          agentId: 'agent',
-          remainingContextTokens: 0,
-          reason: 'overflow',
-          allowSummarization: true,
-          windowMessages: messages,
-        },
-      },
-      {}
-    );
-    expect(model.calls.length).toBeGreaterThan(1);
-    expect(model.calls[0].length).toBeLessThan(messages.length);
-    for (let i = 1; i < model.calls.length; i++)
-      expect(model.calls[i].length).toBeLessThan(model.calls[i - 1].length);
-    for (const sent of model.calls) expect(sent).toContain(messages.at(-1));
-    expect(result.messages?.[0].getType()).toBe('remove');
+    const before = JSON.stringify(messages);
+    model.failure = sent => sent.length > 24 ? new Error('maximum context length exceeded') : undefined;
+    const result = await node({messages, summarizationRequest: {agentId: 'agent', remainingContextTokens: 0, reason: 'overflow', allowSummarization: true, windowMessages: messages}}, {});
+    expect(model.calls.length).toBeLessThanOrEqual(5);
+    for (const sent of model.calls) expect(sent.slice(1, -1)).toEqual(messages.slice(0, -4));
+    expect(result.messages).toBeUndefined();
+    expect(JSON.stringify(messages)).toBe(before);
+    expect(agentContext.getSummaryText()).toBeUndefined();
   });
 
   it('discards partial output from an overloaded attempt before retrying', async () => {
@@ -592,7 +570,7 @@ describe('compaction request windows', () => {
         ],
       },
       summarizationConfig: {
-        maxSummaryTokens: 1_000,
+        maxSummaryTokens: 1_000, contextBudgetMode: 'window',
         prompt: 'Write a checkpoint.',
         retainRecent: { turns: 0 },
       },
@@ -659,7 +637,7 @@ describe('compaction request windows', () => {
         ],
       },
       summarizationConfig: {
-        maxSummaryTokens: 1_000,
+        maxSummaryTokens: 1_000, contextBudgetMode: 'window',
         prompt: 'Write a checkpoint.',
         retainRecent: { turns: 0 },
       },
@@ -888,15 +866,8 @@ describe('compaction request windows', () => {
         },
         {}
       );
-      expect(fallback.calls).toHaveLength(1);
-      expect(fallback.calls[0]).toContain(newest);
-      expect(
-        fallback.calls[0].reduce(
-          (total, message) => total + claudeCount(message),
-          64
-        )
-      ).toBeLessThanOrEqual(512);
-      expect(agentContext.getSummaryText()).toBe('CLEAN_SUMMARY');
+      expect(fallback.calls).toHaveLength(0);
+      expect(agentContext.getSummaryText()).toBeUndefined();
     }
   );
 
@@ -1072,7 +1043,6 @@ describe('compaction request windows', () => {
     { response_metadata: { stop_reason: 'refusal' } },
     { response_metadata: { stop_reason: 'stop_sequence' } },
     { additional_kwargs: { refusal: 'Cannot comply' } },
-    { tool_calls: [{ id: 'tool', name: 'search', args: {} }] },
   ])(
     'does not retry known truncation, refusal, or tool-use outcomes as reasoning-only: %j',
     async (extra) => {
@@ -1547,7 +1517,7 @@ describe('compaction request windows', () => {
     {provider: Providers.VERTEXAI, options: {thinkingConfig: {thinkingBudget: 8192}}, expected: 12288},
     {provider: Providers.GOOGLE, options: {thinkingConfig: {thinkingBudget: -1}}, expected: 4096},
     {provider: Providers.VERTEXAI, options: {thinkingConfig: {thinkingBudget: 8192, thinkingLevel: 'HIGH' as const}}, expected: 4096},
-    {provider: Providers.GOOGLE, options: {thinkingConfig: {thinkingBudget: 8192}, maxOutputTokens: 1024}, expected: 1024},
+    {provider: Providers.GOOGLE, options: {thinkingConfig: {thinkingBudget: 8192}, maxOutputTokens: 1024}, expected: 12288},
   ])('reserves the serving Google fixed thinking budget without overriding explicit caps: %j', async ({provider, options, expected}) => {
     const {node, model} = harness({provider, maxContextTokens: 100_000, clientOptions: options, summarizationConfig: {}});
     const messages = history(6);
@@ -1620,12 +1590,12 @@ describe('compaction request windows', () => {
 
   it('reserves the configured Google thinking allowance in the request input budget', async () => {
     const {node, model} = harness({provider: Providers.GOOGLE, maxContextTokens: 20_000,
-      clientOptions: {thinkingConfig: {thinkingBudget: 8192}}, summarizationConfig: {},
+      clientOptions: {thinkingConfig: {thinkingBudget: 8192}}, summarizationConfig: {contextBudgetMode: 'window', retainRecent: {turns: 0}},
     });
-    const messages = history(200);
+    const messages = history(100);
     await node({messages, summarizationRequest: {agentId: 'agent', remainingContextTokens: 0, windowMessages: messages}}, {});
     expect(model.calls).toHaveLength(1);
-    expect(model.calls[0].length).toBeLessThan(messages.length);
+    expect(model.calls[0]).toHaveLength(messages.length + 2);
     expect(model.calls[0].reduce((total, message) => total + count(message), 10192)).toBeLessThanOrEqual(20_000);
     expect(init.initializeModel).toHaveBeenCalledWith(expect.objectContaining({clientOptions: expect.objectContaining({maxOutputTokens: 10192})}));
   });
@@ -1737,17 +1707,36 @@ describe('compaction request windows', () => {
         maxContextTokens, clientOptions: {model: 'production', maxTokens: 128},
       }] : []},
       summarizationConfig: {provider: mode === 'dedicated' ? Providers.ANTHROPIC : undefined,
-        prompt: 'Checkpoint.', maxSummaryTokens: 128, retainRecent: {turns: 0}},
+        prompt: 'Checkpoint.', maxSummaryTokens: 128, contextBudgetMode: 'window', retainRecent: {turns: 0}},
     });
     await agentContext.tokenCalculationPromise;
     jest.spyOn(init, 'initializeModel').mockImplementation(({provider}) => provider === Providers.ANTHROPIC ? secondary : primary);
-    const messages = history(150);
+    const messages = history(3);
     await node({messages, summarizationRequest: {agentId: 'agent', remainingContextTokens: 0, windowMessages: messages}}, {});
     expect(secondary.calls).toHaveLength(1);
-    expect(secondary.calls[0].length).toBeLessThan(messages.length);
+    expect(secondary.calls[0].length).toBe(messages.length + 1);
     expect(secondary.calls[0].reduce((total, message) => total + countClaude(message), toolTokens + 128)).toBeLessThanOrEqual(maxContextTokens);
     expect(init.initializeModel).toHaveBeenCalledWith(expect.objectContaining({provider: Providers.ANTHROPIC, tools}));
     expect(agentContext.getSummaryText()).toBe('CLEAN_SUMMARY');
+  });
+
+  it('retries an Anthropic tool-only summary without executing the tool or changing request options', async () => {
+    jest.useFakeTimers();
+    const model = new SummaryModel();
+    Object.defineProperty(model, 'stream', {value: undefined});
+    const invoke = jest.spyOn(model, 'invoke').mockResolvedValueOnce(new AIMessageChunk({content: '',
+      tool_calls: [{id: 'calculator', name: 'calculator', args: {expression: '2+2'}}],
+      response_metadata: {stop_reason: 'tool_use'},
+    })).mockResolvedValue(new AIMessageChunk('CLEAN_SUMMARY'));
+    const {node, emitted, agentContext} = harness({provider: Providers.ANTHROPIC, model});
+    const messages = history(6);
+    const pending = node({messages, summarizationRequest: {agentId: 'agent', remainingContextTokens: 0, reason: 'manual', windowMessages: messages}}, {});
+    await jest.runAllTimersAsync(); await pending;
+    expect(invoke).toHaveBeenCalledTimes(2);
+    expect(invoke.mock.calls[1][0]).toEqual(invoke.mock.calls[0][0]);
+    expect(agentContext.getSummaryText()).toBe('CLEAN_SUMMARY');
+    expect(emitted.filter(({event}) => event === GraphEvents.ON_SUMMARIZE_COMPLETE)).toHaveLength(1);
+    expect(JSON.stringify(emitted.filter(({event}) => event === GraphEvents.ON_SUMMARIZE_COMPLETE))).not.toContain('calculator');
   });
 
   const cancellations = [

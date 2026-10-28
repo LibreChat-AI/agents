@@ -99,7 +99,6 @@ export function initializeModel<P extends t.ProviderName>({
   const family = getProviderFamily(provider);
   const canDisableTools =
     family === 'openai' ||
-    family === 'anthropic' ||
     family === 'google' ||
     provider === Providers.MOONSHOT;
   if (disableToolCalling !== true || !canDisableTools)

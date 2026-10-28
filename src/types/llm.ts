@@ -226,9 +226,13 @@ export type ProviderClientOptionsConfig =
       clientOptions: ClientOptions;
     };
 
+export type ContextBudgetMode = 'input' | 'window';
+
 export type FallbackConfig = ProviderClientOptionsConfig & {
   /** Context window used to corroborate ambiguous fallback overflow errors. */
   maxContextTokens?: number;
+  /** Explicit fallback ceilings default to full-window budgets. */
+  contextBudgetMode?: ContextBudgetMode;
 };
 
 type LLMConfigFor<P extends CustomProviderName> = SharedLLMConfig<P> &

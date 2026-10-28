@@ -1,6 +1,6 @@
 import type { UsageMetadata, BaseMessage } from '@langchain/core/messages';
+import type { ProviderName, ContextBudgetMode } from '@/types/llm';
 import type { SummaryContentBlock } from '@/types/stream';
-import type { ProviderName } from '@/types/llm';
 
 export type SummarizationTrigger = {
   type:
@@ -98,6 +98,8 @@ export type SummarizationConfig = {
   updatePrompt?: string;
   trigger?: SummarizationTrigger;
   maxSummaryTokens?: number;
+  /** maxContextTokens is an input ceiling by default; use window for a full model window. */
+  contextBudgetMode?: ContextBudgetMode;
   /** Fraction of the token budget reserved as headroom (0–1). Defaults to 0.05. */
   reserveRatio?: number;
   /**

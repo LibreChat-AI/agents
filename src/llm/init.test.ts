@@ -23,7 +23,7 @@ const tools: t.GraphTools = [
   },
 ];
 
-it('disables tool calls on a thinking summary while preserving the normal Anthropic tool prefix', () => {
+it('preserves the normal Anthropic tool prefix and thinking options on summaries', () => {
   const model = new CustomAnthropic({
     apiKey: 'offline-test',
     model: 'claude-haiku-4-5',
@@ -48,12 +48,85 @@ it('disables tool calls on a thinking summary while preserving the normal Anthro
     throw new Error('Expected tool bindings');
   const normalParams = model.invocationParams(normal.config);
   const summaryParams = model.invocationParams(summary.config);
-  expect(summaryParams.tool_choice).toEqual({ type: 'none' });
   expect(normalParams.tool_choice).toBeUndefined();
+  expect(summaryParams.tool_choice).toBeUndefined();
+  expect(summaryParams.tool_choice).toEqual(normalParams.tool_choice);
   expect(summaryParams.tools).toEqual(normalParams.tools);
   expect(summaryParams.thinking).toEqual(normalParams.thinking);
   expect(summaryParams.max_tokens).toBe(2048);
 });
+
+it.each(['auto', 'none', 'calculate'])(
+  'preserves the normal Anthropic binding with an unbound client tool_choice of %s',
+  (tool_choice) => {
+    const clientOptions = {
+      apiKey: 'offline-test',
+      model: 'claude-haiku-4-5',
+      tool_choice,
+    };
+    const model = new CustomAnthropic(clientOptions);
+    const bindTools = jest.spyOn(model, 'bindTools');
+    const normal = initializeModel({
+      provider: Providers.ANTHROPIC,
+      clientOptions,
+      override: model,
+      tools,
+    });
+    const summary = initializeModel({
+      provider: Providers.ANTHROPIC,
+      clientOptions,
+      override: model,
+      tools,
+      disableToolCalling: true,
+    });
+    if (
+      !(normal instanceof RunnableBinding) ||
+      !(summary instanceof RunnableBinding)
+    )
+      throw new Error('Expected tool bindings');
+
+    expect(bindTools).toHaveBeenNthCalledWith(1, tools);
+    expect(bindTools).toHaveBeenNthCalledWith(2, tools);
+    expect(summary.config).toEqual(normal.config);
+    expect(normal.config).not.toHaveProperty('tool_choice');
+    expect(model.invocationParams(normal.config).tool_choice).toBeUndefined();
+    expect(model.invocationParams(summary.config).tool_choice).toBeUndefined();
+    bindTools.mockRestore();
+  }
+);
+
+it.each(['auto', 'none'] as const)(
+  'preserves an explicit Anthropic invocation default of %s on summaries',
+  (type) => {
+    const model = new CustomAnthropic({
+      apiKey: 'offline-test',
+      model: 'claude-haiku-4-5',
+      invocationKwargs: { tool_choice: { type } },
+    });
+    const normal = initializeModel({
+      provider: Providers.ANTHROPIC,
+      override: model,
+      tools,
+    });
+    const summary = initializeModel({
+      provider: Providers.ANTHROPIC,
+      override: model,
+      tools,
+      disableToolCalling: true,
+    });
+    if (
+      !(normal instanceof RunnableBinding) ||
+      !(summary instanceof RunnableBinding)
+    )
+      throw new Error('Expected tool bindings');
+    const normalParams = model.invocationParams(normal.config);
+    const summaryParams = model.invocationParams(summary.config);
+
+    expect(normalParams.tool_choice).toEqual({ type });
+    expect(summaryParams.tool_choice).toEqual(normalParams.tool_choice);
+    expect(summaryParams.tools).toEqual(normalParams.tools);
+  }
+);
 
 it('preserves OpenAI tool definitions when disabling summary tool calls', () => {
   const model = new ChatOpenAI({

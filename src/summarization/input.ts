@@ -5,7 +5,6 @@ import {
   cloneToolMessageWithContent,
   compactToolContent,
 } from '@/utils/toolContent';
-import { getPairingBalancedSuffixStarts } from '@/messages/recency';
 
 export const DEFAULT_SUMMARY_OUTPUT_TOKENS = 4_096;
 export const DEFAULT_RETAIN_RECENT_TOKENS = 16_000;
@@ -17,18 +16,19 @@ export class SummarizationInputTooLargeError extends Error {
   }
 }
 
-/** Bounds a provider window without ever removing its newest exchange. */
+/** Compresses tool output, then omits only the tail retained verbatim after compaction. */
 export function boundSummarizationInput({
   messages,
   tokenCounter,
   budget,
-  provider,
+  requiredHeadLength = messages.length,
   shrink = false,
 }: {
   messages: BaseMessage[];
   tokenCounter: TokenCounter;
   budget: number;
   provider: ProviderName;
+  requiredHeadLength?: number;
   shrink?: boolean;
 }): BaseMessage[] {
   const counts = new WeakMap<BaseMessage, number>();
@@ -39,6 +39,9 @@ export function boundSummarizationInput({
     counts.set(message, tokens);
     return tokens;
   };
+  if (!Number.isSafeInteger(requiredHeadLength) || requiredHeadLength < 0 || requiredHeadLength > messages.length) {
+    throw new SummarizationInputTooLargeError();
+  }
   let total = 0;
   for (const message of messages) total += count(message);
   if (!shrink && total <= budget) return messages;
@@ -51,24 +54,28 @@ export function boundSummarizationInput({
     const candidate = cloneToolMessageWithContent(message, result.content);
     return count(candidate) < count(message) ? candidate : message;
   });
-  const minimumSuffix = new Array<number>(messages.length + 1);
-  const toolCounts = new Array<number>(messages.length + 1);
-  minimumSuffix[messages.length] = 0;
-  toolCounts[messages.length] = 0;
-  for (let i = messages.length - 1; i >= 0; i--) {
-    minimumSuffix[i] = minimumSuffix[i + 1] + count(minimal[i]);
-    toolCounts[i] = toolCounts[i + 1] + Number(messages[i] instanceof ToolMessage);
+  let minimumTokens = 0;
+  let requiredTokens = 0;
+  let toolCount = 0;
+  let requiredToolCount = 0;
+  for (let i = 0; i < messages.length; i++) {
+    const tokens = count(minimal[i]);
+    minimumTokens += tokens;
+    if (messages[i] instanceof ToolMessage) toolCount++;
+    if (i < requiredHeadLength) {
+      requiredTokens += tokens;
+      if (messages[i] instanceof ToolMessage) requiredToolCount++;
+    }
   }
-  const starts = getPairingBalancedSuffixStarts(messages, provider);
-  const start = starts.find((index) => minimumSuffix[index] <= budget);
-  if (start == null) throw new SummarizationInputTooLargeError();
-
-  const additionalTokens = budget - minimumSuffix[start];
-  const maxChars = Math.max(0, Math.floor((additionalTokens * 2) / Math.max(1, toolCounts[start])));
+  const includesTail = minimumTokens <= budget;
+  if (!includesTail && requiredTokens > budget) throw new SummarizationInputTooLargeError();
+  const end = includesTail ? messages.length : requiredHeadLength;
+  const additionalTokens = budget - (includesTail ? minimumTokens : requiredTokens);
+  const maxChars = Math.max(0, Math.floor((additionalTokens * 2) / Math.max(1, includesTail ? toolCount : requiredToolCount)));
   for (const scale of [1, 0.5, 0.25, 0.125, 0]) {
     let tokens = 0;
     const candidate: BaseMessage[] = [];
-    for (let i = start; i < messages.length; i++) {
+    for (let i = 0; i < end; i++) {
       const original = messages[i];
       let message = original;
       if (original instanceof ToolMessage) {

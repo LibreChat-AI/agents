@@ -282,7 +282,7 @@ describe('createSummarizeNode', () => {
       Providers.ANTHROPIC,
       expect.objectContaining({ promptCache: true })
     );
-    expect(bindTools).toHaveBeenCalledWith(projectedTools, { tool_choice: 'none' });
+    expect(bindTools).toHaveBeenCalledWith(projectedTools);
   });
 
   it('keeps cached raw history identical when semantic guidance is appended', async () => {
@@ -1929,13 +1929,14 @@ describe('createSummarizeNode — overflow recovery', () => {
         }
       } as never
     );
-    const agentContext = createAgentContext();
+    const agentContext = createAgentContext({tokenCounter: (message: BaseMessage) => Math.ceil(JSON.stringify(message.content).length / 4) + 4, summarizationConfig: {retainRecent: {turns: 0}}});
     const graph = mockGraph(() => {});
     const node = createSummarizeNode({ agentContext, graph, generateStepId });
 
     await node(
       {
-        messages: [new HumanMessage('Hello'), new HumanMessage('World')],
+        messages: [new HumanMessage('Hello'), new AIMessage({content: '', tool_calls: [{id: 'compressible', name: 'search', args: {}}]}),
+          new ToolMessage({content: 'x'.repeat(4000), tool_call_id: 'compressible'}), new AIMessage('World')],
         summarizationRequest: {
           remainingContextTokens: 0,
           agentId: 'agent_0',
@@ -2178,7 +2179,7 @@ describe('createSummarizeNode — empty summarizer output', () => {
     expect(agentContext.getSummaryText()).toContain('A real checkpoint');
   });
 
-  it('counts input-bound rejections and provider failures toward the failure cap', async () => {
+  it('counts provider failures toward the failure cap without weakening required-head coverage', async () => {
     const events = captureEvents();
 
     const invoke = jest.fn().mockRejectedValue(new Error('provider down'));
@@ -2190,7 +2191,7 @@ describe('createSummarizeNode — empty summarizer output', () => {
       } as never
     );
 
-    const agentContext = createAgentContext({ tokenCounter: () => 10 });
+    const agentContext = createAgentContext({ tokenCounter: () => 10, summarizationConfig: {retainRecent: {turns: 0}} });
     const node = createSummarizeNode({
       agentContext,
       graph: mockGraph() as never,
@@ -2207,19 +2208,17 @@ describe('createSummarizeNode — empty summarizer output', () => {
           summarizationRequest: {
             remainingContextTokens: 0,
             agentId: 'agent_0',
-            reason: 'overflow',
+            reason: 'trigger',
             allowSummarization: true,
           },
         },
         {} as RunnableConfig
       );
       expect(result.messages).toBeUndefined();
-      if (attempt === 0) {
-        expect(invoke).not.toHaveBeenCalled();
-      }
+
     }
 
-    expect(invoke).toHaveBeenCalledTimes(2);
+    expect(invoke).toHaveBeenCalledTimes(3);
     expect(agentContext.summarizationFailures).toBe(3);
     expect(agentContext.summarizationExhausted).toBe(true);
     expect(agentContext.hasSummary()).toBe(false);
@@ -2227,7 +2226,7 @@ describe('createSummarizeNode — empty summarizer output', () => {
       events
         .filter((event) => event.event === GraphEvents.ON_SUMMARIZE_COMPLETE)
         .map((event) => (event.data as t.SummarizeCompleteEvent).errorCode)
-    ).toEqual(['context_exceeded', 'unknown', 'unknown']);
+    ).toEqual(['unknown', 'unknown', 'unknown']);
   });
 });
 
