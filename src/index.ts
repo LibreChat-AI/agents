@@ -27,6 +27,7 @@ export * from './tools/subagent';
 export * from './tools/ReadFile';
 export * from './tools/skillCatalog';
 export * from './tools/ToolSearch';
+export { TOOL_DISPATCHER_NAME } from './tools/toolDispatch';
 export * from './tools/ToolNode';
 export * from './tools/intentArg';
 export * from './tools/schema';

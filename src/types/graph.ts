@@ -36,6 +36,7 @@ import type {
   ToolEndEvent,
   GenericTool,
   LCTool,
+  ToolDispatchOptions,
   ToolExecutionConfig,
   ToolExecuteBatchRequest,
 } from '@/types/tools';
@@ -1039,6 +1040,14 @@ interface AgentInputFields {
    * ON_TOOL_EXECUTE events instead of invoking tools directly.
    */
   toolDefinitions?: LCTool[];
+  /**
+   * Binds a fixed `call_tool` dispatcher from the first turn. Deferred tools
+   * (`defer_loading: true`) are called through it with `{ name, arguments }`
+   * and the SDK unwraps the call before hooks, approval, and execution, so a
+   * host can make a tool available mid-conversation without changing the
+   * provider's `tools` parameter (and its prompt cache).
+   */
+  toolDispatch?: boolean | ToolDispatchOptions;
   /**
    * Tool names discovered from previous conversation history.
    * These tools will be pre-marked as discovered so they're included
