@@ -223,6 +223,43 @@ describe('_convertMessagesToOpenAIParams', () => {
     expect(openRouterContent).toEqual(toolMessage.content);
   });
 
+  it('sends a plain tool result as the text block the tail marker produces', () => {
+    const plain = new ToolMessage({
+      content: 'result body',
+      tool_call_id: 'call_plain',
+    });
+    const marked = new ToolMessage({
+      content: [
+        {
+          type: 'text',
+          text: 'result body',
+          cache_control: { type: 'ephemeral', ttl: '1h' },
+        },
+      ],
+      tool_call_id: 'call_plain',
+    });
+    const convert = (message: ToolMessage): unknown =>
+      _convertMessagesToOpenAIParams([message], 'anthropic/claude-sonnet-4', {
+        preserveToolCacheControl: true,
+      })[0].content;
+
+    expect(convert(plain)).toEqual([{ type: 'text', text: 'result body' }]);
+    const plainBlock = new ToolMessage({
+      content: [{ type: 'text', text: 'result body' }],
+      tool_call_id: 'call_plain',
+    });
+    expect(convert(plainBlock)).toEqual([{ type: 'text', text: 'result body' }]);
+    expect(JSON.stringify(convert(marked))).toBe(
+      JSON.stringify([
+        {
+          type: 'text',
+          text: 'result body',
+          cache_control: { type: 'ephemeral', ttl: '1h' },
+        },
+      ])
+    );
+  });
+
   it('bounds direct structured tool-call args without invoking accessors or toJSON', () => {
     const maxInputChars = calculateMaxToolCallInputChars();
     let getterCalls = 0;
