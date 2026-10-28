@@ -680,7 +680,7 @@ const hasAnthropic = hasEnv('ANTHROPIC_API_KEY');
         spies,
         tokenCounter,
         indexTokenCountMap,
-        summaryPrompt: 'Write a concise checkpoint preserving the goal, verified calculations, tool results, exact identifiers, and next actions. Return checkpoint text only.',
+        summaryPrompt: 'Write a concise checkpoint preserving the goal, verified calculations, tool results, exact identifiers, and next actions. Do not call tools, perform calculations, or continue the task. Summarize the existing transcript only.',
         summaryReserveRatio: 0.2,
       });
       return { run, contentParts };
@@ -1101,7 +1101,7 @@ const hasAnthropic = hasEnv('ANTHROPIC_API_KEY');
         spies,
         tokenCounter,
         indexTokenCountMap,
-        summaryPrompt: 'Write a concise checkpoint preserving the goal, verified calculations, tool results, exact identifiers, and next actions. Return checkpoint text only.',
+        summaryPrompt: 'Write a concise checkpoint preserving the goal, verified calculations, tool results, exact identifiers, and next actions. Do not call tools, perform calculations, or continue the task. Summarize the existing transcript only.',
         summaryReserveRatio: 0.2,
         maxSummaryTokens: 2048,
         llmConfigOverride: {
@@ -2749,7 +2749,7 @@ const hasAnyApiKey = hasAnyEnv(['ANTHROPIC_API_KEY', 'OPENAI_API_KEY']);
         spies,
         tokenCounter,
         indexTokenCountMap,
-        summaryPrompt: 'Write a concise checkpoint preserving the goal, verified calculations, tool results, exact identifiers, and next actions. Return checkpoint text only.',
+        summaryPrompt: 'Write a concise checkpoint preserving the goal, verified calculations, tool results, exact identifiers, and next actions. Do not call tools, perform calculations, or continue the task. Summarize the existing transcript only.',
         summaryReserveRatio: 0.2,
         maxSummaryTokens: 300,
         tools: [],

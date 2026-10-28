@@ -486,11 +486,17 @@ describe('protected model-visible compaction history', () => {
     expect(agentContext.getSummaryText()).toBe('PROTECTED_CHECKPOINT');
   });
 
-  it.each([false, true])('keeps corrected input units for overflow with inherited fallback=%s', async withFallback => {
+  it.each([
+    {withFallback: false, fallbackMode: undefined},
+    {withFallback: true, fallbackMode: undefined},
+    {withFallback: true, fallbackMode: 'input'},
+    {withFallback: true, fallbackMode: 'window'},
+  ] as const)('keeps corrected input units for inherited ceiling: %j', async ({withFallback, fallbackMode}) => {
     const model = new CapturingSummaryModel();
     if (withFallback) model.failure = () => new Error('Primary unavailable');
     const {agentContext, node, fallback} = harness({model, maxContextTokens: 32_000,
       clientOptions: {model: 'primary', maxTokens: 4_000, fallbacks: withFallback ? [{provider: Providers.OPENAI,
+        contextBudgetMode: fallbackMode,
         clientOptions: {model: 'fallback', maxTokens: 2_660},
       }] : []},
       summarizationConfig: {contextBudgetMode: 'window', prompt: 'Checkpoint. '.repeat(150), maxSummaryTokens: 2_660, retainRecent: {turns: 0}},

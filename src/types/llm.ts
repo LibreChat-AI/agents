@@ -231,7 +231,7 @@ export type ContextBudgetMode = 'input' | 'window';
 export type FallbackConfig = ProviderClientOptionsConfig & {
   /** Context window used to corroborate ambiguous fallback overflow errors. */
   maxContextTokens?: number;
-  /** Explicit fallback ceilings default to full-window budgets. */
+  /** Applies to an explicit maxContextTokens; inherited ceilings retain their source units. */
   contextBudgetMode?: ContextBudgetMode;
 };
 

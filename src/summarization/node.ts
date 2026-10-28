@@ -875,8 +875,8 @@ async function executeSummarizationWithFallback(params: {
             ...fallback,
             clientOptions,
             maxContextTokens,
-            contextBudgetMode: fallback.contextBudgetMode ?? (fallback.maxContextTokens == null
-              ? agentContext.summarizationBudgetMode : 'window'),
+            contextBudgetMode: fallback.maxContextTokens == null
+              ? agentContext.summarizationBudgetMode : fallback.contextBudgetMode ?? 'window',
           } as t.FallbackConfig;
         });
         let fallbackIdentity: {provider: string; model?: string} | undefined;

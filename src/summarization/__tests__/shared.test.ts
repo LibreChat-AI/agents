@@ -50,6 +50,11 @@ describe('summarization primitives', () => {
   });
 
   describe('buildSummarizationInstruction', () => {
+    it('explicitly forbids tools and task continuation in both default checkpoint prompts', () => {
+      expect(DEFAULT_SUMMARIZATION_PROMPT).toContain('Do not call tools, perform calculations, or continue the task');
+      expect(DEFAULT_UPDATE_SUMMARIZATION_PROMPT).toContain('Do not call tools, perform calculations, or continue the task');
+    });
+
     it('sends the fresh prompt when there is no prior summary', () => {
       expect(
         buildSummarizationInstruction(
