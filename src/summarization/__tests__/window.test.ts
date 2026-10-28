@@ -366,7 +366,7 @@ describe('compaction request windows', () => {
     model.failure = sent => sent.length > 24 ? new Error('maximum context length exceeded') : undefined;
     const result = await node({messages, summarizationRequest: {agentId: 'agent', remainingContextTokens: 0, reason: 'overflow', allowSummarization: true, windowMessages: messages}}, {});
     expect(model.calls.length).toBeLessThanOrEqual(5);
-    for (const sent of model.calls) expect(sent.slice(1, -1)).toEqual(messages.slice(0, -4));
+    for (const sent of model.calls) expect(sent.slice(1, 1 + messages.length - 4)).toEqual(messages.slice(0, -4));
     expect(result.messages).toBeUndefined();
     expect(JSON.stringify(messages)).toBe(before);
     expect(agentContext.getSummaryText()).toBeUndefined();

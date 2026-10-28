@@ -876,7 +876,7 @@ async function executeSummarizationWithFallback(params: {
             clientOptions,
             maxContextTokens,
             contextBudgetMode: fallback.contextBudgetMode ?? (fallback.maxContextTokens == null
-              ? agentContext.summarizationConfig?.contextBudgetMode ?? 'input' : 'window'),
+              ? agentContext.summarizationBudgetMode : 'window'),
           } as t.FallbackConfig;
         });
         let fallbackIdentity: {provider: string; model?: string} | undefined;
@@ -2102,13 +2102,12 @@ async function summarizeWithCacheHit({
     clientOptions,
     maxContextTokens: agentContext.maxContextTokens,
     outputTokens,
-    contextBudgetMode: agentContext.summarizationConfig?.contextBudgetMode,
+    contextBudgetMode: agentContext.summarizationBudgetMode,
     instruction,
     tools,
     config,
   });
-  const scales =
-    shrinkInput === true ? [0.85, 0.65, 0.45, 0.3] : [1, 0.85, 0.65, 0.45, 0.3];
+  const scales = [1, 0.85, 0.65, 0.45, 0.3];
   let result: Partial<t.BaseGraphState> | undefined;
   const initialTokens = messages.reduce(
     (total, message) => total + count(message),

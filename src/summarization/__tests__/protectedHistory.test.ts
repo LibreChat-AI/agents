@@ -486,6 +486,33 @@ describe('protected model-visible compaction history', () => {
     expect(agentContext.getSummaryText()).toBe('PROTECTED_CHECKPOINT');
   });
 
+  it.each([false, true])('keeps corrected input units for overflow with inherited fallback=%s', async withFallback => {
+    const model = new CapturingSummaryModel();
+    if (withFallback) model.failure = () => new Error('Primary unavailable');
+    const {agentContext, node, fallback} = harness({model, maxContextTokens: 32_000,
+      clientOptions: {model: 'primary', maxTokens: 4_000, fallbacks: withFallback ? [{provider: Providers.OPENAI,
+        clientOptions: {model: 'fallback', maxTokens: 2_660},
+      }] : []},
+      summarizationConfig: {contextBudgetMode: 'window', prompt: 'Checkpoint. '.repeat(150), maxSummaryTokens: 2_660, retainRecent: {turns: 0}},
+    });
+    await agentContext.tokenCalculationPromise;
+    agentContext.applyContextBudgetCorrection(26_600);
+    expect(agentContext.summarizationBudgetMode).toBe('input');
+    const head = new HumanMessage({id: 'corrected-head', content: 'x'.repeat(100_000)});
+    const result = await node.invoke({messages: [head], summarizationRequest: {agentId: agentContext.agentId,
+      remainingContextTokens: 0, reason: 'overflow', allowSummarization: true, windowMessages: [head],
+    }});
+    const successful = withFallback ? fallback : model;
+    expect(successful.requests).toHaveLength(1);
+    expect(successful.requests[0]).toContain(head);
+    expect(successful.requests[0].reduce((total, message) => total + count(message), 0)).toBeLessThanOrEqual(26_600);
+    expect(result.messages?.[0].getType()).toBe('remove');
+    expect(agentContext.getSummaryText()).toBe('PROTECTED_CHECKPOINT');
+    agentContext.reset();
+    expect(agentContext.summarizationBudgetMode).toBe('window');
+    expect(agentContext.maxContextTokens).toBe(32_000);
+  });
+
   it.each([
     {
       name: 'explicit input',

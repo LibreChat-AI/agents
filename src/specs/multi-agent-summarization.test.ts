@@ -146,6 +146,8 @@ describe('Multi-agent summarization', () => {
         summarizationEnabled: true,
         summarizationConfig: {
           provider: Providers.OPENAI,
+          prompt: 'Write a concise checkpoint.',
+          maxSummaryTokens: 128,
         },
       },
       {
@@ -182,7 +184,7 @@ describe('Multi-agent summarization', () => {
 
     await run.processStream({ messages: conversationHistory }, streamConfig);
 
-    // Agent A should have triggered summarization due to tight context (200 tokens)
+    // Agent A should have triggered summarization due to its tight 800-token input budget
     const startCalls = spies.onSummarizeStartSpy.mock.calls;
     const completeCalls = spies.onSummarizeCompleteSpy.mock.calls;
 

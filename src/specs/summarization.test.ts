@@ -189,6 +189,8 @@ async function createSummarizationRun(opts: {
   indexTokenCountMap?: Record<string, number>;
   llmConfigOverride?: Record<string, unknown>;
   maxSummaryTokens?: number;
+  summaryPrompt?: string;
+  summaryReserveRatio?: number;
 }): Promise<Run<t.IState>> {
   const llmConfig = {
     ...getLLMConfig(opts.agentProvider),
@@ -209,6 +211,9 @@ async function createSummarizationRun(opts: {
         provider: opts.summarizationProvider,
         model: opts.summarizationModel,
         maxSummaryTokens: opts.maxSummaryTokens,
+        prompt: opts.summaryPrompt,
+        updatePrompt: opts.summaryPrompt,
+        reserveRatio: opts.summaryReserveRatio,
       },
     },
     returnContent: true,
@@ -675,6 +680,8 @@ const hasAnthropic = hasEnv('ANTHROPIC_API_KEY');
         spies,
         tokenCounter,
         indexTokenCountMap,
+        summaryPrompt: 'Write a concise checkpoint preserving the goal, verified calculations, tool results, exact identifiers, and next actions. Return checkpoint text only.',
+        summaryReserveRatio: 0.2,
       });
       return { run, contentParts };
     };
@@ -1094,6 +1101,8 @@ const hasAnthropic = hasEnv('ANTHROPIC_API_KEY');
         spies,
         tokenCounter,
         indexTokenCountMap,
+        summaryPrompt: 'Write a concise checkpoint preserving the goal, verified calculations, tool results, exact identifiers, and next actions. Return checkpoint text only.',
+        summaryReserveRatio: 0.2,
         maxSummaryTokens: 2048,
         llmConfigOverride: {
           model: 'claude-sonnet-4-5',
@@ -2740,6 +2749,8 @@ const hasAnyApiKey = hasAnyEnv(['ANTHROPIC_API_KEY', 'OPENAI_API_KEY']);
         spies,
         tokenCounter,
         indexTokenCountMap,
+        summaryPrompt: 'Write a concise checkpoint preserving the goal, verified calculations, tool results, exact identifiers, and next actions. Return checkpoint text only.',
+        summaryReserveRatio: 0.2,
         maxSummaryTokens: 300,
         tools: [],
         llmConfigOverride: {
