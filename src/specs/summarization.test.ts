@@ -1520,6 +1520,7 @@ const hasOpenAI = hasEnv('OPENAI_API_KEY');
         spies,
         tokenCounter,
         indexTokenCountMap,
+        summaryReserveRatio: 0.25,
       });
     };
 
