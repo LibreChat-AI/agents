@@ -116,7 +116,7 @@ import {
   disposeLangfuseHandler,
   isLangfuseCallbackHandler,
 } from '@/langfuse';
-import { retainToolMessageReleases, normalizeToolResultError, getLiveToolMessageRelease, commitToolMessageRelease, snapshotToolMessageReleases, validateToolMessageHistory, requiresToolResultProtection, ToolResultProtectionError, validateToolResultProtection } from '@/protection/toolResult';
+import { snapshotToolHistoryMessages, retainToolMessageReleases, normalizeToolResultError, getLiveToolMessageRelease, commitToolMessageRelease, snapshotToolMessageReleases, validateToolMessageHistory, requiresToolResultProtection, ToolResultProtectionError, validateToolResultProtection } from '@/protection/toolResult';
 import {
   getBlindRecoveryBudget,
   planContextOverflowRecovery,
@@ -734,7 +734,7 @@ function buildRunStepStateAnnotation(): RunStepStateChannel {
 }
 
 type ToolResultCheckpoint = {
-  values?: { messages?: BaseMessage[]; runStepState?: t.RunStepResumeState };
+  values?: { messages?: BaseMessage[]; agentMessages?: BaseMessage[]; runStepState?: t.RunStepResumeState };
   tasks?: readonly { state?: ToolResultCheckpoint | RunnableConfig }[];
 };
 
@@ -761,6 +761,12 @@ export abstract class Graph<
   async validateToolResultCheckpoint(snapshot: ToolResultCheckpoint, signal?: AbortSignal): Promise<void> {
     const messages = snapshot.values?.messages;
     if (messages != null && snapshot.values != null) snapshot.values.messages = await this.validateToolResultHistory(messages, snapshot.values.runStepState, signal);
+    if (snapshot.values?.agentMessages != null) {
+      const current = snapshotToolHistoryMessages(snapshot.values.messages ?? []);
+      const alternate = snapshotToolHistoryMessages(snapshot.values.agentMessages);
+      const canonical = await this.validateToolResultHistory([...current, ...alternate], snapshot.values.runStepState, signal);
+      snapshot.values.agentMessages = canonical.slice(current.length);
+    }
     for (const task of snapshot.tasks ?? []) {
       const nested = task.state;
       if (nested != null && 'tasks' in nested && Array.isArray(nested.tasks)) await this.validateToolResultCheckpoint(nested, signal);

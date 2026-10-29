@@ -1,6 +1,6 @@
 import { types } from 'node:util';
-import { ToolMessage } from '@langchain/core/messages';
 import { GraphInterrupt, ParentCommand } from '@langchain/langgraph';
+import { RemoveMessage, ToolMessage } from '@langchain/core/messages';
 import {
   StructuredTool,
   DynamicStructuredTool,
@@ -500,6 +500,21 @@ export function snapshotToolResumeMessages(value: unknown): { messages: BaseMess
   if (Array.isArray(messages)) return { messages: snapshotDataArray(messages, Number.MAX_SAFE_INTEGER, true), overwrite };
   if (messages == null || typeof messages !== 'object' || typeof ownMessageValue(messages, 'type') !== 'string') throw new ToolResultProtectionError('unsupported');
   return { messages: [messages as BaseMessage], overwrite };
+}
+
+/** Removal controls carry identity only and must never be certified as retained output. */
+export function snapshotToolMessageRemoval(message: BaseMessage): RemoveMessage | undefined {
+  if (ownMessageValue(message, 'type') !== 'remove') return undefined;
+  const id = ownMessageValue(message, 'id');
+  if (typeof id !== 'string' || id === '') throw new ToolResultProtectionError('unsupported');
+  const content = ownMessageValue(message, 'content');
+  if (content !== '' && (content == null || !Array.isArray(content) || snapshotDataArray(content, 0).length !== 0)) throw new ToolResultProtectionError('unsupported');
+  for (const key of ['name', 'artifact', 'tool_call_id', 'status', 'metadata']) if (ownMessageValue(message, key) != null) throw new ToolResultProtectionError('unsupported');
+  for (const key of ['additional_kwargs', 'response_metadata']) {
+    const metadata = ownMessageValue(message, key);
+    if (metadata != null) plainObject(metadata as object, []);
+  }
+  return new RemoveMessage({ id });
 }
 
 export function snapshotToolHistoryMessages(messages: readonly BaseMessage[]): BaseMessage[] {

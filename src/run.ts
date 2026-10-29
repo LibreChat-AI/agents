@@ -1,4 +1,4 @@
-import { snapshotToolResumeUpdates, snapshotToolResumeMessages, snapshotToolHistoryMessages, normalizeToolResultError, hasRequiredToolExecuteProtection, ToolResultProtectionError } from '@/protection/toolResult';
+import { snapshotToolMessageRemoval, snapshotToolResumeUpdates, snapshotToolResumeMessages, snapshotToolHistoryMessages, normalizeToolResultError, hasRequiredToolExecuteProtection, ToolResultProtectionError } from '@/protection/toolResult';
 import { messagesStateReducer } from '@/messages/reducer';
 // src/run.ts
 import { nanoid } from 'nanoid';
@@ -299,6 +299,7 @@ type InterruptStateSnapshot = {
   values?: {
     handoffState?: t.HandoffState;
     messages?: BaseMessage[];
+    agentMessages?: BaseMessage[];
     runStepState?: t.RunStepResumeState;
   };
   tasks?: Array<{
@@ -1416,6 +1417,11 @@ export class Run<_T extends t.BaseGraphState> {
     if (stateInputs != null) {
       if (this.toolResultProtection != null) {
         stateInputs = { ...stateInputs, messages: await graph.validateToolResultHistory(stateInputs.messages, stateInputs.runStepState, callerConfig.signal) };
+        if ('agentMessages' in stateInputs && stateInputs.agentMessages != null) {
+          const alternate = snapshotToolHistoryMessages(stateInputs.agentMessages as BaseMessage[]);
+          const canonical = await graph.validateToolResultHistory([...stateInputs.messages, ...alternate], stateInputs.runStepState, callerConfig.signal);
+          stateInputs = { ...stateInputs, agentMessages: canonical.slice(stateInputs.messages.length) } as t.IState;
+        }
         inputs = stateInputs;
       }
       this.activityPhaseTraceInput = findActivityPhaseTraceInput(stateInputs.messages);
@@ -2229,20 +2235,28 @@ export class Run<_T extends t.BaseGraphState> {
   private async validateToolResultResumeUpdate(snapshot: InterruptStateSnapshot, update: ResumeCommandUpdate, signal?: AbortSignal): Promise<{ update: ResumeCommandUpdate; messages: BaseMessage[] }> {
     const graph = this.Graph!;
     let messages = snapshotToolHistoryMessages(snapshot.values?.messages ?? []);
+    let alternate = snapshotToolHistoryMessages(snapshot.values?.agentMessages ?? []);
     const writes = snapshotToolResumeUpdates(update);
     if (writes.length === 0) return { update, messages };
     const admitted: Array<[string, unknown]> = [];
     for (const [key, value] of writes) {
-      if (key !== 'messages') { admitted.push([key, value]); continue; }
+      if (key !== 'messages' && key !== 'agentMessages') { admitted.push([key, value]); continue; }
       const change = snapshotToolResumeMessages(value);
-      // Validate each write before reduction, even if a later write removes it.
-      const history = await graph.validateToolResultHistory([...messages, ...change.messages], snapshot.values?.runStepState, signal);
+      const removals = change.messages.map(snapshotToolMessageRemoval);
+      if ((key === 'agentMessages' || change.overwrite) && removals.some((control) => control != null)) throw new ToolResultProtectionError('unsupported');
+      const outputs = change.messages.filter((_message, index) => removals[index] == null);
+      // Validate all result writes before applying control reduction, including later-removed writes.
+      const history = await graph.validateToolResultHistory([...messages, ...outputs], snapshot.values?.runStepState, signal);
       const canonical = history.slice(messages.length);
       graph.commitToolResultMessages(canonical);
-      messages = change.overwrite ? canonical : messagesStateReducer(messages, canonical);
-      admitted.push([key, change.overwrite ? new Overwrite(canonical) : canonical]);
+      let position = 0;
+      const effective = change.messages.map((_message, index) => removals[index] ?? canonical[position++]);
+      if (key === 'agentMessages') alternate = effective;
+      else messages = change.overwrite ? effective : messagesStateReducer(messages, effective);
+      admitted.push([key, change.overwrite ? new Overwrite(effective) : effective]);
     }
     messages = await graph.validateToolResultHistory(messages, snapshot.values?.runStepState, signal);
+    if (alternate.length > 0) await graph.validateToolResultHistory([...messages, ...alternate], snapshot.values?.runStepState, signal);
     return { update: update == null ? update : admitted, messages };
   }
 
