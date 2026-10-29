@@ -1,6 +1,6 @@
 import { ToolMessage } from '@langchain/core/messages';
 import type { ToolResultProtection } from '@/protection/toolResult';
-import { ToolResultProtectionError, normalizeToolResultError, protectToolMessage, isReleasedToolError, protectToolText, withToolResultBoundary, requiresToolResultProtection } from '@/protection/toolResult';
+import { ToolResultProtectionError, normalizeToolResultError, protectToolMessage, protectToolErrorText, protectToolText, withToolResultBoundary, requiresToolResultProtection } from '@/protection/toolResult';
 import { ProviderTextProtectionError } from '@/protection/providerText';
 // src/tools/ProgrammaticToolCalling.ts
 import { config } from 'dotenv';
@@ -921,7 +921,7 @@ export async function executeTools(
         call_id: call.id,
         result: null,
         is_error: true,
-        error_message: error instanceof Error && isReleasedToolError(protection?.policy, call.name, call.id, error) ? error.message : await protectToolText(protection?.policy, call.name, call.id, (error as Error).message || 'Tool execution failed', 'error', protection?.signal) as string,
+        error_message: await protectToolErrorText(protection?.policy, call.name, call.id, error, protection?.signal),
       };
     }
   });

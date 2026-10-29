@@ -2588,3 +2588,40 @@ it.each((['direct', 'host', 'eager'] as const).flatMap((path) => (['success', 'e
   await resumed.processStream({ messages: [new HumanMessage('Allowed next control')] }, config);
   expect(executions).toBe(1); expect(inputs).toHaveLength(1); expect(inputs[0]).toContain('[EMAIL_1]'); assertNoCanary(inputs[0]);
 });
+
+it.each(['accessor', 'message', 'stack', 'cause', 'alias', 'unchanged'] as const)('validates nested post-callback error %s before extraction', async (field) => {
+  let reads = 0; const inspected: string[] = []; let callbacks = 0;
+  const callback = BaseCallbackHandler.fromMethods({ handleToolError: (error: Error): void => {
+    callbacks++; expect(error.message).toBe('[EMAIL_1]');
+    if (field === 'accessor') Object.defineProperty(error, 'message', { get: () => { reads++; throw new Error(fixtures.canaries[0]); } });
+    if (field === 'message') error.message = fixtures.canaries[0];
+    if (field === 'stack') error.stack = fixtures.canaries[0];
+    if (field === 'cause') Object.defineProperty(error, 'cause', { value: new Error(fixtures.canaries[0]) });
+    if (field === 'alias') Object.defineProperty(error, Symbol('raw-alias'), { value: fixtures.canaries[0] });
+  } }); callback.awaitHandlers = true;
+  const lookup = direct(() => { throw new Error(fixtures.canaries[0]); }); lookup.callbacks = [callback];
+  const pending = executeTools([{ id: 'nested-error', name: 'lookup', input: { count: 42 } }], new Map([['lookup', lookup]]), 'run_tools_with_code', { policy: policy({ inspect: ({ content }) => { inspected.push(content); return approve('[EMAIL_1]'); } }) });
+  if (field === 'accessor' || field === 'message') await expect(pending).rejects.toMatchObject({ code: 'unsupported' });
+  else { const result = await pending; expect(result).toEqual([{ call_id: 'nested-error', is_error: true, result: null, error_message: '[EMAIL_1]' }]); assertNoCanary(result); }
+  expect(reads).toBe(0); expect(callbacks).toBe(1); expect(inspected).toEqual([fixtures.canaries[0]]);
+});
+
+it.each(['local', 'python', 'bash'] as const)('keeps callback-installed error accessors terminal before %s runner reuse', async (runtime) => {
+  const requests: string[] = []; let reads = 0; let callbacks = 0;
+  const server = createServer((request, response) => {
+    let body = ''; request.on('data', (chunk: Buffer): void => { body += chunk.toString(); });
+    request.on('end', (): void => { requests.push(body); response.setHeader('Content-Type', 'application/json'); response.end(JSON.stringify(requests.length === 1 ? { status: 'tool_call_required', continuation_token: 'Allowed continuation', tool_calls: [{ id: 'nested-error', name: 'lookup', input: { count: 42 } }] } : { status: 'completed', stdout: 'Must not continue', files: [] })); });
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const callback = BaseCallbackHandler.fromMethods({ handleToolError: (error: Error): void => { callbacks++; expect(error.message).toBe('[EMAIL_1]'); Object.defineProperty(error, 'message', { get: () => { reads++; throw new Error(fixtures.canaries[0]); } }); } }); callback.awaitHandlers = true;
+    const lookup = direct(() => { throw new Error(fixtures.canaries[0]); }); lookup.callbacks = [callback];
+    const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    let runner = createLocalProgrammaticToolCallingTool({ cwd: process.cwd() });
+    if (runtime === 'python') runner = createProgrammaticToolCallingTool({ baseUrl });
+    if (runtime === 'bash') runner = createBashProgrammaticToolCallingTool({ baseUrl });
+    const events: string[] = [];
+    const error = await runner.invoke({ lang: 'bash', code: runtime === 'python' ? 'print(await lookup(count=42))' : 'lookup \'{"count":42}\' || true', tool_manifest: ['lookup'] }, { callbacks: [observer(events)], toolCall: { id: 'outer-error', name: runner.name, type: 'tool_call', args: {}, toolMap: new Map([['lookup', lookup]]), toolDefs: [{ name: 'lookup', allowed_callers: ['code_execution'], parameters: { type: 'object', properties: { count: { type: 'number' } } } }], toolResultProtection: policy() } }).catch((value: Error) => value);
+    expect(error).toMatchObject({ code: 'unsupported' }); expect(reads).toBe(0); expect(callbacks).toBe(1); expect(requests).toHaveLength(runtime === 'local' ? 0 : 1); assertNoCanary(String(error)); assertNoCanary(events.join('')); assertNoCanary(requests);
+  } finally { server.closeAllConnections(); await new Promise<void>((resolve) => server.close(() => resolve())); }
+});
