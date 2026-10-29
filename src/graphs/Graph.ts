@@ -116,7 +116,7 @@ import {
   disposeLangfuseHandler,
   isLangfuseCallbackHandler,
 } from '@/langfuse';
-import { normalizeToolResultError, getLiveToolMessageRelease, commitToolMessageRelease, snapshotToolMessageReleases, validateToolMessageHistory, requiresToolResultProtection, ToolResultProtectionError, validateToolResultProtection } from '@/protection/toolResult';
+import { retainToolMessageReleases, normalizeToolResultError, getLiveToolMessageRelease, commitToolMessageRelease, snapshotToolMessageReleases, validateToolMessageHistory, requiresToolResultProtection, ToolResultProtectionError, validateToolResultProtection } from '@/protection/toolResult';
 import {
   getBlindRecoveryBudget,
   planContextOverflowRecovery,
@@ -756,10 +756,10 @@ export abstract class Graph<
     currentTools?: t.GraphTools;
     currentToolMap?: t.ToolMap;
   }): CustomToolNode<T> | ToolNode<T>;
-  async validateToolResultHistory(_messages: BaseMessage[], _state?: t.RunStepResumeState, _signal?: AbortSignal): Promise<void> {}
+  async validateToolResultHistory(messages: BaseMessage[], _state?: t.RunStepResumeState, _signal?: AbortSignal): Promise<BaseMessage[]> { return messages; }
   async validateToolResultCheckpoint(snapshot: ToolResultCheckpoint, signal?: AbortSignal): Promise<void> {
     const messages = snapshot.values?.messages;
-    if (messages != null) await this.validateToolResultHistory(messages, snapshot.values?.runStepState, signal);
+    if (messages != null && snapshot.values != null) snapshot.values.messages = await this.validateToolResultHistory(messages, snapshot.values.runStepState, signal);
     for (const task of snapshot.tasks ?? []) {
       const nested = task.state;
       if (nested != null && 'tasks' in nested && Array.isArray(nested.tasks)) await this.validateToolResultCheckpoint(nested, signal);
@@ -1836,19 +1836,28 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       const release = commitToolMessageRelease(policy, entry.message, entry.release, entry.content);
       this.toolResultHistoryReleases.set(JSON.stringify([release.name, release.id, release.envelope.id]), release);
     }
+    this.pruneRemovedToolReceipts(current, result);
     return result;
   }
 
-  override async validateToolResultHistory(messages: BaseMessage[], state?: t.RunStepResumeState, signal?: AbortSignal): Promise<void> {
-    if (this.toolResultProtection == null) return;
+  private pruneRemovedToolReceipts(previous: BaseMessage[], current: BaseMessage[]): void {
+    const receipts = [...this.toolResultHistoryReleases.values()];
+    const before = new Set(retainToolMessageReleases(previous, receipts));
+    for (const receipt of retainToolMessageReleases(current, receipts)) before.delete(receipt);
+    for (const receipt of before) this.toolResultHistoryReleases.delete(JSON.stringify([receipt.name, receipt.id, receipt.envelope.id]));
+  }
+
+  override async validateToolResultHistory(messages: BaseMessage[], state?: t.RunStepResumeState, signal?: AbortSignal): Promise<BaseMessage[]> {
+    if (this.toolResultProtection == null) return messages;
     const breaker = this.breakerAbort;
     try {
       const persisted = snapshotToolMessageReleases(state?.toolResultReleases ?? []);
-      await validateToolMessageHistory(this.toolResultProtection, messages, [...this.toolResultHistoryReleases.values(), ...persisted], signal);
-      for (const release of persisted) {
+      const canonical = await validateToolMessageHistory(this.toolResultProtection, messages, [...this.toolResultHistoryReleases.values(), ...persisted], signal);
+      for (const release of retainToolMessageReleases(canonical, persisted)) {
         const key = JSON.stringify([release.name, release.id, release.envelope.id]);
         if (!this.toolResultHistoryReleases.has(key)) this.toolResultHistoryReleases.set(key, release);
       }
+      return canonical;
     } catch (error) {
       if (!(error instanceof ProviderTextProtectionError)) throw error;
       const failure = normalizeToolResultError(error);
@@ -2113,12 +2122,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
   restoreRunStepResumeState(state?: t.RunStepResumeState): void {
     if (!isRunStepResumeState(state)) return;
-    if (this.toolResultProtection != null) {
-      for (const release of snapshotToolMessageReleases(state.toolResultReleases ?? [])) {
-        const key = JSON.stringify([release.name, release.id, release.envelope.id]);
-        if (!this.toolResultHistoryReleases.has(key)) this.toolResultHistoryReleases.set(key, release);
-      }
-    }
     if (this.contentData.length > 0 || this.runStepStateRevision > 0) return;
 
     this.nextContentIndex = state.nextIndex;
@@ -3402,8 +3405,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         return { messages: [] };
       }
 
-      const { messages } = state;
-      if (this.toolResultProtection != null) await this.validateToolResultHistory(messages, state.runStepState, composeAbortSignals(config.signal, this.signal));
+      const messages = this.toolResultProtection == null ? state.messages : await this.validateToolResultHistory(state.messages, state.runStepState, composeAbortSignals(config.signal, this.signal));
 
       const discoveredNames = extractToolDiscoveries(messages);
       if (discoveredNames.length > 0) {
@@ -5636,6 +5638,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       this.restoreRunStepResumeState(state.runStepState);
       this.handoffRouting?.restore(state.handoffState);
       const result = await invoke();
+      if (this.toolResultProtection != null && result.messages?.some((message) => message.getType() === 'remove') === true) {
+        this.pruneRemovedToolReceipts(state.messages, messagesStateReducer(state.messages, result.messages));
+      }
       /** An ordinary run on a checkpointed thread inherits the last
        *  compaction's summary in state; it is not this run's output. */
       const clearsManualSummary =

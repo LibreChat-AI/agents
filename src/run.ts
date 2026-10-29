@@ -1305,12 +1305,7 @@ export class Run<_T extends t.BaseGraphState> {
     if (!isResume) {
       graph.startFreshLangfuseExecution();
     }
-    const stateInputs = isResume ? undefined : (inputs as t.IState);
-    if (stateInputs != null) {
-      this.activityPhaseTraceInput = findActivityPhaseTraceInput(
-        stateInputs.messages
-      );
-    }
+    let stateInputs = isResume ? undefined : (inputs as t.IState);
 
     /**
      * Every honored seal costs one extra superstep, so a preemption-enabled
@@ -1410,6 +1405,13 @@ export class Run<_T extends t.BaseGraphState> {
         const checkpoint = await workflow.getState?.(config, { subgraphs: true });
         if (checkpoint != null) await graph.validateToolResultCheckpoint(checkpoint, callerConfig.signal);
       }
+    }
+    if (stateInputs != null) {
+      if (this.toolResultProtection != null) {
+        stateInputs = { ...stateInputs, messages: await graph.validateToolResultHistory(stateInputs.messages, stateInputs.runStepState, callerConfig.signal) };
+        inputs = stateInputs;
+      }
+      this.activityPhaseTraceInput = findActivityPhaseTraceInput(stateInputs.messages);
     }
     this._interrupt = undefined;
     this._haltedReason = undefined;

@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { createServer } from 'node:http';
 import { DynamicStructuredTool } from '@langchain/core/tools';
 import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
-import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
+import { RemoveMessage, AIMessage, HumanMessage, ToolMessage  } from '@langchain/core/messages';
 import {
   GraphInterrupt,
   Command,
@@ -35,6 +35,7 @@ import {
   createCloudflareProgrammaticToolCallingTool,
   createCloudflareBashProgrammaticToolCallingTool,
 } from '@/tools/cloudflare/CloudflareProgrammaticToolCalling';
+import { validateToolMessageHistory, getToolMessageRelease, ToolResultProtectionError  } from '@/protection/toolResult';
 import { createLocalProgrammaticToolCallingTool } from '@/tools/local/LocalProgrammaticToolCalling';
 import {
   createProgrammaticToolCallingTool,
@@ -47,11 +48,11 @@ import {
 } from '@/tools/toolBatchReplay';
 import { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import { ProviderTextProtectionError } from '@/protection/providerText';
-import { ToolResultProtectionError } from '@/protection/toolResult';
 import { PreparedSubagentError } from '@/tools/preparedSubagents';
 import fixtures from '@/protection/__tests__/fixtures/a1.json';
 import { StreamLimitExceededError } from '@/llm/streamLimits';
 import { Constants, GraphEvents, Providers } from '@/common';
+import { createRemoveAllMessage } from '@/messages/reducer';
 import { ChatModelStreamHandler } from '@/stream';
 import { StandardGraph } from '@/graphs/Graph';
 import { ToolNode } from '@/tools/ToolNode';
@@ -2658,4 +2659,159 @@ it('preserves admitted empty error text without a second policy decision', async
   const node = new ToolNode({ tools: [direct(() => { throw new Error('Allowed initial error'); })], toolResultProtection: policy({ inspect: () => { inspections++; return approve(''); } }), errorHandler: async ({ error }) => { handled.push(error!.message); return false; } });
   const result = await node.invoke(state()) as { messages: ToolMessage[] };
   expect(inspections).toBe(1); expect(handled).toEqual(['']); expect(result.messages[0].content).toBe('Error: \n Please fix your mistakes.');
+});
+
+async function certifiedHistory(): Promise<{ gate: ToolResultProtection; messages: BaseMessage[]; releases: NonNullable<RunStepResumeState['toolResultReleases']> }> {
+  const gate = policy();
+  const producer = new ToolNode({ tools: [direct(() => fixtures.canaries[0])], toolResultProtection: gate });
+  const result = await producer.invoke(state()) as { messages: ToolMessage[] };
+  const message = result.messages[0];
+  const release = getToolMessageRelease(gate, 'lookup', 'call-control', message)!;
+  return { gate, messages: [state().messages[0], message], releases: [release] };
+}
+
+it.each(['iterator', 'proxy', 'subclass', 'index', 'sparse'] as const)('rejects checkpoint message collection %s without controlled reads', async (kind) => {
+  const fixture = await certifiedHistory(); let reads = 0; let messages = fixture.messages;
+  if (kind === 'iterator') Object.defineProperty(messages, Symbol.iterator, { value: function* () { reads++; if (reads > 1) yield* fixture.messages; } });
+  if (kind === 'proxy') messages = new Proxy(messages, { get: (target, key, receiver): unknown => { reads++; return Reflect.get(target, key, receiver); } });
+  if (kind === 'subclass') { class MessageArray extends Array<BaseMessage> {} messages = new MessageArray(...messages); }
+  if (kind === 'index') Object.defineProperty(messages, '1', { get: () => { reads++; throw new Error(fixtures.canaries[0]); } });
+  if (kind === 'sparse') messages = new Array<BaseMessage>(2);
+  await expect(validateToolMessageHistory(fixture.gate, messages, fixture.releases)).rejects.toMatchObject({ code: 'unsupported' }); expect(reads).toBe(0);
+});
+
+it.each(['content', 'name', 'id', 'status', 'tool_call_id', 'additional_kwargs', 'response_metadata'] as const)('rejects inherited historical %s accessors before reading them', async (field) => {
+  const fixture = await certifiedHistory(); const original = fixture.messages[1] as ToolMessage; let reads = 0;
+  const message = new ToolMessage({ ...original });
+  Reflect.deleteProperty(message, field);
+  Object.setPrototypeOf(message, Object.create(ToolMessage.prototype, { [field]: { get: () => { reads++; throw new Error(fixtures.canaries[0]); } } }));
+  const error = await validateToolMessageHistory(fixture.gate, [fixture.messages[0], message], fixture.releases).catch((value: Error) => value);
+  expect(error).toMatchObject({ code: 'unsupported' }); expect(reads).toBe(0); assertNoCanary(String(error));
+});
+
+it.each(['call', 'message', 'both'] as const)('binds historical %s names to certified result identities', async (changed) => {
+  const fixture = await certifiedHistory(); const call = fixture.messages[0] as AIMessage; const message = fixture.messages[1] as ToolMessage;
+  const renamed = new AIMessage({ ...call, tool_calls: call.tool_calls!.map((entry) => ({ ...entry, name: changed === 'message' ? entry.name : 'other' })) });
+  const aliased = new ToolMessage({ ...message, name: changed === 'call' ? message.name : 'other', content: fixtures.canaries[0] });
+  await expect(validateToolMessageHistory(policy(), [renamed, aliased], fixture.releases)).rejects.toMatchObject({ code: 'unsupported' });
+});
+
+it('rejects restored protected references renamed to an unselected source', async () => {
+  let executions = 0;
+  const registry = new ToolOutputReferenceRegistry(); registry.restoreState('renamed-reference', { entries: [{ key: 'tool0turn0', value: fixtures.canaries[0], protection: { version: 1, toolName: 'other', toolCallId: 'call-control', protected: true } }], turnCounter: 1, warnedNonStringTools: [] });
+  const pipe = new DynamicStructuredTool({ name: 'pipe', description: 'Allowed pipe.', schema: z.object({ command: z.string() }), func: async ({ command }) => { executions++; return command; } });
+  const node = new ToolNode({ tools: [pipe], toolOutputRegistry: registry, toolResultProtection: policy() });
+  await expect(node.invoke({ messages: [new AIMessage({ content: '', tool_calls: [{ id: 'pipe-control', name: 'pipe', args: { command: '{{' + 'tool0turn0' + '}}' } }] })] }, { configurable: { run_id: 'renamed-reference' } })).rejects.toMatchObject({ code: 'incompatible' }); expect(executions).toBe(0);
+});
+
+it.each([false, true])('validates supplied tool history before RunStart (checkpoint=%s)', async (checkpoint) => {
+  let hooks = 0; let model = 0;
+  const registry = new HookRegistry(); registry.register('RunStart', { hooks: [async () => { hooks++; return {}; }] });
+  const run = await Run.create({ runId: `supplied-history-${checkpoint}`, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, compileOptions: checkpoint ? { checkpointer: new MemorySaver() } : undefined }, hooks: registry, toolResultProtection: policy() });
+  class Model extends FakeChatModel { override async *_streamResponseChunks(...args: Parameters<FakeChatModel['_streamResponseChunks']>): ReturnType<FakeChatModel['_streamResponseChunks']> { model++; yield* super._streamResponseChunks(...args); } }
+  run.Graph!.overrideModel = new Model({ responses: ['Must not run'] });
+  await expect(run.processStream({ messages: [state().messages[0], new ToolMessage({ tool_call_id: 'call-control', name: 'lookup', content: fixtures.canaries[0] }), new HumanMessage('Allowed control')] }, { version: 'v2', configurable: { thread_id: `supplied-history-${checkpoint}` } })).rejects.toMatchObject({ code: 'incompatible' });
+  expect(hooks).toBe(0); expect(model).toBe(0);
+});
+
+it.each(['remove', 'compact'] as const)('prunes historical release receipts after %s', async (kind) => {
+  class Graph extends StandardGraph { reduce(current: BaseMessage[], update: BaseMessage[]): BaseMessage[] { return this.reduceProtectedMessages(current, update); } }
+  const fixture = await certifiedHistory(); const graph = new Graph({ runId: `prune-${kind}`, agents: [{ agentId: 'agent', provider: Providers.OPENAI }], toolResultProtection: fixture.gate });
+  let messages = graph.reduce([], fixture.messages);
+  expect(graph.createRunStepResumeState().toolResultReleases).toHaveLength(1);
+  const id = messages[1].id!;
+  messages = graph.reduce(messages, kind === 'remove' ? [new RemoveMessage({ id })] : [createRemoveAllMessage(), new HumanMessage('Allowed compacted control')]);
+  expect(messages.some((message) => message.id === id)).toBe(false); expect(graph.createRunStepResumeState().toolResultReleases).toEqual([]);
+});
+
+it('retains certified results with repeated provider call IDs in distinct message identities', async () => {
+  class Graph extends StandardGraph { reduce(current: BaseMessage[], update: BaseMessage[]): BaseMessage[] { return this.reduceProtectedMessages(current, update); } }
+  const fixture = await certifiedHistory(); const graph = new Graph({ runId: 'repeated-history', agents: [{ agentId: 'agent', provider: Providers.OPENAI }], toolResultProtection: fixture.gate });
+  let history = graph.reduce([], fixture.messages);
+  const producer = new ToolNode({ tools: [direct(() => fixtures.canaries[0])], toolResultProtection: fixture.gate });
+  const next = await producer.invoke(state()) as { messages: ToolMessage[] };
+  history = graph.reduce(history, [new AIMessage({ content: '', tool_calls: [{ id: 'call-control', name: 'lookup', args: { count: 42 } }] }), ...next.messages]);
+  expect(graph.createRunStepResumeState().toolResultReleases).toHaveLength(2);
+  const canonical = await validateToolMessageHistory(policy(), history, graph.createRunStepResumeState().toolResultReleases!);
+  expect(canonical.filter((message) => message.getType() === 'tool')).toHaveLength(2); assertNoCanary(canonical);
+});
+
+it('never resurrects receipts for results absent from restored checkpoint history', async () => {
+  class Graph extends StandardGraph { reduce(current: BaseMessage[], update: BaseMessage[]): BaseMessage[] { return this.reduceProtectedMessages(current, update); } }
+  const fixture = await certifiedHistory(); const source = new Graph({ runId: 'stale-history', agents: [{ agentId: 'agent', provider: Providers.OPENAI }], toolResultProtection: fixture.gate });
+  source.reduce([], fixture.messages); const state = source.createRunStepResumeState(); expect(state.toolResultReleases).toHaveLength(1);
+  const restored = new Graph({ runId: 'stale-history', agents: [{ agentId: 'agent', provider: Providers.OPENAI }], toolResultProtection: policy() });
+  restored.restoreRunStepResumeState(state);
+  await restored.validateToolResultHistory([new HumanMessage('Allowed retained control')], state);
+  expect(restored.createRunStepResumeState().toolResultReleases).toEqual([]);
+});
+
+it.each([false, true])('preserves validated supplied-history RunStart controls (selected=%s)', async (selected) => {
+  const fixture = await certifiedHistory(); let observed = 0;
+  const gate = selected ? fixture.gate : policy({ toolNames: ['other'] });
+  const hooks = new HookRegistry(); hooks.register('RunStart', { hooks: [async (input) => { observed++; assertNoCanary(JSON.stringify(input)); return {}; }] });
+  const run = await Run.create({ runId: `safe-supplied-${selected}`, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI } }, toolResultProtection: gate, hooks });
+  run.Graph!.overrideModel = new FakeChatModel({ responses: ['Allowed answer'] });
+  const runStepState = run.Graph!.createRunStepResumeState(); runStepState.toolResultReleases = fixture.releases;
+  await run.processStream({ messages: [...fixture.messages, new HumanMessage('Allowed control')], runStepState }, { version: 'v2', configurable: { thread_id: `safe-supplied-${selected}` } });
+  expect(observed).toBe(1);
+});
+
+it.each(['iterator', 'proxy', 'subclass', 'inherited', 'renamed', 'control'] as const)('gates custom-checkpointer restored history before any model request (%s)', async (kind) => {
+  let tamper = false; let reads = 0; let executions = 0; let models = 0;
+  class Checkpointer extends MemorySaver {
+    override async getTuple(config: RunnableConfig): ReturnType<MemorySaver['getTuple']> {
+      const tuple = await super.getTuple(config);
+      const messages = tuple?.checkpoint.channel_values.messages as BaseMessage[] | undefined;
+      if (!tamper || tuple == null || messages == null || !messages.some((message) => message instanceof ToolMessage)) return tuple;
+      let history = messages;
+      if (kind === 'iterator') Object.defineProperty(history, Symbol.iterator, { value: function* () { reads++; if (reads > 1) yield* messages; } });
+      if (kind === 'proxy') history = new Proxy(history, { get: (target, key, receiver): unknown => { reads++; return Reflect.get(target, key, receiver); } });
+      if (kind === 'subclass') { class History extends Array<BaseMessage> {} history = new History(...messages); }
+      if (kind === 'inherited') {
+        const message = messages.find((entry) => entry instanceof ToolMessage)!; Reflect.deleteProperty(message, 'content');
+        Object.setPrototypeOf(message, Object.create(ToolMessage.prototype, { content: { get: () => { reads++; throw new Error(fixtures.canaries[0]); } } }));
+      }
+      if (kind === 'renamed') for (const message of messages) {
+        if (message instanceof AIMessage) for (const call of message.tool_calls ?? []) call.name = 'other';
+        if (message instanceof ToolMessage) { message.name = 'other'; message.content = fixtures.canaries[0]; }
+      }
+      return { ...tuple, checkpoint: { ...tuple.checkpoint, channel_values: { ...tuple.checkpoint.channel_values, messages: history } } };
+    }
+  }
+  const saver = new Checkpointer(); const runId = `restored-custom-${kind}`;
+  const lookup = direct(() => { executions++; return fixtures.canaries[0]; });
+  const create = (): Promise<Run<IState>> => Run.create({ runId, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, tools: [lookup], toolEnd: true, compileOptions: { checkpointer: saver } }, toolResultProtection: policy() });
+  const first = await create(); first.Graph!.overrideModel = new FakeChatModel({ responses: [''], toolCalls: [{ id: 'custom-source', name: 'lookup', args: { count: 42 }, type: 'tool_call' }] });
+  const config = { version: 'v2' as const, configurable: { thread_id: runId } };
+  await first.processStream({ messages: [new HumanMessage('Allowed control')] }, config); expect(executions).toBe(1); tamper = true;
+  const next = await create();
+  class Model extends FakeChatModel { override async *_streamResponseChunks(...args: Parameters<FakeChatModel['_streamResponseChunks']>): ReturnType<FakeChatModel['_streamResponseChunks']> { models++; assertNoCanary(JSON.stringify(args[0])); yield* super._streamResponseChunks(...args); } }
+  next.Graph!.overrideModel = new Model({ responses: ['Allowed answer'] });
+  const outcome = next.processStream({ messages: [new HumanMessage('Allowed next control')] }, config);
+  if (kind === 'control') { await outcome; expect(models).toBe(1); }
+  else { const error = await outcome.catch((value: Error) => value); expect(error).toMatchObject({ code: 'unsupported' }); assertNoCanary(String(error)); expect(models).toBe(0); }
+  expect(reads).toBe(0); expect(executions).toBe(1);
+});
+
+it('keeps checkpoint receipt size bounded across compaction and rebuilt runs', async () => {
+  const saver = new MemorySaver(); const runId = 'bounded-receipts'; let executions = 0;
+  const lookup = direct(() => { executions++; return fixtures.canaries[0]; });
+  const create = (): Promise<Run<IState>> => Run.create({ runId, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, tools: [lookup], toolEnd: true, compileOptions: { checkpointer: saver } }, toolResultProtection: policy() });
+  const config = { version: 'v2' as const, configurable: { thread_id: runId } };
+  for (let turn = 0; turn < 4; turn++) {
+    const run = await create(); run.Graph!.overrideModel = new FakeChatModel({ responses: [''], toolCalls: [{ id: `bounded-${turn}`, name: 'lookup', args: { count: 42 }, type: 'tool_call' }] });
+    await run.processStream({ messages: [createRemoveAllMessage(), new HumanMessage('Allowed compacted control')] }, config);
+    const tuple = await saver.getTuple(config); const values = tuple!.checkpoint.channel_values as { messages: BaseMessage[]; runStepState: RunStepResumeState };
+    expect(values.messages.filter((message) => message instanceof ToolMessage)).toHaveLength(1); expect(values.runStepState.toolResultReleases).toHaveLength(1); expect(values.runStepState.toolResultReleases![0].id).toBe(`bounded-${turn}`); assertNoCanary(values.messages);
+  }
+  expect(executions).toBe(4);
+});
+
+it('rejects a certified selected result disguised as another message role', async () => {
+  class Graph extends StandardGraph { reduce(current: BaseMessage[], update: BaseMessage[]): BaseMessage[] { return this.reduceProtectedMessages(current, update); } }
+  const fixture = await certifiedHistory(); const graph = new Graph({ runId: 'renamed-role', agents: [{ agentId: 'agent', provider: Providers.OPENAI }], toolResultProtection: fixture.gate });
+  const messages = graph.reduce([], fixture.messages); const original = messages[1] as ToolMessage;
+  const disguised = new HumanMessage({ id: original.id, content: fixtures.canaries[0] });
+  await expect(validateToolMessageHistory(policy(), [messages[0], disguised], graph.createRunStepResumeState().toolResultReleases!)).rejects.toMatchObject({ code: 'unsupported' });
 });

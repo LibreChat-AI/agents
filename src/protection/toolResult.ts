@@ -1,5 +1,5 @@
 import { types } from 'node:util';
-import { ToolMessage, isAIMessage } from '@langchain/core/messages';
+import { ToolMessage } from '@langchain/core/messages';
 import { GraphInterrupt, ParentCommand } from '@langchain/langgraph';
 import {
   StructuredTool,
@@ -462,25 +462,67 @@ function validateReplayReferenceMetadata(
     throw new ToolResultProtectionError('unsupported');
 }
 
+function ownMessageValue(message: object, key: string): unknown {
+  const candidate: unknown = message;
+  if (candidate == null || typeof candidate !== 'object' || types.isProxy(message)) throw new ToolResultProtectionError('unsupported');
+  const descriptor = Object.getOwnPropertyDescriptor(message, key);
+  if (descriptor != null) {
+    if (!('value' in descriptor)) throw new ToolResultProtectionError('unsupported');
+    return descriptor.value;
+  }
+  let prototype = Object.getPrototypeOf(message);
+  while (prototype != null) {
+    if (types.isProxy(prototype) || Object.getOwnPropertyDescriptor(prototype, key) != null) throw new ToolResultProtectionError('unsupported');
+    prototype = Object.getPrototypeOf(prototype);
+  }
+  return undefined;
+}
+
+export function snapshotToolHistoryMessages(messages: readonly BaseMessage[]): BaseMessage[] {
+  return snapshotDataArray(messages, Number.MAX_SAFE_INTEGER, true);
+}
+
+function historyMessageType(message: BaseMessage): string {
+  const type = ownMessageValue(message, 'type');
+  if (typeof type !== 'string') throw new ToolResultProtectionError('unsupported');
+  return type;
+}
+
+function historyIdentity(message: BaseMessage): { id?: string; tool_call_id: string; name?: string } {
+  const id = ownMessageValue(message, 'id');
+  const tool_call_id = ownMessageValue(message, 'tool_call_id');
+  const name = ownMessageValue(message, 'name');
+  if ((id != null && typeof id !== 'string') || typeof tool_call_id !== 'string' || (name != null && typeof name !== 'string')) throw new ToolResultProtectionError('unsupported');
+  return { id: id ?? undefined, tool_call_id, name: name ?? undefined };
+}
+
+/** Receipt retention uses stable message/call identities, never mutable tool names. */
+export function retainToolMessageReleases(messages: readonly BaseMessage[], releases: readonly ToolMessageRelease[]): ToolMessageRelease[] {
+  const identities = new Set<string>();
+  for (const message of snapshotToolHistoryMessages(messages)) {
+    if (historyMessageType(message) !== 'tool') continue;
+    const identity = historyIdentity(message);
+    identities.add(JSON.stringify([identity.tool_call_id, identity.id]));
+  }
+  return releases.filter((release) => identities.has(JSON.stringify([release.id, release.envelope.id])));
+}
+
 function snapshotToolMessageEnvelope(
   message: ToolMessageEnvelope
 ): ToolMessageEnvelope {
-  if (types.isProxy(message))
-    throw new ToolResultProtectionError('unsupported');
-  for (const key of messageFields) {
-    const descriptor = Object.getOwnPropertyDescriptor(message, key);
-    if (descriptor != null && !('value' in descriptor))
-      throw new ToolResultProtectionError('unsupported');
+  const values = Object.fromEntries(messageFields.map((key) => [key, ownMessageValue(message, key)])) as ToolMessageEnvelope;
+  for (const key of ['content', 'tool_call_id', 'status', 'additional_kwargs', 'response_metadata']) {
+    if (!Object.hasOwn(message, key)) throw new ToolResultProtectionError('unsupported');
   }
-  plainObject(message.additional_kwargs, [
+  plainObject(values.additional_kwargs, [
     '_refKey',
     '_refScope',
     '_unresolvedRefs',
   ]);
-  plainObject(message.response_metadata, []);
-  const unresolved = message.additional_kwargs._unresolvedRefs;
+  plainObject(values.response_metadata, []);
+  const unresolved = values.additional_kwargs._unresolvedRefs;
   const additional_kwargs = {
-    ...message.additional_kwargs,
+    ...values.additional_kwargs,
     ...(unresolved != null
       ? {
         _unresolvedRefs: snapshotDataArray(
@@ -493,12 +535,12 @@ function snapshotToolMessageEnvelope(
   };
   validateReplayReferenceMetadata(additional_kwargs);
   return {
-    content: message.content,
-    artifact: message.artifact,
-    name: message.name,
-    id: message.id,
-    tool_call_id: message.tool_call_id,
-    status: message.status,
+    content: values.content,
+    artifact: values.artifact,
+    name: values.name,
+    id: values.id,
+    tool_call_id: values.tool_call_id,
+    status: values.status,
     additional_kwargs,
     response_metadata: {},
   };
@@ -621,31 +663,54 @@ export function snapshotToolMessageReleases(releases: readonly ToolMessageReleas
 }
 
 /** Historical state is immutable: reject legacy or newly incompatible history before model reuse. */
-export async function validateToolMessageHistory(policy: ToolResultProtection | undefined, messages: readonly BaseMessage[], releases: readonly ToolMessageRelease[], signal?: AbortSignal): Promise<void> {
-  if (policy == null) return;
-  const certified = new Map<string, ToolMessageRelease>();
+export async function validateToolMessageHistory(policy: ToolResultProtection | undefined, messages: readonly BaseMessage[], releases: readonly ToolMessageRelease[], signal?: AbortSignal): Promise<BaseMessage[]> {
+  if (policy == null) return [...messages];
+  const history = snapshotToolHistoryMessages(messages);
+  const byIdentity = new Map<string, ToolMessageRelease>();
+  const byMessage = new Map<string, ToolMessageRelease>();
   for (const release of snapshotToolMessageReleases(releases)) {
-    const key = JSON.stringify([release.name, release.id, release.envelope.id]);
-    if (!certified.has(key)) certified.set(key, release);
+    const key = JSON.stringify([release.id, release.envelope.id]);
+    const existing = byIdentity.get(key);
+    if (existing != null && existing.name !== release.name) throw new ToolResultProtectionError('incompatible');
+    if (!byIdentity.has(key)) byIdentity.set(key, release);
+    if (release.envelope.id != null && !byMessage.has(release.envelope.id)) byMessage.set(release.envelope.id, release);
   }
   const calls = new Map<string, string>();
-  for (const message of messages) {
-    if (isAIMessage(message)) {
-      for (const call of message.tool_calls ?? []) if (call.id != null) calls.set(call.id, call.name);
+  for (let index = 0; index < history.length; index++) {
+    const message = history[index];
+    const type = historyMessageType(message);
+    const messageId = ownMessageValue(message, 'id');
+    if (messageId != null && typeof messageId !== 'string') throw new ToolResultProtectionError('unsupported');
+    const knownRelease = messageId == null ? undefined : byMessage.get(messageId);
+    if (knownRelease != null && requiresToolResultProtection(policy, knownRelease.name) && type !== 'tool') throw new ToolResultProtectionError('unsupported');
+    if (type === 'ai') {
+      const toolCalls = ownMessageValue(message, 'tool_calls');
+      for (const call of snapshotDataArray((toolCalls ?? []) as readonly { id?: string; name: string }[], Number.MAX_SAFE_INTEGER, true)) {
+        const id = ownMessageValue(call, 'id'); const name = ownMessageValue(call, 'name');
+        if ((id != null && typeof id !== 'string') || typeof name !== 'string') throw new ToolResultProtectionError('unsupported');
+        if (id != null) calls.set(id, name);
+      }
       continue;
     }
-    if (!(message instanceof ToolMessage)) continue;
-    const name = calls.get(message.tool_call_id) ?? message.name;
-    if (!requiresToolResultProtection(policy, name ?? '') && !requiresToolResultProtection(policy, message.name ?? '')) continue;
+    if (type !== 'tool') continue;
+    const identity = historyIdentity(message);
+    const callName = calls.get(identity.tool_call_id);
+    const admission = approved.get(message);
+    const certified = byIdentity.get(JSON.stringify([identity.tool_call_id, identity.id])) ?? (identity.id == null ? undefined : byMessage.get(identity.id));
+    const name = certified?.name ?? admission?.name ?? callName ?? identity.name;
+    const selected = requiresToolResultProtection(policy, name ?? '') || requiresToolResultProtection(policy, callName ?? '') || requiresToolResultProtection(policy, identity.name ?? '');
+    if (!selected) continue;
     if (name == null) throw new ToolResultProtectionError('incompatible');
-    const live = getLiveToolMessageRelease(policy, message);
-    if (live != null) continue;
-    const release = certified.get(JSON.stringify([name, message.tool_call_id, message.id]));
+    if ((callName != null && callName !== name) || (identity.name != null && identity.name !== name) || (certified != null && (certified.id !== identity.tool_call_id || certified.envelope.id !== identity.id))) throw new ToolResultProtectionError('unsupported');
+    const toolMessage = message as ToolMessage;
+    const live = getLiveToolMessageRelease(policy, toolMessage);
+    const release = live ?? certified;
     if (release == null) throw new ToolResultProtectionError('incompatible');
-    const canonical = await protectToolMessage(policy, name, message.tool_call_id, message, signal, release);
-    if (canonical.content !== message.content) throw new ToolResultProtectionError('incompatible');
-    markReleasedToolMessage(policy, name, message.tool_call_id, message);
+    const canonical = await protectToolMessage(policy, name, identity.tool_call_id, toolMessage, signal, release);
+    if (canonical.content !== ownMessageValue(message, 'content')) throw new ToolResultProtectionError('incompatible');
+    history[index] = canonical;
   }
+  return history;
 }
 
 export async function protectToolMessage(
@@ -860,8 +925,7 @@ export function validateToolReferenceSources(
       source.toolName.length === 0 ||
       typeof source.toolCallId !== 'string' ||
       typeof source.protected !== 'boolean' ||
-      (requiresToolResultProtection(policy, source.toolName) &&
-        !source.protected)
+      (requiresToolResultProtection(policy, source.toolName) !== source.protected)
     )
       throw new ToolResultProtectionError('incompatible');
     snapshot.entries.push({
