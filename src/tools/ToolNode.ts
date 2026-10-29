@@ -54,7 +54,7 @@ import type { PreparedSubagents } from '@/tools/preparedSubagents';
 import type { ToolMessageRelease } from '@/protection/toolResult';
 import type { RunBreakerScope } from '@/llm/streamLimits';
 import type * as t from '@/types';
-import { detachReleasedToolError, getToolMessageRelease, replaceReleasedToolMessage, normalizeToolResultError, needsToolReferenceInspection, protectToolReferenceState, bindToolExecuteProtection, validateToolExecuteResults, hasReleasedToolReference, isReleasedToolError, markReleasedToolMessage, protectToolText, protectToolMessage, protectToolExecuteResult, withToolResultBoundary, requiresToolResultProtection, validateToolResultProtection, ToolResultProtectionError } from '@/protection/toolResult';
+import { snapshotToolErrorText, protectToolErrorText, detachReleasedToolError, getToolMessageRelease, replaceReleasedToolMessage, normalizeToolResultError, needsToolReferenceInspection, protectToolReferenceState, bindToolExecuteProtection, validateToolExecuteResults, hasReleasedToolReference, isReleasedToolError, markReleasedToolMessage, protectToolText, protectToolMessage, protectToolExecuteResult, withToolResultBoundary, requiresToolResultProtection, validateToolResultProtection, ToolResultProtectionError } from '@/protection/toolResult';
 import {
   TOOL_BATCH_REPLAY_KEY,
   getToolBatchReplayOwner,
@@ -2165,7 +2165,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         if (requiresToolResultProtection(this.toolResultProtection, call.name) && !isReleasedToolError(this.toolResultProtection, call.name, call.id ?? '', e) && !(e instanceof ProviderTextProtectionError) &&
             !(e instanceof StreamLimitExceededError) && !(e instanceof PreparedSubagentError) && !isGraphInterrupt(e)) {
           // eslint-disable-next-line preserve-caught-error -- Raw causes must not escape protection.
-          throw new Error(await protectToolText(this.toolResultProtection, call.name, call.id ?? '', e.message, 'error', config.signal) as string);
+          throw new Error(await protectToolErrorText(this.toolResultProtection, call.name, call.id ?? '', e, config.signal));
         }
         throw e;
       }
@@ -2185,10 +2185,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         throw e;
       }
       if (requiresToolResultProtection(this.toolResultProtection, call.name) && !isReleasedToolError(this.toolResultProtection, call.name, call.id ?? '', e)) {
-        const safeError = await protectToolText(this.toolResultProtection, call.name, call.id ?? '', e.message, 'error', config.signal);
-        e = new Error(safeError as string);
+        const safeError = await protectToolErrorText(this.toolResultProtection, call.name, call.id ?? '', e, config.signal);
+        e = new Error(safeError);
       }
-      const admittedErrorText = e.message;
+      const selectedResult = requiresToolResultProtection(this.toolResultProtection, call.name);
+      const admittedErrorText = selectedResult ? snapshotToolErrorText(e) : e.message;
       if (this.errorHandler) {
         try {
           const dispatched = await this.errorHandler(
@@ -2258,11 +2259,15 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           });
         }
       }
-      if (requiresToolResultProtection(this.toolResultProtection, call.name) && e.message !== admittedErrorText) {
-        e = new Error(await protectToolText(this.toolResultProtection, call.name, call.id ?? '', e.message, 'error', config.signal) as string);
-      }
+      let errorText: string;
+      if (selectedResult) {
+        const replacement = snapshotToolErrorText(e);
+        errorText = replacement === admittedErrorText ? admittedErrorText
+          : await protectToolText(this.toolResultProtection, call.name, call.id ?? '', replacement, 'error', config.signal) as string;
+        e = new Error(errorText);
+      } else errorText = e.message;
       const errorContent = formatToolErrorContent(
-        e.message,
+        errorText,
         this.maxToolResultChars,
         config.signal,
         e

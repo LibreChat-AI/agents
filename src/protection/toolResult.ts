@@ -358,16 +358,20 @@ export function detachReleasedToolError(policy: ToolResultProtection | undefined
   return detached;
 }
 
-/** Read external error text only from an own data property, never callback accessors. */
-export async function protectToolErrorText(policy: ToolResultProtection | undefined, name: string, id: string, error: unknown, signal?: AbortSignal): Promise<string> {
-  if (!requiresToolResultProtection(policy, name)) return (error as Error).message || 'Tool execution failed';
+export function snapshotToolErrorText(error: unknown): string {
   if (error == null || typeof error !== 'object' || types.isProxy(error)) throw new ToolResultProtectionError('unsupported');
-  const detached = detachReleasedToolError(policy, name, id, error as Error);
-  if (detached != null) return detached.message;
   const descriptor = Object.getOwnPropertyDescriptor(error, 'message');
   const value: unknown = descriptor?.value;
   if (descriptor != null && (!('value' in descriptor) || typeof value !== 'string')) throw new ToolResultProtectionError('unsupported');
-  const content = typeof value === 'string' && value !== '' ? value : 'Tool execution failed';
+  return typeof value === 'string' ? value : 'Tool execution failed';
+}
+
+/** Read external error text only from an own data property, never callback accessors. */
+export async function protectToolErrorText(policy: ToolResultProtection | undefined, name: string, id: string, error: unknown, signal?: AbortSignal): Promise<string> {
+  if (!requiresToolResultProtection(policy, name)) return (error as Error).message || 'Tool execution failed';
+  const detached = detachReleasedToolError(policy, name, id, error as Error);
+  if (detached != null) return detached.message;
+  const content = snapshotToolErrorText(error);
   return await protectToolText(policy, name, id, content, 'error', signal) as string;
 }
 

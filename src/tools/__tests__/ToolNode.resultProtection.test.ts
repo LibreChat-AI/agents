@@ -2625,3 +2625,37 @@ it.each(['local', 'python', 'bash'] as const)('keeps callback-installed error ac
     expect(error).toMatchObject({ code: 'unsupported' }); expect(reads).toBe(0); expect(callbacks).toBe(1); expect(requests).toHaveLength(runtime === 'local' ? 0 : 1); assertNoCanary(String(error)); assertNoCanary(events.join('')); assertNoCanary(requests);
   } finally { server.closeAllConnections(); await new Promise<void>((resolve) => server.close(() => resolve())); }
 });
+
+it.each((['changing', 'throwing', 'replacement', 'stack', 'name'] as const).flatMap((kind) => [false, true].map((throws) => [kind, throws] as const)))('snapshots selected post-handler %s error text without accessor reads (throws=%s)', async (kind, throws) => {
+  let reads = 0; let handlers = 0; const inspected: string[] = []; const logs: string[] = []; const events: string[] = [];
+  jest.spyOn(console, 'error').mockImplementation((...args): void => { logs.push(JSON.stringify(args)); });
+  const node = new ToolNode({ trace: true, tools: [direct(() => { throw new Error(fixtures.canaries[0]); })], toolCallStepIds: new Map([['call-control', 'step-control']]), toolOutputReferences: { enabled: true }, toolResultProtection: policy({ inspect: ({ content }) => { inspected.push(content); return approve(content.replaceAll(fixtures.canaries[0], '[EMAIL_1]')); } }), errorHandler: async ({ error }) => {
+    handlers++; expect(error!.message).toBe('[EMAIL_1]');
+    if (kind === 'changing') Object.defineProperty(error, 'message', { get: () => { reads++; return reads === 1 ? '[EMAIL_1]' : fixtures.canaries[0]; } });
+    if (kind === 'throwing') Object.defineProperty(error, 'message', { get: () => { reads++; throw new Error(fixtures.canaries[0]); } });
+    if (kind === 'replacement') error!.message = fixtures.canaries[0];
+    if (kind === 'stack') { error!.stack = fixtures.canaries[0]; Object.defineProperty(error, 'cause', { value: new Error(fixtures.canaries[0]) }); }
+    if (kind === 'name') Object.defineProperty(error, 'name', { get: () => { reads++; throw new Error(fixtures.canaries[0]); } });
+    if (throws) throw new Error(fixtures.canaries[0]);
+    return false;
+  } });
+  const pending = node.invoke(state(), { configurable: { run_id: `post-error-${kind}-${throws}` }, callbacks: [observer(events)] });
+  if (kind === 'changing' || kind === 'throwing') await expect(pending).rejects.toMatchObject({ code: 'unsupported' });
+  else { const output = await pending; assertNoCanary(output); expect(JSON.stringify(output)).toContain('[EMAIL_1]'); }
+  expect(reads).toBe(0); expect(handlers).toBe(1); expect(inspected).toEqual(kind === 'replacement' ? [fixtures.canaries[0], fixtures.canaries[0]] : [fixtures.canaries[0]]); assertNoCanary(events.join('')); assertNoCanary(logs.join('')); expect(node._unsafeGetToolOutputRegistry()!.size).toBe(0);
+});
+
+it('uses the detached post-handler data snapshot across an awaited replacement inspection', async () => {
+  const started = deferred<void>(); const decision = deferred<ToolResultProtectionResult>(); let retained: Error | undefined; const inspected: string[] = []; const events: string[] = [];
+  const node = new ToolNode({ trace: true, tools: [direct(() => { throw new Error('Allowed initial error'); })], toolResultProtection: policy({ inspect: ({ content }) => { inspected.push(content); if (content === 'Allowed replacement error') { started.resolve(); return decision.promise; } return approve(content); } }), errorHandler: async ({ error }) => { retained = error; error!.message = 'Allowed replacement error'; return false; } });
+  const pending = node.invoke(state(), { callbacks: [observer(events)] });
+  await started.promise; retained!.message = fixtures.canaries[0]; retained!.stack = fixtures.canaries[0]; decision.resolve(approve('Allowed canonical replacement'));
+  const output = await pending; expect(inspected).toEqual(['Allowed initial error', 'Allowed replacement error']); expect(JSON.stringify(output)).toContain('Allowed canonical replacement'); assertNoCanary(output); assertNoCanary(events.join(''));
+});
+
+it('preserves admitted empty error text without a second policy decision', async () => {
+  let inspections = 0; const handled: string[] = [];
+  const node = new ToolNode({ tools: [direct(() => { throw new Error('Allowed initial error'); })], toolResultProtection: policy({ inspect: () => { inspections++; return approve(''); } }), errorHandler: async ({ error }) => { handled.push(error!.message); return false; } });
+  const result = await node.invoke(state()) as { messages: ToolMessage[] };
+  expect(inspections).toBe(1); expect(handled).toEqual(['']); expect(result.messages[0].content).toBe('Error: \n Please fix your mistakes.');
+});
