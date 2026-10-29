@@ -175,7 +175,7 @@ function buildSummarizationClientConfig(
     separateSummarizationParameters(parameters);
 
   const isSelfSummarize = provider === (agentContext.provider as string);
-  const baseOptions =
+  const baseOptions: Record<string, unknown> =
     isSelfSummarize && agentContext.clientOptions
       ? { ...agentContext.clientOptions }
       : {};
@@ -190,17 +190,21 @@ function buildSummarizationClientConfig(
     clientOptions.modelName = modelName;
   }
 
-  // Agent output limits belong to ordinary turns, not checkpoint generation.
-  if (llmParams[getMaxOutputTokensKey(provider)] == null) delete clientOptions[getMaxOutputTokensKey(provider)];
+  const outputKey = getMaxOutputTokensKey(provider);
+  const inheritedOutputTokens = baseOptions[outputKey];
+  if (llmParams[outputKey] == null) delete clientOptions[outputKey];
+  const defaultOutputTokens = resolveSummaryOutputTokens(
+    provider, clientOptions, agentContext.maxContextTokens
+  );
+  const reasoningOutputTokens = resolveSummaryReasoning(provider, clientOptions).enabled &&
+    typeof inheritedOutputTokens === 'number' && Number.isFinite(inheritedOutputTokens) && inheritedOutputTokens > 0
+    ? inheritedOutputTokens : 0;
   const effectiveMaxSummaryTokens =
     paramMaxSummaryTokens ??
     summarizationConfig?.maxSummaryTokens ??
-    resolveSummaryOutputTokens(
-      provider,
-      clientOptions,
-      agentContext.maxContextTokens
-    );
-  clientOptions[getMaxOutputTokensKey(provider)] = effectiveMaxSummaryTokens;
+    (llmParams[outputKey] as number | undefined) ??
+    Math.max(defaultOutputTokens, reasoningOutputTokens);
+  clientOptions[outputKey] = effectiveMaxSummaryTokens;
 
   return {
     provider,
@@ -212,34 +216,59 @@ function buildSummarizationClientConfig(
   };
 }
 
+function resolveSummaryReasoning(provider: t.ProviderName, clientOptions: Record<string, unknown>): {enabled: boolean; fixedBudget: number} {
+  type ReasoningOptions = {
+    reasoningEffort?: string;
+    reasoning_effort?: string;
+    reasoning?: {effort?: string; enabled?: boolean; max_tokens?: number};
+    thinking?: t.AnthropicReasoning['thinking'];
+    thinkingBudget?: number;
+    thinkingConfig?: t.GoogleThinkingConfig;
+  };
+  const options = clientOptions as ReasoningOptions & {
+    include_reasoning?: boolean;
+    modelKwargs?: ReasoningOptions;
+    additionalModelRequestFields?: ReasoningOptions;
+    invocationKwargs?: ReasoningOptions;
+  };
+  const family = getProviderFamily(provider);
+  const google = options.thinkingConfig;
+  if (provider === Providers.GOOGLE || provider === Providers.VERTEXAI || family === 'google') {
+    const budget = google?.thinkingBudget ?? options.thinkingBudget;
+    const hasLevel = google?.thinkingLevel != null && google.thinkingLevel !== 'THINKING_LEVEL_UNSPECIFIED';
+    const fixedBudget = budget != null && Number.isFinite(budget) && budget > 0 ? budget : 0;
+    return {
+      enabled: hasLevel || (budget != null && (budget > 0 || budget === -1)),
+      fixedBudget: provider === Providers.VERTEXAI && hasLevel ? 0 : fixedBudget,
+    };
+  }
+  const thinking = (provider === Providers.ANTHROPIC || family === 'anthropic'
+    ? options.invocationKwargs?.thinking : undefined) ?? options.thinking ??
+    options.additionalModelRequestFields?.thinking ?? options.modelKwargs?.thinking;
+  if (thinking != null) {
+    const enabled = thinking === true || (typeof thinking === 'object' &&
+      (thinking.type === 'enabled' || thinking.type === 'adaptive'));
+    let budget = thinking === true ? options.thinkingBudget ?? options.additionalModelRequestFields?.thinkingBudget : 0;
+    if (typeof thinking === 'object' && thinking.type === 'enabled') budget = thinking.budget_tokens;
+    return {enabled, fixedBudget: enabled && budget != null && Number.isFinite(budget) && budget > 0 ? budget : 0};
+  }
+  const reasoning = {...options.modelKwargs?.reasoning, ...options.reasoning};
+  const effort = reasoning.effort ?? options.reasoningEffort ?? options.reasoning_effort ??
+    options.modelKwargs?.reasoning_effort ?? options.modelKwargs?.reasoningEffort;
+  return {enabled: reasoning.enabled !== false && (
+    (effort != null && effort !== '' && effort !== 'none' && effort !== 'disabled') ||
+    reasoning.enabled === true || (reasoning.max_tokens != null && reasoning.max_tokens > 0) ||
+    (provider === Providers.OPENROUTER && options.reasoning == null &&
+      options.modelKwargs?.reasoning == null && options.include_reasoning === true)
+  ), fixedBudget: 0};
+}
+
 function resolveSummaryOutputTokens(
   provider: t.ProviderName,
   clientOptions: Record<string, unknown>,
   maxContextTokens?: number
 ): number {
-  const reasoningOptions = clientOptions as t.AnthropicReasoning &
-    Pick<t.BedrockAnthropicInput, 'additionalModelRequestFields'> &
-    Pick<t.OpenAIClientOptions, 'modelKwargs'>;
-  const thinking =
-    reasoningOptions.thinking ??
-    reasoningOptions.additionalModelRequestFields?.thinking ??
-    (reasoningOptions.modelKwargs
-      ?.thinking as t.AnthropicReasoning['thinking']);
-  let thinkingBudget = 0;
-  if (typeof thinking === 'object' && thinking.type === 'enabled') {
-    thinkingBudget = thinking.budget_tokens;
-  } else if (thinking === true) {
-    thinkingBudget =
-      reasoningOptions.thinkingBudget ??
-      reasoningOptions.additionalModelRequestFields?.thinkingBudget ??
-      0;
-  }
-  if (provider === Providers.GOOGLE || provider === Providers.VERTEXAI || getProviderFamily(provider) === 'google') {
-    const google = clientOptions as t.GoogleThinkingConfig & Pick<t.VertexAIClientOptions, 'thinkingConfig'>;
-    const fixedBudget = provider === Providers.VERTEXAI && google.thinkingConfig?.thinkingLevel != null
-      ? 0 : google.thinkingConfig?.thinkingBudget ?? google.thinkingBudget;
-    if (fixedBudget != null && Number.isFinite(fixedBudget) && fixedBudget > 0) thinkingBudget = fixedBudget;
-  }
+  const thinkingBudget = resolveSummaryReasoning(provider, clientOptions).fixedBudget;
   const defaultOutputTokens =
     thinkingBudget +
     Math.min(
