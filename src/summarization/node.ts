@@ -29,17 +29,18 @@ import {
   STREAM_LIMIT_EPOCH_KEY,
   STREAM_LIMIT_ATTEMPT_KEY,
 } from '@/llm/streamLimits';
+import {
+  boundSummarizationInput,
+  SummarizationInputTooLargeError,
+  DEFAULT_SUMMARY_OUTPUT_TOKENS,
+  DEFAULT_RETAIN_RECENT_TOKENS,
+} from './input';
 import { classifySummarizationError, withSummarizationRetry, withSummarizationRetryOwner, ReasoningOnlySummaryError } from './retry';
 import {
   DEFAULT_RETAIN_RECENT_TURNS,
   resolveIntraTurnRetainTokens,
   splitAtRecencyBoundary,
 } from '@/messages/recency';
-import {
-  boundSummarizationInput,
-  DEFAULT_SUMMARY_OUTPUT_TOKENS,
-  DEFAULT_RETAIN_RECENT_TOKENS,
-} from './input';
 import { isReasoningContentBlock, hasMeaningfulReasoningContentBlock } from '@/messages/reasoningTypes';
 import {
   createTokenCounter,
@@ -152,7 +153,7 @@ interface SummarizationClientConfig {
   provider: string;
   modelName?: string;
   clientOptions: Record<string, unknown>;
-  effectiveMaxSummaryTokens: number;
+  effectiveMaxSummaryTokens: number | undefined;
   promptText: string;
   updatePromptText: string;
 }
@@ -194,18 +195,15 @@ function buildSummarizationClientConfig(
   const inheritedOutputTokens = readSummaryOutputLimit(provider, baseOptions);
   const explicitOutputTokens = readSummaryOutputLimit(provider, llmParams);
   clearSummaryOutputLimits(provider, clientOptions);
-  const defaultOutputTokens = resolveSummaryOutputTokens(
-    provider, clientOptions, agentContext.maxContextTokens
-  );
-  const reasoningOutputTokens = resolveSummaryReasoning(provider, clientOptions).enabled &&
-    typeof inheritedOutputTokens === 'number' && Number.isFinite(inheritedOutputTokens) && inheritedOutputTokens > 0
-    ? inheritedOutputTokens : 0;
-  const effectiveMaxSummaryTokens =
-    paramMaxSummaryTokens ??
-    summarizationConfig?.maxSummaryTokens ??
-    explicitOutputTokens ??
-    Math.max(defaultOutputTokens, reasoningOutputTokens);
-  clientOptions[outputKey] = effectiveMaxSummaryTokens;
+  let effectiveMaxSummaryTokens =
+    paramMaxSummaryTokens ?? summarizationConfig?.maxSummaryTokens ?? explicitOutputTokens;
+  if (effectiveMaxSummaryTokens == null) {
+    effectiveMaxSummaryTokens = resolveSummaryOutputTokens(
+      provider, clientOptions, agentContext.maxContextTokens, inheritedOutputTokens
+    );
+  }
+  if (effectiveMaxSummaryTokens === -1 && usesCompletionTokenAlias(provider)) effectiveMaxSummaryTokens = undefined;
+  if (effectiveMaxSummaryTokens != null) clientOptions[outputKey] = effectiveMaxSummaryTokens;
 
   return {
     provider,
@@ -299,18 +297,37 @@ function resolveSummaryReasoning(provider: t.ProviderName, clientOptions: Record
 function resolveSummaryOutputTokens(
   provider: t.ProviderName,
   clientOptions: Record<string, unknown>,
-  maxContextTokens?: number
-): number {
-  const thinkingBudget = resolveSummaryReasoning(provider, clientOptions).fixedBudget;
-  const defaultOutputTokens =
-    thinkingBudget +
-    Math.min(
-      DEFAULT_SUMMARY_OUTPUT_TOKENS,
-      Math.max(1, Math.floor((maxContextTokens ?? 40_960) * 0.1))
-    );
-  return (
-    readSummaryOutputLimit(provider, clientOptions) ?? defaultOutputTokens
+  maxContextTokens?: number,
+  inheritedOutputTokens?: number
+): number | undefined {
+  const explicit = readSummaryOutputLimit(provider, clientOptions);
+  if (explicit != null) return explicit === -1 && usesCompletionTokenAlias(provider) ? undefined : explicit;
+  const reasoning = resolveSummaryReasoning(provider, clientOptions);
+  if (reasoning.enabled && (inheritedOutputTokens == null || inheritedOutputTokens === -1)) return undefined;
+  const defaultOutputTokens = reasoning.fixedBudget + Math.min(
+    DEFAULT_SUMMARY_OUTPUT_TOKENS,
+    Math.max(1, Math.floor((maxContextTokens ?? 40_960) * 0.1))
   );
+  const inherited = reasoning.enabled && inheritedOutputTokens != null &&
+    Number.isFinite(inheritedOutputTokens) && inheritedOutputTokens > 0 ? inheritedOutputTokens : 0;
+  return Math.max(defaultOutputTokens, inherited);
+}
+
+function resolveSummaryOutputReserve(model: t.ChatModel): number {
+  let candidate: object | undefined = model;
+  const seen = new Set<object>();
+  for (let depth = 0; candidate != null && depth < 20 && !seen.has(candidate); depth++) {
+    seen.add(candidate);
+    const runnable = candidate as {
+      profile?: {maxOutputTokens?: number};
+      bound?: object;
+      last?: object;
+    };
+    const maximum = runnable.profile?.maxOutputTokens;
+    if (maximum != null && Number.isSafeInteger(maximum) && maximum > 0) return maximum;
+    candidate = runnable.bound ?? runnable.last;
+  }
+  throw new SummarizationInputTooLargeError();
 }
 
 /**
@@ -425,6 +442,7 @@ function encodingForSummarizationModel(
 
 async function prepareSummarizationBudget({
   agentContext,
+  model,
   provider,
   clientOptions,
   maxContextTokens,
@@ -435,10 +453,11 @@ async function prepareSummarizationBudget({
   config,
 }: {
   agentContext: AgentContext;
+  model: t.ChatModel;
   provider: t.ProviderName;
   clientOptions?: t.ClientOptions;
   maxContextTokens?: number;
-  outputTokens: number;
+  outputTokens: number | undefined;
   contextBudgetMode?: t.ContextBudgetMode;
   instruction: string;
   tools?: t.GraphTools;
@@ -478,13 +497,15 @@ async function prepareSummarizationBudget({
   const ratio = usesAgentCounter
     ? Math.max(1, agentContext.calibrationRatio)
     : 1;
+  const outputReserve = contextBudgetMode === 'window' && maxContextTokens != null
+    ? outputTokens ?? resolveSummaryOutputReserve(model) : 0;
   const budget =
     maxContextTokens == null
       ? Number.MAX_SAFE_INTEGER
       : Math.floor(
         (maxContextTokens -
             overhead -
-            (contextBudgetMode === 'window' ? outputTokens : 0) -
+            outputReserve -
             count(new HumanMessage(instruction))) /
             ratio
       );
@@ -950,7 +971,7 @@ async function executeSummarizationWithFallback(params: {
           );
           const clientOptions: Record<string, unknown> = withSummarizationRetryOwner(fallback.provider, {...fallback.clientOptions});
           clearSummaryOutputLimits(fallback.provider, clientOptions);
-          clientOptions[getMaxOutputTokensKey(fallback.provider)] = outputTokens;
+          if (outputTokens != null) clientOptions[getMaxOutputTokensKey(fallback.provider)] = outputTokens;
           return {
             ...fallback,
             clientOptions,
@@ -992,11 +1013,12 @@ async function executeSummarizationWithFallback(params: {
             );
             const { count, system, budget } = await prepareSummarizationBudget({
               agentContext,
+              model,
               provider,
               clientOptions,
               maxContextTokens,
               contextBudgetMode,
-              outputTokens: resolveSummaryOutputTokens(provider, {...clientOptions}, maxContextTokens),
+              outputTokens: readSummaryOutputLimit(provider, {...clientOptions}),
               instruction,
               tools: fallbackTools,
               config,
@@ -2151,7 +2173,7 @@ async function summarizeWithCacheHit({
   agentContext: AgentContext;
   onUsage: (usage: Partial<UsageMetadata>) => void;
   shrinkInput?: boolean;
-  outputTokens: number;
+  outputTokens: number | undefined;
   clientOptions?: t.ClientOptions;
   model: t.ChatModel;
   tools?: t.GraphTools;
@@ -2181,6 +2203,7 @@ async function summarizeWithCacheHit({
 
   const { count, system, budget } = await prepareSummarizationBudget({
     agentContext,
+    model,
     provider,
     clientOptions,
     maxContextTokens: agentContext.maxContextTokens,

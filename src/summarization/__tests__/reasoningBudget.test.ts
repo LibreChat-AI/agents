@@ -82,7 +82,7 @@ function fixture({
         maxTokens?: number;
         maxOutputTokens?: number;
       };
-      model.outputLimit = output.maxOutputTokens ?? output.maxTokens ?? 0;
+      model.outputLimit = output.maxOutputTokens ?? output.maxTokens ?? Number.POSITIVE_INFINITY;
       return model;
     });
   const graph = {
@@ -540,5 +540,146 @@ it.each(['max_tokens', 'max_completion_tokens'].flatMap(field =>
     expect(model.invocationParams()).toMatchObject({
       [useResponsesApi ? 'max_output_tokens' : 'max_completion_tokens']: 64_000,
     });
+  }
+);
+
+it.each([
+  {modelName: 'gpt-6.1-sol', mode: 'input' as const, maxContextTokens: 129_200},
+  {modelName: 'gpt-5.4', mode: 'window' as const, maxContextTokens: 300_000},
+])('keeps uncapped xhigh Responses requests uncapped through compaction: %j', async ({modelName, mode, maxContextTokens}) => {
+  const requests: Array<{max_output_tokens?: number; reasoning?: {effort?: string}}> = [];
+  const fetch = jest.fn<ReturnType<typeof globalThis.fetch>, Parameters<typeof globalThis.fetch>>(async (_input, init) => {
+    if (typeof init?.body !== 'string') throw new Error('Expected a JSON request body');
+    const request = JSON.parse(init.body) as typeof requests[number];
+    requests.push(request);
+    const starved = request.max_output_tokens != null && request.max_output_tokens <= 4096;
+    return Response.json({id: 'resp_offline', created_at: 0, object: 'response', model: modelName,
+      status: starved ? 'incomplete' : 'completed', error: null,
+      incomplete_details: starved ? {reason: 'max_output_tokens'} : null,
+      output: starved ? [{id: 'rs_offline', type: 'reasoning', summary: []}] : [
+        {id: 'msg_offline', type: 'message', status: 'completed', role: 'assistant',
+          content: [{type: 'output_text', text: 'REASONING_CHECKPOINT', annotations: []}]},
+      ], usage: {input_tokens: 100, output_tokens: starved ? 4096 : 9000, total_tokens: starved ? 4196 : 9100},
+    });
+  });
+  const {node, agentContext} = fixture({options: {model: modelName, useResponsesApi: true,
+    reasoning: {effort: 'xhigh'},
+  }, config: {contextBudgetMode: mode}, maxContextTokens});
+  jest.spyOn(init, 'initializeModel').mockImplementation(({clientOptions}) => {
+    const model = new ChatOpenAI({...clientOptions as t.OpenAIClientOptions, apiKey: 'offline-test',
+      useResponsesApi: true, streaming: false, disableStreaming: true, configuration: {fetch, maxRetries: 0},
+    });
+    if (mode === 'window') expect(model.profile.maxOutputTokens).toBe(128_000);
+    return model.bindTools([]);
+  });
+  const messages = [new HumanMessage({id: 'protected-head', content: 'x'.repeat(400_000)})];
+  const result = await node({messages, summarizationRequest: {agentId: 'reasoner', reason: 'manual',
+    remainingContextTokens: 0, windowMessages: messages,
+  }}, {});
+  expect(requests).toHaveLength(1);
+  expect(requests[0]).not.toHaveProperty('max_output_tokens');
+  expect(requests[0].reasoning).toMatchObject({effort: 'xhigh'});
+  expect(agentContext.getSummaryText()).toBe('REASONING_CHECKPOINT');
+  expect(result.messages?.[0].getType()).toBe('remove');
+});
+
+it.each(reasoningCases)('does not invent a cap for reasoning without a configured limit: %j', async ({provider, options}) => {
+  const uncapped = {...options};
+  for (const key of ['maxTokens', 'maxCompletionTokens', 'maxOutputTokens']) Reflect.deleteProperty(uncapped, key);
+  const before = JSON.stringify(uncapped);
+  const {node, model, agentContext} = fixture({provider, options: uncapped});
+  const messages = [new HumanMessage({id: 'protected-head', content: 'x'.repeat(400_000)})];
+  const result = await node({messages, summarizationRequest: {agentId: 'reasoner', remainingContextTokens: 0,
+    reason: 'manual', windowMessages: messages,
+  }}, {});
+  expect(model.outputLimit).toBe(Number.POSITIVE_INFINITY);
+  expect(model.calls).toHaveLength(1);
+  expect(agentContext.getSummaryText()).toBe('REASONING_CHECKPOINT');
+  expect(result.messages?.[0].getType()).toBe('remove');
+  expect(JSON.stringify(uncapped)).toBe(before);
+  const sentOptions = jest.mocked(init.initializeModel).mock.calls[0][0].clientOptions;
+  for (const key of ['maxTokens', 'maxCompletionTokens', 'maxOutputTokens']) expect(sentOptions).not.toHaveProperty(key);
+});
+
+it.each([
+  {maxSummaryTokens: 1024},
+  {parameters: {maxSummaryTokens: 1024}},
+  {parameters: {maxTokens: 1024}},
+  {parameters: {maxCompletionTokens: 1024}},
+])('honors explicit summary caps for an otherwise uncapped reasoner: %j', async config => {
+  const {node, model, agentContext} = fixture({options: {reasoning: {effort: 'xhigh'}}, config});
+  const messages = [new HumanMessage('Protected history')];
+  const before = JSON.stringify(messages);
+  const result = await node({messages, summarizationRequest: {agentId: 'reasoner', remainingContextTokens: 0, windowMessages: messages}}, {});
+  expect(model.outputLimit).toBe(1024);
+  expect(model.calls).toHaveLength(1);
+  expect(result.messages).toBeUndefined();
+  expect(agentContext.getSummaryText()).toBeUndefined();
+  expect(JSON.stringify(messages)).toBe(before);
+});
+
+it.each([undefined, 0, -1, Number.NaN, Number.POSITIVE_INFINITY, 128_000])(
+  'fails unchanged when an uncapped full-window request lacks sufficient profiled output room: %s', async maximum => {
+    const {node, model, agentContext} = fixture({options: {model: 'gpt-6.1-sol', reasoning: {effort: 'xhigh'}},
+      config: {contextBudgetMode: 'window'}, maxContextTokens: 200_000,
+    });
+    Object.defineProperty(model, 'profile', {value: {maxOutputTokens: maximum}});
+    const messages = [new HumanMessage({id: 'protected-head', content: 'x'.repeat(400_000)})];
+    const before = JSON.stringify(messages);
+    const result = await node({messages, summarizationRequest: {agentId: 'reasoner', remainingContextTokens: 0, windowMessages: messages}}, {});
+    expect(model.calls).toHaveLength(0);
+    expect(result.messages).toBeUndefined();
+    expect(agentContext.getSummaryText()).toBeUndefined();
+    expect(JSON.stringify(messages)).toBe(before);
+  }
+);
+
+it.each([
+  {mode: 'input' as const, maxContextTokens: undefined, maximum: undefined, fits: true},
+  {mode: 'window' as const, maxContextTokens: 300_000, maximum: 128_000, fits: true},
+  {mode: 'window' as const, maxContextTokens: 200_000, maximum: undefined, fits: false},
+  {mode: 'window' as const, maxContextTokens: 200_000, maximum: 128_000, fits: false},
+])('applies the same uncapped output policy to fallback requests: %j', async ({mode, maxContextTokens, maximum, fits}) => {
+  const {node, model, agentContext} = fixture({options: {reasoning: {effort: 'high'}}, config: {maxSummaryTokens: 1024}});
+  jest.spyOn(model, '_streamResponseChunks').mockImplementation(async function* (messages) {
+    model.calls.push(messages);
+    yield new ChatGenerationChunk({text: 'FAILED_UNPUBLISHED', message: new AIMessageChunk('FAILED_UNPUBLISHED')});
+    throw new Error('Primary unavailable');
+  });
+  const fallback = new ReasoningBudgetModel(); fallback.outputLimit = Number.POSITIVE_INFINITY;
+  Object.defineProperty(fallback, 'profile', {value: {maxOutputTokens: maximum}});
+  const options = agentContext.clientOptions as t.BuiltInLLMConfig;
+  options.fallbacks = [{provider: Providers.OPENAI, maxContextTokens, contextBudgetMode: mode,
+    clientOptions: {model: 'fallback', reasoning: {effort: 'xhigh'}},
+  }];
+  jest.spyOn(init, 'initializeModel').mockImplementation(({clientOptions}) => {
+    const sent = clientOptions as t.OpenAIClientOptions;
+    if (sent.model === 'fallback') {
+      expect(sent).not.toHaveProperty('maxTokens');
+      expect(sent).not.toHaveProperty('maxCompletionTokens');
+      return fallback;
+    }
+    model.outputLimit = sent.maxTokens ?? Number.POSITIVE_INFINITY;
+    return model;
+  });
+  const messages = [new HumanMessage({id: 'protected-head', content: 'x'.repeat(400_000)})];
+  const before = JSON.stringify(messages);
+  const result = await node({messages, summarizationRequest: {agentId: 'reasoner', remainingContextTokens: 0, windowMessages: messages}}, {});
+  expect(model.calls).toHaveLength(1);
+  expect(fallback.calls).toHaveLength(fits ? 1 : 0);
+  expect(agentContext.getSummaryText()).toBe(fits ? 'REASONING_CHECKPOINT' : undefined);
+  expect(result.messages?.[0].getType()).toBe(fits ? 'remove' : undefined);
+  expect(JSON.stringify(messages)).toBe(before);
+});
+
+it.each(['maxTokens', 'maxCompletionTokens'])(
+  'keeps the OpenAI unlimited %s sentinel uncapped without reserving a negative allowance', async key => {
+    const {node, model, agentContext} = fixture({options: {[key]: -1, reasoning: {effort: 'xhigh'}}});
+    const messages = [new HumanMessage('Protected history')];
+    const result = await node({messages, summarizationRequest: {agentId: 'reasoner', remainingContextTokens: 0, windowMessages: messages}}, {});
+    expect(model.outputLimit).toBe(Number.POSITIVE_INFINITY);
+    expect(model.calls).toHaveLength(1);
+    expect(result.messages?.[0].getType()).toBe('remove');
+    expect(agentContext.getSummaryText()).toBe('REASONING_CHECKPOINT');
   }
 );

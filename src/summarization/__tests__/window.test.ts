@@ -433,12 +433,12 @@ describe('compaction request windows', () => {
       },
     ],
   ] as const)(
-    'reserves inherited thinking plus visible summary output for %s',
+    'reserves thinking plus visible output above a smaller inherited limit for %s',
     async (provider, clientOptions) => {
       const { node, agentContext } = harness({
         maxContextTokens: 3_000,
         provider,
-        clientOptions,
+        clientOptions: {...clientOptions, maxTokens: 1},
         summarizationConfig: {},
       });
       const messages = history(6);
@@ -1512,17 +1512,19 @@ describe('compaction request windows', () => {
   });
 
   it.each([
-    {provider: Providers.GOOGLE, options: {thinkingConfig: {thinkingBudget: 8192}}, expected: 12288},
-    {provider: Providers.VERTEXAI, options: {thinkingBudget: 8192}, expected: 12288},
-    {provider: Providers.VERTEXAI, options: {thinkingConfig: {thinkingBudget: 8192}}, expected: 12288},
-    {provider: Providers.GOOGLE, options: {thinkingConfig: {thinkingBudget: -1}}, expected: 4096},
-    {provider: Providers.VERTEXAI, options: {thinkingConfig: {thinkingBudget: 8192, thinkingLevel: 'HIGH' as const}}, expected: 4096},
+    {provider: Providers.GOOGLE, options: {thinkingConfig: {thinkingBudget: 8192}}, expected: undefined},
+    {provider: Providers.VERTEXAI, options: {thinkingBudget: 8192}, expected: undefined},
+    {provider: Providers.VERTEXAI, options: {thinkingConfig: {thinkingBudget: 8192}}, expected: undefined},
+    {provider: Providers.GOOGLE, options: {thinkingConfig: {thinkingBudget: -1}}, expected: undefined},
+    {provider: Providers.VERTEXAI, options: {thinkingConfig: {thinkingBudget: 8192, thinkingLevel: 'HIGH' as const}}, expected: undefined},
     {provider: Providers.GOOGLE, options: {thinkingConfig: {thinkingBudget: 8192}, maxOutputTokens: 1024}, expected: 12288},
-  ])('reserves the serving Google fixed thinking budget without overriding explicit caps: %j', async ({provider, options, expected}) => {
+  ])('preserves uncapped Google reasoning unless an inherited allowance exists: %j', async ({provider, options, expected}) => {
     const {node, model} = harness({provider, maxContextTokens: 100_000, clientOptions: options, summarizationConfig: {}});
     const messages = history(6);
     await node({messages, summarizationRequest: {agentId: 'agent', remainingContextTokens: 0, windowMessages: messages}}, {});
-    expect(init.initializeModel).toHaveBeenCalledWith(expect.objectContaining({clientOptions: expect.objectContaining({maxOutputTokens: expected})}));
+    const sentOptions = jest.mocked(init.initializeModel).mock.calls[0][0].clientOptions;
+    if (expected == null) expect(sentOptions).not.toHaveProperty('maxOutputTokens');
+    else expect(sentOptions).toMatchObject({maxOutputTokens: expected});
     expect(model.calls).toHaveLength(1);
   });
 
@@ -1590,7 +1592,7 @@ describe('compaction request windows', () => {
 
   it('reserves the configured Google thinking allowance in the request input budget', async () => {
     const {node, model} = harness({provider: Providers.GOOGLE, maxContextTokens: 20_000,
-      clientOptions: {thinkingConfig: {thinkingBudget: 8192}}, summarizationConfig: {contextBudgetMode: 'window', retainRecent: {turns: 0}},
+      clientOptions: {maxOutputTokens: 10192, thinkingConfig: {thinkingBudget: 8192}}, summarizationConfig: {contextBudgetMode: 'window', retainRecent: {turns: 0}},
     });
     const messages = history(100);
     await node({messages, summarizationRequest: {agentId: 'agent', remainingContextTokens: 0, windowMessages: messages}}, {});
