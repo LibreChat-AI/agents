@@ -2510,3 +2510,33 @@ it.each(['legacy', 'protected', 'unselected', 'stricter', 'blocked'] as const)('
   }
   expect(executions).toBe(1);
 });
+
+it.each(['legacy', 'protected'] as const)('gates committed child history before executing a resumed child tool (%s)', async (mode) => {
+  let executions = 0; let approvals = 0; const resumedInputs: string[] = [];
+  const lookup = direct(() => { executions++; return fixtures.canaries[0]; });
+  const approval = new DynamicStructuredTool({ name: 'approval_control', description: 'Allowed child approval.', schema: z.object({ count: z.number() }), func: async () => { approvals++; return 'Approved child control'; } });
+  class ChildModel extends FakeChatModel {
+    constructor(private readonly resumed: boolean) { super({ responses: ['Allowed child answer'] }); }
+    override async *_streamResponseChunks(...args: Parameters<FakeChatModel['_streamResponseChunks']>): ReturnType<FakeChatModel['_streamResponseChunks']> {
+      if (this.resumed) resumedInputs.push(JSON.stringify(args[0]));
+      const tools = args[0].filter((message) => message.getType() === 'tool') as ToolMessage[];
+      let call: ToolCall | undefined;
+      if (!tools.some((message) => message.tool_call_id === 'child-source')) call = { id: 'child-source', name: 'lookup', args: { count: 42 }, type: 'tool_call' };
+      else if (!tools.some((message) => message.tool_call_id === 'child-approval')) call = { id: 'child-approval', name: 'approval_control', args: { count: 42 }, type: 'tool_call' };
+      yield* new FakeChatModel({ responses: [call == null ? 'Allowed child answer' : ''], toolCalls: call == null ? [] : [call] })._streamResponseChunks(...args);
+    }
+  }
+  const runId = `committed-child-${mode}`; const saver = new MemorySaver();
+  const create = async (protectedRun: boolean, resumed: boolean): Promise<Run<IState>> => {
+    const hooks = new HookRegistry(); hooks.register('PreToolUse', { hooks: [async (input) => ({ decision: input.toolName === 'approval_control' ? 'ask' : 'allow', reason: 'Allowed child approval' })] });
+    const run = await Run.create({ runId, graphConfig: { type: 'standard', agents: [{ agentId: 'parent', provider: Providers.OPENAI, instructions: 'Allowed parent.', subagentConfigs: [{ type: 'worker', name: 'Worker', description: 'Allowed child.', agentInputs: { agentId: 'child', provider: Providers.OPENAI, instructions: 'Allowed child.', tools: [lookup, approval] } }] }], compileOptions: { checkpointer: saver } }, hooks, humanInTheLoop: { enabled: true }, toolResultProtection: protectedRun ? policy() : undefined, skipCleanup: true });
+    run.Graph!.overrideModel = new FakeChatModel({ responses: resumed ? ['Allowed final answer'] : ['', 'Allowed final answer'], toolCalls: resumed ? [] : [{ id: 'worker-control', name: Constants.SUBAGENT, args: { description: 'Allowed child task.', subagent_type: 'worker' }, type: 'tool_call' }] });
+    run.Graph!.setSubagentModelOverride(new ChildModel(resumed)); return run;
+  };
+  const first = await create(mode === 'protected', false); const config = { version: 'v2' as const, configurable: { thread_id: runId } };
+  await first.processStream({ messages: [new HumanMessage('Allowed control')] }, config); expect(first.getInterrupt()).toBeDefined(); expect(executions).toBe(1); expect(approvals).toBe(0);
+  const resumed = await create(true, true); const pending = resumed.resume([{ type: 'approve' }], config);
+  if (mode === 'legacy') { await expect(pending).rejects.toMatchObject({ code: 'incompatible' }); expect(approvals).toBe(0); expect(resumedInputs).toEqual([]); }
+  else { await pending; expect(approvals).toBe(1); assertNoCanary(resumedInputs.join('')); assertNoCanary(resumed.Graph!.getRunMessages()); }
+  expect(executions).toBe(1);
+});

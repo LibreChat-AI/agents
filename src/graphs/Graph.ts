@@ -733,6 +733,11 @@ function buildRunStepStateAnnotation(): RunStepStateChannel {
   });
 }
 
+type ToolResultCheckpoint = {
+  values?: { messages?: BaseMessage[]; runStepState?: t.RunStepResumeState };
+  tasks?: readonly { state?: ToolResultCheckpoint | RunnableConfig }[];
+};
+
 export abstract class Graph<
   T extends t.BaseGraphState = t.BaseGraphState,
   _TNodeName extends string = string,
@@ -752,6 +757,14 @@ export abstract class Graph<
     currentToolMap?: t.ToolMap;
   }): CustomToolNode<T> | ToolNode<T>;
   async validateToolResultHistory(_messages: BaseMessage[], _state?: t.RunStepResumeState, _signal?: AbortSignal): Promise<void> {}
+  async validateToolResultCheckpoint(snapshot: ToolResultCheckpoint, signal?: AbortSignal): Promise<void> {
+    const messages = snapshot.values?.messages;
+    if (messages != null) await this.validateToolResultHistory(messages, snapshot.values?.runStepState, signal);
+    for (const task of snapshot.tasks ?? []) {
+      const nested = task.state;
+      if (nested != null && 'tasks' in nested && Array.isArray(nested.tasks)) await this.validateToolResultCheckpoint(nested, signal);
+    }
+  }
   abstract getRunMessages(): BaseMessage[] | undefined;
   /** Returns a snapshot of deferred tools discovered by this graph. */
   getDiscoveredTools(_agentId?: string): string[] {
