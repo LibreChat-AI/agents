@@ -196,6 +196,16 @@ it.each(reasoningCases)(
     expect(JSON.stringify(options)).toBe(before);
     const expectedOptions = {...options};
     for (const key of ['maxTokens', 'maxCompletionTokens', 'maxOutputTokens']) Reflect.deleteProperty(expectedOptions, key);
+    if ('modelKwargs' in expectedOptions) {
+      const kwargs = {...expectedOptions.modelKwargs};
+      for (const key of ['max_tokens', 'max_completion_tokens', 'max_output_tokens']) Reflect.deleteProperty(kwargs, key);
+      expectedOptions.modelKwargs = kwargs;
+    }
+    if ('invocationKwargs' in expectedOptions) {
+      const kwargs = {...expectedOptions.invocationKwargs};
+      Reflect.deleteProperty(kwargs, 'max_tokens');
+      expectedOptions.invocationKwargs = kwargs;
+    }
     expect(init.initializeModel).toHaveBeenCalledWith(
       expect.objectContaining({clientOptions: expect.objectContaining(expectedOptions)})
     );
@@ -424,6 +434,10 @@ it.each([
   {options: {maxCompletionTokens: 64_000, reasoning: {effort: 'high' as const}}, config: {parameters: {maxTokens: 1024}}, expected: 1024},
   {options: {maxTokens: 64_000, reasoning: {effort: 'high' as const}}, config: {parameters: {maxTokens: 64_000, maxCompletionTokens: 1024}}, expected: 1024},
   {options: {maxCompletionTokens: 64_000}, config: {}, expected: 4096},
+  {options: {maxTokens: 64_000, reasoning: {effort: 'high' as const}}, config: {parameters: {modelKwargs: {max_output_tokens: 1024}}}, expected: 1024},
+  {options: {maxTokens: 64_000, modelKwargs: {max_output_tokens: 64_000}, reasoning: {effort: 'high' as const}}, config: {maxSummaryTokens: 1024}, expected: 1024},
+  {options: {maxTokens: 64_000, modelKwargs: {max_completion_tokens: 1024}, reasoning: {effort: 'high' as const}}, config: {}, expected: 64_000},
+
   {options: {maxTokens: 8_000, maxCompletionTokens: 64_000, reasoning: {effort: 'high' as const}}, config: {}, expected: 64_000},
 ].flatMap(test => ['chat', 'responses'].map(mode => ({...test, mode}))))(
   'budgets and sends one canonical cap through the real OpenAI transport: %j', async ({options, config, expected, mode}) => {
@@ -458,18 +472,22 @@ it.each([
     }}, {});
     expect(requests).toHaveLength(1);
     expect(mode === 'responses' ? requests[0].max_output_tokens : requests[0].max_completion_tokens).toBe(expected);
+    expect(requests[0]).not.toHaveProperty('max_tokens');
+    expect(requests[0]).not.toHaveProperty(mode === 'responses' ? 'max_completion_tokens' : 'max_output_tokens');
     expect(result.messages?.[0].getType()).toBe('remove');
     expect(agentContext.getSummaryText()).toBe('REASONING_CHECKPOINT');
   });
 
-it('uses the effective alias allowance for a fallback’s window budget', async () => {
+it.each(['constructor', 'native'])('uses the effective %s allowance for a fallback’s window budget', async mode => {
   const {node, model, agentContext} = fixture({options: {reasoning: {effort: 'high'}, maxTokens: 64_000},
     config: {contextBudgetMode: 'window'}, maxContextTokens: 100_000,
   });
   const fallback = new ReasoningBudgetModel(); fallback.requiredOutput = 0;
   const options = agentContext.clientOptions as t.BuiltInLLMConfig;
   options.fallbacks = [{provider: Providers.OPENAI, maxContextTokens: 100_000,
-    clientOptions: {model: 'fallback', maxTokens: 64_000, maxCompletionTokens: 1024},
+    clientOptions: {model: 'fallback', maxTokens: 64_000,
+      ...(mode === 'native' ? {useResponsesApi: true, modelKwargs: {max_output_tokens: 1024}} : {maxCompletionTokens: 1024}),
+    },
   }];
   jest.spyOn(init, 'initializeModel').mockImplementation(({clientOptions}) => {
     const options = clientOptions as {model?: string; maxTokens?: number; maxCompletionTokens?: number};
@@ -487,4 +505,26 @@ it('uses the effective alias allowance for a fallback’s window budget', async 
   expect(fallback.calls).toHaveLength(1);
   expect(result.messages?.[0].getType()).toBe('remove');
   expect(agentContext.getSummaryText()).toBe('REASONING_CHECKPOINT');
+});
+
+it('normalizes Anthropic native overrides without losing adaptive thinking or caller-owned options', async () => {
+  const options = {maxTokens: 64_000, thinking: {type: 'adaptive' as const}, invocationKwargs: {max_tokens: 64_000, thinking: {type: 'adaptive'}}};
+  const before = JSON.stringify(options);
+  const {node, model, agentContext} = fixture({provider: Providers.ANTHROPIC, options,
+    config: {parameters: {invocationKwargs: {max_tokens: 1024, thinking: {type: 'adaptive'}}}, contextBudgetMode: 'window'},
+    maxContextTokens: 100_000,
+  });
+  model.requiredOutput = 0;
+  jest.spyOn(init, 'initializeModel').mockImplementation(({clientOptions}) => {
+    const normalized = clientOptions as t.AnthropicClientOptions;
+    const realModel = new CustomAnthropic({...normalized, apiKey: 'offline-test', model: 'claude-sonnet-4-5'});
+    expect(realModel.invocationParams()).toMatchObject({max_tokens: 1024, thinking: {type: 'adaptive'}});
+    model.outputLimit = normalized.maxTokens ?? 0;
+    return model;
+  });
+  const messages = [new HumanMessage('x'.repeat(200_000))];
+  const result = await node({messages, summarizationRequest: {agentId: 'reasoner', remainingContextTokens: 0, windowMessages: messages}}, {});
+  expect(model.calls).toHaveLength(1); expect(model.outputLimit).toBe(1024);
+  expect(result.messages?.[0].getType()).toBe('remove'); expect(agentContext.getSummaryText()).toBe('REASONING_CHECKPOINT');
+  expect(JSON.stringify(options)).toBe(before);
 });

@@ -193,8 +193,7 @@ function buildSummarizationClientConfig(
   const outputKey = getMaxOutputTokensKey(provider);
   const inheritedOutputTokens = readSummaryOutputLimit(provider, baseOptions);
   const explicitOutputTokens = readSummaryOutputLimit(provider, llmParams);
-  delete clientOptions[outputKey];
-  if (usesCompletionTokenAlias(provider)) delete clientOptions.maxCompletionTokens;
+  clearSummaryOutputLimits(provider, clientOptions);
   const defaultOutputTokens = resolveSummaryOutputTokens(
     provider, clientOptions, agentContext.maxContextTokens
   );
@@ -223,8 +222,31 @@ function usesCompletionTokenAlias(provider: t.ProviderName): boolean {
 }
 
 function readSummaryOutputLimit(provider: t.ProviderName, options: Record<string, unknown>): number | undefined {
-  return ((usesCompletionTokenAlias(provider) ? options.maxCompletionTokens : undefined) ??
+  const openai = usesCompletionTokenAlias(provider);
+  const native = (openai ? options.modelKwargs : options.invocationKwargs) as
+    {max_output_tokens?: number; max_tokens?: number} | undefined;
+  const anthropic = provider === Providers.ANTHROPIC || getProviderFamily(provider) === 'anthropic';
+  // Completions rewrites its active output field after merging modelKwargs.
+  let nativeLimit: number | undefined;
+  if (openai) nativeLimit = native?.max_output_tokens;
+  else if (anthropic) nativeLimit = native?.max_tokens;
+  return (nativeLimit ?? (openai ? options.maxCompletionTokens : undefined) ??
     options[getMaxOutputTokensKey(provider)]) as number | undefined;
+}
+
+function clearSummaryOutputLimits(provider: t.ProviderName, options: Record<string, unknown>): void {
+  delete options[getMaxOutputTokensKey(provider)];
+  const openai = usesCompletionTokenAlias(provider);
+  if (openai) delete options.maxCompletionTokens;
+  const key = openai ? 'modelKwargs' : 'invocationKwargs';
+  if (!openai && provider !== Providers.ANTHROPIC && getProviderFamily(provider) !== 'anthropic') return;
+  const native = options[key] as object | undefined;
+  if (native == null) return;
+  const normalized = {...native};
+  for (const field of openai ? ['max_output_tokens', 'max_completion_tokens', 'max_tokens'] : ['max_tokens']) {
+    Reflect.deleteProperty(normalized, field);
+  }
+  options[key] = normalized;
 }
 
 function resolveSummaryReasoning(provider: t.ProviderName, clientOptions: Record<string, unknown>): {enabled: boolean; fixedBudget: number} {
@@ -901,16 +923,12 @@ async function executeSummarizationWithFallback(params: {
         const boundedFallbacks = fallbacks.map((fallback) => {
           const maxContextTokens =
             fallback.maxContextTokens ?? agentContext.maxContextTokens;
-          const clientOptions = withSummarizationRetryOwner(fallback.provider, {
-            ...fallback.clientOptions,
-            [getMaxOutputTokensKey(fallback.provider)]:
-              resolveSummaryOutputTokens(
-                fallback.provider,
-                { ...fallback.clientOptions },
-                maxContextTokens
-              ),
-          });
-          if (usesCompletionTokenAlias(fallback.provider)) Reflect.deleteProperty(clientOptions, 'maxCompletionTokens');
+          const outputTokens = resolveSummaryOutputTokens(
+            fallback.provider, {...fallback.clientOptions}, maxContextTokens
+          );
+          const clientOptions: Record<string, unknown> = withSummarizationRetryOwner(fallback.provider, {...fallback.clientOptions});
+          clearSummaryOutputLimits(fallback.provider, clientOptions);
+          clientOptions[getMaxOutputTokensKey(fallback.provider)] = outputTokens;
           return {
             ...fallback,
             clientOptions,
