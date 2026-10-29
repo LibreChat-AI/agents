@@ -78,6 +78,13 @@ const messageFields = [
 ] as const;
 type ToolMessageEnvelope = Pick<ToolMessage, (typeof messageFields)[number]>;
 
+export type ToolMessageRelease = {
+  readonly version: 1;
+  readonly name: string;
+  readonly id: string;
+  readonly envelope: Omit<ToolMessageEnvelope, 'content'>;
+};
+
 const adapters = new WeakMap<ToolResultProtection, ProviderTextProtection>();
 const approved = new WeakMap<
   object,
@@ -429,7 +436,7 @@ function validateReplayReferenceMetadata(
 }
 
 function snapshotToolMessageEnvelope(
-  message: ToolMessage
+  message: ToolMessageEnvelope
 ): ToolMessageEnvelope {
   if (types.isProxy(message))
     throw new ToolResultProtectionError('unsupported');
@@ -533,13 +540,36 @@ export function replaceReleasedToolMessage(
   );
 }
 
+/** Written only from live release provenance, never inferred from checkpoint ownership. */
+export function getToolMessageRelease(policy: ToolResultProtection | undefined, name: string, id: string, message: ToolMessage): ToolMessageRelease | undefined {
+  if (!requiresToolResultProtection(policy, name)) return undefined;
+  const entry = approved.get(message);
+  const envelope = snapshotToolMessageEnvelope(message);
+  if (entry?.policy !== policy || entry.name !== name || entry.id !== id || entry.envelope == null || !matchesToolMessageEnvelope(envelope, entry.envelope)) throw new ToolResultProtectionError('unsupported');
+  const { content: _content, ...identity } = envelope;
+  return { version: 1, name, id, envelope: identity };
+}
+
+function validateToolMessageRelease(release: ToolMessageRelease, name: string, id: string, envelope: ToolMessageEnvelope): void {
+  plainObject(release, ['version', 'name', 'id', 'envelope'], true);
+  for (const field of ['version', 'name', 'id', 'envelope']) if (!Object.hasOwn(release, field)) throw new ToolResultProtectionError('incompatible');
+  const version: number = release.version;
+  if (version !== 1 || release.name !== name || release.id !== id) throw new ToolResultProtectionError('incompatible');
+  plainObject(release.envelope, ['artifact', 'name', 'id', 'tool_call_id', 'status', 'additional_kwargs', 'response_metadata'], true);
+  for (const field of ['tool_call_id', 'status', 'additional_kwargs', 'response_metadata']) if (!Object.hasOwn(release.envelope, field)) throw new ToolResultProtectionError('incompatible');
+  plainObject(release.envelope.additional_kwargs, ['_refKey', '_refScope', '_unresolvedRefs'], true);
+  plainObject(release.envelope.response_metadata, [], true);
+  const certified = snapshotToolMessageEnvelope({ ...release.envelope, content: envelope.content, additional_kwargs: { ...release.envelope.additional_kwargs }, response_metadata: {} });
+  if (!matchesToolMessageEnvelope(envelope, certified)) throw new ToolResultProtectionError('unsupported');
+}
+
 export async function protectToolMessage(
   policy: ToolResultProtection | undefined,
   name: string,
   id: string,
   message: ToolMessage,
   signal?: AbortSignal,
-  ownedReplayMetadata = false
+  replayRelease?: ToolMessageRelease
 ): Promise<ToolMessage> {
   if (!requiresToolResultProtection(policy, name)) return message;
   const envelope = snapshotToolMessageEnvelope(message);
@@ -551,9 +581,10 @@ export async function protectToolMessage(
     (status != null && status !== 'success' && status !== 'error')
   )
     throw new ToolResultProtectionError('unsupported');
+  if (replayRelease != null) validateToolMessageRelease(replayRelease, name, id, envelope);
   if (
     approved.get(message) == null &&
-    !ownedReplayMetadata &&
+    replayRelease == null &&
     (Object.keys(envelope.additional_kwargs).length > 0 ||
       (envelope.id != null && envelope.id !== id))
   )

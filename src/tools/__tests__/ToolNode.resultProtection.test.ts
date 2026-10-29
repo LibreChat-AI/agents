@@ -27,6 +27,7 @@ import type {
   ToolResultProtectionResult,
 } from '@/protection/toolResult';
 import type { ToolOutputReferenceState } from '@/tools/toolOutputReferences';
+import type { SettledToolBatchResult } from '@/tools/toolBatchReplay';
 import {
   createCloudflareProgrammaticToolCallingTool,
   createCloudflareBashProgrammaticToolCallingTool,
@@ -2414,4 +2415,39 @@ it('preserves ordinary handler diagnostics when result protection is absent', as
   const logs: string[] = []; jest.spyOn(console, 'error').mockImplementation((...args): void => { logs.push(JSON.stringify(args)); });
   const node = new ToolNode({ tools: [direct(() => { throw new Error('Allowed original control'); })], errorHandler: async () => { throw new Error('Allowed observer failure'); } });
   const result = await node.invoke(state()); expect(JSON.stringify(result)).toContain('Allowed original control'); expect(logs.join('')).toContain('Allowed observer failure');
+});
+
+it.each(['legacy-id', 'legacy-scope', 'legacy-safe', 'protected', 'protected-refs', 'stripped', 'tampered-id', 'tampered-scope', 'future'] as const)('requires certified envelope aliases on settled checkpoint replay (%s)', async (kind) => {
+  let executions = 0; let approvals = 0; const inspected: string[] = []; const events: string[] = [];
+  const lookup = direct(() => {
+    executions++;
+    return new ToolMessage({ id: kind === 'legacy-id' ? fixtures.canaries[0] : 'call-control', name: 'lookup', tool_call_id: 'call-control', status: 'success', content: fixtures.canaries[0], additional_kwargs: kind === 'legacy-scope' ? { _refScope: fixtures.canaries[0] } : {} });
+  });
+  const approval = new DynamicStructuredTool({ name: 'approval_control', description: 'Allowed approval control.', schema: z.object({ count: z.number() }), func: async () => { approvals++; return 'Approved control'; } });
+  const hooks = new HookRegistry(); hooks.register('PreToolUse', { hooks: [async (input) => ({ decision: input.toolName === 'approval_control' ? 'ask' : 'allow', reason: 'Allowed approval' })] });
+  const gate = policy({ inspect: ({ content }) => { inspected.push(content); return approve(content.replaceAll(fixtures.canaries[0], '[EMAIL_1]')); } });
+  const saver = new MemorySaver();
+  const certified = !kind.startsWith('legacy');
+  const references = certified && kind !== 'protected';
+  const compile = (protectedRun: boolean): Pick<Runnable<unknown, unknown>, 'invoke'> => new StateGraph(MessagesAnnotation).addNode('tools', new ToolNode({ trace: true, tools: [lookup, approval], hookRegistry: hooks, humanInTheLoop: { enabled: true }, toolResultProtection: protectedRun ? gate : undefined, toolOutputReferences: { enabled: references } })).addEdge(START, 'tools').addEdge('tools', END).compile({ checkpointer: saver });
+  const config = { configurable: { thread_id: `envelope-replay-${kind}`, run_id: `envelope-replay-${kind}` }, callbacks: [observer(events)] };
+  const paused = await compile(certified).invoke({ messages: [new AIMessage({ id: 'envelope-batch', content: '', tool_calls: [{ id: 'call-control', name: 'lookup', args: { count: 42 } }, { id: 'approval-control', name: 'approval_control', args: { count: 42 } }] })] }, config);
+  expect(isInterrupted(paused)).toBe(true); if (!isInterrupted(paused)) throw new Error('Expected approval checkpoint');
+  const replay = getToolBatchReplayState(paused.__interrupt__[0].value); expect(replay).toBeDefined(); expect(executions).toBe(1); expect(approvals).toBe(0); events.length = 0;
+  if (['stripped', 'tampered-id', 'tampered-scope', 'future'].includes(kind)) {
+    if (replay == null) throw new Error('Expected replay state');
+    const record = replay.records[0];
+    const restored = await saver.serde.loadsTyped(record.encoding, Buffer.from(record.data, 'base64')) as Array<[string, SettledToolBatchResult]>;
+    const settled = restored[0][1];
+    if (!(settled.output instanceof ToolMessage)) throw new Error('Expected settled ToolMessage');
+    if (kind === 'stripped') delete settled.release;
+    if (kind === 'tampered-id') settled.output.id = fixtures.canaries[0];
+    if (kind === 'tampered-scope') settled.output.additional_kwargs._refScope = fixtures.canaries[0];
+    if (kind === 'future') Object.defineProperty(settled.release!, 'version', { value: 2 });
+    const [encoding, bytes] = await saver.serde.dumpsTyped(restored); record.encoding = encoding; record.data = Buffer.from(bytes).toString('base64');
+  }
+  const resumed = compile(true).invoke(new Command({ resume: [{ type: 'approve' }] }), { ...config, configurable: { ...config.configurable, [TOOL_BATCH_REPLAY_KEY]: replay } });
+  if (['legacy-id', 'legacy-scope', 'stripped', 'tampered-id', 'tampered-scope', 'future'].includes(kind)) await expect(resumed).rejects.toMatchObject({ code: kind === 'future' ? 'incompatible' : 'unsupported' });
+  else { const result = await resumed; assertNoCanary(result); expect(JSON.stringify(result)).toContain('[EMAIL_1]'); expect(approvals).toBe(1); expect(inspected).toEqual(certified ? [fixtures.canaries[0], '[EMAIL_1]'] : [fixtures.canaries[0]]); }
+  expect(executions).toBe(1); assertNoCanary(events.join(''));
 });

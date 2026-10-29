@@ -1,17 +1,16 @@
-import { Command, MemorySaver, isCommand } from '@langchain/langgraph';
 import { isBaseMessage } from '@langchain/core/messages';
-import type { BaseMessage } from '@langchain/core/messages';
+import { Command, MemorySaver, isCommand } from '@langchain/langgraph';
 import type { RunnableConfig } from '@langchain/core/runnables';
+import type { BaseMessage } from '@langchain/core/messages';
 import type { SubagentToolNodeResumeState } from '@/tools/subagent/SubagentReplay';
 import type { ToolOutputReferenceState } from '@/tools/toolOutputReferences';
+import type { ToolMessageRelease } from '@/protection/toolResult';
 import {
   isToolNodeResumeState,
   isToolOutputReferenceState,
   stripSubagentResumeManifest,
   requireValidSubagentResumeManifest,
 } from '@/tools/subagent/SubagentReplay';
-import { isToolApprovalInterrupt } from '@/types/hitl';
-import { TOOL_APPROVAL_EXECUTION_SCOPE_CONFIG_KEY } from '@/hooks/types';
 import {
   TOOL_APPROVAL_REVIEW_CONFIG_KEY,
   getToolApprovalReviewEvidence,
@@ -22,6 +21,8 @@ import {
   getRunStepResumeState,
   stripRunStepResumeState,
 } from '@/tools/runStepResume';
+import { TOOL_APPROVAL_EXECUTION_SCOPE_CONFIG_KEY } from '@/hooks/types';
+import { isToolApprovalInterrupt } from '@/types/hitl';
 
 export const TOOL_BATCH_REPLAY_KEY = '__librechat_tool_batch_replay';
 const TOOL_BATCH_PAYLOAD_KEY = '__librechat_tool_batch_payload';
@@ -36,6 +37,7 @@ export interface SettledToolBatchResult {
   codeSessionBaseline?: Array<[string, string]>;
   completionHandled?: boolean;
   referenceContent?: string;
+  release?: ToolMessageRelease;
   turn?: number;
 }
 

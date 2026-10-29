@@ -51,9 +51,10 @@ import type {
 } from '@/hooks';
 import type { SettledToolBatchResult } from '@/tools/toolBatchReplay';
 import type { PreparedSubagents } from '@/tools/preparedSubagents';
+import type { ToolMessageRelease } from '@/protection/toolResult';
 import type { RunBreakerScope } from '@/llm/streamLimits';
 import type * as t from '@/types';
-import { replaceReleasedToolMessage, normalizeToolResultError, needsToolReferenceInspection, protectToolReferenceState, bindToolExecuteProtection, validateToolExecuteResults, hasReleasedToolReference, isReleasedToolError, markReleasedToolMessage, protectToolText, protectToolMessage, protectToolExecuteResult, withToolResultBoundary, requiresToolResultProtection, validateToolResultProtection, ToolResultProtectionError } from '@/protection/toolResult';
+import { getToolMessageRelease, replaceReleasedToolMessage, normalizeToolResultError, needsToolReferenceInspection, protectToolReferenceState, bindToolExecuteProtection, validateToolExecuteResults, hasReleasedToolReference, isReleasedToolError, markReleasedToolMessage, protectToolText, protectToolMessage, protectToolExecuteResult, withToolResultBoundary, requiresToolResultProtection, validateToolResultProtection, ToolResultProtectionError } from '@/protection/toolResult';
 import {
   TOOL_BATCH_REPLAY_KEY,
   getToolBatchReplayOwner,
@@ -5185,7 +5186,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     );
   }
 
-  private async protectSettledToolResult(call: ToolCall, output: ToolMessage, referenceContent: string | undefined, config: RunnableConfig): Promise<{ output: ToolMessage; referenceContent?: string }> {
+  private async protectSettledToolResult(call: ToolCall, output: ToolMessage, referenceContent: string | undefined, config: RunnableConfig, release?: ToolMessageRelease): Promise<{ output: ToolMessage; referenceContent?: string }> {
     const policy = this.toolResultProtection;
     if (!requiresToolResultProtection(policy, call.name)) return { output, referenceContent };
     const id = call.id ?? '';
@@ -5196,7 +5197,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     }
     // Only checkpoint-owner/identity-validated replay enters this path.
     const candidate = referenceContent == null ? output : new ToolMessage({ ...output, content: referenceContent });
-    const canonical = await protectToolMessage(policy, call.name, id, candidate, config.signal, true);
+    const canonical = await protectToolMessage(policy, call.name, id, candidate, config.signal, release);
     const fullReference = referenceContent == null ? undefined : canonical.content as string;
     const preview = referenceContent == null ? canonical : cloneToolMessageWithContent(canonical, compactToolContent(canonical.content, this.maxToolResultChars).content);
     return { output: markReleasedToolMessage(policy, call.name, id, preview, fullReference), referenceContent: fullReference };
@@ -5272,9 +5273,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     ): Promise<SettledDirectToolResult> => {
       if (requiresToolResultProtection(this.toolResultProtection, call.name)) {
         if (!(result.output instanceof ToolMessage) || result.additionalContexts.length > 0) throw new ToolResultProtectionError('unsupported');
-        const released = await this.protectSettledToolResult(call, result.output, result.referenceContent, config);
+        const released = await this.protectSettledToolResult(call, result.output, result.referenceContent, config, result.release);
         result.output = released.output;
         result.referenceContent = released.referenceContent;
+        result.release = getToolMessageRelease(this.toolResultProtection, call.name, call.id ?? '', released.output);
       }
       baseContext.additionalContextsSink?.push(...result.additionalContexts);
       const turn = result.turn;
@@ -5372,6 +5374,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               this.directPathTurns.get(call.id)),
         output,
         additionalContexts,
+        ...(output instanceof ToolMessage && requiresToolResultProtection(this.toolResultProtection, call.name)
+          ? { release: getToolMessageRelease(this.toolResultProtection, call.name, call.id ?? '', output) }
+          : {}),
         ...(resolvedArgs == null ? {} : { resolvedArgs }),
         ...(codeSessionBaseline == null
           ? {}
