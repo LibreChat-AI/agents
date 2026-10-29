@@ -1381,7 +1381,7 @@ export class MultiAgentGraph extends StandardGraph {
           if (!this.messages.length) {
             this.startIndex = a.length + b.length;
           }
-          const result = messagesStateReducer(a, b);
+          const result = this.reduceProtectedMessages(a, b);
           this.messages = result;
           return result;
         },

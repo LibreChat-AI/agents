@@ -54,7 +54,7 @@ import type { PreparedSubagents } from '@/tools/preparedSubagents';
 import type { ToolMessageRelease } from '@/protection/toolResult';
 import type { RunBreakerScope } from '@/llm/streamLimits';
 import type * as t from '@/types';
-import { getToolMessageRelease, replaceReleasedToolMessage, normalizeToolResultError, needsToolReferenceInspection, protectToolReferenceState, bindToolExecuteProtection, validateToolExecuteResults, hasReleasedToolReference, isReleasedToolError, markReleasedToolMessage, protectToolText, protectToolMessage, protectToolExecuteResult, withToolResultBoundary, requiresToolResultProtection, validateToolResultProtection, ToolResultProtectionError } from '@/protection/toolResult';
+import { detachReleasedToolError, getToolMessageRelease, replaceReleasedToolMessage, normalizeToolResultError, needsToolReferenceInspection, protectToolReferenceState, bindToolExecuteProtection, validateToolExecuteResults, hasReleasedToolReference, isReleasedToolError, markReleasedToolMessage, protectToolText, protectToolMessage, protectToolExecuteResult, withToolResultBoundary, requiresToolResultProtection, validateToolResultProtection, ToolResultProtectionError } from '@/protection/toolResult';
 import {
   TOOL_BATCH_REPLAY_KEY,
   getToolBatchReplayOwner,
@@ -2150,6 +2150,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     } catch (_e: unknown) {
       let e = _e as Error;
       if (this.toolResultProtection != null && e instanceof ProviderTextProtectionError) e = normalizeToolResultError(e);
+      if (requiresToolResultProtection(this.toolResultProtection, call.name)) e = detachReleasedToolError(this.toolResultProtection, call.name, call.id ?? '', e) ?? e;
       if (!this.handleToolErrors) {
         if (requiresToolResultProtection(this.toolResultProtection, call.name) && !isReleasedToolError(this.toolResultProtection, call.name, call.id ?? '', e) && !(e instanceof ProviderTextProtectionError) &&
             !(e instanceof StreamLimitExceededError) && !(e instanceof PreparedSubagentError) && !isGraphInterrupt(e)) {
@@ -3768,12 +3769,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         const contentString = await protectToolText(this.toolResultProtection, entry.call.name, entry.call.id ?? '', `Blocked: ${reason}`, 'error', config.signal) as string;
         messageByCallId.set(
           entry.call.id!,
-          new ToolMessage({
+          markReleasedToolMessage(this.toolResultProtection, entry.call.name, entry.call.id!, new ToolMessage({
             status: 'error',
             content: contentString,
             name: entry.call.name,
             tool_call_id: entry.call.id!,
-          })
+          }))
         );
         postToolBatchEntryByCallId.set(entry.call.id!, {
           toolName: entry.call.name,
@@ -4168,12 +4169,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             );
             messageByCallId.set(
               entry.call.id!,
-              new ToolMessage({
+              markReleasedToolMessage(this.toolResultProtection, entry.call.name, entry.call.id!, new ToolMessage({
                 status: 'success',
                 content: truncatedResponse,
                 name: entry.call.name,
                 tool_call_id: entry.call.id!,
-              })
+              }))
             );
             postToolBatchEntryByCallId.set(entry.call.id!, {
               toolName: entry.call.name,
@@ -4823,7 +4824,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             : { toolOutput: finalToolOutput }),
         });
 
-        messageByCallId.set(result.toolCallId, toolMessage);
+        messageByCallId.set(result.toolCallId, markReleasedToolMessage(this.toolResultProtection, toolName, result.toolCallId, toolMessage));
       }
     }
 

@@ -1,3 +1,4 @@
+import type { ToolMessageRelease } from '@/protection/toolResult';
 /* eslint-disable no-console */
 import { v4 } from 'uuid';
 import { nanoid } from 'nanoid';
@@ -115,7 +116,7 @@ import {
   disposeLangfuseHandler,
   isLangfuseCallbackHandler,
 } from '@/langfuse';
-import { requiresToolResultProtection, ToolResultProtectionError, validateToolResultProtection } from '@/protection/toolResult';
+import { normalizeToolResultError, getLiveToolMessageRelease, commitToolMessageRelease, snapshotToolMessageReleases, validateToolMessageHistory, requiresToolResultProtection, ToolResultProtectionError, validateToolResultProtection } from '@/protection/toolResult';
 import {
   getBlindRecoveryBudget,
   planContextOverflowRecovery,
@@ -750,6 +751,7 @@ export abstract class Graph<
     currentTools?: t.GraphTools;
     currentToolMap?: t.ToolMap;
   }): CustomToolNode<T> | ToolNode<T>;
+  async validateToolResultHistory(_messages: BaseMessage[], _state?: t.RunStepResumeState, _signal?: AbortSignal): Promise<void> {}
   abstract getRunMessages(): BaseMessage[] | undefined;
   /** Returns a snapshot of deferred tools discovered by this graph. */
   getDiscoveredTools(_agentId?: string): string[] {
@@ -1329,6 +1331,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   messages: BaseMessage[] = [];
   /** Whether a rebuilt resume seeded the message baseline from its checkpoint. */
   private hasRestoredCheckpointMessages = false;
+  private toolResultHistoryReleases = new Map<string, ToolMessageRelease>();
   /** Cached run messages preserved before clearHeavyState() so getRunMessages() works after cleanup. */
   private cachedRunMessages?: BaseMessage[];
   /** Per-agent discovery snapshots preserved before contexts are reset on cleanup. */
@@ -1701,6 +1704,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     this.resetSubagentCheckpointThreadIds();
     this.messages = [];
     this.hasRestoredCheckpointMessages = false;
+    this.toolResultHistoryReleases.clear();
     this.cachedRunMessages = undefined;
     this.cachedDiscoveredTools = undefined;
     this.config = resetIfNotEmpty(this.config, undefined);
@@ -1805,6 +1809,41 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       : undefined;
   }
 
+  protected reduceProtectedMessages(current: BaseMessage[], update: BaseMessage[]): BaseMessage[] {
+    const policy = this.toolResultProtection;
+    if (policy == null) return messagesStateReducer(current, update);
+    const admissions: Array<{ message: ToolMessage; release: ToolMessageRelease; content: ToolMessage['content'] }> = [];
+    for (const message of update) {
+      if (!(message instanceof ToolMessage)) continue;
+      const release = getLiveToolMessageRelease(policy, message);
+      if (release != null) admissions.push({ message, release, content: message.content });
+    }
+    const result = messagesStateReducer(current, update);
+    for (const entry of admissions) {
+      const release = commitToolMessageRelease(policy, entry.message, entry.release, entry.content);
+      this.toolResultHistoryReleases.set(JSON.stringify([release.name, release.id, release.envelope.id]), release);
+    }
+    return result;
+  }
+
+  override async validateToolResultHistory(messages: BaseMessage[], state?: t.RunStepResumeState, signal?: AbortSignal): Promise<void> {
+    if (this.toolResultProtection == null) return;
+    const breaker = this.breakerAbort;
+    try {
+      const persisted = snapshotToolMessageReleases(state?.toolResultReleases ?? []);
+      await validateToolMessageHistory(this.toolResultProtection, messages, [...this.toolResultHistoryReleases.values(), ...persisted], signal);
+      for (const release of persisted) {
+        const key = JSON.stringify([release.name, release.id, release.envelope.id]);
+        if (!this.toolResultHistoryReleases.has(key)) this.toolResultHistoryReleases.set(key, release);
+      }
+    } catch (error) {
+      if (!(error instanceof ProviderTextProtectionError)) throw error;
+      const failure = normalizeToolResultError(error);
+      breaker.abort(failure);
+      throw failure;
+    }
+  }
+
   /** Seeds the sidecar message view that checkpoint restoration bypasses. */
   override restoreCheckpointMessages(
     messages: BaseMessage[],
@@ -1824,6 +1863,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
   override clearHeavyState(): void {
     this.cachedRunMessages = this.messages.slice(this.startIndex);
+    this.toolResultHistoryReleases.clear();
     this.cachedDiscoveredTools = new Map(
       Array.from(this.agentContexts, ([agentId, context]) => [
         agentId,
@@ -2040,6 +2080,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     }
     return {
       version: 1,
+      ...(this.toolResultProtection == null ? {} : { toolResultReleases: [...this.toolResultHistoryReleases.values()] }),
       revision: this.runStepStateRevision,
       nextIndex: this.nextContentIndex,
       stopContinuationCount: this.stopContinuationCount,
@@ -2058,13 +2099,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   }
 
   restoreRunStepResumeState(state?: t.RunStepResumeState): void {
-    if (
-      !isRunStepResumeState(state) ||
-      this.contentData.length > 0 ||
-      this.runStepStateRevision > 0
-    ) {
-      return;
+    if (!isRunStepResumeState(state)) return;
+    if (this.toolResultProtection != null) {
+      for (const release of snapshotToolMessageReleases(state.toolResultReleases ?? [])) {
+        const key = JSON.stringify([release.name, release.id, release.envelope.id]);
+        if (!this.toolResultHistoryReleases.has(key)) this.toolResultHistoryReleases.set(key, release);
+      }
     }
+    if (this.contentData.length > 0 || this.runStepStateRevision > 0) return;
 
     this.nextContentIndex = state.nextIndex;
     this.runStepStateRevision = state.revision;
@@ -3348,6 +3390,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       }
 
       const { messages } = state;
+      if (this.toolResultProtection != null) await this.validateToolResultHistory(messages, state.runStepState, composeAbortSignals(config.signal, this.signal));
 
       const discoveredNames = extractToolDiscoveries(messages);
       if (discoveredNames.length > 0) {
@@ -5658,7 +5701,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       messages: Annotation<BaseMessage[]>({
         reducer: (a, b) => {
           agentContext.invalidateProviderProjectionForMessageUpdates(b);
-          return messagesStateReducer(a, b);
+          return this.reduceProtectedMessages(a, b);
         },
         default: () => [],
       }),
@@ -5878,7 +5921,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           if (!this.messages.length && !this.hasRestoredCheckpointMessages) {
             this.startIndex = a.length + b.length;
           }
-          const result = messagesStateReducer(a, b);
+          const result = this.reduceProtectedMessages(a, b);
           this.messages = result;
           return result;
         },

@@ -2222,6 +2222,15 @@ export class Run<_T extends t.BaseGraphState> {
     return manifestConfig;
   }
 
+  private async validateCheckpointToolHistory(snapshot: InterruptStateSnapshot, signal?: AbortSignal): Promise<void> {
+    const messages = getPersistedMessages(snapshot);
+    if (messages != null) await this.Graph?.validateToolResultHistory(messages, snapshot.values?.runStepState, signal);
+    for (const task of snapshot.tasks ?? []) {
+      const nested = task.state;
+      if (nested != null && 'tasks' in nested && Array.isArray(nested.tasks)) await this.validateCheckpointToolHistory(nested, signal);
+    }
+  }
+
   private async restoreInterruptFromCheckpoint(
     callerConfig: t.RunStreamConfig,
     resumeUpdate?: ResumeCommandUpdate
@@ -2248,6 +2257,7 @@ export class Run<_T extends t.BaseGraphState> {
       getRunStepResumeState(persistedInterrupt.value) ??
         snapshot.values?.runStepState
     );
+    if (this.toolResultProtection != null) await this.validateCheckpointToolHistory(snapshot, callerConfig.signal);
     const persistedMessages = getPersistedMessages(snapshot);
     if (persistedMessages != null) {
       const resumeMessages = getResumeUpdateMessages(resumeUpdate);

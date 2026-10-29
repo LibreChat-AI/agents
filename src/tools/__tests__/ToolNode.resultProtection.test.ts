@@ -21,6 +21,7 @@ import type {
   ToolExecuteResult,
   EventHandler,
   ProgrammaticCache,
+  IState,
 } from '@/types';
 import type {
   ToolResultProtection,
@@ -2450,4 +2451,62 @@ it.each(['legacy-id', 'legacy-scope', 'legacy-safe', 'protected', 'protected-ref
   if (['legacy-id', 'legacy-scope', 'stripped', 'tampered-id', 'tampered-scope', 'future'].includes(kind)) await expect(resumed).rejects.toMatchObject({ code: kind === 'future' ? 'incompatible' : 'unsupported' });
   else { const result = await resumed; assertNoCanary(result); expect(JSON.stringify(result)).toContain('[EMAIL_1]'); expect(approvals).toBe(1); expect(inspected).toEqual(certified ? [fixtures.canaries[0], '[EMAIL_1]'] : [fixtures.canaries[0]]); }
   expect(executions).toBe(1); assertNoCanary(events.join(''));
+});
+
+it.each(['stack', 'cause', 'alias', 'message', 'accessor'] as const)('detaches released %s errors after native callbacks when tool errors are not handled', async (field) => {
+  let retained: Error | undefined; const inspected: string[] = [];
+  const callback = BaseCallbackHandler.fromMethods({ handleToolError: (error: Error): void => {
+    expect(error.message).toBe('[EMAIL_1]'); retained = error;
+    if (field === 'stack') error.stack = fixtures.canaries[0];
+    if (field === 'cause') Object.defineProperty(error, 'cause', { value: new Error(fixtures.canaries[0]), enumerable: true });
+    if (field === 'alias') Object.defineProperty(error, Symbol('raw-alias'), { value: fixtures.canaries[0], enumerable: true });
+    if (field === 'message') error.message = fixtures.canaries[0];
+    if (field === 'accessor') Object.defineProperty(error, 'message', { get: () => { throw new Error(fixtures.canaries[0]); } });
+  } }); callback.awaitHandlers = true;
+  const node = new ToolNode({ trace: true, tools: [direct(() => { throw new Error(fixtures.canaries[0]); })], handleToolErrors: false, toolResultProtection: policy({ inspect: ({ content }) => { inspected.push(content); return approve('[EMAIL_1]'); } }) });
+  const error = await node.invoke(state(), { callbacks: [callback] }).catch((value: Error) => value);
+  expect(error).toBeInstanceOf(Error); expect(error).not.toBe(retained);
+  if (field === 'message' || field === 'accessor') expect(error).toMatchObject({ code: 'unsupported' });
+  else expect(error).toMatchObject({ message: '[EMAIL_1]' }); expect((error as Error).cause).toBeUndefined();
+  for (const key of Reflect.ownKeys(error as Error)) { const value = Object.getOwnPropertyDescriptor(error, key)?.value; if (typeof value === 'string') assertNoCanary(value); }
+  expect(inspected).toEqual([fixtures.canaries[0]]);
+});
+
+it.each(['legacy', 'protected', 'unselected', 'stricter', 'blocked'] as const)('gates earlier committed checkpoint ToolMessages before a rebuilt Run resumes (%s)', async (mode) => {
+  let executions = 0; let approvals = 0; const resumedInputs: string[] = []; const inspections: string[] = [];
+  const sourceName = mode === 'unselected' ? 'other' : 'lookup';
+  const source = new DynamicStructuredTool({ name: sourceName, description: 'Allowed source control.', schema: z.object({ count: z.number() }), func: async () => { executions++; return mode === 'unselected' ? 'Allowed unselected control' : fixtures.canaries[0]; } });
+  const approval = new DynamicStructuredTool({ name: 'approval_control', description: 'Allowed approval control.', schema: z.object({ count: z.number() }), func: async () => { approvals++; return 'Approved control'; } });
+  class Model extends FakeChatModel {
+    constructor(private readonly resumed: boolean) { super({ responses: ['Allowed final answer'] }); }
+    override async *_streamResponseChunks(...args: Parameters<FakeChatModel['_streamResponseChunks']>): ReturnType<FakeChatModel['_streamResponseChunks']> {
+      if (this.resumed) resumedInputs.push(JSON.stringify(args[0]));
+      const tools = args[0].filter((message) => message.getType() === 'tool') as ToolMessage[];
+      const next = !tools.some((message) => message.tool_call_id === 'historical-source') ? { id: 'historical-source', name: sourceName, args: { count: 42 }, type: 'tool_call' as const } : undefined;
+      const call = next ?? (!tools.some((message) => message.tool_call_id === 'historical-approval') ? { id: 'historical-approval', name: 'approval_control', args: { count: 42 }, type: 'tool_call' as const } : undefined);
+      yield* new FakeChatModel({ responses: [call == null ? 'Allowed final answer' : ''], toolCalls: call == null ? [] : [call] })._streamResponseChunks(...args);
+    }
+  }
+  const saver = new MemorySaver(); const runId = `committed-history-${mode}`;
+  const create = async (gate: ToolResultProtection | undefined, resumed: boolean): Promise<Run<IState>> => {
+    const hooks = new HookRegistry(); hooks.register('PreToolUse', { hooks: [async (input) => ({ decision: input.toolName === 'approval_control' ? 'ask' : 'allow', reason: 'Allowed approval' })] });
+    const run = await Run.create({ runId, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, tools: [source, approval], compileOptions: { checkpointer: saver } }, hooks, humanInTheLoop: { enabled: true }, toolResultProtection: gate, skipCleanup: true });
+    run.Graph!.overrideModel = new Model(resumed); return run;
+  };
+  let previous: ToolResultProtection | undefined = policy();
+  if (mode === 'legacy') previous = undefined;
+  if (mode === 'stricter') previous = policy({ inspect: ({ content }) => approve(content) });
+  const first = await create(previous, false);
+  const config = { version: 'v2' as const, configurable: { thread_id: runId } };
+  await first.processStream({ messages: [new HumanMessage('Allowed control')] }, config);
+  expect(first.getInterrupt()).toBeDefined(); expect(executions).toBe(1); expect(approvals).toBe(0);
+  const gate = policy({ inspect: ({ content }) => { inspections.push(content); return mode === 'blocked' ? { version: 1, ok: false, error: { code: 'blocked' } } : approve(content.replaceAll(fixtures.canaries[0], '[EMAIL_1]')); } });
+  const resumed = await create(gate, true);
+  const pending = resumed.resume([{ type: 'approve' }], config);
+  if (mode === 'legacy' || mode === 'stricter' || mode === 'blocked') {
+    await expect(pending).rejects.toMatchObject({ code: mode === 'blocked' ? 'blocked' : 'incompatible' }); expect(resumedInputs).toEqual([]); expect(approvals).toBe(0);
+  } else {
+    await pending; expect(resumedInputs).toHaveLength(1); assertNoCanary(resumedInputs[0]); expect(resumedInputs[0]).toContain(mode === 'unselected' ? 'Allowed unselected control' : '[EMAIL_1]'); expect(approvals).toBe(1);
+  }
+  expect(executions).toBe(1);
 });

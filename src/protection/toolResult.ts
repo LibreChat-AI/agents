@@ -1,5 +1,5 @@
 import { types } from 'node:util';
-import { ToolMessage } from '@langchain/core/messages';
+import { ToolMessage, isAIMessage } from '@langchain/core/messages';
 import { GraphInterrupt, ParentCommand } from '@langchain/langgraph';
 import {
   StructuredTool,
@@ -9,6 +9,7 @@ import {
 } from '@langchain/core/tools';
 import type { CallbackManagerForToolRun } from '@langchain/core/callbacks/manager';
 import type { RunnableConfig } from '@langchain/core/runnables';
+import type { BaseMessage } from '@langchain/core/messages';
 import type {
   ProviderTextProtection,
   ProviderTextProtectionResult,
@@ -348,6 +349,15 @@ export async function protectToolText(
   }
 }
 
+export function detachReleasedToolError(policy: ToolResultProtection | undefined, name: string, id: string, error: Error): Error | undefined {
+  const admission = approved.get(error);
+  if (admission == null || admission.policy !== policy || admission.name !== name || admission.id !== id || admission.status !== 'error') return undefined;
+  if (types.isProxy(error) || Object.getOwnPropertyDescriptor(error, 'message')?.value !== admission.text) throw new ToolResultProtectionError('unsupported');
+  const detached = new Error(admission.text);
+  approved.set(detached, { ...admission });
+  return detached;
+}
+
 export function isReleasedToolError(
   policy: ToolResultProtection | undefined,
   name: string,
@@ -361,7 +371,7 @@ export function isReleasedToolError(
     entry.name === name &&
     entry.id === id &&
     entry.status === 'error' &&
-    entry.text === error.message
+    !types.isProxy(error) && Object.getOwnPropertyDescriptor(error, 'message')?.value === entry.text
   );
 }
 
@@ -561,6 +571,60 @@ function validateToolMessageRelease(release: ToolMessageRelease, name: string, i
   plainObject(release.envelope.response_metadata, [], true);
   const certified = snapshotToolMessageEnvelope({ ...release.envelope, content: envelope.content, additional_kwargs: { ...release.envelope.additional_kwargs }, response_metadata: {} });
   if (!matchesToolMessageEnvelope(envelope, certified)) throw new ToolResultProtectionError('unsupported');
+}
+
+export function getLiveToolMessageRelease(policy: ToolResultProtection, message: ToolMessage): ToolMessageRelease | undefined {
+  const entry = approved.get(message);
+  if (entry?.policy !== policy || entry.envelope == null) return undefined;
+  return getToolMessageRelease(policy, entry.name, entry.id, message);
+}
+
+/** Only the SDK reducer may bind an ID generated while committing a live release. */
+export function commitToolMessageRelease(policy: ToolResultProtection, message: ToolMessage, release: ToolMessageRelease, content: ToolMessage['content']): ToolMessageRelease {
+  const envelope = snapshotToolMessageEnvelope(message);
+  if (envelope.content !== content || (release.envelope.id != null && envelope.id !== release.envelope.id) || !matchesToolMessageEnvelope({ ...envelope, id: release.envelope.id }, { ...release.envelope, content })) throw new ToolResultProtectionError('unsupported');
+  markReleasedToolMessage(policy, release.name, release.id, message);
+  return getToolMessageRelease(policy, release.name, release.id, message)!;
+}
+
+export function snapshotToolMessageReleases(releases: readonly ToolMessageRelease[]): ToolMessageRelease[] {
+  return snapshotDataArray(releases, Number.MAX_SAFE_INTEGER, true).map((release) => {
+    plainObject(release, ['version', 'name', 'id', 'envelope'], true);
+    for (const field of ['version', 'name', 'id', 'envelope']) if (!Object.hasOwn(release, field)) throw new ToolResultProtectionError('incompatible');
+    const version: number = release.version;
+    if (version !== 1 || typeof release.name !== 'string' || typeof release.id !== 'string') throw new ToolResultProtectionError('incompatible');
+    plainObject(release.envelope, ['artifact', 'name', 'id', 'tool_call_id', 'status', 'additional_kwargs', 'response_metadata'], true);
+    plainObject(release.envelope.additional_kwargs, ['_refKey', '_refScope', '_unresolvedRefs'], true);
+    plainObject(release.envelope.response_metadata, [], true);
+    const envelope = snapshotToolMessageEnvelope({ ...release.envelope, content: '', additional_kwargs: { ...release.envelope.additional_kwargs }, response_metadata: {} });
+    validateToolMessageRelease(release, release.name, release.id, envelope);
+    const { content: _content, ...identity } = envelope;
+    return { version: 1, name: release.name, id: release.id, envelope: identity };
+  });
+}
+
+/** Historical state is immutable: reject legacy or newly incompatible history before model reuse. */
+export async function validateToolMessageHistory(policy: ToolResultProtection | undefined, messages: readonly BaseMessage[], releases: readonly ToolMessageRelease[], signal?: AbortSignal): Promise<void> {
+  if (policy == null) return;
+  const certified = snapshotToolMessageReleases(releases);
+  const calls = new Map<string, string>();
+  for (const message of messages) {
+    if (isAIMessage(message)) {
+      for (const call of message.tool_calls ?? []) if (call.id != null) calls.set(call.id, call.name);
+      continue;
+    }
+    if (!(message instanceof ToolMessage)) continue;
+    const name = calls.get(message.tool_call_id) ?? message.name;
+    if (!requiresToolResultProtection(policy, name ?? '') && !requiresToolResultProtection(policy, message.name ?? '')) continue;
+    if (name == null) throw new ToolResultProtectionError('incompatible');
+    const live = getLiveToolMessageRelease(policy, message);
+    if (live != null) continue;
+    const release = certified.find((entry) => entry.name === name && entry.id === message.tool_call_id && entry.envelope.id === message.id);
+    if (release == null) throw new ToolResultProtectionError('incompatible');
+    const canonical = await protectToolMessage(policy, name, message.tool_call_id, message, signal, release);
+    if (canonical.content !== message.content) throw new ToolResultProtectionError('incompatible');
+    markReleasedToolMessage(policy, name, message.tool_call_id, message);
+  }
 }
 
 export async function protectToolMessage(
