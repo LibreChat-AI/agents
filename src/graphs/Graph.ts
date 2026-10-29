@@ -115,6 +115,7 @@ import {
   disposeLangfuseHandler,
   isLangfuseCallbackHandler,
 } from '@/langfuse';
+import { requiresToolResultProtection, ToolResultProtectionError, validateToolResultProtection } from '@/protection/toolResult';
 import {
   getBlindRecoveryBudget,
   planContextOverflowRecovery,
@@ -184,7 +185,6 @@ import { SUBAGENT_REPLAY_CONTROLLER } from '@/tools/subagent/SubagentReplay';
 import { applyGraphRuntimeConfig } from '@/graphs/applyGraphRuntimeConfig';
 import { isFadingTier, isInformativeFadingTier } from '@/messages/fading';
 import { createContextPressureMeter } from '@/llm/contextPressureMeter';
-import { validateToolResultProtection } from '@/protection/toolResult';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { createCloudflareCodingToolBundle } from '@/tools/cloudflare';
 import { calculateMaxToolCallInputChars } from '@/utils/truncation';
@@ -1616,6 +1616,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       }
       if (clientDelegatedToolNames.some((name) => !name.trim())) {
         throw new Error('Client delegated tool names must be nonempty');
+      }
+      if (clientDelegatedToolNames.some((name) => requiresToolResultProtection(toolResultProtection, name))) {
+        throw new ToolResultProtectionError('unsupported');
       }
       this.clientDelegatedToolNames = new Set(clientDelegatedToolNames);
     }

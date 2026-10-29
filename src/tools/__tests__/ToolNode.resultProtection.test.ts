@@ -49,6 +49,7 @@ import fixtures from '@/protection/__tests__/fixtures/a1.json';
 import { StreamLimitExceededError } from '@/llm/streamLimits';
 import { Constants, GraphEvents, Providers } from '@/common';
 import { ChatModelStreamHandler } from '@/stream';
+import { StandardGraph } from '@/graphs/Graph';
 import { ToolNode } from '@/tools/ToolNode';
 import { FakeChatModel } from '@/llm/fake';
 import { HookRegistry } from '@/hooks';
@@ -2267,7 +2268,7 @@ it.each(['ToolResultProtectionError', 'ProviderTextProtectionError'] as const)('
   expect(failure).toMatchObject({ code: kind === 'ToolResultProtectionError' ? 'blocked' : 'timeout' }); expect(failure).not.toBe(error); assertNoCanary(String(failure)); assertNoCanary(events.join(''));
 });
 
-it.each(['hook', 'inspection'] as const)('validates post-hook source provenance before stamping replacement (%s)', async (phase) => {
+it.each(['hook', 'inspection'] as const)('isolates callback-held post-hook source mutations before replacement (%s)', async (phase) => {
   let retained: ToolMessage | undefined; let executions = 0; const events: string[] = [];
   const hooks = new HookRegistry(); hooks.register('PostToolUse', { hooks: [async () => {
     if (retained == null) throw new Error('Expected canonical message');
@@ -2281,8 +2282,8 @@ it.each(['hook', 'inspection'] as const)('validates post-hook source provenance 
     return approve(content);
   } });
   const node = new ToolNode({ trace: true, tools: [direct(() => { executions++; return 'Allowed source control'; })], hookRegistry: hooks, toolResultProtection: gate, toolOutputReferences: { enabled: true }, toolCallStepIds: new Map([['call-control', 'step-control']]) });
-  await expect(node.invoke(state(), { configurable: { run_id: `post-envelope-${phase}` }, callbacks: [callback] })).rejects.toMatchObject({ code: 'unsupported' });
-  expect(executions).toBe(1); assertNoCanary(events.join('')); expect(events.join('')).not.toContain('Allowed replacement control');
+  const result = await node.invoke(state(), { configurable: { run_id: `post-envelope-${phase}` }, callbacks: [callback] }) as { messages: ToolMessage[] };
+  expect(executions).toBe(1); expect(result.messages[0].content).toBe('Allowed replacement control'); expect(result.messages[0]).not.toBe(retained); assertNoCanary(result); assertNoCanary(events.join(''));
 });
 
 it.each(([false, true] as const).flatMap((eager) => (['root-throw', 'root-reject', 'child-throw'] as const).map((path) => [eager, path] as const)))('keeps externally supplied policy exceptions raw-free across required host dispatch (%s/%s)', async (eager, path) => {
@@ -2335,4 +2336,82 @@ it('normalizes a producer protection error without invoking its code accessor', 
 it('preserves absent-policy nested exception behavior', async () => {
   const original = new ProviderTextProtectionError('blocked');
   await expect(executeTools([{ id: 'plain-control', name: 'lookup', input: { count: 42 } }], new Map([['lookup', direct(() => { throw original; })]]))).rejects.toBe(original);
+});
+
+it.each([false, true])('never logs handler-mutated selected errors before required reinspection (block=%s)', async (block) => {
+  const logs: string[] = []; const inspected: string[] = [];
+  jest.spyOn(console, 'error').mockImplementation((...args): void => { logs.push(JSON.stringify(args)); });
+  const node = new ToolNode({ tools: [direct(() => { throw new Error('Allowed initial error'); })], toolResultProtection: policy({ inspect: ({ content }) => { inspected.push(content); return block && content.includes(fixtures.canaries[0]) ? { version: 1, ok: false, error: { code: 'blocked' } } : approve(content.replaceAll(fixtures.canaries[0], '[EMAIL_1]')); } }), errorHandler: async ({ error }) => {
+    error!.message = fixtures.canaries[0]; error!.stack = fixtures.canaries[0];
+    throw new Error(fixtures.canaries[0], { cause: error });
+  } });
+  const pending = node.invoke(state());
+  if (block) await expect(pending).rejects.toMatchObject({ code: 'blocked' });
+  else assertNoCanary(await pending);
+  expect(inspected).toEqual(['Allowed initial error', fixtures.canaries[0]]);
+  expect(logs).toHaveLength(1); assertNoCanary(logs.join(''));
+});
+
+it.each(['lookup', 'unregistered'] as const)('rejects required client delegation before graph execution (%s)', async (name) => {
+  let inspections = 0;
+  await expect(Run.create({ runId: `required-delegation-${name}`, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, tools: [direct(() => 'Must not execute')] }, clientDelegatedToolNames: [name], toolResultProtection: policy({ toolNames: [name], inspect: () => { inspections++; return approve('Must not inspect'); } }), customHandlers: { [GraphEvents.ON_MODEL_RESPONSE]: { handle: (): void => {} } } })).rejects.toMatchObject({ code: 'unsupported' });
+  expect(inspections).toBe(0);
+});
+
+it.each([false, true])('preserves unselected or absent-policy client delegation (configured=%s)', async (configured) => {
+  const accepted: string[] = []; let executions = 0;
+  const run = await Run.create({ runId: `allowed-delegation-${configured}`, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, tools: [direct(() => { executions++; return 'Must not execute on server'; })] }, clientDelegatedToolNames: ['lookup'], toolResultProtection: configured ? policy({ toolNames: ['other'] }) : undefined, customHandlers: { [GraphEvents.ON_MODEL_RESPONSE]: { handle: (_event, data): void => { accepted.push(JSON.stringify(data)); } } }, skipCleanup: true });
+  run.Graph!.overrideModel = new FakeChatModel({ responses: [''], toolCalls: [{ id: 'delegated-control', name: 'lookup', args: { count: 42 }, type: 'tool_call' }] });
+  await run.processStream({ messages: [new HumanMessage('Allowed control')] }, { version: 'v2', configurable: { thread_id: `allowed-delegation-${configured}` } });
+  expect(executions).toBe(0); expect(accepted.join('')).toContain('delegated-control');
+});
+
+it.each(['content', 'id', 'metadata'] as const)('detaches native callback-held %s before the next model request', async (field) => {
+  let retained: ToolMessage | undefined; const inputs: string[] = []; let executions = 0;
+  const callback = BaseCallbackHandler.fromMethods({ handleToolEnd: (output): void => { if (!(output instanceof ToolMessage)) throw new Error('Expected canonical message'); retained = output; } }); callback.awaitHandlers = true;
+  const lookup = direct(() => { executions++; return fixtures.canaries[0]; }); lookup.callbacks = [callback];
+  class Model extends FakeChatModel {
+    override async *_streamResponseChunks(...args: Parameters<FakeChatModel['_streamResponseChunks']>): ReturnType<FakeChatModel['_streamResponseChunks']> {
+      if (retained != null) {
+        const alias = retained;
+        await new Promise<void>((resolve) => setImmediate(() => {
+          if (field === 'content') alias.content = fixtures.canaries[0];
+          if (field === 'id') alias.id = fixtures.canaries[0];
+          if (field === 'metadata') alias.additional_kwargs._refScope = fixtures.canaries[0];
+          resolve();
+        }));
+      }
+      inputs.push(JSON.stringify(args[0])); yield* super._streamResponseChunks(...args);
+    }
+  }
+  const run = await Run.create({ runId: `callback-detach-${field}`, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, tools: [lookup] }, toolResultProtection: policy(), toolOutputReferences: { enabled: true }, skipCleanup: true });
+  run.Graph!.overrideModel = new Model({ responses: ['', 'Allowed final answer'], toolCalls: [{ id: 'call-control', name: 'lookup', args: { count: 42 }, type: 'tool_call' }] });
+  await run.processStream({ messages: [new HumanMessage('Allowed control')] }, { version: 'v2', configurable: { thread_id: `callback-detach-${field}` } });
+  expect(executions).toBe(1); expect(retained).toBeDefined(); expect(inputs).toHaveLength(2); expect(inputs[1]).toContain('[EMAIL_1]'); assertNoCanary(inputs[1]); assertNoCanary(run.Graph!.getRunMessages());
+});
+
+it.each(['content', 'metadata'] as const)('returns state detached from a callback-retained %s alias', async (field) => {
+  let retained: ToolMessage | undefined;
+  const callback = BaseCallbackHandler.fromMethods({ handleToolEnd: (output): void => { if (!(output instanceof ToolMessage)) throw new Error('Expected canonical message'); retained = output; } }); callback.awaitHandlers = true;
+  const node = new ToolNode({ trace: true, tools: [direct(() => fixtures.canaries[0])], toolResultProtection: policy() });
+  const result = await node.invoke(state(), { callbacks: [callback] }) as { messages: ToolMessage[] };
+  expect(retained).toBeDefined();
+  if (retained == null) throw new Error('Expected callback retention');
+  await new Promise<void>((resolve) => setImmediate(() => {
+    if (field === 'content') retained!.content = fixtures.canaries[0];
+    if (field === 'metadata') retained!.additional_kwargs._refScope = fixtures.canaries[0];
+    resolve();
+  }));
+  expect(result.messages[0]).not.toBe(retained); expect(result.messages[0].additional_kwargs).not.toBe(retained.additional_kwargs);
+  expect(result.messages[0].content).toBe('[EMAIL_1]'); assertNoCanary(result);
+});
+
+it('rejects required delegation through the standalone graph constructor', () => {
+  expect(() => new StandardGraph({ runId: 'direct-required-delegation', agents: [{ agentId: 'agent', provider: Providers.OPENAI }], clientDelegatedToolNames: ['lookup'], toolResultProtection: policy() })).toThrow(ToolResultProtectionError);
+});
+
+it('preserves ordinary handler diagnostics when result protection is absent', async () => {
+  const logs: string[] = []; jest.spyOn(console, 'error').mockImplementation((...args): void => { logs.push(JSON.stringify(args)); });
+  const node = new ToolNode({ tools: [direct(() => { throw new Error('Allowed original control'); })], errorHandler: async () => { throw new Error('Allowed observer failure'); } });
+  const result = await node.invoke(state()); expect(JSON.stringify(result)).toContain('Allowed original control'); expect(logs.join('')).toContain('Allowed observer failure');
 });

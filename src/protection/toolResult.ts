@@ -571,7 +571,7 @@ export async function protectToolMessage(
     existing.text === message.content &&
     existing.status === (message.status ?? 'success')
   )
-    return message;
+    return replaceReleasedToolMessage(policy, name, id, message, envelope.content, existing.referenceContent);
   const content = await protectToolText(
     policy,
     name,

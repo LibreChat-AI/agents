@@ -2218,7 +2218,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             ).handlerOwned.add(call.id);
           }
           // eslint-disable-next-line no-console
-          console.error('Error in errorHandler:', {
+          console.error('Error in errorHandler:', requiresToolResultProtection(this.toolResultProtection, call.name) ? {
+            toolName: call.name,
+            toolCallId: call.id,
+            stepId: this.toolCallStepIds?.get(call.id!),
+            turn: this.toolUsageCount.get(call.name),
+          } : {
             toolName: call.name,
             toolCallId: call.id,
             toolArgs: call.args,
