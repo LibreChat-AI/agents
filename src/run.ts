@@ -1405,6 +1405,11 @@ export class Run<_T extends t.BaseGraphState> {
       graph.resetValues(streamOptions?.keepContent, checkpointScope);
       graph.handoffRouting?.start();
       graph.startStopContinuationExecution(nanoid());
+      if (this.toolResultProtection != null && this.hasCheckpointer) {
+        const workflow = graphRunnable as t.CompiledStateWorkflow & WorkflowWithStateHistory;
+        const checkpoint = await workflow.getState?.(config, { subgraphs: true });
+        if (checkpoint != null) await graph.validateToolResultCheckpoint(checkpoint, callerConfig.signal);
+      }
     }
     this._interrupt = undefined;
     this._haltedReason = undefined;

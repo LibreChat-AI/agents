@@ -2540,3 +2540,23 @@ it.each(['legacy', 'protected'] as const)('gates committed child history before 
   else { await pending; expect(approvals).toBe(1); assertNoCanary(resumedInputs.join('')); assertNoCanary(resumed.Graph!.getRunMessages()); }
   expect(executions).toBe(1);
 });
+
+it.each(['same-run', 'rebuilt', 'legacy', 'unselected', 'stricter'] as const)('preserves certified checkpoint history on a fresh same-thread turn (%s)', async (mode) => {
+  const inputs: string[] = []; let executions = 0;
+  const name = mode === 'unselected' ? 'other' : 'lookup';
+  const lookup = new DynamicStructuredTool({ name, description: 'Allowed source control.', schema: z.object({ count: z.number() }), func: async () => { executions++; return mode === 'unselected' ? 'Allowed unselected control' : fixtures.canaries[0]; } });
+  const saver = new MemorySaver(); const runId = `fresh-history-${mode}`;
+  const create = (protectedRun: boolean, gate = policy()): Promise<Run<IState>> => Run.create({ runId, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, tools: [lookup], compileOptions: { checkpointer: saver } }, toolResultProtection: protectedRun ? gate : undefined });
+  const first = await create(mode !== 'legacy', mode === 'stricter' ? policy({ inspect: ({ content }) => approve(content) }) : policy()); first.Graph!.overrideModel = new FakeChatModel({ responses: ['', 'Allowed first answer'], toolCalls: [{ id: 'first-source', name, args: { count: 42 }, type: 'tool_call' }] });
+  const config = { version: 'v2' as const, configurable: { thread_id: runId } };
+  await first.processStream({ messages: [new HumanMessage('Allowed first control')] }, config); expect(executions).toBe(1);
+  const next = mode === 'same-run' ? first : await create(true);
+  class Model extends FakeChatModel {
+    override async *_streamResponseChunks(...args: Parameters<FakeChatModel['_streamResponseChunks']>): ReturnType<FakeChatModel['_streamResponseChunks']> { inputs.push(JSON.stringify(args[0])); yield* super._streamResponseChunks(...args); }
+  }
+  next.Graph!.overrideModel = new Model({ responses: ['Allowed next answer'] });
+  const pending = next.processStream({ messages: [new HumanMessage('Allowed next control')] }, config);
+  if (mode === 'legacy' || mode === 'stricter') { await expect(pending).rejects.toMatchObject({ code: 'incompatible' }); expect(inputs).toEqual([]); }
+  else { await pending; expect(inputs).toHaveLength(1); expect(inputs[0]).toContain(mode === 'unselected' ? 'Allowed unselected control' : '[EMAIL_1]'); assertNoCanary(inputs[0]); }
+  expect(executions).toBe(1);
+});

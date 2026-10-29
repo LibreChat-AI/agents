@@ -606,7 +606,11 @@ export function snapshotToolMessageReleases(releases: readonly ToolMessageReleas
 /** Historical state is immutable: reject legacy or newly incompatible history before model reuse. */
 export async function validateToolMessageHistory(policy: ToolResultProtection | undefined, messages: readonly BaseMessage[], releases: readonly ToolMessageRelease[], signal?: AbortSignal): Promise<void> {
   if (policy == null) return;
-  const certified = snapshotToolMessageReleases(releases);
+  const certified = new Map<string, ToolMessageRelease>();
+  for (const release of snapshotToolMessageReleases(releases)) {
+    const key = JSON.stringify([release.name, release.id, release.envelope.id]);
+    if (!certified.has(key)) certified.set(key, release);
+  }
   const calls = new Map<string, string>();
   for (const message of messages) {
     if (isAIMessage(message)) {
@@ -619,7 +623,7 @@ export async function validateToolMessageHistory(policy: ToolResultProtection | 
     if (name == null) throw new ToolResultProtectionError('incompatible');
     const live = getLiveToolMessageRelease(policy, message);
     if (live != null) continue;
-    const release = certified.find((entry) => entry.name === name && entry.id === message.tool_call_id && entry.envelope.id === message.id);
+    const release = certified.get(JSON.stringify([name, message.tool_call_id, message.id]));
     if (release == null) throw new ToolResultProtectionError('incompatible');
     const canonical = await protectToolMessage(policy, name, message.tool_call_id, message, signal, release);
     if (canonical.content !== message.content) throw new ToolResultProtectionError('incompatible');
