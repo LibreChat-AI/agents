@@ -188,6 +188,7 @@ describe('strict structured-chat decisionModel', () => {
     [400, 'bad_request'],
     [401, 'unauthorized'],
     [403, 'unauthorized'],
+    [402, 'quota'],
     [429, 'rate_limited'],
     [503, 'server_error'],
   ] as const)(

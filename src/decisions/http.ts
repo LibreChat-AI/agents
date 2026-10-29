@@ -119,6 +119,7 @@ export function createHttpDecisionModel(
   return {
     id: providerId,
     model,
+    reportsRequests: true,
     async decide(request: DecisionRequest): Promise<DecisionResult> {
       return send(
         () => {
@@ -168,7 +169,9 @@ export function createHttpDecisionModel(
         },
         request.signal,
         request.label ?? 'decide',
-        request.timeoutMs
+        request.timeoutMs,
+        request.onRequest,
+        request.onResponse
       );
     },
   };

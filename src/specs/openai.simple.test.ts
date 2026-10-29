@@ -4,11 +4,8 @@
 import { config } from 'dotenv';
 config();
 import { Calculator } from '@/tools/Calculator';
-import {
-  HumanMessage,
-  BaseMessage,
-  UsageMetadata,
-} from '@langchain/core/messages';
+import { HumanMessage } from '@langchain/core/messages';
+import type { BaseMessage, UsageMetadata } from '@langchain/core/messages';
 import type * as t from '@/types';
 import {
   ToolEndHandler,
@@ -174,6 +171,7 @@ describeIfOpenAI(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
       inputText: userMessage,
       titleMethod: TitleMethod.STRUCTURED,
       contentParts,
+      clientOptions: llmConfig,
       chainOptions: {
         callbacks: [
           {
@@ -226,6 +224,7 @@ describeIfOpenAI(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
       inputText: userMessage,
       titleMethod: TitleMethod.COMPLETION, // Using completion method
       contentParts,
+      clientOptions: llmConfig,
       chainOptions: {
         callbacks: [
           {

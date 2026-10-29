@@ -695,6 +695,29 @@ function resolveAttemptRequest(
   });
 }
 
+const EMPTY_PROVIDER_RESPONSE_MESSAGE =
+  'The model provider returned an empty response.';
+
+/**
+ * Tool calls across an attempt's messages. A missing message means the provider produced
+ * nothing, which is reported as such rather than surfacing as a `TypeError` from reading
+ * `tool_calls` off `undefined`.
+ */
+export function collectAttemptToolCalls(
+  messages: ReadonlyArray<BaseMessage | null | undefined> | undefined
+): ToolCall[] {
+  const calls: ToolCall[] = [];
+  for (const message of messages ?? []) {
+    if (message == null) {
+      throw new Error(EMPTY_PROVIDER_RESPONSE_MESSAGE);
+    }
+    if ('tool_calls' in message) {
+      calls.push(...((message.tool_calls as ToolCall[] | undefined) ?? []));
+    }
+  }
+  return calls;
+}
+
 /**
  * One model attempt. Stamps the attempt identity into callback metadata
  * (see the generation-key notes in `streamLimits.ts`), leases the attempt's
@@ -786,12 +809,7 @@ export async function attemptInvoke(
       },
       stampedConfig
     );
-    const calls =
-      result.messages?.flatMap((message) =>
-        'tool_calls' in message
-          ? ((message.tool_calls as ToolCall[] | undefined) ?? [])
-          : []
-      ) ?? [];
+    const calls = collectAttemptToolCalls(result.messages);
     prepared?.finish(preparedAttempt, calls);
     return result;
   } catch (error) {
@@ -1499,15 +1517,19 @@ async function attemptInvokeBody(
       );
     }
 
-    if (finalChunk != null) detachValidatedModelToolCalls(finalChunk);
-    if ((finalChunk?.tool_calls?.length ?? 0) > 0) {
-      finalChunk!.tool_calls = finalChunk!.tool_calls?.filter(
+    if (finalChunk == null) {
+      throw new Error(EMPTY_PROVIDER_RESPONSE_MESSAGE);
+    }
+
+    detachValidatedModelToolCalls(finalChunk);
+    if ((finalChunk.tool_calls?.length ?? 0) > 0) {
+      finalChunk.tool_calls = finalChunk.tool_calls?.filter(
         (tool_call: ToolCall) => !!tool_call.name
       );
     }
 
     assertNotTruncatedToolCall(finalChunk, provider);
-    return { messages: [finalChunk as AIMessageChunk] };
+    return { messages: [finalChunk] };
   }
 
   const finalMessage = snapshotValidatedModelChunk(

@@ -69,6 +69,21 @@ describe('AgentContext', () => {
       expect(hostGraphTools).toHaveLength(1);
     });
 
+    it('drops graphTools outside the local coding allowlist', () => {
+      const runner = createMockTool('run_tools_with_code');
+      const askTool = createMockTool('ask_user_question');
+      const ctx = createBasicContext({
+        agentConfig: { graphTools: [runner, askTool] },
+        toolExecution: {
+          engine: 'local',
+          local: { codingToolNames: ['read_file'] },
+        },
+      });
+      expect(
+        (ctx.graphTools as t.GenericTool[]).map((tool) => tool.name)
+      ).toEqual(['ask_user_question']);
+    });
+
     it('leaves graphTools undefined when the host supplies none (or an empty list)', () => {
       expect(createBasicContext().graphTools).toBeUndefined();
       expect(
@@ -1792,6 +1807,51 @@ describe('AgentContext', () => {
       void ctx.systemRunnable;
 
       expect(ctx.instructionTokens).toBeGreaterThan(initialTokens);
+    });
+
+    it('ignores a cached toolSchemaTokens total once the local allowlist removes tools', async () => {
+      const defs: t.LCTool[] = ['read_file', 'bash_tool'].map((name) => ({
+        name,
+        description: name,
+        parameters: { type: 'object', properties: {} },
+      }));
+      const toolExecution: t.ToolExecutionConfig = {
+        engine: 'local',
+        local: { codingToolNames: ['read_file'] },
+      };
+      const filtered = createBasicContext({
+        agentConfig: { toolDefinitions: defs, toolSchemaTokens: 99999 },
+        tokenCounter: mockTokenCounter,
+        toolExecution,
+      });
+      const unfiltered = createBasicContext({
+        agentConfig: { toolDefinitions: defs, toolSchemaTokens: 99999 },
+        tokenCounter: mockTokenCounter,
+      });
+      await filtered.tokenCalculationPromise;
+      await unfiltered.tokenCalculationPromise;
+      expect(filtered.toolSchemaTokens).not.toBe(99999);
+      expect(unfiltered.toolSchemaTokens).toBe(99999);
+    });
+
+    it('keeps the cached total when a retained tool is a native schema the recount cannot measure', async () => {
+      const nativeSearch = {
+        type: 'function',
+        function: { name: 'web_search', parameters: {} },
+      } as unknown as t.GenericTool;
+      const ctx = createBasicContext({
+        agentConfig: {
+          tools: [createMockTool('bash_tool'), nativeSearch],
+          toolSchemaTokens: 99999,
+        },
+        tokenCounter: mockTokenCounter,
+        toolExecution: {
+          engine: 'local',
+          local: { codingToolNames: ['read_file'] },
+        },
+      });
+      await ctx.tokenCalculationPromise;
+      expect(ctx.toolSchemaTokens).toBe(99999);
     });
 
     it('excludes deferred-undiscovered toolDefinitions from toolSchemaTokens', async () => {

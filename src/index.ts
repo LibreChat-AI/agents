@@ -16,6 +16,7 @@ export * from './summarization';
 
 /* Tools */
 export * from './tools/Calculator';
+export * from './tools/GitHubCompare';
 export * from './tools/CodeExecutor';
 export * from './tools/BashExecutor';
 export * from './tools/ProgrammaticToolCalling';

@@ -29,6 +29,7 @@ import type {
   MessageContentReasoningBlock,
 } from '../types';
 import { serializeStructuredValueBounded } from '@/utils/toolContent';
+import { neutralizeHarmonyRequest } from './harmony';
 import { isReasoningContentBlock } from '@/messages/reasoningTypes';
 import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
 
@@ -1133,8 +1134,34 @@ function convertToolMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
 
 /** Options for {@link convertToConverseMessages}. */
 export interface ConvertToConverseMessagesOptions {
-  /** The model the request is for, which decides whether prior reasoning is replayed. */
+  /**
+   * The model the request is for, which decides whether prior reasoning is replayed and
+   * whether harmony control tokens in text are neutralized.
+   */
   model?: string;
+}
+
+/**
+ * Whether the model is an identified OpenAI model on Bedrock (`openai.*`, a geo/global
+ * inference profile such as `global.openai.*`, or an ARN naming one). Missing model IDs and
+ * opaque resource ARNs are not identified.
+ */
+export function isBedrockOpenAIModel(model?: string): boolean {
+  if (model == null || model === '') {
+    return false;
+  }
+  let id = model.toLowerCase();
+  if (id.startsWith('arn:')) {
+    const modelId =
+      /^arn:[^:]+:bedrock:[^:]*:[^:]*:(?:foundation-model|inference-profile)\/(.+)$/.exec(
+        id
+      )?.[1];
+    if (modelId == null) {
+      return false;
+    }
+    id = modelId;
+  }
+  return /(?:^|\.)openai\./.test(id);
 }
 
 /**
@@ -1144,21 +1171,7 @@ export interface ConvertToConverseMessagesOptions {
  * Missing model IDs and opaque resource ARNs also retain the existing behavior.
  */
 export function replaysBedrockReasoning(model?: string): boolean {
-  if (model == null || model === '') {
-    return true;
-  }
-  let id = model.toLowerCase();
-  if (id.startsWith('arn:')) {
-    const modelId =
-      /^arn:[^:]+:bedrock:[^:]*:[^:]*:(?:foundation-model|inference-profile)\/(.+)$/.exec(
-        id
-      )?.[1];
-    if (modelId == null) {
-      return true;
-    }
-    id = modelId;
-  }
-  return !/(?:^|\.)openai\./.test(id);
+  return !isBedrockOpenAIModel(model);
 }
 
 /**
@@ -1171,7 +1184,8 @@ export function convertToConverseMessages(
   converseMessages: BedrockMessage[];
   converseSystem: BedrockSystemContentBlock[];
 } {
-  const replayReasoning = replaysBedrockReasoning(options.model);
+  const openAITarget = isBedrockOpenAIModel(options.model);
+  const replayReasoning = !openAITarget;
   const converseSystem = messages
     .filter((msg) => msg._getType() === 'system')
     .flatMap((msg) => convertSystemMessageToConverseMessage(msg));
@@ -1237,5 +1251,14 @@ export function convertToConverseMessages(
     );
   }
 
-  return { converseMessages: combinedConverseMessages, converseSystem };
+  if (!openAITarget) {
+    return { converseMessages: combinedConverseMessages, converseSystem };
+  }
+  return {
+    converseMessages: combinedConverseMessages,
+    converseSystem: neutralizeHarmonyRequest(
+      combinedConverseMessages,
+      converseSystem
+    ),
+  };
 }
