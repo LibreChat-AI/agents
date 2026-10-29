@@ -21,14 +21,18 @@ import type {
   AnthropicRequestOptions,
   AnthropicMessageStreamEvent,
 } from '@/llm/anthropic/types';
-import type { SmoothItem } from '@/llm/stream/smoother';
 import type { AnthropicUsageData } from './utils/message_outputs';
+import type { SmoothItem } from '@/llm/stream/smoother';
 import {
   _convertMessagesToAnthropicPayload,
   stripUnsupportedAssistantPrefill,
 } from './utils/message_inputs';
+import {
+  smoothStream,
+  resolveStreamDelay,
+  isSignalAborted,
+} from '@/llm/stream/smoother';
 import { _makeMessageChunkFromAnthropicEvent } from './utils/message_outputs';
-import { smoothStream, resolveStreamDelay, isSignalAborted } from '@/llm/stream/smoother';
 import { convertAnthropicStream } from './utils/stream_events';
 import { handleToolChoice } from './utils/tools';
 
@@ -124,6 +128,24 @@ function isThinkingEnabled(thinking: Anthropic.ThinkingConfigParam): boolean {
 
 function isOpus47Model(model?: string): boolean {
   return /^claude-opus-4-7(?:-|$)/.test(model ?? '');
+}
+
+const CLAUDE_GENERATION_PATTERN = /^claude-[a-z]+-(\d+)(?:-|$)/;
+const CURRENT_CLAUDE_DEFAULT_MAX_TOKENS = 16384;
+
+/**
+ * Upstream's default `max_tokens` table is keyed by model prefix and falls back
+ * to 4096 for any Claude name it does not list yet, which caps newer models
+ * (and thinking, which shares that budget) far below the 16384 it gives every
+ * other Claude 4+ model. Raising the default further would trip the SDK's
+ * non-streaming guard, which rejects `max_tokens` above ~21K.
+ */
+function resolveDefaultMaxTokens(model: string, inherited: number): number {
+  const generation = CLAUDE_GENERATION_PATTERN.exec(model)?.[1];
+  if (generation == null || Number(generation) < 4) {
+    return inherited;
+  }
+  return Math.max(inherited, CURRENT_CLAUDE_DEFAULT_MAX_TOKENS);
 }
 
 function combineBetas(
@@ -458,6 +480,9 @@ export class CustomAnthropic extends ChatAnthropicMessages {
   contextManagement?: AnthropicContextManagementConfigParam;
   constructor(fields?: CustomAnthropicInput) {
     super(fields);
+    if (fields?.maxTokens == null) {
+      this.maxTokens = resolveDefaultMaxTokens(this.model, this.maxTokens);
+    }
     this.resetTokenEvents();
     this.setDirectFields(fields);
     this._lc_stream_delay = resolveStreamDelay(fields?._lc_stream_delay);
