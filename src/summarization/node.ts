@@ -191,8 +191,10 @@ function buildSummarizationClientConfig(
   }
 
   const outputKey = getMaxOutputTokensKey(provider);
-  const inheritedOutputTokens = baseOptions[outputKey];
-  if (llmParams[outputKey] == null) delete clientOptions[outputKey];
+  const inheritedOutputTokens = readSummaryOutputLimit(provider, baseOptions);
+  const explicitOutputTokens = readSummaryOutputLimit(provider, llmParams);
+  delete clientOptions[outputKey];
+  if (usesCompletionTokenAlias(provider)) delete clientOptions.maxCompletionTokens;
   const defaultOutputTokens = resolveSummaryOutputTokens(
     provider, clientOptions, agentContext.maxContextTokens
   );
@@ -202,7 +204,7 @@ function buildSummarizationClientConfig(
   const effectiveMaxSummaryTokens =
     paramMaxSummaryTokens ??
     summarizationConfig?.maxSummaryTokens ??
-    (llmParams[outputKey] as number | undefined) ??
+    explicitOutputTokens ??
     Math.max(defaultOutputTokens, reasoningOutputTokens);
   clientOptions[outputKey] = effectiveMaxSummaryTokens;
 
@@ -214,6 +216,15 @@ function buildSummarizationClientConfig(
     promptText,
     updatePromptText,
   };
+}
+
+function usesCompletionTokenAlias(provider: t.ProviderName): boolean {
+  return getProviderFamily(provider) === 'openai' || provider === Providers.MOONSHOT;
+}
+
+function readSummaryOutputLimit(provider: t.ProviderName, options: Record<string, unknown>): number | undefined {
+  return ((usesCompletionTokenAlias(provider) ? options.maxCompletionTokens : undefined) ??
+    options[getMaxOutputTokensKey(provider)]) as number | undefined;
 }
 
 function resolveSummaryReasoning(provider: t.ProviderName, clientOptions: Record<string, unknown>): {enabled: boolean; fixedBudget: number} {
@@ -276,8 +287,7 @@ function resolveSummaryOutputTokens(
       Math.max(1, Math.floor((maxContextTokens ?? 40_960) * 0.1))
     );
   return (
-    (clientOptions[getMaxOutputTokensKey(provider)] as number | undefined) ??
-    defaultOutputTokens
+    readSummaryOutputLimit(provider, clientOptions) ?? defaultOutputTokens
   );
 }
 
@@ -900,6 +910,7 @@ async function executeSummarizationWithFallback(params: {
                 maxContextTokens
               ),
           });
+          if (usesCompletionTokenAlias(fallback.provider)) Reflect.deleteProperty(clientOptions, 'maxCompletionTokens');
           return {
             ...fallback,
             clientOptions,

@@ -156,6 +156,8 @@ const reasoningCases = [
     provider: Providers.OPENROUTER,
     options: { maxTokens: 64_000, include_reasoning: true },
   },
+  {provider: Providers.OPENAI, options: {maxCompletionTokens: 64_000, reasoning: {effort: 'high' as const}}},
+  {provider: Providers.OPENAI, options: {maxTokens: 8_000, maxCompletionTokens: 64_000, reasoning: {effort: 'high' as const}}},
 ] as const;
 
 it.each(reasoningCases)(
@@ -192,10 +194,10 @@ it.each(reasoningCases)(
     expect(agentContext.getSummaryText()).toBe('REASONING_CHECKPOINT');
     expect(result.messages?.[0].getType()).toBe('remove');
     expect(JSON.stringify(options)).toBe(before);
+    const expectedOptions = {...options};
+    for (const key of ['maxTokens', 'maxCompletionTokens', 'maxOutputTokens']) Reflect.deleteProperty(expectedOptions, key);
     expect(init.initializeModel).toHaveBeenCalledWith(
-      expect.objectContaining({
-        clientOptions: expect.objectContaining(options),
-      })
+      expect.objectContaining({clientOptions: expect.objectContaining(expectedOptions)})
     );
   }
 );
@@ -231,6 +233,7 @@ it.each([
   { maxSummaryTokens: 1024 },
   { parameters: { maxSummaryTokens: 1024 } },
   { parameters: { maxTokens: 1024 } },
+  { parameters: { maxCompletionTokens: 1024 } },
 ])(
   'honors an explicit summary cap even when inherited reasoning needs more room: %j',
   async (config) => {
@@ -413,4 +416,75 @@ it('keeps a fixed thinking allowance above an inherited smaller agent cap', asyn
   await node({messages, summarizationRequest: {agentId: 'reasoner', remainingContextTokens: 0, windowMessages: messages}}, {});
   expect(model.outputLimit).toBe(12_288);
   expect(model.calls).toHaveLength(1);
+});
+
+it.each([
+  {options: {maxTokens: 64_000, reasoning: {effort: 'high' as const}}, config: {parameters: {maxCompletionTokens: 1024}}, expected: 1024},
+  {options: {maxCompletionTokens: 64_000, reasoning: {effort: 'high' as const}}, config: {maxSummaryTokens: 1024}, expected: 1024},
+  {options: {maxCompletionTokens: 64_000, reasoning: {effort: 'high' as const}}, config: {parameters: {maxTokens: 1024}}, expected: 1024},
+  {options: {maxTokens: 64_000, reasoning: {effort: 'high' as const}}, config: {parameters: {maxTokens: 64_000, maxCompletionTokens: 1024}}, expected: 1024},
+  {options: {maxCompletionTokens: 64_000}, config: {}, expected: 4096},
+  {options: {maxTokens: 8_000, maxCompletionTokens: 64_000, reasoning: {effort: 'high' as const}}, config: {}, expected: 64_000},
+].flatMap(test => ['chat', 'responses'].map(mode => ({...test, mode}))))(
+  'budgets and sends one canonical cap through the real OpenAI transport: %j', async ({options, config, expected, mode}) => {
+    const requests: Array<{max_completion_tokens?: number; max_tokens?: number; max_output_tokens?: number}> = [];
+    const fetch = jest.fn<ReturnType<typeof globalThis.fetch>, Parameters<typeof globalThis.fetch>>(async (_input, init) => {
+      if (typeof init?.body !== 'string') throw new Error('Expected a JSON request body');
+      requests.push(JSON.parse(init.body));
+      if (mode === 'responses') return Response.json({id: 'resp_offline', created_at: 0, object: 'response',
+        model: 'gpt-5.4', status: 'completed', error: null, incomplete_details: null,
+        output: [{id: 'msg_offline', type: 'message', status: 'completed', role: 'assistant',
+          content: [{type: 'output_text', text: 'REASONING_CHECKPOINT', annotations: []}],
+        }], usage: {input_tokens: 100, output_tokens: 10, total_tokens: 110},
+      });
+      return Response.json({id: 'offline', created: 0, object: 'chat.completion', model: 'gpt-5.4',
+        choices: [{index: 0, message: {role: 'assistant', content: 'REASONING_CHECKPOINT'}, finish_reason: 'stop', logprobs: null}],
+      });
+    });
+    const {node, agentContext} = fixture({options: {model: 'gpt-5.4', ...options},
+      config: {...config, contextBudgetMode: 'window'}, maxContextTokens: 100_000,
+    });
+    jest.spyOn(init, 'initializeModel').mockImplementation(({clientOptions}) => {
+      expect(clientOptions).not.toHaveProperty('maxCompletionTokens');
+      return new ChatOpenAI({...clientOptions as t.OpenAIClientOptions, apiKey: 'offline-test', model: 'gpt-5.4',
+        useResponsesApi: mode === 'responses', streaming: false, disableStreaming: true, maxRetries: 0,
+        configuration: {fetch, maxRetries: 0},
+      });
+    });
+    const head = new HumanMessage({id: 'protected-head', content: 'x'.repeat(expected < 64_000 ? 200_000 : 40_000)});
+    const messages = [head];
+    const result = await node({messages, summarizationRequest: {agentId: 'reasoner', remainingContextTokens: 0,
+      reason: 'manual', windowMessages: messages,
+    }}, {});
+    expect(requests).toHaveLength(1);
+    expect(mode === 'responses' ? requests[0].max_output_tokens : requests[0].max_completion_tokens).toBe(expected);
+    expect(result.messages?.[0].getType()).toBe('remove');
+    expect(agentContext.getSummaryText()).toBe('REASONING_CHECKPOINT');
+  });
+
+it('uses the effective alias allowance for a fallback’s window budget', async () => {
+  const {node, model, agentContext} = fixture({options: {reasoning: {effort: 'high'}, maxTokens: 64_000},
+    config: {contextBudgetMode: 'window'}, maxContextTokens: 100_000,
+  });
+  const fallback = new ReasoningBudgetModel(); fallback.requiredOutput = 0;
+  const options = agentContext.clientOptions as t.BuiltInLLMConfig;
+  options.fallbacks = [{provider: Providers.OPENAI, maxContextTokens: 100_000,
+    clientOptions: {model: 'fallback', maxTokens: 64_000, maxCompletionTokens: 1024},
+  }];
+  jest.spyOn(init, 'initializeModel').mockImplementation(({clientOptions}) => {
+    const options = clientOptions as {model?: string; maxTokens?: number; maxCompletionTokens?: number};
+    expect(options.maxCompletionTokens).toBeUndefined();
+    const serving = options.model === 'fallback' ? fallback : model;
+    serving.outputLimit = options.maxTokens ?? 0;
+    return serving;
+  });
+  const messages = [new HumanMessage({id: 'protected-head', content: 'x'.repeat(200_000)})];
+  const result = await node({messages, summarizationRequest: {agentId: 'reasoner', remainingContextTokens: 0,
+    windowMessages: messages,
+  }}, {});
+  expect(model.calls).toHaveLength(0);
+  expect(fallback.outputLimit).toBe(1024);
+  expect(fallback.calls).toHaveLength(1);
+  expect(result.messages?.[0].getType()).toBe('remove');
+  expect(agentContext.getSummaryText()).toBe('REASONING_CHECKPOINT');
 });
