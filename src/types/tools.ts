@@ -1,3 +1,4 @@
+import type { BaseMessage } from '@langchain/core/messages';
 import type { ToolResultProtection } from '@/protection/toolResult';
 // src/types/tools.ts
 import type {
@@ -313,8 +314,8 @@ export type ToolNodeOptions = {
     state?: RunStepResumeState,
     config?: RunnableConfig
   ) => void;
-  /** SDK-owned checkpoint snapshot for open run-step lifecycle state. */
-  createRunStepResumeState?: () => RunStepResumeState;
+  /** SDK-owned snapshot; commits returned message identities before capturing receipts. */
+  createRunStepResumeState?: (messages?: BaseMessage[]) => RunStepResumeState;
   /** Internal ownership bridge, awaited before ToolNode can execute a batch. */
   onToolCallsClaimed?: (
     messageId: string,

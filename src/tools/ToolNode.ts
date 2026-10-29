@@ -291,6 +291,14 @@ function withSubagentReplayBatch(
   };
 }
 
+function collectToolResultMessages(output: unknown): BaseMessage[] {
+  if (Array.isArray(output)) return output.flatMap(collectToolResultMessages);
+  if (isBaseMessage(output)) return [output];
+  if (isCommand(output)) return collectToolResultMessages(output.update);
+  if (output != null && typeof output === 'object' && 'messages' in output && Array.isArray(output.messages)) return output.messages.filter(isBaseMessage);
+  return [];
+}
+
 type SettledDirectToolResult = SettledToolBatchResult;
 
 /** Positional identity is safe within the immutable full-proposal batch key. */
@@ -1219,7 +1227,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         if (createRunStepResumeState == null) {
           return result;
         }
-        const runStepState = createRunStepResumeState();
+        const runStepState = toolResultProtection == null
+          ? createRunStepResumeState()
+          : createRunStepResumeState(collectToolResultMessages(result));
         if (Array.isArray(result)) {
           return [...result, { runStepState }] as T;
         }

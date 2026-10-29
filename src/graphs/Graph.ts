@@ -3048,8 +3048,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           this.restoreRunStepResumeState(state);
         },
         onToolCallsClaimed,
-        createRunStepResumeState: (): t.RunStepResumeState =>
-          this.createRunStepResumeState(),
+        createRunStepResumeState: (messages): t.RunStepResumeState =>
+          this.createToolRunStepResumeState(messages),
         errorHandler: (data, metadata): Promise<boolean> =>
           StandardGraph.handleToolCallErrorStatic(this, data, metadata),
       });
@@ -3132,8 +3132,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         this.restoreRunStepResumeState(state);
       },
       onToolCallsClaimed,
-      createRunStepResumeState: (): t.RunStepResumeState =>
-        this.createRunStepResumeState(),
+      createRunStepResumeState: (messages): t.RunStepResumeState =>
+        this.createToolRunStepResumeState(messages),
     });
     this.registerCompiledToolNode(node);
     return node;
@@ -5324,6 +5324,13 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       messages: injected,
       preventContinuation: result.preventContinuation === true,
     };
+  }
+
+  private createToolRunStepResumeState(messages?: BaseMessage[]): t.RunStepResumeState {
+    if (this.toolResultProtection != null && messages != null) {
+      this.reduceProtectedMessages([], messages.filter((message) => message instanceof ToolMessage));
+    }
+    return this.createRunStepResumeState();
   }
 
   protected createRunStepStateAnnotation(): RunStepStateChannel {
