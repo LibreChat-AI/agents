@@ -559,6 +559,28 @@ function isSyntheticContext(message: BaseMessage): boolean {
   return kwargs.source != null && kwargs.source !== 'steer';
 }
 
+function restoreRetainedMessages(
+  retained: BaseMessage[],
+  canonical: BaseMessage[]
+): BaseMessage[] {
+  if (retained.length === 0) return retained;
+  const pending = new Map<string, number>();
+  for (let i = 0; i < retained.length; i++) {
+    const id = retained[i].id;
+    if (id != null) pending.set(id, i);
+  }
+  const restored = [...retained];
+  for (let i = canonical.length - 1; i >= 0 && pending.size > 0; i--) {
+    const message = canonical[i];
+    if (message.id == null) continue;
+    const index = pending.get(message.id);
+    if (index == null) continue;
+    restored[index] = message;
+    pending.delete(message.id);
+  }
+  return restored;
+}
+
 function resolveSummaryCoverage(
   messagesToRetain: BaseMessage[]
 ): t.SummaryCoverage | undefined {
@@ -1462,7 +1484,7 @@ export function createSummarizeNode({
         : undefined);
     const {
       head: compactableHead,
-      tail: messagesToRetain,
+      tail: projectedTail,
     } = splitAtRecencyBoundary(windowMessages, {
       provider: agentContext.provider,
       turns:
@@ -1500,7 +1522,7 @@ export function createSummarizeNode({
         'summarize',
         'Summarization skipped — recency window retains all messages',
         {
-          messagesRetained: messagesToRetain.length,
+          messagesRetained: projectedTail.length,
           retainTurns,
         },
         { runId: graph.runId, agentId: request.agentId }
@@ -1508,6 +1530,9 @@ export function createSummarizeNode({
       agentContext.markSummarizationTriggered(state.messages.length);
       return { summarizationRequest: undefined };
     }
+
+    const messagesToRetain = windowMessages === state.messages
+      ? projectedTail : restoreRetainedMessages(projectedTail, state.messages);
 
     const semanticIndex = renderCompactionSemanticIndex(
       agentContext.compactionSemanticIndex,

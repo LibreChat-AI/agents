@@ -1751,14 +1751,7 @@ export async function tryFallbackProviders({
       let fallbackMessages = messages;
       if (preparedRequest == null) {
         fallbackMessages =
-          (await prepareProviderMessages?.({
-            model: fbModel as t.ChatModel,
-            messages,
-            provider: fb.provider,
-            clientOptions: fb.clientOptions,
-            maxContextTokens: fb.maxContextTokens,
-            config: fbConfig,
-          })) ?? messages;
+          (await prepareProviderMessages?.(preparationInput)) ?? messages;
       }
       /** A sibling can trip the breaker while the preparation above is
        * awaited — and the catch below only sees attempts that THROW, so a

@@ -437,6 +437,8 @@ it.each([
   {options: {maxTokens: 64_000, reasoning: {effort: 'high' as const}}, config: {parameters: {modelKwargs: {max_output_tokens: 1024}}}, expected: 1024},
   {options: {maxTokens: 64_000, modelKwargs: {max_output_tokens: 64_000}, reasoning: {effort: 'high' as const}}, config: {maxSummaryTokens: 1024}, expected: 1024},
   {options: {maxTokens: 64_000, modelKwargs: {max_completion_tokens: 1024}, reasoning: {effort: 'high' as const}}, config: {}, expected: 64_000},
+  {options: {maxTokens: 64_000, reasoning: {effort: 'high' as const}}, config: {parameters: {modelKwargs: {max_completion_tokens: 1024}}}, expected: 64_000},
+  {options: {maxTokens: 64_000, reasoning: {effort: 'high' as const}}, config: {parameters: {modelKwargs: {max_tokens: 1024}}}, expected: 64_000},
 
   {options: {maxTokens: 8_000, maxCompletionTokens: 64_000, reasoning: {effort: 'high' as const}}, config: {}, expected: 64_000},
 ].flatMap(test => ['chat', 'responses'].map(mode => ({...test, mode}))))(
@@ -528,3 +530,15 @@ it('normalizes Anthropic native overrides without losing adaptive thinking or ca
   expect(result.messages?.[0].getType()).toBe('remove'); expect(agentContext.getSummaryText()).toBe('REASONING_CHECKPOINT');
   expect(JSON.stringify(options)).toBe(before);
 });
+
+it.each(['max_tokens', 'max_completion_tokens'].flatMap(field =>
+  [false, true].map(useResponsesApi => ({field, useResponsesApi}))))(
+  'does not treat native cap fields as constructor aliases: %j', ({field, useResponsesApi}) => {
+    const model = new ChatOpenAI({apiKey: 'offline-test', model: 'gpt-5.4', maxTokens: 64_000,
+      useResponsesApi, reasoning: {effort: 'high'}, modelKwargs: {[field]: 1024},
+    });
+    expect(model.invocationParams()).toMatchObject({
+      [useResponsesApi ? 'max_output_tokens' : 'max_completion_tokens']: 64_000,
+    });
+  }
+);

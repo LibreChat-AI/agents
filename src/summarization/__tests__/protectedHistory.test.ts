@@ -13,6 +13,7 @@ import {
   ManualSummarizationSkippedError,
 } from '@/summarization/shared';
 import { createSummarizeNode } from '@/summarization/node';
+import { maskConsumedToolResults } from '@/messages/prune';
 import { messagesStateReducer } from '@/messages/reducer';
 import { resolveClientOptionsModel } from '@/llm/request';
 import { AgentContext } from '@/agents/AgentContext';
@@ -304,6 +305,44 @@ describe('protected model-visible compaction history', () => {
       expect(JSON.stringify(messages)).toBe(before);
       expect(agentContext.getSummaryText()).toBe('PROTECTED_CHECKPOINT');
       expect(completed).toHaveLength(1);
+    }
+  );
+
+  it.each((['manual', 'trigger', 'overflow'] as const).flatMap(reason =>
+    [false, true].map(withFallback => ({reason, withFallback}))))(
+    'persists the canonical tail after real masking for $reason with fallback=$withFallback',
+    async ({reason, withFallback}) => {
+      const {agentContext, node, model, fallback, completed} = harness({clientOptions: {model: 'primary',
+        fallbacks: withFallback ? [{provider: Providers.OPENAI, clientOptions: {model: 'fallback', maxTokens: 128}}] : [],
+      }});
+      if (withFallback) model.failure = () => new Error('Primary unavailable');
+      const fixture = history();
+      const messages = fixture.messages.map(message => message instanceof ToolMessage
+        ? new ToolMessage({...message, content: `${message.id} CANONICAL_FULL_RESULT ` + 'evidence '.repeat(4_000)})
+        : message);
+      const before = JSON.stringify(messages);
+      const projection = agentContext.getProviderProjectedMessages(messages);
+      expect(maskConsumedToolResults({messages: projection, indexTokenCountMap: {}, tokenCounter: count, maxChars: 1_000})).toBe(2);
+      const windowMessages = projection.slice(2);
+      const canonicalTail = messages.slice(-fixture.tail.length);
+      const projectedTail = windowMessages.slice(-fixture.tail.length);
+      expect(projectedTail[2]).not.toBe(canonicalTail[2]);
+      expect(JSON.stringify(projectedTail[2].content).length).toBeLessThan(JSON.stringify(canonicalTail[2].content).length);
+      const projectionBefore = JSON.stringify(windowMessages);
+      const result = await node.invoke({messages, summarizationRequest: {agentId: agentContext.agentId,
+        reason, remainingContextTokens: 0, allowSummarization: true, windowMessages,
+      }});
+      const sent = (withFallback ? fallback : model).requests[0];
+      expect(sent).toBeDefined();
+      expect(JSON.stringify(sent)).not.toContain('evidence '.repeat(200));
+      assertHeadWasSent(windowMessages.slice(0, -fixture.tail.length), sent);
+      const surviving = messagesStateReducer(messages, result.messages ?? []);
+      expect(surviving).toHaveLength(canonicalTail.length);
+      expect(JSON.stringify(surviving)).toBe(JSON.stringify(canonicalTail));
+      for (let i = 0; i < canonicalTail.length; i++) expect(surviving[i]).toBe(canonicalTail[i]);
+      expect(completed).toHaveLength(1);
+      expect(JSON.stringify(messages)).toBe(before);
+      expect(JSON.stringify(windowMessages)).toBe(projectionBefore);
     }
   );
 
