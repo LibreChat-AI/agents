@@ -1,4 +1,5 @@
-import { normalizeToolResultError, hasRequiredToolExecuteProtection, ToolResultProtectionError } from '@/protection/toolResult';
+import { snapshotToolResumeUpdates, snapshotToolResumeMessages, snapshotToolHistoryMessages, normalizeToolResultError, hasRequiredToolExecuteProtection, ToolResultProtectionError } from '@/protection/toolResult';
+import { messagesStateReducer } from '@/messages/reducer';
 // src/run.ts
 import { nanoid } from 'nanoid';
 import { PromptTemplate } from '@langchain/core/prompts';
@@ -435,6 +436,10 @@ function overwriteResumeRunStepState(
         ['runStepState', overwrite] as [string, unknown],
     ]
     : { ...(command.update ?? {}), runStepState: overwrite };
+  return withCommandUpdate(command, update);
+}
+
+function withCommandUpdate(command: Command, update: ResumeCommandUpdate): Command {
   const resumed = new Command({
     ...(command.graph == null ? {} : { graph: command.graph }),
     ...(command.resume === undefined ? {} : { resume: command.resume }),
@@ -480,6 +485,7 @@ export class Run<_T extends t.BaseGraphState> {
   private preemption?: t.StreamPreemption;
   private maxStopContinuations: number;
   private toolResultProtection?: t.StandardGraphInput['toolResultProtection'];
+  private readonly preparedToolResumes = new WeakSet<Command>();
   private providerTextProtection?: t.StandardGraphInput['providerTextProtection'];
   private streamLimits?: t.StreamLimits;
   private subagentTasks?: t.SubagentTaskConfig;
@@ -1332,10 +1338,11 @@ export class Run<_T extends t.BaseGraphState> {
     }
     let overwriteLegacyResumeState = false;
     if (isResume) {
-      await this.restoreInterruptFromCheckpoint(
-        config,
-        (inputs as Command).update
-      );
+      const command = inputs as Command;
+      if (!this.preparedToolResumes.delete(command)) {
+        const update = await this.restoreInterruptFromCheckpoint(config, command.update);
+        if (this.toolResultProtection != null) inputs = withCommandUpdate(command, update);
+      }
       const publicPayload = stripRunStepResumeState(this._interrupt?.payload);
       if (config.configurable != null) {
         restoreToolReplayConfig(
@@ -2100,7 +2107,7 @@ export class Run<_T extends t.BaseGraphState> {
       'update' | 'goto'
     >
   ): Promise<MessageContentComplex[] | undefined> {
-    const resumeConfig = await this.resolveInterruptResumeConfig(
+    const prepared = await this.resolveInterruptResumeConfig(
       callerConfig,
       commandOptions?.update
     );
@@ -2113,26 +2120,20 @@ export class Run<_T extends t.BaseGraphState> {
         : resumeValue;
     // langgraph 1.4.5 applies resume + state update + reroute in one superstep
     // (single checkpoint). `update`/`goto` are omitted unless the caller sets them.
-    return this.processStream(
-      new Command({
-        resume: scopedResume,
-        ...(commandOptions?.update !== undefined
-          ? { update: commandOptions.update }
-          : {}),
-        ...(commandOptions?.goto !== undefined
-          ? { goto: commandOptions.goto }
-          : {}),
-      }),
-      resumeConfig,
-      streamOptions
-    );
+    const command = new Command({
+      resume: scopedResume,
+      ...(prepared.update === undefined ? {} : { update: prepared.update }),
+      ...(commandOptions?.goto !== undefined ? { goto: commandOptions.goto } : {}),
+    });
+    if (this.toolResultProtection != null) this.preparedToolResumes.add(command);
+    return this.processStream(command, prepared.config, streamOptions);
   }
 
   private async resolveInterruptResumeConfig(
     callerConfig: t.RunStreamConfig,
     resumeUpdate?: ResumeCommandUpdate
-  ): Promise<t.RunStreamConfig> {
-    await this.restoreInterruptFromCheckpoint(callerConfig, resumeUpdate);
+  ): Promise<{ config: t.RunStreamConfig; update: ResumeCommandUpdate }> {
+    const update = await this.restoreInterruptFromCheckpoint(callerConfig, resumeUpdate);
     const interrupt = this._interrupt;
     const replayPayload = stripRunStepResumeState(interrupt?.payload);
     const resumeManifest =
@@ -2169,16 +2170,14 @@ export class Run<_T extends t.BaseGraphState> {
       | undefined;
     const stateHistory = workflow?.getStateHistory;
     if (interrupt?.checkpointId != null && interrupt.checkpointId.length > 0) {
-      return {
+      return { update, config: {
         ...manifestConfig,
         configurable: {
           ...manifestConfig.configurable,
           checkpoint_id: interrupt.checkpointId,
-          ...(typeof interrupt.checkpointNs === 'string'
-            ? { checkpoint_ns: interrupt.checkpointNs }
-            : {}),
+          ...(typeof interrupt.checkpointNs === 'string' ? { checkpoint_ns: interrupt.checkpointNs } : {}),
         },
-      };
+      } };
     }
     if (
       interrupt == null ||
@@ -2186,7 +2185,7 @@ export class Run<_T extends t.BaseGraphState> {
       interruptId.length === 0 ||
       typeof stateHistory !== 'function'
     ) {
-      return manifestConfig;
+      return { config: manifestConfig, update };
     }
 
     for await (const snapshot of stateHistory.call(
@@ -2213,58 +2212,77 @@ export class Run<_T extends t.BaseGraphState> {
           checkpointId,
           ...(typeof checkpointNs === 'string' ? { checkpointNs } : {}),
         };
-        return {
+        return { update, config: {
           ...manifestConfig,
           configurable: {
             ...manifestConfig.configurable,
             checkpoint_id: checkpointId,
-            ...(typeof checkpointNs === 'string'
-              ? { checkpoint_ns: checkpointNs }
-              : {}),
+            ...(typeof checkpointNs === 'string' ? { checkpoint_ns: checkpointNs } : {}),
           },
-        };
+        } };
       }
     }
 
-    return manifestConfig;
+    return { config: manifestConfig, update };
+  }
+
+  private async validateToolResultResumeUpdate(snapshot: InterruptStateSnapshot, update: ResumeCommandUpdate, signal?: AbortSignal): Promise<{ update: ResumeCommandUpdate; messages: BaseMessage[] }> {
+    const graph = this.Graph!;
+    let messages = snapshotToolHistoryMessages(snapshot.values?.messages ?? []);
+    const writes = snapshotToolResumeUpdates(update);
+    if (writes.length === 0) return { update, messages };
+    const admitted: Array<[string, unknown]> = [];
+    for (const [key, value] of writes) {
+      if (key !== 'messages') { admitted.push([key, value]); continue; }
+      const change = snapshotToolResumeMessages(value);
+      // Validate each write before reduction, even if a later write removes it.
+      const history = await graph.validateToolResultHistory([...messages, ...change.messages], snapshot.values?.runStepState, signal);
+      const canonical = history.slice(messages.length);
+      graph.commitToolResultMessages(canonical);
+      messages = change.overwrite ? canonical : messagesStateReducer(messages, canonical);
+      admitted.push([key, change.overwrite ? new Overwrite(canonical) : canonical]);
+    }
+    messages = await graph.validateToolResultHistory(messages, snapshot.values?.runStepState, signal);
+    return { update: update == null ? update : admitted, messages };
   }
 
   private async restoreInterruptFromCheckpoint(
     callerConfig: t.RunStreamConfig,
     resumeUpdate?: ResumeCommandUpdate
-  ): Promise<void> {
-    if (this._interrupt != null || !this.hasCheckpointer) {
-      return;
+  ): Promise<ResumeCommandUpdate> {
+    if (!this.hasCheckpointer) {
+      if (this.toolResultProtection != null && resumeUpdate != null) throw new ToolResultProtectionError('unsupported');
+      return resumeUpdate;
     }
+    if (this._interrupt != null && this.toolResultProtection == null) return resumeUpdate;
     const workflow = this.graphRunnable as
       | (t.CompiledStateWorkflow & WorkflowWithStateHistory)
       | undefined;
     if (typeof workflow?.getState !== 'function') {
-      return;
+      if (this.toolResultProtection != null) throw new ToolResultProtectionError('unsupported');
+      return resumeUpdate;
     }
 
     const snapshot = await workflow.getState(callerConfig as RunnableConfig, {
       subgraphs: true,
     });
-    this.Graph?.handoffRouting?.resume(snapshot.values?.handoffState);
-    const persistedInterrupt = getFirstPersistedInterrupt(snapshot);
-    if (persistedInterrupt == null) {
-      return;
+    let validated: { update: ResumeCommandUpdate; messages: BaseMessage[] } | undefined;
+    if (this.toolResultProtection != null) {
+      await this.Graph?.validateToolResultCheckpoint(snapshot, callerConfig.signal);
+      validated = await this.validateToolResultResumeUpdate(snapshot, resumeUpdate, callerConfig.signal);
     }
+    if (this._interrupt != null) return validated?.update ?? resumeUpdate;
+    const persistedInterrupt = getFirstPersistedInterrupt(snapshot);
+    if (persistedInterrupt == null) return validated?.update ?? resumeUpdate;
+    this.Graph?.handoffRouting?.resume(snapshot.values?.handoffState);
     this.Graph?.restoreRunStepResumeState(
-      getRunStepResumeState(persistedInterrupt.value) ??
-        snapshot.values?.runStepState
+      getRunStepResumeState(persistedInterrupt.value) ?? snapshot.values?.runStepState
     );
-    if (this.toolResultProtection != null) await this.Graph?.validateToolResultCheckpoint(snapshot, callerConfig.signal);
-    const persistedMessages = getPersistedMessages(snapshot);
+    const persistedMessages = validated?.messages ?? getPersistedMessages(snapshot);
     if (persistedMessages != null) {
-      const resumeMessages = getResumeUpdateMessages(resumeUpdate);
+      const resumeMessages = validated == null ? getResumeUpdateMessages(resumeUpdate) : undefined;
       this.Graph?.restoreCheckpointMessages(persistedMessages, resumeMessages);
-      this.activityPhaseTraceInput = findActivityPhaseTraceInput(
-        resumeMessages == null
-          ? persistedMessages
-          : [...persistedMessages, ...resumeMessages]
-      );
+      this.activityPhaseTraceInput = findActivityPhaseTraceInput(resumeMessages == null ? persistedMessages : [...persistedMessages, ...resumeMessages]);
     }
 
     const checkpointConfigurable = snapshot.config?.configurable;
@@ -2278,6 +2296,7 @@ export class Run<_T extends t.BaseGraphState> {
       ...(typeof checkpointId === 'string' ? { checkpointId } : {}),
       ...(typeof checkpointNs === 'string' ? { checkpointNs } : {}),
     };
+    return validated?.update ?? resumeUpdate;
   }
 
   private createSystemCallback<K extends keyof t.ClientCallbacks>(

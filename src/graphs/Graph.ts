@@ -757,6 +757,7 @@ export abstract class Graph<
     currentToolMap?: t.ToolMap;
   }): CustomToolNode<T> | ToolNode<T>;
   async validateToolResultHistory(messages: BaseMessage[], _state?: t.RunStepResumeState, _signal?: AbortSignal): Promise<BaseMessage[]> { return messages; }
+  commitToolResultMessages(_messages: BaseMessage[]): void {}
   async validateToolResultCheckpoint(snapshot: ToolResultCheckpoint, signal?: AbortSignal): Promise<void> {
     const messages = snapshot.values?.messages;
     if (messages != null && snapshot.values != null) snapshot.values.messages = await this.validateToolResultHistory(messages, snapshot.values.runStepState, signal);
@@ -5328,10 +5329,12 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     };
   }
 
+  override commitToolResultMessages(messages: BaseMessage[]): void {
+    if (this.toolResultProtection != null) this.reduceProtectedMessages([], messages.filter((message) => message instanceof ToolMessage));
+  }
+
   private createToolRunStepResumeState(messages?: BaseMessage[]): t.RunStepResumeState {
-    if (this.toolResultProtection != null && messages != null) {
-      this.reduceProtectedMessages([], messages.filter((message) => message instanceof ToolMessage));
-    }
+    if (messages != null) this.commitToolResultMessages(messages);
     return this.createRunStepResumeState();
   }
 

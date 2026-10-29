@@ -478,6 +478,30 @@ function ownMessageValue(message: object, key: string): unknown {
   return undefined;
 }
 
+/** Command updates preserve other channel payloads; only message writes are admitted here. */
+export function snapshotToolResumeUpdates(update: unknown): Array<[string, unknown]> {
+  if (update == null) return [];
+  if (Array.isArray(update)) return snapshotDataArray(update, Number.MAX_SAFE_INTEGER).map((entry) => {
+    const pair = snapshotDataArray(entry as readonly unknown[], 2);
+    if (pair.length !== 2 || typeof pair[0] !== 'string') throw new ToolResultProtectionError('unsupported');
+    return [pair[0], pair[1]];
+  });
+  if (typeof update !== 'object' || types.isProxy(update)) throw new ToolResultProtectionError('unsupported');
+  const keys = Object.getOwnPropertyNames(update);
+  plainObject(update, keys);
+  return keys.map((key) => [key, Object.getOwnPropertyDescriptor(update, key)!.value]);
+}
+
+export function snapshotToolResumeMessages(value: unknown): { messages: BaseMessage[]; overwrite: boolean } {
+  if (value == null || typeof value !== 'object' || types.isProxy(value)) throw new ToolResultProtectionError('unsupported');
+  const replacement = ownMessageValue(value, '__overwrite__');
+  const overwrite = Object.hasOwn(value, '__overwrite__');
+  const messages: unknown = overwrite ? replacement : value;
+  if (Array.isArray(messages)) return { messages: snapshotDataArray(messages, Number.MAX_SAFE_INTEGER, true), overwrite };
+  if (messages == null || typeof messages !== 'object' || typeof ownMessageValue(messages, 'type') !== 'string') throw new ToolResultProtectionError('unsupported');
+  return { messages: [messages as BaseMessage], overwrite };
+}
+
 export function snapshotToolHistoryMessages(messages: readonly BaseMessage[]): BaseMessage[] {
   return snapshotDataArray(messages, Number.MAX_SAFE_INTEGER, true);
 }
