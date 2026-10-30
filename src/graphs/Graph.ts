@@ -117,7 +117,7 @@ import {
   disposeLangfuseHandler,
   isLangfuseCallbackHandler,
 } from '@/langfuse';
-import { snapshotToolRunStepWrite, mergeToolCallSources, snapshotToolCallSources, snapshotToolSend, snapshotToolInputMessages, snapshotToolCheckpointConfig, snapshotToolCheckpointData, snapshotToolRunStepState, snapshotToolResumeMessages, snapshotToolMessageRemoval, snapshotToolCheckpointRecord, snapshotToolCheckpointArray, snapshotToolHistoryMessages, retainToolMessageReleases, normalizeToolResultError, getLiveToolMessageRelease, commitToolMessageRelease, snapshotToolMessageReleases, validateToolMessageHistory, requiresToolResultProtection, ToolResultProtectionError, validateToolResultProtection } from '@/protection/toolResult';
+import { snapshotToolSummarizationRequest, snapshotToolRunStepWrite, mergeToolCallSources, snapshotToolCallSources, snapshotToolSend, snapshotToolInputMessages, snapshotToolCheckpointConfig, snapshotToolCheckpointData, snapshotToolRunStepState, snapshotToolResumeMessages, snapshotToolMessageRemoval, snapshotToolCheckpointRecord, snapshotToolCheckpointArray, snapshotToolHistoryMessages, retainToolMessageReleases, normalizeToolResultError, getLiveToolMessageRelease, commitToolMessageRelease, snapshotToolMessageReleases, validateToolMessageHistory, requiresToolResultProtection, ToolResultProtectionError, validateToolResultProtection } from '@/protection/toolResult';
 import {
   getBlindRecoveryBudget,
   planContextOverflowRecovery,
@@ -179,6 +179,10 @@ import {
   createRemoveAllMessage,
   messagesStateReducer,
 } from '@/messages/reducer';
+import {
+  isThinkingEnabled,
+  getConfiguredCompletionTokens,
+} from '@/llm/request';
 import { createToolHistoryPreparation } from '@/messages/toolHistoryProjection';
 import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
 import { shouldTraceToolNodeForLangfuse } from '@/langfuseToolOutputTracing';
@@ -203,7 +207,6 @@ import { AgentContext } from '@/agents/AgentContext';
 import { createFakeStreamingLLM } from '@/llm/fake';
 import { handoffStateAnnotation } from './handoff';
 import { handleToolCalls } from '@/tools/handlers';
-import { isThinkingEnabled } from '@/llm/request';
 import { resolveMaxSeals } from '@/llm/preempt';
 import { initializeModel } from '@/llm/init';
 import { HandlerRegistry } from '@/events';
@@ -489,26 +492,6 @@ function clearCurrentDeltaStepMarkers({
 }
 
 /**
- * The completion allowance the caller configured, under whichever key the
- * provider's client uses. Providers count it against the same ceiling as the
- * prompt, so overflow recovery has to reserve it when the error did not
- * itemize the total.
- */
-function getConfiguredCompletionTokens(
-  clientOptions: t.ClientOptions | undefined
-): number | undefined {
-  const options = clientOptions as
-    | { maxTokens?: unknown; maxOutputTokens?: unknown }
-    | undefined;
-  for (const value of [options?.maxTokens, options?.maxOutputTokens]) {
-    if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
-      return value;
-    }
-  }
-  return undefined;
-}
-
-/**
  * Our own estimate of the prompt that was actually sent, derived from the
  * pre-invoke usage snapshot. Used to corroborate ambiguous provider errors
  * and to measure how far our token accounting sits from the provider's.
@@ -736,7 +719,8 @@ function buildRunStepStateAnnotation(): RunStepStateChannel {
 
 type ToolResultCheckpoint = {
   config?: RunnableConfig;
-  values?: { messages?: BaseMessage[]; agentMessages?: BaseMessage[]; runStepState?: t.RunStepResumeState };
+  next?: readonly string[];
+  values?: { messages?: BaseMessage[]; agentMessages?: BaseMessage[]; runStepState?: t.RunStepResumeState; summarizationRequest?: t.SummarizationNodeInput };
   tasks?: readonly { state?: ToolResultCheckpoint | RunnableConfig; interrupts?: readonly { id?: string; value?: unknown }[] }[];
 };
 
@@ -763,15 +747,20 @@ export abstract class Graph<
   async validateToolResultCheckpoint<S extends ToolResultCheckpoint>(input: S, signal?: AbortSignal, sources?: ToolCallSources): Promise<S> {
     const active = new WeakSet<object>();
     const visit = async <C extends ToolResultCheckpoint>(candidate: C): Promise<C> => {
-      const snapshot = snapshotToolCheckpointRecord(candidate, ['values', 'tasks', 'config']);
+      const snapshot = snapshotToolCheckpointRecord(candidate, ['values', 'tasks', 'config', 'next']);
       if (active.has(candidate)) throw new ToolResultProtectionError('unsupported');
       active.add(candidate);
       try {
         if (snapshot.config != null) snapshot.config = snapshotToolCheckpointConfig(snapshot.config);
+        if (snapshot.next != null) {
+          snapshot.next = snapshotToolCheckpointArray(snapshot.next);
+          if (snapshot.next.some((name) => typeof name !== 'string')) throw new ToolResultProtectionError('unsupported');
+        }
         if (snapshot.values != null) {
-          const values = snapshotToolCheckpointRecord(snapshot.values, ['messages', 'agentMessages', 'runStepState', 'handoffState']);
+          const values = snapshotToolCheckpointRecord(snapshot.values, ['messages', 'agentMessages', 'runStepState', 'summarizationRequest', 'handoffState']);
           snapshot.values = values;
           if (values.runStepState != null) values.runStepState = snapshotToolRunStepState(values.runStepState);
+          if (values.summarizationRequest != null) values.summarizationRequest = snapshotToolSummarizationRequest(values.summarizationRequest);
           if (values.messages != null) values.messages = snapshotToolInputMessages(values.messages);
           if (values.agentMessages != null) values.agentMessages = snapshotToolInputMessages(values.agentMessages);
           if (values.messages != null) values.messages = await this.validateToolResultHistory(values.messages, values.runStepState, signal, sources);
@@ -781,13 +770,14 @@ export abstract class Graph<
             const canonical = await this.validateToolResultHistory([...current, ...alternate], values.runStepState, signal, sources);
             values.agentMessages = canonical.slice(current.length);
           }
+          if (values.summarizationRequest != null) values.summarizationRequest = await this.validateToolResultWindow(values.summarizationRequest, values.runStepState, signal, sources);
         }
         if (snapshot.tasks != null) {
           const tasks = snapshotToolCheckpointArray(snapshot.tasks);
           const admittedTasks: typeof tasks = [];
           for (const entry of tasks) {
-            const task = snapshotToolCheckpointRecord(entry, ['state', 'interrupts']);
-            if (task.interrupts != null) task.interrupts = snapshotToolCheckpointArray(task.interrupts).map((interrupt) => snapshotToolCheckpointRecord(interrupt, ['id', 'value']));
+            const task = snapshotToolCheckpointRecord(entry, ['state', 'interrupts', 'name']);
+            if (task.interrupts != null) task.interrupts = snapshotToolCheckpointArray(task.interrupts).map((interrupt) => snapshotToolCheckpointData(snapshotToolCheckpointRecord(interrupt, ['id', 'value'])));
             if (task.state != null) {
               const state = snapshotToolCheckpointRecord(task.state, ['values', 'tasks', 'config']);
               task.state = Object.hasOwn(state, 'values') || Object.hasOwn(state, 'tasks') ? await visit(task.state as ToolResultCheckpoint) : state;
@@ -801,6 +791,12 @@ export abstract class Graph<
     };
     return visit(input);
   }
+  async validateToolResultWindow(input: t.SummarizationNodeInput, state?: Pick<t.RunStepResumeState, 'toolResultReleases'>, signal?: AbortSignal, sources?: ToolCallSources, requireSource = false): Promise<t.SummarizationNodeInput> {
+    const request = snapshotToolSummarizationRequest(input);
+    if (request.windowMessages != null) request.windowMessages = await this.validateToolResultHistory(request.windowMessages, state, signal, sources, requireSource);
+    return request;
+  }
+
   getToolResultCallSources(snapshot: ToolResultCheckpoint, enclosing?: ToolCallSources): ToolCallSources {
     let sources: ToolCallSources = snapshotToolCallSources([snapshot.values?.messages ?? [], snapshot.values?.agentMessages ?? []], snapshot.values?.runStepState?.toolResultReleases ?? [], enclosing, snapshot.config?.configurable?.checkpoint_ns ?? '');
     for (const task of snapshot.tasks ?? []) if (task.state != null && Object.hasOwn(task.state, 'values')) sources = this.getToolResultCallSources(task.state as ToolResultCheckpoint, sources);
@@ -815,6 +811,7 @@ export abstract class Graph<
     const canonical = await this.validateToolResultHistory([...primary, ...alternate], state, signal, sources, true);
     if (args.messages != null) args.messages = canonical.slice(0, primary.length);
     if (args.agentMessages != null) args.agentMessages = canonical.slice(primary.length);
+    if (args.summarizationRequest != null) args.summarizationRequest = await this.validateToolResultWindow(args.summarizationRequest, state, signal, sources, true);
     return Object.assign(Object.create(Send.prototype) as Send, packet, { args });
   }
 
@@ -857,9 +854,10 @@ export abstract class Graph<
     const checkpoint = snapshotToolCheckpointRecord(tuple.checkpoint, ['channel_values', 'channel_versions', 'versions_seen', 'v', 'id', 'ts']);
     checkpoint.channel_versions = snapshotToolCheckpointData(checkpoint.channel_versions);
     checkpoint.versions_seen = snapshotToolCheckpointData(checkpoint.versions_seen);
-    const values = snapshotToolCheckpointRecord(checkpoint.channel_values, ['messages', 'agentMessages', 'runStepState', '__pregel_tasks']);
+    const values = snapshotToolCheckpointRecord(checkpoint.channel_values, ['messages', 'agentMessages', 'runStepState', 'summarizationRequest', '__pregel_tasks']);
     if (values.messages != null) values.messages = snapshotToolInputMessages(values.messages as BaseMessage[]);
     if (values.agentMessages != null) values.agentMessages = snapshotToolInputMessages(values.agentMessages as BaseMessage[]);
+    if (values.summarizationRequest != null) values.summarizationRequest = snapshotToolSummarizationRequest(values.summarizationRequest as t.SummarizationNodeInput);
     const tasks = values.__pregel_tasks;
     if (tasks != null) {
       const topic = snapshotToolCheckpointArray(tasks as readonly unknown[]);
@@ -887,6 +885,8 @@ export abstract class Graph<
     const updates: Array<{ write: NonNullable<CheckpointTuple['pendingWrites']>[number]; change: ReturnType<typeof snapshotToolResumeMessages>; controls: Array<ReturnType<typeof snapshotToolMessageRemoval>> }> = [];
     for (const write of pending) {
       if (write[1] === 'runStepState') write[2] = addState(write[2]);
+      if (write[1] === 'summarizationRequest' && write[2] != null) write[2] = snapshotToolSummarizationRequest(write[2] as t.SummarizationNodeInput);
+      if (write[1] === '__interrupt__') write[2] = snapshotToolCheckpointData(write[2]);
       if (write[1] === '__pregel_tasks' || write[1] === '__pregel_push') write[2] = Array.isArray(write[2]) ? snapshotToolCheckpointArray(write[2]).map(snapshotToolSend) : snapshotToolSend(write[2]);
       if (write[1] !== 'messages' && write[1] !== 'agentMessages') continue;
       const change = snapshotToolResumeMessages(write[2]);
@@ -908,6 +908,8 @@ export abstract class Graph<
     const owned = scopes == null ? local : mergeToolCallSources(scopes.values());
     const admitted = await this.validateToolResultHistory(outputs, state, signal, owned);
     const sources = snapshotToolCallSources([[...history, ...admitted]], releases, owned, namespace);
+    if (values.summarizationRequest != null) values.summarizationRequest = await this.validateToolResultWindow(values.summarizationRequest as t.SummarizationNodeInput, state, signal, sources);
+    for (const write of pending) if (write[1] === 'summarizationRequest' && write[2] != null) write[2] = await this.validateToolResultWindow(write[2] as t.SummarizationNodeInput, state, signal, sources);
     const admitTasks = async (value: unknown): Promise<Send | Send[]> => Array.isArray(value)
       ? Promise.all(value.map((packet) => this.validateToolResultSend(packet, signal, state, sources)))
       : this.validateToolResultSend(value, signal, state, sources);
@@ -3364,6 +3366,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     config,
     originalToolContent,
     estimatedPromptTokens,
+    windowMessages,
   }: {
     recovery: OverflowRecoveryPlan;
     agentContext: AgentContext;
@@ -3373,6 +3376,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     originalToolContent?: Map<number, string>;
     /** Size of the rejected prompt, recorded to detect a correction that changed nothing. */
     estimatedPromptTokens?: number;
+    windowMessages: BaseMessage[];
   }): Partial<t.AgentSubgraphState> {
     const previousBudget = agentContext.maxContextTokens;
     /**
@@ -3420,6 +3424,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         remainingContextTokens: 0,
         agentId: agentId || agentContext.agentId,
         reason: 'overflow',
+        windowMessages,
         allowSummarization,
       },
     };
@@ -3456,12 +3461,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     agentContext,
     agentId,
     messageCount,
+    windowMessages,
     contextUsage,
     config,
   }: {
     agentContext: AgentContext;
     agentId: string;
     messageCount: number;
+    windowMessages: BaseMessage[];
     contextUsage: t.ContextUsageEvent | null;
     config: RunnableConfig;
   }): Promise<Partial<t.AgentSubgraphState> | null> {
@@ -3493,6 +3500,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           remainingContextTokens: contextUsage?.remainingContextTokens ?? 0,
           agentId: agentId || agentContext.agentId,
           reason: 'manual',
+          windowMessages,
         },
         /** A checkpointed thread may still hold the previous compaction's
          *  summary; only the one this run produces may be reported. */
@@ -3715,6 +3723,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           agentContext,
           agentId,
           messageCount: messages.length,
+          windowMessages: context,
           contextUsage,
           config,
         });
@@ -3772,6 +3781,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             return {
               summarizationRequest: {
                 remainingContextTokens: remainingContextTokens ?? 0,
+                windowMessages: context,
                 agentId: agentId || agentContext.agentId,
               },
             };
@@ -3801,6 +3811,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           agentContext,
           agentId,
           messageCount: messages.length,
+          windowMessages: messagesToUse,
           contextUsage: null,
           config,
         });
@@ -4785,6 +4796,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             instructionTokens: agentContext.instructionTokens,
             canSummarize: agentContext.summarizationEnabled === true,
             configuredCompletionTokens: getConfiguredCompletionTokens(
+              fallbackContext?.provider ?? agentContext.provider,
               fallbackContext?.clientOptions ?? agentContext.clientOptions
             ),
             attemptsSoFar: agentContext.overflowRecoveryAttempts,
@@ -4827,6 +4839,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             agentId,
             config,
             originalToolContent: prunedOriginalToolContent,
+            windowMessages: messagesToUse,
             estimatedPromptTokens: recoveryPromptEstimate,
           });
         }
@@ -5061,6 +5074,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             agentId,
             config,
             originalToolContent: prunedOriginalToolContent,
+            windowMessages: messagesToUse,
             estimatedPromptTokens: fallbackRecoveryPromptEstimate,
           });
         }

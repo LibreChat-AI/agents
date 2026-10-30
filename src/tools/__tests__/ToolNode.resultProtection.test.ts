@@ -2,9 +2,11 @@ import { z } from 'zod';
 import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
 import { RunnableLambda } from '@langchain/core/runnables';
+import { ChatGenerationChunk } from '@langchain/core/outputs';
 import { DynamicStructuredTool } from '@langchain/core/tools';
+import { FakeListChatModel } from '@langchain/core/utils/testing';
 import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
-import { RemoveMessage, AIMessage, HumanMessage, ToolMessage  } from '@langchain/core/messages';
+import { RemoveMessage, AIMessage, AIMessageChunk, HumanMessage, ToolMessage  } from '@langchain/core/messages';
 import {
   GraphInterrupt,
   Send,
@@ -18,9 +20,9 @@ import {
   END,
   isInterrupted,
 } from '@langchain/langgraph';
+import type { CheckpointTuple, StateSnapshot } from '@langchain/langgraph';
 import type { RunnableConfig, Runnable } from '@langchain/core/runnables';
 import type { ToolCall } from '@langchain/core/messages/tool';
-import type { CheckpointTuple } from '@langchain/langgraph';
 import type { BaseMessage } from '@langchain/core/messages';
 import type { AddressInfo } from 'node:net';
 import type {
@@ -30,6 +32,8 @@ import type {
   ProgrammaticCache,
   RunStepResumeState,
   IState,
+  AgentInputs,
+  GraphSubagentConfig,
 } from '@/types';
 import type {
   ToolResultProtection,
@@ -60,6 +64,7 @@ import { PreparedSubagentError } from '@/tools/preparedSubagents';
 import fixtures from '@/protection/__tests__/fixtures/a1.json';
 import { stableStringify } from '@/tools/eagerEventExecution';
 import { StreamLimitExceededError } from '@/llm/streamLimits';
+import { isToolApprovalInterrupt } from '@/types/hitl';
 import { ChatModelStreamHandler } from '@/stream';
 import { StandardGraph } from '@/graphs/Graph';
 import { ToolNode } from '@/tools/ToolNode';
@@ -3753,4 +3758,95 @@ it.each(['plain', 'overwrite'] as const)('rejects accessor-backed resume run-ste
   const callback = BaseCallbackHandler.fromMethods({ handleChainStart: (_chain, input): void => { observed.push(JSON.stringify(input)); } }); callback.awaitHandlers = true;
   const error = await run.resume([{ type: 'approve' }], { ...config, callbacks: [callback] }, undefined, { update: { runStepState: shape === 'overwrite' ? new Overwrite(state) : state } }).catch((value: Error) => value);
   expect(error).toMatchObject({ code: 'unsupported' }); expect(reads).toBe(0); expect(observed).toEqual([]); assertNoCanary(String(error));
+});
+
+it.each((['root', 'graph-child'] as const).flatMap((scope) => (['warm', 'rebuilt'] as const).flatMap((runtime) => [false, true].flatMap((eventDriven) => (['approve', 'respond'] as const).map((decision) => [scope, runtime, eventDriven, decision] as const)))))('keeps mandatory tool protection across parallel approval scopes (%s/%s/event=%s/%s)', async (scope, runtime, eventDriven, decision) => {
+  const saver = new MemorySaver(); const runId = `protected-parallel-${scope}-${runtime}-${eventDriven}-${decision}`; const observed: string[] = []; const modelInputs: string[] = []; const executions: string[] = [];
+  class Model extends FakeListChatModel {
+    private readonly owners: Map<string, string>;
+    constructor() {
+      const owners = new Map<string, string>();
+      super({ responses: ['unused'], callbacks: [{ handleChatModelStart: (_model, _messages, id, _parent, _extra, _tags, metadata): void => { if (typeof metadata?.activeAgentId === 'string') owners.set(id, metadata.activeAgentId); } }] }); this.owners = owners;
+    }
+    override async *_streamResponseChunks(...args: Parameters<FakeListChatModel['_streamResponseChunks']>): ReturnType<FakeListChatModel['_streamResponseChunks']> {
+      const owner = this.owners.get(args[2]?.runId ?? ''); modelInputs.push(JSON.stringify(args[0]));
+      const toolName = `${owner}_tool`;
+      if ((owner === 'left' || owner === 'right') && !args[0].some((message) => message.type === 'tool' && (message as ToolMessage).name === toolName)) {
+        yield new ChatGenerationChunk({ text: '', message: new AIMessageChunk({ content: '', tool_call_chunks: [{ name: toolName, args: '{"count":42}', id: 'same-member-call', index: 0, type: 'tool_call_chunk' }] }) }); return;
+      }
+      yield new ChatGenerationChunk({ text: 'Allowed member answer', message: new AIMessageChunk('Allowed member answer') });
+    }
+  }
+  const create = async (resumed: boolean): Promise<Run<IState>> => {
+    const hooks = new HookRegistry(); hooks.register('PreToolUse', { pattern: '.*_tool', hooks: [async () => ({ decision: 'ask', reason: 'Allowed member approval' })] });
+    const agents: AgentInputs[] = ['entry', 'left', 'right', 'result'].map((id) => ({ agentId: id, provider: Providers.OPENAI, instructions: `Allowed ${id} instructions.`, ...(['left', 'right'].includes(id) ? { tools: [new DynamicStructuredTool({ name: `${id}_tool`, description: 'Allowed member tool.', schema: z.object({ count: z.number() }), func: async ({ count }) => { expect(count).toBe(42); executions.push(id); return fixtures.canaries[0]; } })], ...(eventDriven ? { toolDefinitions: [{ name: `${id}_tool`, description: 'Allowed host member tool.', parameters: { type: 'object' as const, properties: { count: { type: 'number' as const } }, required: ['count'] } }] } : {}) } : {}) }));
+    const definition: GraphSubagentConfig = { kind: 'graph', configId: 'protected-parallel-v1', type: 'team', name: 'Team', description: 'Allowed parallel team.', agents, entryAgentId: 'entry', resultAgentId: 'result', edges: [{ from: 'entry', to: ['left', 'right'], edgeType: 'direct' }, { from: ['left', 'right'], to: 'result', edgeType: 'direct' }] };
+    const run = await Run.create({ runId, graphConfig: scope === 'root' ? { type: 'multi-agent', agents, entryAgentId: 'entry', edges: definition.edges, compileOptions: { checkpointer: saver } } : { type: 'standard', agents: [{ agentId: 'parent', provider: Providers.OPENAI, instructions: 'Allowed parent.', subagentConfigs: [definition], maxSubagentDepth: 1 }], compileOptions: { checkpointer: saver } }, toolResultProtection: policy({ toolNames: ['left_tool', 'right_tool'] }), hooks, humanInTheLoop: { enabled: true }, skipCleanup: true, ...(eventDriven ? { customHandlers: { [GraphEvents.ON_TOOL_EXECUTE]: { handle: async (_event, raw): Promise<void> => { const batch = raw as ToolExecuteBatchRequest; batch.resolve(batch.toolCalls.map((call) => { expect(call.args.count).toBe(42); executions.push(call.name); return { toolCallId: call.id, content: fixtures.canaries[0], status: 'success' as const }; })); } } } } : {}) });
+    if (scope === 'root') run.Graph!.overrideModel = new Model();
+    else { run.Graph!.overrideModel = new FakeChatModel({ responses: resumed ? ['Allowed parent answer'] : ['', 'Allowed parent answer'], toolCalls: resumed ? [] : [{ id: 'parallel-parent', name: Constants.SUBAGENT, args: { description: 'Allowed team task.', subagent_type: 'team' }, type: 'tool_call' }] }); run.Graph!.setSubagentModelOverride(new Model()); }
+    return run;
+  };
+  const config = { version: 'v2' as const, configurable: { thread_id: runId } }; const first = await create(false); await first.processStream({ messages: [new HumanMessage('Allowed parallel task')] }, config);
+  const pending = first.getInterrupt()!.pendingInterrupts!.filter((entry) => isToolApprovalInterrupt(entry.payload)); expect(pending).toHaveLength(2); expect(executions).toEqual([]);
+  const next = runtime === 'warm' ? first : await create(true);
+  const decisions = Object.fromEntries(pending.map((entry) => [entry.interruptId, decision === 'respond' ? [{ type: 'respond' as const, responseText: fixtures.canaries[0] }] : [{ type: 'approve' as const }]]));
+  const callback = BaseCallbackHandler.fromMethods({ handleChainStart: (_chain, input): void => { observed.push(JSON.stringify(input)); }, handleToolEnd: (output): void => { observed.push(JSON.stringify(output)); } }); callback.awaitHandlers = true;
+  await next.resume(decisions, { ...config, callbacks: [callback] });
+  expect(next.getInterrupt()).toBeUndefined(); expect(executions).toHaveLength(decision === 'respond' ? 0 : 2); assertNoCanary(observed.join('')); assertNoCanary(modelInputs.join('')); expect(modelInputs.join('')).toContain('[EMAIL_1]');
+});
+
+it.each((['fresh', 'resume', 'values', 'pending', 'send'] as const).flatMap((carrier) => (['nameless', 'renamed', 'forged', 'getter', 'control'] as const).map((kind) => [carrier, kind] as const)))('admits compaction window messages before native loading (%s/%s)', async (carrier, kind) => {
+  let tamper = false; let reads = 0; const observed: string[] = []; const runId = `protected-window-${carrier}-${kind}`;
+  const result = new ToolMessage({ tool_call_id: 'window-pending-call', content: fixtures.canaries[0], ...(kind === 'renamed' || kind === 'forged' ? { name: 'other' } : {}) });
+  const request = { agentId: 'default', remainingContextTokens: 10, reason: 'overflow' as const, windowMessages: kind === 'control' ? [new HumanMessage('Allowed compaction window')] : [result] as BaseMessage[] };
+  if (kind === 'forged') request.windowMessages.unshift(new AIMessage({ id: 'forged-window-batch', content: '', tool_calls: [{ id: 'window-pending-call', name: 'other', args: { count: 42 } }] }));
+  if (kind === 'getter') Object.defineProperty(request, 'windowMessages', { get: () => { reads++; throw new Error(fixtures.canaries[0]); } });
+  class Saver extends MemorySaver {
+    override async getTuple(config: RunnableConfig): ReturnType<MemorySaver['getTuple']> {
+      const tuple = await super.getTuple(config); if (tuple == null || !tamper || (config.configurable?.checkpoint_ns ?? '') !== '') return tuple;
+      if (carrier === 'values') tuple.checkpoint.channel_values.summarizationRequest = request;
+      if (carrier === 'pending') tuple.pendingWrites = [...(tuple.pendingWrites ?? []), ['00000000-0000-0000-0000-000000000000', 'summarizationRequest', request]];
+      return tuple;
+    }
+  }
+  const hooks = new HookRegistry(); hooks.register('PreToolUse', { hooks: [async () => ({ decision: 'ask', reason: 'Allowed approval' })] });
+  const run = await Run.create({ runId, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, tools: [direct(() => 'Allowed result')], compileOptions: { checkpointer: new Saver() } }, toolResultProtection: policy(), hooks, humanInTheLoop: { enabled: true } });
+  run.Graph!.overrideModel = new FakeChatModel({ responses: ['', 'Allowed final answer'], toolCalls: [{ id: 'window-pending-call', name: 'lookup', args: { count: 42 }, type: 'tool_call' }] });
+  const config = { version: 'v2' as const, configurable: { thread_id: runId } }; await run.processStream({ messages: [new HumanMessage('Allowed first input')] }, config); tamper = true;
+  const callback = BaseCallbackHandler.fromMethods({ handleChainStart: (_chain, input): void => { observed.push(JSON.stringify(input)); } }); callback.awaitHandlers = true;
+  const invoke = (): Promise<unknown> => {
+    const options = { ...config, callbacks: [callback] };
+    if (carrier === 'fresh') return run.processStream({ messages: [new HumanMessage('Allowed next input')], summarizationRequest: request } as IState, options);
+    if (carrier === 'send') { const packet = new Send('default', { messages: [new HumanMessage('Allowed Send input')], summarizationRequest: undefined as typeof request | undefined }); packet.args.summarizationRequest = request; return run.resume([{ type: 'approve' }], options, undefined, { goto: [packet] }); }
+    return run.resume([{ type: 'approve' }], options, undefined, carrier === 'resume' ? { update: { summarizationRequest: request } } : undefined);
+  };
+  const outcome = await invoke().catch((error: Error) => error); assertNoCanary(observed.join('')); assertNoCanary(String(outcome)); expect(reads).toBe(0);
+  if (kind === 'control') expect(outcome).toBeUndefined(); else { expect(outcome).toBeInstanceOf(ToolResultProtectionError); expect(observed).toEqual([]); }
+});
+
+it('preserves certified compaction windows while detaching their message and receipt aliases', async () => {
+  const fixture = await certifiedHistory(); const graph = new StandardGraph({ runId: 'certified-compaction-window', agents: [{ agentId: 'worker', provider: Providers.OPENAI }], toolResultProtection: fixture.gate });
+  const state = graph.createRunStepResumeState(); state.toolResultReleases = fixture.releases;
+  const sources = graph.getToolResultCallSources({ values: { messages: fixture.messages, runStepState: state } });
+  const request = { agentId: 'worker', remainingContextTokens: 100, windowMessages: fixture.messages };
+  const admitted = await graph.validateToolResultWindow(request, state, undefined, sources); expect(admitted.windowMessages).not.toBe(request.windowMessages); expect(admitted.windowMessages![1]).not.toBe(fixture.messages[1]); expect(admitted.windowMessages![1].id).toBe(fixture.messages[1].id); expect(admitted.windowMessages![1].content).toBe('[EMAIL_1]'); assertNoCanary(admitted);
+});
+
+it.each(['next', 'next-array', 'task-name', 'payload', 'pending-payload'] as const)('rejects new checkpoint interrupt traversal %s getters before reading them', async (field) => {
+  let tamper = false; let reads = 0; const runId = `interrupt-traversal-${field}`;
+  const getter = (): never => { reads++; throw new Error(fixtures.canaries[0]); };
+  const change = (snapshot: StateSnapshot): typeof snapshot => {
+    if (field === 'next') { Reflect.deleteProperty(snapshot, 'next'); Object.setPrototypeOf(snapshot, { get next() { return getter(); } }); }
+    if (field === 'next-array') Object.defineProperty(snapshot.next, Symbol.iterator, { value: getter });
+    if (field === 'task-name') { Reflect.deleteProperty(snapshot.tasks[0], 'name'); Object.setPrototypeOf(snapshot.tasks[0], { get name() { return getter(); } }); }
+    if (field === 'payload') Object.defineProperty(snapshot.tasks[0].interrupts![0].value as object, 'type', { get: getter });
+    return snapshot;
+  };
+  class Saver extends MemorySaver { override async getTuple(config: RunnableConfig): ReturnType<MemorySaver['getTuple']> { const tuple = await super.getTuple(config); if (tuple == null || !tamper || field !== 'pending-payload') return tuple; tuple.pendingWrites = [...(tuple.pendingWrites ?? []), ['task-control', '__interrupt__', [Object.defineProperty({}, 'value', { get: getter })]]]; return tuple; } }
+  const run = await Run.create({ runId, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, tools: [direct(() => 'Allowed result')], compileOptions: { checkpointer: new Saver() } }, toolResultProtection: policy(), humanInTheLoop: { enabled: true }, hooks: (() => { const hooks = new HookRegistry(); hooks.register('PreToolUse', { hooks: [async () => ({ decision: 'ask', reason: 'Allowed approval' })] }); return hooks; })() });
+  run.Graph!.overrideModel = new FakeChatModel({ responses: [''], toolCalls: [{ id: 'traversal-control', name: 'lookup', args: { count: 42 }, type: 'tool_call' }] }); const config = { version: 'v2' as const, configurable: { thread_id: runId } };
+  await run.processStream({ messages: [new HumanMessage('Allowed input')] }, config); tamper = true;
+  if (field !== 'pending-payload') { const workflow = run.graphRunnable as typeof run.graphRunnable & { getState(config: RunnableConfig, options?: { subgraphs?: boolean }): Promise<StateSnapshot> }; const getState = workflow.getState.bind(workflow); workflow.getState = async (...args) => change(await getState(...args)); }
+  const error = await run.resume([{ type: 'approve' }], config).catch((value: Error) => value);
+  expect(error).toMatchObject({ code: 'unsupported' }); expect(reads).toBe(0); assertNoCanary(String(error));
 });

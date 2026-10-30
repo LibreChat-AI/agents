@@ -2,6 +2,7 @@ import { nanoid } from 'nanoid';
 import { createHash } from 'crypto';
 import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
 import { AsyncLocalStorageProviderSingleton } from '@langchain/core/singletons';
+import { convertToOpenAITool, isLangChainTool } from '@langchain/core/utils/function_calling';
 import {
   AIMessage,
   BaseMessage,
@@ -118,23 +119,25 @@ import {
   SUBAGENT_RESUME_MANIFEST_CONFIG_KEY,
 } from './SubagentReplay';
 import {
+  TOOL_REPLAY_CONFIGS_KEY,
+  TOOL_PENDING_APPROVAL_KEY,
+  rebindToolBatchReplayPayload,
+  restoreToolReplayConfigs,
+  getPublicToolInterruptPayload,
+} from '@/tools/toolBatchReplay';
+import {
   logSubagentResolutionFailure,
   SubagentResolutionError,
   getSubagentHostArgumentFailure,
   getSubagentHostArgumentFailureMessage,
 } from './diagnostics';
 import {
-  rebindToolBatchReplayScope,
-  rebindToolBatchReplayPayload,
-  getPublicToolInterruptPayload,
-  restoreToolReplayConfig,
-} from '@/tools/toolBatchReplay';
-import {
   getSubagentHostArgSpecs,
   resolveSubagentHostArgs,
   pickSubagentHostArgInput,
   getSubagentHostArgsDigest,
 } from './hostArgs';
+import { createToolApprovalReviewEvidence, cloneToolApprovalInterruptPayload } from '@/hitl/approvalReview';
 import {
   executeHooks,
   HookRegistry,
@@ -159,7 +162,6 @@ import {
   createChildGraphPlan,
   isGraphSubagentConfig,
 } from './childGraphConfig';
-import { createToolApprovalReviewEvidence } from '@/hitl/approvalReview';
 import { ProviderTextProtectionError } from '@/protection/providerText';
 import { stripRunStepResumeState } from '@/tools/runStepResume';
 import { seedAgentInitialSessions } from '@/utils/toolSessions';
@@ -433,6 +435,152 @@ type SubagentCheckpointMarker = {
   settledOutput?: PersistedToolOutput;
 };
 
+/** Hash serializable options; executable or opaque inputs require a host revision. */
+function getRuntimeOptionsIdentity(
+  options: unknown
+): { digest: string; requiresRevision: boolean } {
+  const hash = createHash('sha256');
+  const ancestors = new Set<object>();
+  let requiresRevision = false;
+  const opaque = (): void => {
+    requiresRevision = true;
+    hash.update('host-revision');
+  };
+  const visit = (value: unknown, depth: number): void => {
+    if (value == null) {
+      hash.update(value === null ? 'null' : 'undefined');
+      return;
+    }
+    const kind = typeof value;
+    if (kind === 'string' || kind === 'boolean' || (kind === 'number' && Number.isFinite(value))) {
+      hash.update(`${kind}:${JSON.stringify(value)};`);
+      return;
+    }
+    if (kind !== 'object') {
+      opaque();
+      return;
+    }
+    const object = value as object;
+    if (depth >= 64 || ancestors.has(object)) {
+      opaque();
+      return;
+    }
+    const prototype = Object.getPrototypeOf(object);
+    if (prototype !== Object.prototype && prototype !== null &&
+      !(Array.isArray(value) && prototype === Array.prototype)) {
+      opaque();
+      return;
+    }
+    ancestors.add(object);
+    if (Object.getOwnPropertySymbols(object).length > 0) opaque();
+    if (Array.isArray(value)) {
+      hash.update('[');
+      for (let index = 0; index < value.length; index++) {
+        const property = Object.getOwnPropertyDescriptor(value, String(index));
+        if (property?.get != null || property?.set != null) opaque();
+        else visit(property?.value, depth + 1);
+      }
+      hash.update(']');
+    } else {
+      hash.update('{');
+      const descriptors = Object.getOwnPropertyDescriptors(object);
+      for (const key of Object.keys(descriptors).sort()) {
+        const property = descriptors[key];
+        if (property.enumerable !== true) continue;
+        if ('value' in property && property.value === undefined) continue;
+        hash.update(`${JSON.stringify(key)}:`);
+        if (property.get != null || property.set != null) opaque();
+        else visit(property.value, depth + 1);
+      }
+      hash.update('}');
+    }
+    ancestors.delete(object);
+  };
+  visit(options, 0);
+  return { digest: hash.digest('hex'), requiresRevision };
+}
+
+const MEMBER_IDENTITY_EXCLUSIONS = new Set([
+  'tools', 'toolMap', 'graphTools', 'toolRegistry', 'toolDefinitions',
+  'codeSessionKey', 'toolEnd', 'summarizeOnly', 'discoveredTools',
+  'initialSessions', 'initialSummary', 'subagentConfigs', 'maxSubagentDepth',
+  'langfuse',
+]);
+
+/** Sessions refresh on resume; scrubbed parent state and tracing are non-authoritative. */
+function getMemberExecutionIdentity(
+  agent: AgentInputs
+): ReturnType<typeof getRuntimeOptionsIdentity> {
+  const descriptors = Object.fromEntries(
+    Object.entries(Object.getOwnPropertyDescriptors(agent)).filter(
+      ([key]) => !MEMBER_IDENTITY_EXCLUSIONS.has(key)
+    )
+  );
+  return getRuntimeOptionsIdentity(Object.defineProperties({}, descriptors));
+}
+
+function hasExecutableMemberTools(agent: AgentInputs): boolean {
+  return (agent.toolMap?.size ?? 0) > 0 ||
+    (agent.graphTools?.length ?? 0) > 0 ||
+    agent.tools?.some(isLangChainTool) === true;
+}
+
+/** Declarative graph identity plus the host's revision for executable implementations. */
+function getSubagentDefinitionId(
+  config: ExecutableSubagentConfigEntry | undefined
+): string | undefined {
+  if (!config || !isGraphSubagentConfig(config)) return config?.configId;
+  const declaration = {
+    revision: config.configId,
+    type: config.type,
+    maxTurns: config.maxTurns,
+    entry: config.entryAgentId,
+    result: config.resultAgentId,
+    edges: config.edges.map((edge) => ({
+      ...edge,
+      prompt: typeof edge.prompt === 'function'
+        ? { revision: config.configId }
+        : edge.prompt,
+    })),
+    members: config.agents.map((agent) => ({
+      id: agent.agentId,
+      provider: agent.provider,
+      codeSessionKey: agent.codeSessionKey ?? Constants.EXECUTE_CODE,
+      toolEnd: agent.toolEnd ?? false,
+      summarizeOnly: agent.summarizeOnly ?? false,
+      model: resolveClientOptionsModel(agent.clientOptions),
+      executionOptions: getMemberExecutionIdentity(agent).digest,
+      instructions: agent.instructions,
+      additionalInstructions: agent.additional_instructions,
+      maxContextTokens: agent.maxContextTokens,
+      discoveredTools: [...new Set(agent.discoveredTools ?? [])].sort(),
+      toolDefinitions: agent.toolDefinitions,
+      toolRegistry: Object.fromEntries(
+        Array.from(agent.toolRegistry ?? [], ([key, definition]) => [
+          key,
+          {
+            ...definition,
+            allowed_callers: [
+              ...new Set(definition.allowed_callers ?? ['direct']),
+            ].sort(),
+          },
+        ])
+      ),
+      toolMap: Object.fromEntries(
+        Array.from(agent.toolMap ?? [], ([key, tool]) => [
+          key,
+          convertToOpenAITool(tool),
+        ])
+      ),
+      tools: agent.tools?.map(
+        (tool) => (isLangChainTool(tool) ? convertToOpenAITool(tool) : tool)
+      ),
+      graphTools: agent.graphTools?.map((tool) => convertToOpenAITool(tool)),
+    })),
+  };
+  return `graph:${createHash('sha256').update(stableStringify(declaration)).digest('hex')}`;
+}
+
 function isResumeExecutionCompatible(
   resumeExecution: SubagentResumeExecution | undefined,
   subagentType: string | undefined,
@@ -445,7 +593,7 @@ function isResumeExecutionCompatible(
   if (
     subagentType == null ||
     executableConfig == null ||
-    resumeExecution.configId !== executableConfig.configId
+    resumeExecution.configId !== getSubagentDefinitionId(executableConfig)
   ) {
     return false;
   }
@@ -2058,6 +2206,19 @@ export class SubagentExecutor {
         checkpoints,
         graphState,
         approvalReplays,
+        ...(activeRun == null
+          ? {}
+          : {
+            pendingInterruptIds: [...new Set(activeRun.pendingInterrupts.flatMap(
+              (pending) => pending.id == null ? [] : [pending.id]
+            ))],
+            pendingInterrupts: activeRun.pendingInterrupts.flatMap((pending) =>
+              pending.id == null ? [] : [{
+                interruptId: pending.id,
+                payload: cloneToolApprovalInterruptPayload(getPublicToolInterruptPayload(pending.value)),
+              }]
+            ),
+          }),
         ...(descendant == null ? {} : { descendant }),
       });
     }
@@ -2328,7 +2489,7 @@ export class SubagentExecutor {
         return undefined;
       }
     }
-    const configId = executableConfig?.configId;
+    const configId = getSubagentDefinitionId(executableConfig);
     const bound = this.bindExecutionDefinition(
       execution,
       {
@@ -2436,9 +2597,9 @@ export class SubagentExecutor {
     const configId =
       resolvedSubagentType == null
         ? (execution.binding?.configId ??
-          executableConfig?.configId ??
+          getSubagentDefinitionId(executableConfig) ??
           resumeExecution?.configId)
-        : executableConfig?.configId;
+        : getSubagentDefinitionId(executableConfig);
     if (subagentType == null) {
       return;
     }
@@ -2593,22 +2754,50 @@ export class SubagentExecutor {
       );
     }
     if (
-      isGraphSubagentConfig(executableConfig) &&
-      this.humanInTheLoop?.enabled === true
-    ) {
-      return Promise.resolve(
-        createSubagentFailure(
-          'Error: Human-in-the-loop execution is not yet supported for graph subagents.'
-        )
-      );
-    }
-    if (
       this.humanInTheLoop?.enabled === true &&
       (params.parentToolCallId == null || params.parentToolCallId === '')
     ) {
       return Promise.resolve(
         createSubagentFailure(
           'Error: Resumable subagent execution requires a parent tool call ID.'
+        )
+      );
+    }
+    if (
+      this.humanInTheLoop?.enabled === true &&
+      isGraphSubagentConfig(executableConfig) &&
+      executableConfig.configId == null &&
+      executableConfig.edges.some((edge) => typeof edge.prompt === 'function')
+    ) {
+      return Promise.resolve(
+        createSubagentFailure(
+          'Error: Resumable graph subagents with functional prompts require a configId revision.'
+        )
+      );
+    }
+    if (
+      this.humanInTheLoop?.enabled === true &&
+      isGraphSubagentConfig(executableConfig) &&
+      executableConfig.configId == null &&
+      executableConfig.agents.some(
+        (agent) => getMemberExecutionIdentity(agent).requiresRevision
+      )
+    ) {
+      return Promise.resolve(
+        createSubagentFailure(
+          'Error: Resumable graph subagents with executable member options require a configId revision.'
+        )
+      );
+    }
+    if (
+      this.humanInTheLoop?.enabled === true &&
+      isGraphSubagentConfig(executableConfig) &&
+      executableConfig.configId == null &&
+      executableConfig.agents.some(hasExecutableMemberTools)
+    ) {
+      return Promise.resolve(
+        createSubagentFailure(
+          'Error: Resumable graph subagents with executable member tools require a configId revision.'
         )
       );
     }
@@ -2622,9 +2811,9 @@ export class SubagentExecutor {
         {
           description: params.description,
           subagentType: params.subagentType,
-          ...(executableConfig.configId == null
+          ...(getSubagentDefinitionId(executableConfig) == null
             ? {}
-            : { configId: executableConfig.configId }),
+            : { configId: getSubagentDefinitionId(executableConfig) }),
           ...(hostArgsDigest == null ? {} : { hostArgsDigest }),
         },
         () =>
@@ -2800,9 +2989,9 @@ export class SubagentExecutor {
       execution,
       {
         subagentType,
-        ...(executableConfig.configId == null
+        ...(getSubagentDefinitionId(executableConfig) == null
           ? {}
-          : { configId: executableConfig.configId }),
+          : { configId: getSubagentDefinitionId(executableConfig) }),
       },
       'effective'
     );
@@ -2902,18 +3091,21 @@ export class SubagentExecutor {
       )) {
         const member = childPlan.memberInputs.get(agentId);
         if (member == null) throw new Error('Unknown subagent context member.');
+        member.codeSessionKey = sessions.codeSessionKey;
+        member.initialSessions = sessions.initialSessions;
+      }
+      for (const member of childPlan.agents) {
         const activeMember =
-          execution.activeRun?.graph.agentContexts.get(agentId);
+          execution.activeRun?.graph.agentContexts.get(member.agentId);
         if (
           activeMember != null &&
-          activeMember.codeSessionKey !== sessions.codeSessionKey
+          (activeMember.codeSessionKey ?? Constants.EXECUTE_CODE) !==
+            (member.codeSessionKey ?? Constants.EXECUTE_CODE)
         ) {
           throw new Error(
             'Subagent session partition changed during execution.'
           );
         }
-        member.codeSessionKey = sessions.codeSessionKey;
-        member.initialSessions = sessions.initialSessions;
       }
     } catch (error) {
       if (childSignal.aborted) {
@@ -3023,7 +3215,6 @@ export class SubagentExecutor {
     if (params.taskRuntime != null) {
       childGraph.hookRegistry = this.hookRegistry;
     }
-    seedChildGraphSessions(childGraph, childPlan.agents);
     let forwarding: ForwarderCallback | undefined;
     if (forwardingEnabled) {
       forwarding = this.createForwarderCallback({
@@ -3123,6 +3314,7 @@ export class SubagentExecutor {
           currentHookSessionId
         );
       }
+      seedChildGraphSessions(childGraph, childPlan.agents);
       const childConfigurable: Record<string, unknown> = {
         ...inheritedConfigurable,
         ...sanitizePreparedConfigurable(preparedContext?.configurable),
@@ -3201,7 +3393,11 @@ export class SubagentExecutor {
               checkpointMessages,
               executionSuffix
             );
-            result = { messages: persistedMessages };
+            const values = persistedState.values as MultiAgentGraphState;
+            result = {
+              messages: persistedMessages,
+              ...(childPlan.kind === 'graph' ? { subagentResult: values.subagentResult } : {}),
+            };
             recoveredComplete = true;
             childAlreadyStarted = true;
             childAlreadyCompleted = marker?.lifecycleComplete === true;
@@ -3222,25 +3418,20 @@ export class SubagentExecutor {
         }
         let childInput: BaseGraphState | Command | null;
         if (childResumeMap != null) {
-          const pending =
-            activeChildRun.pendingInterrupts.find(
-              (entry) =>
-                entry.id != null &&
-                Object.prototype.hasOwnProperty.call(childResumeMap, entry.id)
-            ) ?? activeChildRun.pendingInterrupts[0];
-          restoreToolReplayConfig(childConfigurable, pending.id, pending.value);
-          rebindToolBatchReplayScope(
+          restoreToolReplayConfigs(
             childConfigurable,
+            activeChildRun.pendingInterrupts,
             resumeExecution?.approvalExecutionScope ?? approvalExecutionScope,
             approvalExecutionScope,
-            childThreadId
+            childThreadId,
+            new Set(Object.keys(childResumeMap))
           );
           const approvals = new Map<string, ToolApprovalInterruptPayload | undefined>();
           if (this.toolResultProtection != null) for (const entry of activeChildRun.pendingInterrupts) {
             const evidence = createToolApprovalReviewEvidence(entry.id, getPublicToolInterruptPayload(entry.value));
             if (entry.id != null) approvals.set(entry.id, evidence?.payload);
           }
-          const resume = this.toolResultProtection == null ? childResumeMap : await protectToolApprovalResume(this.toolResultProtection, childResumeMap, approvals, pending.id, childSignal);
+          const resume = this.toolResultProtection == null ? childResumeMap : await protectToolApprovalResume(this.toolResultProtection, childResumeMap, approvals, activeChildRun.pendingInterrupts[0]?.id, childSignal);
           childInput = new Command({ resume });
         } else if (recoveredInProgress) {
           childInput = null;
@@ -4135,6 +4326,8 @@ function isLangGraphRuntimeConfigKey(key: string): boolean {
     key === SUBAGENT_RESUME_MANIFEST_CONFIG_KEY ||
     key === SUBAGENT_PARENT_BATCH_CONFIG_KEY ||
     key === TOOL_APPROVAL_EXECUTION_SCOPE_CONFIG_KEY ||
+    key === TOOL_REPLAY_CONFIGS_KEY ||
+    key === TOOL_PENDING_APPROVAL_KEY ||
     /** The parent batch's breaker scope must not leak into the child
      * workflow's configurable — children own separate controllers. */
     key === RUN_BREAKER_SCOPE_CONFIG_KEY

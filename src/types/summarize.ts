@@ -1,5 +1,6 @@
+import type { UsageMetadata, BaseMessage } from '@langchain/core/messages';
+import type { ProviderName, ContextBudgetMode } from '@/types/llm';
 import type { SummaryContentBlock } from '@/types/stream';
-import type { ProviderName } from '@/types/llm';
 
 export type SummarizationTrigger = {
   type:
@@ -97,6 +98,8 @@ export type SummarizationConfig = {
   updatePrompt?: string;
   trigger?: SummarizationTrigger;
   maxSummaryTokens?: number;
+  /** maxContextTokens is an input ceiling by default; use window for a full model window. */
+  contextBudgetMode?: ContextBudgetMode;
   /** Fraction of the token budget reserved as headroom (0–1). Defaults to 0.05. */
   reserveRatio?: number;
   /**
@@ -118,6 +121,8 @@ export interface SummarizeResult {
 export interface SummarizationNodeInput {
   remainingContextTokens: number;
   agentId: string;
+  /** Pruned, masked provider history from the turn requesting compaction. */
+  windowMessages?: BaseMessage[];
   /**
    * Why the detour was requested.
    *
@@ -128,8 +133,7 @@ export interface SummarizationNodeInput {
    *   variant performs no model call — the corrected budget alone is what the
    *   retry needs.
    * - `manual`: the host asked for a summary outright (a summarize-only run).
-   *   The recency window is not applied unless the host configured
-   *   `retainRecent` explicitly, so the summary replaces the whole history.
+   *   Uses the same bounded recent-tail policy as automatic compaction.
    */
   reason?: 'trigger' | 'overflow' | 'manual';
   /**
@@ -165,9 +169,24 @@ export interface SummarizeDeltaEvent {
   };
 }
 
+export type SummarizationErrorCode =
+  | 'provider_overloaded'
+  | 'rate_limited'
+  | 'context_exceeded'
+  | 'timeout'
+  | 'unknown';
+
+export interface SummarizationAttemptUsage {
+  provider: ProviderName;
+  model?: string;
+  usage: Partial<UsageMetadata>;
+}
+
 export interface SummarizeCompleteEvent {
   id: string;
   agentId: string;
   summary?: SummaryContentBlock;
   error?: string;
+  errorCode?: SummarizationErrorCode;
+  attemptUsage?: readonly SummarizationAttemptUsage[];
 }

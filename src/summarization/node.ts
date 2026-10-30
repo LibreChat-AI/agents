@@ -1,4 +1,4 @@
-import { AIMessage, ToolMessage, HumanMessage } from '@langchain/core/messages';
+import { ToolMessage, HumanMessage } from '@langchain/core/messages';
 import type { UsageMetadata, BaseMessage } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { RenderedCompactionSemanticIndex } from '@/summarization/semanticIndex';
@@ -24,26 +24,30 @@ import {
   type PromptCacheTtl,
 } from '@/messages/cache';
 import {
-  cloneToolMessageWithContent,
-  compactToolContent,
-  isComputerCallOutputMessage,
-  serializeToolContentBounded,
-} from '@/utils/toolContent';
-import {
   enforceStreamLimitsForWireChunk,
   StreamLimitExceededError,
   STREAM_LIMIT_EPOCH_KEY,
+  STREAM_LIMIT_ATTEMPT_KEY,
 } from '@/llm/streamLimits';
+import {
+  boundSummarizationInput,
+  SummarizationInputTooLargeError,
+  DEFAULT_SUMMARY_OUTPUT_TOKENS,
+  DEFAULT_RETAIN_RECENT_TOKENS,
+} from './input';
+import { classifySummarizationError, withSummarizationRetry, withSummarizationRetryOwner, ReasoningOnlySummaryError } from './retry';
 import {
   DEFAULT_RETAIN_RECENT_TURNS,
   resolveIntraTurnRetainTokens,
   splitAtRecencyBoundary,
 } from '@/messages/recency';
+import { isReasoningContentBlock, hasMeaningfulReasoningContentBlock } from '@/messages/reasoningTypes';
 import {
   createTokenCounter,
   encodingForModel,
   encodingOfTokenCounter,
 } from '@/utils/tokens';
+import { prepareProviderRequest, resolveServingModelId } from '@/llm/prepareProviderRequest';
 import {
   Constants,
   ContentTypes,
@@ -56,72 +60,22 @@ import {
   resolveClientOptionsModel,
 } from '@/llm/request';
 import { renderCompactionSemanticIndex } from '@/summarization/semanticIndex';
+import { readSummarizationUsage, buildSummarizationStepUsage } from './usage';
 import { ProviderTextProtectionError } from '@/protection/providerText';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { prepareToolsForPromptCache } from '@/llm/promptCacheTools';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
-import { calculateMaxToolResultChars } from '@/utils/truncation';
+import { serializeToolContentBounded } from '@/utils/toolContent';
+import { hasReasoningKwargs } from '@/llm/stream/chunkAdapters';
 import { makeIsDeferred } from '@/messages/anthropicToolCache';
+import { countSummarizationToolTokens } from './toolBudget';
 import { createRemoveAllMessage } from '@/messages/reducer';
 import { getProviderFamily } from '@/llm/providerRegistry';
+import { getProviderStopReasons } from '@/llm/truncation';
+import { isProviderCancellation } from '@/utils/errors';
 import { initializeModel } from '@/llm/init';
 import { getChunkContent } from '@/stream';
 import { executeHooks } from '@/hooks';
-
-/**
- * Default number of recent user-led turns preserved verbatim during
- * compaction.  A turn begins at a HumanMessage and includes every
- * following AIMessage and ToolMessage up to the next HumanMessage.
- * The most recent turn is always retained regardless of this value;
- * the default of `2` additionally keeps the prior exchange so the
- * model has fresh context on what just happened.  Setting
- * `retainRecent.turns` to `0` reverts to the legacy "summarize every
- * message" behavior.
- */
-
-/**
- * Generates a structural metadata summary without making an LLM call.
- * Used as a last-resort fallback when all summarization attempts fail.
- * Preserves tool names and message counts so the agent retains basic context.
- */
-function generateMetadataStub(messages: BaseMessage[]): string {
-  const counts: Record<string, number> = {};
-  const toolNames = new Set<string>();
-
-  for (const msg of messages) {
-    const role = msg.getType();
-    counts[role] = (counts[role] ?? 0) + 1;
-
-    if (role === 'tool' && msg.name != null && msg.name !== '') {
-      toolNames.add(msg.name);
-    }
-
-    if (
-      role === 'ai' &&
-      msg instanceof AIMessage &&
-      msg.tool_calls &&
-      msg.tool_calls.length > 0
-    ) {
-      for (const tc of msg.tool_calls) {
-        toolNames.add(tc.name);
-      }
-    }
-  }
-
-  const countParts = Object.entries(counts)
-    .map(([role, count]) => `${count} ${role}`)
-    .join(', ');
-
-  const lines = [
-    `[Metadata summary: ${messages.length} messages (${countParts})]`,
-  ];
-
-  if (toolNames.size > 0) {
-    lines.push(`[Tools used: ${Array.from(toolNames).join(', ')}]`);
-  }
-
-  return lines.join('\n');
-}
 
 /** Maximum number of tool failures to include in the enrichment section. */
 const MAX_TOOL_FAILURES = 8;
@@ -191,56 +145,6 @@ function enrichSummary(summaryText: string, messages: BaseMessage[]): string {
   return summaryText + extractToolFailuresSection(messages);
 }
 
-/**
- * Restores pre-masking tool content onto the messages array using
- * `pendingOriginalToolContent` stored on AgentContext. Only allocates
- * a new array when there are entries to restore; otherwise returns the
- * input reference unchanged.
- */
-function restoreOriginalToolContent(
-  messages: BaseMessage[],
-  originalToolContent: Map<number, string> | undefined,
-  maxContextTokens?: number
-): BaseMessage[] {
-  if (originalToolContent == null || originalToolContent.size === 0) {
-    return messages;
-  }
-
-  const restorable: Array<{
-    index: number;
-    message: ToolMessage;
-    content: string;
-  }> = [];
-  for (const [index, content] of originalToolContent) {
-    const message = messages[index];
-    if (
-      message instanceof ToolMessage &&
-      !isComputerCallOutputMessage(message)
-    ) {
-      restorable.push({ index, message, content });
-    }
-  }
-  if (restorable.length === 0) {
-    return messages;
-  }
-
-  /**
-   * Restored originals improve checkpoint quality, but they still feed a
-   * provider call. Share one tool-result budget across every restoration so
-   * several previously masked results cannot overflow the summarizer.
-   */
-  let remainingChars = calculateMaxToolResultChars(maxContextTokens);
-  const restored = [...messages];
-  for (let i = 0; i < restorable.length; i++) {
-    const { index, message, content } = restorable[i];
-    const maxChars = Math.floor(remainingChars / (restorable.length - i));
-    const compacted = compactToolContent(content, maxChars).content;
-    restored[index] = cloneToolMessageWithContent(message, compacted);
-    remainingChars -= serializeToolContentBounded(compacted, maxChars).length;
-  }
-  return restored;
-}
-
 // ---------------------------------------------------------------------------
 // Extracted helpers for createSummarizeNode
 // ---------------------------------------------------------------------------
@@ -249,7 +153,7 @@ interface SummarizationClientConfig {
   provider: string;
   modelName?: string;
   clientOptions: Record<string, unknown>;
-  effectiveMaxSummaryTokens?: number;
+  effectiveMaxSummaryTokens: number | undefined;
   promptText: string;
   updatePromptText: string;
 }
@@ -272,27 +176,34 @@ function buildSummarizationClientConfig(
     separateSummarizationParameters(parameters);
 
   const isSelfSummarize = provider === (agentContext.provider as string);
-  const baseOptions =
+  const baseOptions: Record<string, unknown> =
     isSelfSummarize && agentContext.clientOptions
       ? { ...agentContext.clientOptions }
       : {};
 
-  const clientOptions: Record<string, unknown> = {
+  const clientOptions: Record<string, unknown> = withSummarizationRetryOwner(provider, {
     ...baseOptions,
     ...llmParams,
-  };
+  });
 
   if (modelName != null && modelName !== '') {
     clientOptions.model = modelName;
     clientOptions.modelName = modelName;
   }
 
-  const effectiveMaxSummaryTokens =
-    paramMaxSummaryTokens ?? summarizationConfig?.maxSummaryTokens;
-
-  if (effectiveMaxSummaryTokens != null) {
-    clientOptions[getMaxOutputTokensKey(provider)] = effectiveMaxSummaryTokens;
+  const outputKey = getMaxOutputTokensKey(provider);
+  const inheritedOutputTokens = readSummaryOutputLimit(provider, baseOptions);
+  const explicitOutputTokens = readSummaryOutputLimit(provider, llmParams);
+  clearSummaryOutputLimits(provider, clientOptions);
+  let effectiveMaxSummaryTokens =
+    paramMaxSummaryTokens ?? summarizationConfig?.maxSummaryTokens ?? explicitOutputTokens;
+  if (effectiveMaxSummaryTokens == null) {
+    effectiveMaxSummaryTokens = resolveSummaryOutputTokens(
+      provider, clientOptions, agentContext.maxContextTokens, inheritedOutputTokens
+    );
   }
+  if (effectiveMaxSummaryTokens === -1 && usesCompletionTokenAlias(provider)) effectiveMaxSummaryTokens = undefined;
+  if (effectiveMaxSummaryTokens != null) clientOptions[outputKey] = effectiveMaxSummaryTokens;
 
   return {
     provider,
@@ -302,6 +213,121 @@ function buildSummarizationClientConfig(
     promptText,
     updatePromptText,
   };
+}
+
+function usesCompletionTokenAlias(provider: t.ProviderName): boolean {
+  return getProviderFamily(provider) === 'openai' || provider === Providers.MOONSHOT;
+}
+
+function readSummaryOutputLimit(provider: t.ProviderName, options: Record<string, unknown>): number | undefined {
+  const openai = usesCompletionTokenAlias(provider);
+  const native = (openai ? options.modelKwargs : options.invocationKwargs) as
+    {max_output_tokens?: number; max_tokens?: number} | undefined;
+  const anthropic = provider === Providers.ANTHROPIC || getProviderFamily(provider) === 'anthropic';
+  // Completions rewrites its active output field after merging modelKwargs.
+  let nativeLimit: number | undefined;
+  if (openai) nativeLimit = native?.max_output_tokens;
+  else if (anthropic) nativeLimit = native?.max_tokens;
+  return (nativeLimit ?? (openai ? options.maxCompletionTokens : undefined) ??
+    options[getMaxOutputTokensKey(provider)]) as number | undefined;
+}
+
+function clearSummaryOutputLimits(provider: t.ProviderName, options: Record<string, unknown>): void {
+  delete options[getMaxOutputTokensKey(provider)];
+  const openai = usesCompletionTokenAlias(provider);
+  if (openai) delete options.maxCompletionTokens;
+  const key = openai ? 'modelKwargs' : 'invocationKwargs';
+  if (!openai && provider !== Providers.ANTHROPIC && getProviderFamily(provider) !== 'anthropic') return;
+  const native = options[key] as object | undefined;
+  if (native == null) return;
+  const normalized = {...native};
+  for (const field of openai ? ['max_output_tokens', 'max_completion_tokens', 'max_tokens'] : ['max_tokens']) {
+    Reflect.deleteProperty(normalized, field);
+  }
+  options[key] = normalized;
+}
+
+function resolveSummaryReasoning(provider: t.ProviderName, clientOptions: Record<string, unknown>): {enabled: boolean; fixedBudget: number} {
+  type ReasoningOptions = {
+    reasoningEffort?: string;
+    reasoning_effort?: string;
+    reasoning?: {effort?: string; enabled?: boolean; max_tokens?: number};
+    thinking?: t.AnthropicReasoning['thinking'];
+    thinkingBudget?: number;
+    thinkingConfig?: t.GoogleThinkingConfig;
+  };
+  const options = clientOptions as ReasoningOptions & {
+    include_reasoning?: boolean;
+    modelKwargs?: ReasoningOptions;
+    additionalModelRequestFields?: ReasoningOptions;
+    invocationKwargs?: ReasoningOptions;
+  };
+  const family = getProviderFamily(provider);
+  const google = options.thinkingConfig;
+  if (provider === Providers.GOOGLE || provider === Providers.VERTEXAI || family === 'google') {
+    const budget = google?.thinkingBudget ?? options.thinkingBudget;
+    const hasLevel = google?.thinkingLevel != null && google.thinkingLevel !== 'THINKING_LEVEL_UNSPECIFIED';
+    const fixedBudget = budget != null && Number.isFinite(budget) && budget > 0 ? budget : 0;
+    return {
+      enabled: hasLevel || (budget != null && (budget > 0 || budget === -1)),
+      fixedBudget: provider === Providers.VERTEXAI && hasLevel ? 0 : fixedBudget,
+    };
+  }
+  const thinking = (provider === Providers.ANTHROPIC || family === 'anthropic'
+    ? options.invocationKwargs?.thinking : undefined) ?? options.thinking ??
+    options.additionalModelRequestFields?.thinking ?? options.modelKwargs?.thinking;
+  if (thinking != null) {
+    const enabled = thinking === true || (typeof thinking === 'object' &&
+      (thinking.type === 'enabled' || thinking.type === 'adaptive'));
+    let budget = thinking === true ? options.thinkingBudget ?? options.additionalModelRequestFields?.thinkingBudget : 0;
+    if (typeof thinking === 'object' && thinking.type === 'enabled') budget = thinking.budget_tokens;
+    return {enabled, fixedBudget: enabled && budget != null && Number.isFinite(budget) && budget > 0 ? budget : 0};
+  }
+  const reasoning = {...options.modelKwargs?.reasoning, ...options.reasoning};
+  const effort = reasoning.effort ?? options.reasoningEffort ?? options.reasoning_effort ??
+    options.modelKwargs?.reasoning_effort ?? options.modelKwargs?.reasoningEffort;
+  return {enabled: reasoning.enabled !== false && (
+    (effort != null && effort !== '' && effort !== 'none' && effort !== 'disabled') ||
+    reasoning.enabled === true || (reasoning.max_tokens != null && reasoning.max_tokens > 0) ||
+    (provider === Providers.OPENROUTER && options.reasoning == null &&
+      options.modelKwargs?.reasoning == null && options.include_reasoning === true)
+  ), fixedBudget: 0};
+}
+
+function resolveSummaryOutputTokens(
+  provider: t.ProviderName,
+  clientOptions: Record<string, unknown>,
+  maxContextTokens?: number,
+  inheritedOutputTokens?: number
+): number | undefined {
+  const explicit = readSummaryOutputLimit(provider, clientOptions);
+  if (explicit != null) return explicit === -1 && usesCompletionTokenAlias(provider) ? undefined : explicit;
+  const reasoning = resolveSummaryReasoning(provider, clientOptions);
+  if (reasoning.enabled && (inheritedOutputTokens == null || inheritedOutputTokens === -1)) return undefined;
+  const defaultOutputTokens = reasoning.fixedBudget + Math.min(
+    DEFAULT_SUMMARY_OUTPUT_TOKENS,
+    Math.max(1, Math.floor((maxContextTokens ?? 40_960) * 0.1))
+  );
+  const inherited = reasoning.enabled && inheritedOutputTokens != null &&
+    Number.isFinite(inheritedOutputTokens) && inheritedOutputTokens > 0 ? inheritedOutputTokens : 0;
+  return Math.max(defaultOutputTokens, inherited);
+}
+
+function resolveSummaryOutputReserve(model: t.ChatModel): number {
+  let candidate: object | undefined = model;
+  const seen = new Set<object>();
+  for (let depth = 0; candidate != null && depth < 20 && !seen.has(candidate); depth++) {
+    seen.add(candidate);
+    const runnable = candidate as {
+      profile?: {maxOutputTokens?: number};
+      bound?: object;
+      last?: object;
+    };
+    const maximum = runnable.profile?.maxOutputTokens;
+    if (maximum != null && Number.isSafeInteger(maximum) && maximum > 0) return maximum;
+    candidate = runnable.bound ?? runnable.last;
+  }
+  throw new SummarizationInputTooLargeError();
 }
 
 /**
@@ -394,14 +420,115 @@ async function computeSummaryTokenCount(
  * the same rule that rejects another agent's counter.
  */
 function encodingForReceivingAgent(agentContext: AgentContext): EncodingName {
-  const model = resolveClientOptionsModel(agentContext.clientOptions);
+  return encodingForSummarizationModel(
+    agentContext.provider,
+    agentContext.clientOptions
+  );
+}
+
+function encodingForSummarizationModel(
+  provider: t.ProviderName,
+  clientOptions?: t.ClientOptions
+): EncodingName {
+  const model = resolveClientOptionsModel(clientOptions);
   if (model != null && encodingForModel(model) === 'claude') {
     return 'claude';
   }
-  return agentContext.provider === Providers.ANTHROPIC ||
-    getProviderFamily(agentContext.provider) === 'anthropic'
+  return provider === Providers.ANTHROPIC ||
+    getProviderFamily(provider) === 'anthropic'
     ? 'claude'
     : 'o200k_base';
+}
+
+async function prepareSummarizationBudget({
+  agentContext,
+  model,
+  provider,
+  clientOptions,
+  maxContextTokens,
+  outputTokens,
+  contextBudgetMode = 'input',
+  instruction,
+  tools,
+  config,
+}: {
+  agentContext: AgentContext;
+  model: t.ChatModel;
+  provider: t.ProviderName;
+  clientOptions?: t.ClientOptions;
+  maxContextTokens?: number;
+  outputTokens: number | undefined;
+  contextBudgetMode?: t.ContextBudgetMode;
+  instruction: string;
+  tools?: t.GraphTools;
+  config?: RunnableConfig;
+}): Promise<{
+  count: t.TokenCounter;
+  system: AgentContext['systemRunnable'];
+  budget: number;
+}> {
+  const encoding = encodingForSummarizationModel(provider, clientOptions);
+  const hostCounter = agentContext.tokenCounter;
+  const hostEncoding =
+    hostCounter == null ? undefined : encodingOfTokenCounter(hostCounter);
+  const usesAgentCounter =
+    provider === agentContext.provider &&
+    encoding === encodingForReceivingAgent(agentContext) &&
+    hostCounter != null &&
+    (hostEncoding == null || hostEncoding === encoding);
+  const count = usesAgentCounter
+    ? (agentContext.contextPressureTokenCounts?.count ?? hostCounter)
+    : await createTokenCounter(encoding);
+  const system =
+    provider === agentContext.provider
+      ? agentContext.systemRunnable
+      : undefined;
+  const toolTokens = usesAgentCounter ? agentContext.toolSchemaTokens :
+    countSummarizationToolTokens({tools, provider, clientOptions, count});
+  let overhead = toolTokens;
+  if (system != null) {
+    overhead = usesAgentCounter
+      ? agentContext.instructionTokens
+      : (await system.invoke([], config)).reduce(
+        (total, message) => total + count(message),
+        overhead
+      );
+  }
+  const ratio = usesAgentCounter
+    ? Math.max(1, agentContext.calibrationRatio)
+    : 1;
+  const outputReserve = contextBudgetMode === 'window' && maxContextTokens != null
+    ? outputTokens ?? resolveSummaryOutputReserve(model) : 0;
+  const budget =
+    maxContextTokens == null
+      ? Number.MAX_SAFE_INTEGER
+      : Math.floor(
+        (maxContextTokens -
+            overhead -
+            outputReserve -
+            count(new HumanMessage(instruction))) /
+            ratio
+      );
+  return { count, system, budget };
+}
+
+async function flushSummarizationDeltas(
+  deltas: t.SummarizeDeltaEvent[],
+  config?: RunnableConfig,
+  graph?: { getBreakerSignal?: () => AbortSignal }
+): Promise<void> {
+  const signal = withBreakerSignal(config, graph)?.signal;
+  signal?.throwIfAborted();
+  for (const delta of deltas) {
+    signal?.throwIfAborted();
+    if (config != null)
+      await safeDispatchCustomEvent(
+        GraphEvents.ON_SUMMARIZE_DELTA,
+        delta,
+        config
+      );
+  }
+  signal?.throwIfAborted();
 }
 
 /**
@@ -451,6 +578,28 @@ function isSyntheticContext(message: BaseMessage): boolean {
     return true;
   }
   return kwargs.source != null && kwargs.source !== 'steer';
+}
+
+function restoreRetainedMessages(
+  retained: BaseMessage[],
+  canonical: BaseMessage[]
+): BaseMessage[] {
+  if (retained.length === 0) return retained;
+  const pending = new Map<string, number>();
+  for (let i = 0; i < retained.length; i++) {
+    const id = retained[i].id;
+    if (id != null) pending.set(id, i);
+  }
+  const restored = [...retained];
+  for (let i = canonical.length - 1; i >= 0 && pending.size > 0; i--) {
+    const message = canonical[i];
+    if (message.id == null) continue;
+    const index = pending.get(message.id);
+    if (index == null) continue;
+    restored[index] = message;
+    pending.delete(message.id);
+  }
+  return restored;
 }
 
 function resolveSummaryCoverage(
@@ -628,17 +777,20 @@ function describeFallbackError(
 
 /**
  * Runs the summarization LLM call with primary + fallback providers,
- * falling back to a metadata stub when all calls fail.
+ * preserving history when every provider fails.
  */
 async function executeSummarizationWithFallback(params: {
   agentContext: AgentContext;
   messages: BaseMessage[];
+  requiredHeadLength: number;
   clientConfig: SummarizationClientConfig;
   summarizeConfig?: RunnableConfig;
   stepId: string;
   usePromptCache: boolean;
+  shrinkInput?: boolean;
   semanticIndex: RenderedCompactionSemanticIndex;
   log: LogFn;
+  onUsage: (attempt: t.SummarizationAttemptUsage) => void;
   /** Carries the run's stream limits so the event cap covers summary streams. */
   graph?: StreamLimitState & {
     getBreakerSignal?: () => AbortSignal;
@@ -650,30 +802,32 @@ async function executeSummarizationWithFallback(params: {
 }): Promise<{
   text: string;
   usage?: Partial<UsageMetadata>;
-  /**
-   * True when every model call failed and `text` is the generated metadata
-   * stub rather than a real summary. Callers that would replace history with
-   * this need to know it carries none of the original content.
-   */
-  usedMetadataStub?: boolean;
+  provider: string;
+  model?: string;
+  errorCode?: t.SummarizationErrorCode;
 }> {
   const {
     agentContext,
     messages,
+    requiredHeadLength,
     clientConfig,
     summarizeConfig,
     stepId,
     usePromptCache,
+    shrinkInput,
     semanticIndex,
     log,
     graph,
+    onUsage,
   } = params;
 
   const priorSummaryText = agentContext.getSummaryText()?.trim() ?? '';
 
   let summaryText = '';
+  let summaryProvider = clientConfig.provider;
+  let summaryModel = clientConfig.modelName;
   let summaryUsage: Partial<UsageMetadata> | undefined;
-  let usedMetadataStub = false;
+  let errorCode: t.SummarizationErrorCode | undefined;
 
   try {
     /**
@@ -681,7 +835,8 @@ async function executeSummarizationWithFallback(params: {
      * (e.g. an unrecognized summarization.provider) surfaces through the
      * `log('error', ...)` path below rather than bubbling up silently.
      */
-    const summarizationTools = usePromptCache
+    const isSelfSummarize = clientConfig.provider === agentContext.provider;
+    const summarizationTools = isSelfSummarize
       ? (graph?.getToolsForBinding?.(
           clientConfig.provider as t.ProviderName,
           clientConfig.clientOptions as t.ClientOptions
@@ -699,22 +854,37 @@ async function executeSummarizationWithFallback(params: {
       provider: clientConfig.provider,
       clientOptions: clientConfig.clientOptions as t.ClientOptions,
       tools: summarizationTools,
+      disableToolCalling: true,
     }) as t.ChatModel;
 
-    const result = await summarizeWithCacheHit({
-      model: summarizationModel,
-      messages,
-      promptText: clientConfig.promptText,
-      updatePromptText: clientConfig.updatePromptText,
-      priorSummaryText,
-      semanticIndexAppendix: semanticIndex.appendix,
-      config: summarizeConfig,
-      stepId,
-      provider: clientConfig.provider,
-      reasoningKey: agentContext.reasoningKey,
-      graph,
-      usePromptCache,
-      promptCacheTtl:
+    const signal = withBreakerSignal(summarizeConfig, graph)?.signal;
+    const result = await withSummarizationRetry(
+      () =>
+        summarizeWithCacheHit({
+          agentContext,
+          onUsage: usage => onUsage({
+            provider: clientConfig.provider as t.ProviderName,
+            model: clientConfig.modelName ?? resolveServingModelId(summarizationModel) ?? resolveClientOptionsModel(clientConfig.clientOptions as t.ClientOptions),
+            usage,
+          }),
+          shrinkInput,
+          outputTokens: clientConfig.effectiveMaxSummaryTokens,
+          clientOptions: clientConfig.clientOptions as t.ClientOptions,
+          model: summarizationModel,
+          tools: summarizationTools,
+          messages,
+          requiredHeadLength,
+          promptText: clientConfig.promptText,
+          updatePromptText: clientConfig.updatePromptText,
+          priorSummaryText,
+          semanticIndexAppendix: semanticIndex.appendix,
+          config: summarizeConfig,
+          stepId,
+          provider: clientConfig.provider,
+          reasoningKey: agentContext.reasoningKey,
+          graph,
+          usePromptCache,
+          promptCacheTtl:
         clientConfig.provider === Providers.ANTHROPIC ||
         clientConfig.provider === Providers.OPENROUTER ||
         clientConfig.provider === Providers.BEDROCK
@@ -724,7 +894,7 @@ async function executeSummarizationWithFallback(params: {
               }
           ).promptCacheTtl
           : undefined,
-      bedrockModelId:
+          bedrockModelId:
         clientConfig.provider === Providers.BEDROCK
           ? resolveBedrockCompactionCacheModel(
               clientConfig.clientOptions as
@@ -735,27 +905,33 @@ async function executeSummarizationWithFallback(params: {
                 | undefined
           )
           : undefined,
-      log,
-    });
+          log,
+        }),
+      {
+        signal,
+        onRetry: (retry) => log('debug', 'Retrying summarization', retry),
+      }
+    );
     summaryText = result.text;
     summaryUsage = result.usage;
   } catch (primaryError) {
     /**
      * A tripped stream circuit breaker is a safety abort, not a
      * summarization failure to recover from: retrying on fallback providers
-     * would spend more provider work after the limit fired, and degrading to
-     * the metadata stub would let the run continue (and periodic compaction
-     * commit the stub) despite the `StreamLimits` contract that a breach
-     * rejects the run. Rethrown so the summarize node fails the run with
+     * would spend more provider work after the limit fired despite the
+     * `StreamLimits` contract that a breach rejects the run. Rethrown so the summarize node fails the run with
      * the actionable limit error, consistent with agent turns and subagents.
      */
-    if (primaryError instanceof StreamLimitExceededError || primaryError instanceof ProviderTextProtectionError) {
+    if (
+      primaryError instanceof StreamLimitExceededError ||
+      primaryError instanceof ProviderTextProtectionError ||
+      isProviderCancellation(primaryError)
+    ) {
       throw primaryError;
     }
     /** A parallel branch's trip aborts the composed summarization signal,
      * and a provider can surface that as a generic abort error; entering
-     * fallback recovery or degrading to the metadata stub would continue
-     * work after the run-wide safety abort. Checked on BOTH channels: the
+     * fallback recovery would continue work after the run-wide safety abort. Checked on BOTH channels: the
      * graph's own breaker, and the composed config signal that carries a
      * parent run's trip into subagent child graphs. */
     {
@@ -767,6 +943,9 @@ async function executeSummarizationWithFallback(params: {
         throw trippedReason;
       }
     }
+
+    withBreakerSignal(summarizeConfig, graph)?.signal?.throwIfAborted();
+    errorCode = classifySummarizationError(primaryError);
 
     const primaryDescribed = describeProviderError(
       primaryError,
@@ -784,27 +963,89 @@ async function executeSummarizationWithFallback(params: {
     const fallbacks = Array.isArray(rawFallbacks) ? rawFallbacks : [];
     if (fallbacks.length > 0) {
       try {
+        const boundedFallbacks = fallbacks.map((fallback) => {
+          const maxContextTokens =
+            fallback.maxContextTokens ?? agentContext.maxContextTokens;
+          const outputTokens = resolveSummaryOutputTokens(
+            fallback.provider, {...fallback.clientOptions}, maxContextTokens
+          );
+          const clientOptions: Record<string, unknown> = withSummarizationRetryOwner(fallback.provider, {...fallback.clientOptions});
+          clearSummaryOutputLimits(fallback.provider, clientOptions);
+          if (outputTokens != null) clientOptions[getMaxOutputTokensKey(fallback.provider)] = outputTokens;
+          return {
+            ...fallback,
+            clientOptions,
+            maxContextTokens,
+            contextBudgetMode: fallback.maxContextTokens == null
+              ? agentContext.summarizationBudgetMode : fallback.contextBudgetMode ?? 'window',
+          } as t.FallbackConfig;
+        });
+        let fallbackIdentity: {provider: string; model?: string} | undefined;
+        const pendingDeltas: t.SummarizeDeltaEvent[] = [];
         const onChunk = createSummarizationChunkHandler({
+          pendingDeltas,
           stepId,
           config: traceConfig(summarizeConfig, 'cache_hit_compaction'),
           provider: clientConfig.provider,
           reasoningKey: agentContext.reasoningKey,
           graph,
         });
+        const fallbackTools = agentContext.getToolsForBinding();
         const fbResult = await tryFallbackProviders({
-          fallbacks,
-          tools: agentContext.getToolsForBinding(),
-          messages: [
-            ...messages,
-            new HumanMessage(
-              buildSummarizationInstruction(
-                clientConfig.promptText,
-                clientConfig.updatePromptText,
-                priorSummaryText,
-                semanticIndex.appendix
-              )
-            ),
-          ],
+          fallbacks: boundedFallbacks,
+          disableToolCalling: true,
+          tools: fallbackTools,
+          messages,
+          prepareProviderRequest: async ({
+            model,
+            provider,
+            clientOptions,
+            maxContextTokens,
+            contextBudgetMode,
+            config,
+          }) => {
+            config?.signal?.throwIfAborted();
+            pendingDeltas.length = 0;
+            const instruction = buildSummarizationInstruction(
+              clientConfig.promptText, clientConfig.updatePromptText, priorSummaryText,
+              semanticIndex.appendix,
+              provider === agentContext.provider && agentContext.systemRunnable != null,
+            );
+            const { count, system, budget } = await prepareSummarizationBudget({
+              agentContext,
+              model,
+              provider,
+              clientOptions,
+              maxContextTokens,
+              contextBudgetMode,
+              outputTokens: readSummaryOutputLimit(provider, {...clientOptions}),
+              instruction,
+              tools: fallbackTools,
+              config,
+            });
+            const bounded = boundSummarizationInput({
+              messages,
+              requiredHeadLength,
+              tokenCounter: count,
+              budget,
+              provider,
+            });
+            const bedrock = clientOptions as t.BedrockAnthropicInput | undefined;
+            const windowWithCache = provider === Providers.BEDROCK
+              ? applySummarizationHistoryCache({messages: bounded, provider,
+                enabled: bedrock?.promptCache === true,
+                promptCacheTtl: bedrock?.promptCacheTtl, bedrockModelId: resolveClientOptionsModel(clientOptions),
+              }) : bounded;
+            const history = system == null ? windowWithCache : await system.invoke(windowWithCache, config);
+            const request = prepareProviderRequest({
+              model,
+              messages: [...history, new HumanMessage(instruction)],
+              provider,
+              config,
+            });
+            fallbackIdentity = {provider, model: request.modelId ?? resolveClientOptionsModel(clientOptions)};
+            return request;
+          },
           config: withBreakerSignal(
             traceConfig(summarizeConfig, 'cache_hit_compaction'),
             graph
@@ -812,19 +1053,53 @@ async function executeSummarizationWithFallback(params: {
           primaryError,
           onChunk,
           streamLimitState: graph,
+          invokeModel: (params, config) => withSummarizationRetry(async () => {
+            pendingDeltas.length = 0;
+            const result = await attemptInvoke({...params, onModelComplete: response => {
+              params.onModelComplete?.(response);
+              const usage = readSummarizationUsage(response);
+              if (usage != null && fallbackIdentity != null) onUsage({
+                provider: fallbackIdentity.provider as t.ProviderName, model: fallbackIdentity.model, usage,
+              });
+            }}, config);
+            config?.signal?.throwIfAborted();
+            const response = result.messages?.[0];
+            validateSummaryResponse(response);
+            return result;
+          }, {signal: config?.signal, onRetry: retry => log('debug', 'Retrying fallback summarization', retry)}),
         });
         const fbMsg = fbResult?.messages?.[0];
         if (fbMsg) {
+          summaryUsage = readSummarizationUsage(fbMsg);
           summaryText = extractResponseText(
             fbMsg as { content: string | object }
           );
+          if (summaryText !== '') {
+            if (fallbackIdentity == null) throw new Error('Missing successful fallback identity', {cause: primaryError});
+            summaryProvider = fallbackIdentity.provider;
+            summaryModel = fallbackIdentity.model;
+            await flushSummarizationDeltas(
+              pendingDeltas,
+              summarizeConfig,
+              graph
+            );
+          }
         }
       } catch (fbErr) {
-        const trip = findStreamLimitAbortReason(graph?.getBreakerSignal?.(), summarizeConfig?.signal);
+        const trip = findStreamLimitAbortReason(
+          graph?.getBreakerSignal?.(),
+          summarizeConfig?.signal
+        );
         if (trip != null) throw trip;
-        if (fbErr instanceof StreamLimitExceededError || fbErr instanceof ProviderTextProtectionError) {
+        if (
+          fbErr instanceof StreamLimitExceededError ||
+          fbErr instanceof ProviderTextProtectionError ||
+          isProviderCancellation(fbErr)
+        ) {
           throw fbErr;
         }
+        withBreakerSignal(summarizeConfig, graph)?.signal?.throwIfAborted();
+        errorCode = classifySummarizationError(fbErr);
         const fbDescribed = describeFallbackError(fbErr, fallbacks);
         log('warn', `Fallback providers also failed ${fbDescribed.suffix}`, {
           ...fbDescribed.data,
@@ -834,20 +1109,28 @@ async function executeSummarizationWithFallback(params: {
     if (!summaryText) {
       log(
         'warn',
-        `Summarization failed, falling back to metadata stub ${primaryDescribed.suffix}`,
+        `Summarization failed; preserving conversation history ${primaryDescribed.suffix}`,
         {
           ...primaryDescribed.data,
           messagesToRefineCount: messages.length,
         }
       );
-      summaryText = generateMetadataStub(messages);
-      usedMetadataStub = true;
+      summaryText = '';
     }
   }
 
-  const trip = findStreamLimitAbortReason(graph?.getBreakerSignal?.(), summarizeConfig?.signal);
+  const trip = findStreamLimitAbortReason(
+    graph?.getBreakerSignal?.(),
+    summarizeConfig?.signal
+  );
   if (trip != null) throw trip;
-  return { text: summaryText, usage: summaryUsage, usedMetadataStub };
+  return {
+    text: summaryText,
+    usage: summaryUsage,
+    provider: summaryProvider,
+    model: summaryModel,
+    ...(summaryText === '' ? { errorCode } : {}),
+  };
 }
 
 /** Dispatches run step completion, ON_SUMMARIZE_COMPLETE, and rebuilds token map. */
@@ -859,6 +1142,7 @@ async function dispatchCompletionEvents(params: {
   agentContext: AgentContext;
   runStep: t.RunStep;
   summaryUsage?: Partial<UsageMetadata>;
+  attemptUsage: readonly t.SummarizationAttemptUsage[];
   agentId: string;
   /**
    * Number of messages preserved verbatim by the recency window after
@@ -876,17 +1160,21 @@ async function dispatchCompletionEvents(params: {
     agentContext,
     runStep,
     summaryUsage,
+    attemptUsage,
     agentId,
     messagesAfterCount,
   } = params;
 
   const assertNotTripped = (): void => {
-    const trip = findStreamLimitAbortReason(graph.getBreakerSignal?.(), runnableConfig?.signal);
+    const trip = findStreamLimitAbortReason(
+      graph.getBreakerSignal?.(),
+      runnableConfig?.signal
+    );
     if (trip != null) throw trip;
   };
   assertNotTripped();
   runStep.summary = summaryBlock;
-  if (summaryUsage) {
+  if (summaryUsage && runStep.usage == null) {
     runStep.usage = {
       prompt_tokens: Number(summaryUsage.input_tokens) || 0,
       completion_tokens: Number(summaryUsage.output_tokens) || 0,
@@ -910,6 +1198,7 @@ async function dispatchCompletionEvents(params: {
         id: stepId,
         agentId,
         summary: summaryBlock,
+        ...(attemptUsage.length > 0 ? {attemptUsage: [...attemptUsage]} : {}),
       } satisfies t.SummarizeCompleteEvent,
       runnableConfig
     );
@@ -1033,7 +1322,8 @@ function findStreamLimitAbortReason(
   for (const signal of signals) {
     if (
       signal?.aborted === true &&
-      (signal.reason instanceof StreamLimitExceededError || signal.reason instanceof ProviderTextProtectionError)
+      (signal.reason instanceof StreamLimitExceededError ||
+        signal.reason instanceof ProviderTextProtectionError)
     ) {
       return signal.reason;
     }
@@ -1163,7 +1453,13 @@ export function createSummarizeNode({
     }
 
     const maxCtx = agentContext.maxContextTokens ?? 0;
-    if (maxCtx > 0 && agentContext.instructionTokens >= maxCtx) {
+    const usesAgentInstructions =
+      (agentContext.summarizationConfig?.provider ?? agentContext.provider) ===
+      agentContext.provider;
+    const instructionOverhead = usesAgentInstructions
+      ? agentContext.instructionTokens
+      : agentContext.toolSchemaTokens;
+    if (usesAgentInstructions && maxCtx > 0 && instructionOverhead >= maxCtx) {
       if (request.reason === 'manual') {
         throw new ManualSummarizationSkippedError(
           'instructions_exceed_budget',
@@ -1185,67 +1481,47 @@ export function createSummarizeNode({
       return { summarizationRequest: undefined };
     }
 
-    /**
-     * Capture the original-tool-content map locally before doing the
-     * split.  We need it in three places: to restore the head for
-     * summarizer quality, to leave intact on the skip path (state is
-     * unchanged), and — critically — to carry forward the tail-relevant
-     * entries on the summarize-fired path.  Clearing it eagerly here
-     * would lose the originals for masked tool messages that the
-     * recency window keeps in the tail; a future summarization could
-     * then only summarize the masked stub instead of the full payload.
-     */
-    const originalPending = agentContext.pendingOriginalToolContent;
-
-    const restoredMessages = restoreOriginalToolContent(
-      state.messages,
-      originalPending,
-      agentContext.maxContextTokens
-    );
-
     const runnableConfig = config ?? graph.config;
-
+    const clientConfig = buildSummarizationClientConfig(
+      agentContext,
+      agentContext.summarizationConfig
+    );
+    const windowMessages = request.windowMessages ?? state.messages;
     const retainRecent = agentContext.summarizationConfig?.retainRecent;
-    /**
-     * A manual summary is the user asking for the whole history to become a
-     * checkpoint, so the default recency window does not apply to it. A
-     * `retainRecent` the host configured explicitly still keeps its tail,
-     * with the ordinary turn default when it only sets a token cap.
-     */
-    const retainTurns =
-      request.reason === 'manual' && retainRecent == null
-        ? 0
-        : (retainRecent?.turns ?? DEFAULT_RETAIN_RECENT_TURNS);
+    const retainTurns = retainRecent?.turns ?? DEFAULT_RETAIN_RECENT_TURNS;
     const recencyTokenCounter =
       agentContext.contextPressureTokenCounts?.count ??
-      agentContext.tokenCounter;
+      agentContext.tokenCounter ??
+      (await createTokenCounter(encodingForReceivingAgent(agentContext)));
+    const retainTokens =
+      retainRecent?.tokens ??
+      (retainRecent == null
+        ? Math.min(
+          DEFAULT_RETAIN_RECENT_TOKENS,
+          Math.max(
+            1,
+            Math.floor((agentContext.maxContextTokens ?? 100_000) * 0.16)
+          )
+        )
+        : undefined);
     const {
-      head: messagesToRefine,
-      tailStartIndex,
-      usedIntraTurnFallback,
-    } = splitAtRecencyBoundary(restoredMessages, {
+      head: compactableHead,
+      tail: projectedTail,
+    } = splitAtRecencyBoundary(windowMessages, {
       provider: agentContext.provider,
-      turns: retainTurns,
-      tokens: retainRecent?.tokens,
+      turns:
+        retainRecent == null
+          ? retainTurns
+          : (retainRecent.turns ?? DEFAULT_RETAIN_RECENT_TURNS),
+      tokens: retainTokens,
       tokenCounter: recencyTokenCounter,
       intraTurnTokens: resolveIntraTurnRetainTokens({
-        tokens: retainRecent?.tokens,
+        tokens: retainTokens,
         maxContextTokens: agentContext.maxContextTokens,
       }),
     });
-    /**
-     * Use the *masked* messages for the retained tail so that any
-     * truncation prune applied to oversized ToolMessage content stays
-     * truncated in live state.  The summarizer above reads the restored
-     * (full-content) head for summary quality, but reinjecting restored
-     * tool payloads into state would defeat masking and bloat the
-     * checkpoint, forcing more expensive re-pruning on later turns.
-     * `restoreOriginalToolContent` returns an array with identical
-     * length and structure to `state.messages` (replacements only at
-     * specific indices), so the same tailStartIndex slices both arrays
-     * at the same turn boundary.
-     */
-    const messagesToRetain = state.messages.slice(tailStartIndex);
+
+    const messagesToRefine = compactableHead;
 
     if (messagesToRefine.length === 0) {
       if (request.reason === 'manual') {
@@ -1268,7 +1544,7 @@ export function createSummarizeNode({
         'summarize',
         'Summarization skipped — recency window retains all messages',
         {
-          messagesRetained: messagesToRetain.length,
+          messagesRetained: projectedTail.length,
           retainTurns,
         },
         { runId: graph.runId, agentId: request.agentId }
@@ -1277,10 +1553,9 @@ export function createSummarizeNode({
       return { summarizationRequest: undefined };
     }
 
-    const clientConfig = buildSummarizationClientConfig(
-      agentContext,
-      agentContext.summarizationConfig
-    );
+    const messagesToRetain = windowMessages === state.messages
+      ? projectedTail : restoreRetainedMessages(projectedTail, state.messages);
+
     const semanticIndex = renderCompactionSemanticIndex(
       agentContext.compactionSemanticIndex,
       messagesToRefine
@@ -1295,6 +1570,7 @@ export function createSummarizeNode({
       provider: clientConfig.provider,
     };
 
+    const attemptUsage: t.SummarizationAttemptUsage[] = [];
     const runStep: t.RunStep = {
       stepIndex,
       id: stepId,
@@ -1442,40 +1718,34 @@ export function createSummarizeNode({
     const {
       text: rawText,
       usage: summaryUsage,
-      usedMetadataStub,
+      provider: summaryProvider,
+      model: summaryModel,
+      errorCode,
     } = await executeSummarizationWithFallback({
       agentContext,
-      messages: messagesToRefine,
+      messages: windowMessages,
+      requiredHeadLength: messagesToRefine.length,
+      onUsage: attempt => {
+        attemptUsage.push(attempt);
+        runStep.usage = buildSummarizationStepUsage(attemptUsage);
+      },
       clientConfig,
       summarizeConfig,
       stepId,
       usePromptCache: isSelfSummarizeModel && hasPromptCache,
+      shrinkInput: request.reason === 'overflow',
       semanticIndex,
       log,
       graph,
     });
 
-    /**
-     * The metadata stub describes the history rather than summarizing it, so
-     * committing it means removing the head and keeping nothing of what it
-     * said. That trade is never worth making to paper over an overflow, and
-     * never for a manual compaction, which would replace the whole history
-     * with a message count: the recovery would "succeed" only by destroying
-     * the conversation it was supposed to preserve. Leave state untouched
-     * and let the provider error surface instead.
-     */
-    if (
-      usedMetadataStub === true &&
-      (request.reason === 'overflow' ||
-        request.reason === 'manual' ||
-        usedIntraTurnFallback)
-    ) {
+    if (errorCode != null) {
       const preservationReason =
         PRESERVATION_REASONS[request.reason ?? 'trigger'] ??
-        'intra-turn compaction';
+        'automatic compaction';
       log(
         'warn',
-        `Summarization failed during ${preservationReason}; keeping history rather than replacing it with a metadata stub`
+        `Summarization failed during ${preservationReason}; keeping history unchanged`
       );
       agentContext.markSummarizationTriggered(state.messages.length);
       agentContext.recordSummarizationFailure();
@@ -1484,14 +1754,18 @@ export function createSummarizeNode({
        * consumers tracking step lifecycle keep an unfinished placeholder for
        * the rest of the run.
        */
-      await graph.dispatchRunStepCompleted(
-        stepId,
+      if (graph.closeRunStep != null) {
+        await graph.closeRunStep(stepId, 'failed', runnableConfig);
+      } else {
+        await graph.dispatchRunStepCompleted(
+          stepId,
         {
           type: 'summary',
           summary: placeholderSummary,
         } satisfies t.SummaryCompleted,
         runnableConfig
-      );
+        );
+      }
       if (runnableConfig) {
         await safeDispatchCustomEvent(
           GraphEvents.ON_SUMMARIZE_COMPLETE,
@@ -1499,6 +1773,8 @@ export function createSummarizeNode({
             id: stepId,
             agentId: request.agentId,
             error: `Summarization failed during ${preservationReason}; conversation history was preserved`,
+            errorCode,
+            ...(attemptUsage.length > 0 ? {attemptUsage: [...attemptUsage]} : {}),
           } satisfies t.SummarizeCompleteEvent,
           runnableConfig
         );
@@ -1530,6 +1806,8 @@ export function createSummarizeNode({
             id: stepId,
             agentId: request.agentId,
             error: 'Summarization produced empty output',
+            errorCode: 'unknown',
+            ...(attemptUsage.length > 0 ? {attemptUsage: [...attemptUsage]} : {}),
           } satisfies t.SummarizeCompleteEvent,
           runnableConfig
         );
@@ -1538,7 +1816,10 @@ export function createSummarizeNode({
       return { summarizationRequest: undefined };
     }
 
-    const postCallTrip = findStreamLimitAbortReason(entryBreakerSignal, config?.signal);
+    const postCallTrip = findStreamLimitAbortReason(
+      entryBreakerSignal,
+      config?.signal
+    );
     if (postCallTrip != null) throw postCallTrip;
     const summaryText = enrichSummary(rawText, messagesToRefine);
 
@@ -1547,9 +1828,14 @@ export function createSummarizeNode({
       agentContext
     );
 
-    const commitTrip = findStreamLimitAbortReason(entryBreakerSignal, config?.signal);
+    const commitTrip = findStreamLimitAbortReason(
+      entryBreakerSignal,
+      config?.signal
+    );
     if (commitTrip != null) throw commitTrip;
-    if (usedIntraTurnFallback) {
+    runnableConfig?.signal?.throwIfAborted();
+    entryBreakerSignal?.throwIfAborted();
+    if (messagesToRetain.length > 0) {
       agentContext.setSummary(summaryText, tokenCount, {
         precedesMessages: true,
       });
@@ -1579,8 +1865,8 @@ export function createSummarizeNode({
       coverage: resolveSummaryCoverage(messagesToRetain),
       stepId,
       stepIndex: runStep.index,
-      modelName: clientConfig.modelName,
-      provider: clientConfig.provider,
+      modelName: summaryModel,
+      provider: summaryProvider,
       summaryVersion: agentContext.summaryVersion,
     });
 
@@ -1592,6 +1878,7 @@ export function createSummarizeNode({
       agentContext,
       runStep,
       summaryUsage,
+      attemptUsage,
       agentId: request.agentId,
       messagesAfterCount: messagesToRetain.length,
     });
@@ -1607,28 +1894,7 @@ export function createSummarizeNode({
      */
     agentContext.markSummarizationTriggered(messagesToRetain.length);
 
-    /**
-     * Carry forward the original-content entries that correspond to the
-     * retained tail, reindexed for the post-removeAll state where tail
-     * messages start at index 0.  Without this, a future summarization
-     * that pulls these tail messages into its head would only see the
-     * masked stubs (since `setSummary` clears `pruneMessages`, and the
-     * fresh pruner at the next turn has no record of prior masks).
-     * Entries for indices < `tailStartIndex` belong to messages we just
-     * summarized — they are no longer reachable so they are dropped.
-     */
-    if (originalPending != null && originalPending.size > 0) {
-      const tailPending = new Map<number, string>();
-      for (const [idx, content] of originalPending) {
-        if (idx >= tailStartIndex) {
-          tailPending.set(idx - tailStartIndex, content);
-        }
-      }
-      agentContext.pendingOriginalToolContent =
-        tailPending.size > 0 ? tailPending : undefined;
-    } else {
-      agentContext.pendingOriginalToolContent = undefined;
-    }
+    agentContext.pendingOriginalToolContent = undefined;
 
     return {
       summarizationRequest: undefined,
@@ -1675,6 +1941,46 @@ function extractResponseText(response: { content: string | object }): string {
   return parts.join('').trim();
 }
 
+class ToolOnlySummaryError extends ReasoningOnlySummaryError {
+  constructor() {
+    super();
+    this.name = 'ToolOnlySummaryError';
+    this.message = 'The summarizer requested tools instead of summary text';
+  }
+}
+
+function validateSummaryResponse(response: BaseMessage | undefined): void {
+  if (response == null) return;
+  if (isReasoningOnlySummary(response)) throw new ReasoningOnlySummaryError();
+  if (extractResponseText(response) === '' && 'tool_calls' in response && Array.isArray(response.tool_calls) && response.tool_calls.length > 0) {
+    const kwargs = response.additional_kwargs as {refusal?: string} | undefined;
+    if (kwargs?.refusal != null || getProviderStopReasons(response).some(reason =>
+      reason !== 'end_turn' && reason !== 'stop' && reason !== 'tool_use' && reason !== 'tool_calls'
+    )) return;
+    throw new ToolOnlySummaryError();
+  }
+}
+
+function isReasoningOnlySummary(response: BaseMessage): boolean {
+  const kwargs = response.additional_kwargs as (BaseMessage['additional_kwargs'] & {refusal?: string}) | undefined;
+  if (kwargs?.refusal != null || getProviderStopReasons(response).some(
+    reason => reason !== 'end_turn' && reason !== 'stop'
+  )) return false;
+  if ('tool_calls' in response && Array.isArray(response.tool_calls) && response.tool_calls.length > 0) return false;
+  if ('invalid_tool_calls' in response && Array.isArray(response.invalid_tool_calls) && response.invalid_tool_calls.length > 0) return false;
+  let hasReasoning = kwargs != null && hasReasoningKwargs(response);
+  if (typeof response.content === 'string') return hasReasoning && response.content.trim() === '';
+  if (!Array.isArray(response.content)) return false;
+  for (const block of response.content) {
+    if (isReasoningContentBlock(block)) {
+      hasReasoning ||= hasMeaningfulReasoningContentBlock(block);
+      continue;
+    }
+    if (block.type !== 'text' || typeof block.text !== 'string' || block.text.trim() !== '') return false;
+  }
+  return hasReasoning;
+}
+
 /** Creates an `onChunk` callback that dispatches `ON_SUMMARIZE_DELTA` events for streaming. */
 export function createSummarizationChunkHandler({
   stepId,
@@ -1682,18 +1988,28 @@ export function createSummarizationChunkHandler({
   provider,
   reasoningKey = 'reasoning_content',
   graph,
+  pendingDeltas,
 }: {
   stepId?: string;
   config?: RunnableConfig;
   provider?: t.ProviderName;
   reasoningKey?: 'reasoning_content' | 'reasoning';
   graph?: StreamLimitState & { getBreakerController?: () => AbortController };
+  pendingDeltas?: t.SummarizeDeltaEvent[];
 }): OnChunk | undefined {
   if (stepId == null || stepId === '' || !config) {
     return undefined;
   }
   const limitMetadata = config.metadata as Record<string, unknown> | undefined;
+  let bufferedAttempt: unknown;
   return (chunk, attemptMetadata) => {
+    if (
+      pendingDeltas != null &&
+      bufferedAttempt !== attemptMetadata?.[STREAM_LIMIT_ATTEMPT_KEY]
+    ) {
+      pendingDeltas.length = 0;
+      bufferedAttempt = attemptMetadata?.[STREAM_LIMIT_ATTEMPT_KEY];
+    }
     /**
      * Charged as `producer` so it PAIRS with the run's registered stream
      * handler: inside a live run the provider callbacks route each chunk
@@ -1709,8 +2025,8 @@ export function createSummarizationChunkHandler({
      * breaker-aborting catch never fires for the same chunk — without the
      * trip here, sibling model calls, tools, and subagents would keep
      * consuming quota while the summary branch rejects.
-     * `executeSummarizationWithFallback` then rethrows past fallbacks and
-     * the metadata stub, failing the run like any other breach.
+     * `executeSummarizationWithFallback` rethrows past fallbacks, failing
+     * the run like any other breach.
      */
     if (graph != null) {
       try {
@@ -1728,10 +2044,21 @@ export function createSummarizationChunkHandler({
         throw error;
       }
     }
-    const protectionTrip = findStreamLimitAbortReason(graph?.getBreakerController?.().signal, config.signal);
+    const protectionTrip = findStreamLimitAbortReason(
+      graph?.getBreakerController?.().signal,
+      config.signal
+    );
     if (protectionTrip != null) throw protectionTrip;
     const chunkAny = chunk as Parameters<typeof getChunkContent>[0]['chunk'];
-    const raw = getChunkContent({ chunk: chunkAny, provider, reasoningKey });
+    const servingProvider =
+      (attemptMetadata?.[Constants.INVOKED_PROVIDER] as
+        | t.ProviderName
+        | undefined) ?? provider;
+    const raw = getChunkContent({
+      chunk: chunkAny,
+      provider: servingProvider,
+      reasoningKey,
+    });
     if (raw == null || (typeof raw === 'string' && !raw)) {
       return;
     }
@@ -1740,21 +2067,28 @@ export function createSummarizationChunkHandler({
         ? [{ type: ContentTypes.TEXT, text: raw } as t.MessageContentComplex]
         : raw;
 
-    void safeDispatchCustomEvent(
-      GraphEvents.ON_SUMMARIZE_DELTA,
-      {
-        id: stepId,
-        delta: {
-          summary: {
-            type: ContentTypes.SUMMARY,
-            content: contentBlocks,
-            provider: String(config.metadata?.summarization_provider ?? ''),
-            model: String(config.metadata?.summarization_model ?? ''),
-          },
+    const event: t.SummarizeDeltaEvent = {
+      id: stepId,
+      delta: {
+        summary: {
+          type: ContentTypes.SUMMARY,
+          content: contentBlocks,
+          provider: String(
+            servingProvider ?? config.metadata?.summarization_provider ?? ''
+          ),
+          model: String(
+            attemptMetadata?.[Constants.INVOKED_MODEL] ??
+              config.metadata?.summarization_model ??
+              ''
+          ),
         },
-      } satisfies t.SummarizeDeltaEvent,
-      config
-    );
+      },
+    };
+    if (pendingDeltas != null) {
+      pendingDeltas.push(event);
+      return;
+    }
+    void safeDispatchCustomEvent(GraphEvents.ON_SUMMARIZE_DELTA, event, config);
   };
 }
 
@@ -1809,13 +2143,19 @@ export function resolveBedrockCompactionCacheModel(
 /**
  * Cache-friendly compaction: sends raw conversation messages with the
  * summarization instruction appended as the final HumanMessage. Bound tool
- * definitions can reuse their cache prefix. Exact replay of the main request's
- * system + tools + messages prefix requires a routed-request projection that
- * this summarization path does not currently own.
+ * definitions and the turn's system runnable preserve the cached prefix.
+ * Tool output stays masked and the final instruction has reserved headroom.
  */
 async function summarizeWithCacheHit({
+  agentContext,
+  onUsage,
+  shrinkInput,
+  outputTokens,
+  clientOptions,
   model,
+  tools,
   messages,
+  requiredHeadLength,
   promptText,
   updatePromptText,
   priorSummaryText,
@@ -1830,8 +2170,15 @@ async function summarizeWithCacheHit({
   bedrockModelId,
   log,
 }: {
+  agentContext: AgentContext;
+  onUsage: (usage: Partial<UsageMetadata>) => void;
+  shrinkInput?: boolean;
+  outputTokens: number | undefined;
+  clientOptions?: t.ClientOptions;
   model: t.ChatModel;
+  tools?: t.GraphTools;
   messages: BaseMessage[];
+  requiredHeadLength: number;
   promptText: string;
   updatePromptText?: string;
   priorSummaryText: string;
@@ -1850,64 +2197,110 @@ async function summarizeWithCacheHit({
     promptText,
     updatePromptText,
     priorSummaryText,
-    semanticIndexAppendix
+    semanticIndexAppendix,
+    provider === agentContext.provider && agentContext.systemRunnable != null
   );
 
-  const cachedHistory = applySummarizationHistoryCache({
-    messages,
+  const { count, system, budget } = await prepareSummarizationBudget({
+    agentContext,
+    model,
     provider,
-    enabled: usePromptCache === true,
-    promptCacheTtl,
-    bedrockModelId,
+    clientOptions,
+    maxContextTokens: agentContext.maxContextTokens,
+    outputTokens,
+    contextBudgetMode: agentContext.summarizationBudgetMode,
+    instruction,
+    tools,
+    config,
   });
-  const invokeMessages = [...cachedHistory, new HumanMessage(instruction)];
-
-  const result = await attemptInvoke(
-    {
-      model,
-      messages: invokeMessages,
-      provider,
-      onChunk: createSummarizationChunkHandler({
-        stepId,
-        config: traceConfig(config, 'cache_hit_compaction'),
-        provider,
-        reasoningKey,
-        graph,
-      }),
-      /** Accounting lease only (summarization passes no `context` so its
-       * producer claim never stacks with the onChunk handler's). */
-      streamLimitState: graph,
-    },
-    withBreakerSignal(traceConfig(config, 'cache_hit_compaction'), graph)
+  const scales = [1, 0.85, 0.65, 0.45, 0.3];
+  let result: Partial<t.BaseGraphState> | undefined;
+  const initialTokens = messages.reduce(
+    (total, message) => total + count(message),
+    0
   );
+  let lastError: unknown;
+  for (let attempt = 0; attempt < scales.length; attempt++) {
+    const signalConfig = withBreakerSignal(
+      traceConfig(config, 'cache_hit_compaction'),
+      graph
+    );
+    signalConfig?.signal?.throwIfAborted();
+    const boundedHistory = boundSummarizationInput({
+      messages,
+      requiredHeadLength,
+      tokenCounter: count,
+      budget: Math.floor(
+        Math.min(
+          budget,
+          attempt === 0 && shrinkInput !== true ? budget : initialTokens
+        ) * scales[attempt]
+      ),
+      provider,
+      shrink: attempt > 0 || shrinkInput === true,
+    });
+    const windowWithCache = provider === Providers.BEDROCK
+      ? applySummarizationHistoryCache({messages: boundedHistory, provider, enabled: usePromptCache === true, promptCacheTtl, bedrockModelId})
+      : boundedHistory;
+    const history = system == null ? windowWithCache : await system.invoke(windowWithCache, config);
+    const cachedHistory =
+      system != null || provider === Providers.BEDROCK
+        ? history
+        : applySummarizationHistoryCache({
+          messages: history,
+          provider,
+          enabled: usePromptCache === true,
+          promptCacheTtl,
+          bedrockModelId,
+        });
+    const pendingDeltas: t.SummarizeDeltaEvent[] = [];
+    try {
+      result = await attemptInvoke(
+        {
+          model,
+          messages: [...cachedHistory, new HumanMessage(instruction)],
+          provider,
+          onModelComplete: response => {
+            const usage = readSummarizationUsage(response);
+            if (usage != null) onUsage(usage);
+          },
+          onChunk: createSummarizationChunkHandler({
+            stepId,
+            config: traceConfig(config, 'cache_hit_compaction'),
+            provider,
+            reasoningKey,
+            graph,
+            pendingDeltas,
+          }),
+          streamLimitState: graph,
+        },
+        signalConfig
+      );
+      const response = result.messages?.[0];
+      signalConfig?.signal?.throwIfAborted();
+      validateSummaryResponse(response);
+      if (response != null && extractResponseText(response) !== '') {
+        await flushSummarizationDeltas(pendingDeltas, config, graph);
+      }
+      break;
+    } catch (error) {
+      signalConfig?.signal?.throwIfAborted();
+      if (classifySummarizationError(error) !== 'context_exceeded') throw error;
+      lastError = error;
+      log?.('debug', 'Shrinking summarization context', {
+        attempt: attempt + 1,
+      });
+    }
+  }
+  if (result == null) throw lastError;
 
   const responseMsg = result.messages?.[0];
   const text = responseMsg
     ? extractResponseText(responseMsg as { content: string | object })
     : '';
-  let usage: Partial<UsageMetadata> | undefined;
-  let usageSource = 'none';
-  if (
-    responseMsg != null &&
-    'usage_metadata' in responseMsg &&
-    responseMsg.usage_metadata != null
-  ) {
-    usage = responseMsg.usage_metadata as Partial<UsageMetadata>;
-    usageSource = 'usage_metadata';
-  } else if (responseMsg != null) {
-    const respMeta = responseMsg.response_metadata as
-      | Record<string, unknown>
-      | undefined;
-    const raw = (respMeta?.metadata as Record<string, unknown> | undefined)
-      ?.usage as Record<string, unknown> | undefined;
-    if (raw != null) {
-      usage = {
-        input_tokens: Number(raw.inputTokens) || undefined,
-        output_tokens: Number(raw.outputTokens) || undefined,
-      } as Partial<UsageMetadata>;
-      usageSource = 'response_metadata';
-    }
-  }
+  const usage = readSummarizationUsage(responseMsg);
+  const usageSource = responseMsg != null && 'usage_metadata' in responseMsg && responseMsg.usage_metadata != null
+    ? 'usage_metadata' : 'response_metadata';
   const cacheDetails = (
     usage as
       | {
@@ -1919,7 +2312,7 @@ async function summarizeWithCacheHit({
       | undefined
   )?.input_token_details;
   log?.('debug', 'Summarization LLM usage', {
-    source: usageSource,
+    source: usage == null ? 'none' : usageSource,
     input_tokens: usage?.input_tokens,
     output_tokens: usage?.output_tokens,
     ...(cacheDetails?.cache_read != null || cacheDetails?.cache_creation != null

@@ -61,6 +61,7 @@ import {
   getProviderFamily,
   providerUsesManualToolStream,
 } from '@/llm/providers';
+import { getContextOverflowInfo, isProviderCancellation } from '@/utils/errors';
 import { ChatModelStreamHandler, dispatchesChatModelStream } from '@/stream';
 import { Constants, ContentTypes, GraphEvents, Providers } from '@/common';
 import { withProviderTextBoundary } from '@/llm/providerTextBoundary';
@@ -68,7 +69,6 @@ import { PreparedSubagentError } from '@/tools/preparedSubagents';
 import { assertNotTruncatedToolCall } from '@/llm/truncation';
 import { resolveClientOptionsModel } from '@/llm/request';
 import { safeDispatchCustomEvent } from '@/utils/events';
-import { getContextOverflowInfo } from '@/utils/errors';
 import { appendCallbacks } from '@/utils/callbacks';
 import { composeAbortSignals } from '@/utils/misc';
 import { initializeModel } from '@/llm/init';
@@ -633,6 +633,8 @@ interface AttemptInvokeCommonParams {
   context?: InvokeContext;
   providerTextProtection?: ProviderTextProtection;
   onChunk?: OnChunk;
+  /** Observes completed model output synchronously, before terminal validation. */
+  onModelComplete?: (message: BaseMessage) => void;
   /**
    * The agent lane this attempt belongs to, as the model node names it. Only
    * read to record a discarded turn, which the node cannot otherwise detect —
@@ -804,6 +806,7 @@ export async function attemptInvoke(
         request,
         context: params.context,
         onChunk: params.onChunk,
+        onModelComplete: params.onModelComplete,
         preemptAgentId: params.preemptAgentId,
         providerTextProtection: policy,
       },
@@ -846,11 +849,16 @@ async function attemptInvokeBody(
     request,
     context,
     onChunk,
+    onModelComplete,
     preemptAgentId,
     providerTextProtection,
   }: Pick<
     AttemptInvokeCommonParams,
-    'context' | 'onChunk' | 'preemptAgentId' | 'providerTextProtection'
+    | 'context'
+    | 'onChunk'
+    | 'onModelComplete'
+    | 'preemptAgentId'
+    | 'providerTextProtection'
   > & {
     request: PreparedProviderRequest;
   },
@@ -1521,6 +1529,9 @@ async function attemptInvokeBody(
       throw new Error(EMPTY_PROVIDER_RESPONSE_MESSAGE);
     }
 
+    if (preemptAction === 'none') {
+      onModelComplete?.(snapshotValidatedModelChunk(finalChunk));
+    }
     detachValidatedModelToolCalls(finalChunk);
     if ((finalChunk.tool_calls?.length ?? 0) > 0) {
       finalChunk.tool_calls = finalChunk.tool_calls?.filter(
@@ -1536,6 +1547,7 @@ async function attemptInvokeBody(
     await model.invoke(messagesForProvider, invocationConfig),
     false
   );
+  onModelComplete?.(finalMessage);
   if ((finalMessage.tool_calls?.length ?? 0) > 0) {
     finalMessage.tool_calls = finalMessage.tool_calls?.filter(
       (tool_call: ToolCall) => !!tool_call.name
@@ -1610,6 +1622,7 @@ export function getFallbackOverflowCandidates(
 export async function tryFallbackProviders({
   fallbacks,
   tools,
+  disableToolCalling,
   messages,
   config,
   primaryError,
@@ -1621,9 +1634,13 @@ export async function tryFallbackProviders({
   overflowContext,
   prepareProviderRequest: prepareFallbackRequest,
   prepareProviderMessages,
+  invokeModel = attemptInvoke,
 }: {
   fallbacks: t.FallbackConfig[];
+  /** Allows callers to retry or validate a completed provider attempt. */
+  invokeModel?: typeof attemptInvoke;
   tools?: t.GraphTools;
+  disableToolCalling?: boolean;
   messages: BaseMessage[];
   config?: RunnableConfig;
   primaryError: unknown;
@@ -1655,6 +1672,7 @@ export async function tryFallbackProviders({
     provider: t.ProviderName;
     clientOptions?: t.ClientOptions;
     maxContextTokens?: number;
+    contextBudgetMode?: t.ContextBudgetMode;
     config?: RunnableConfig;
   }) => PreparedProviderRequest | Promise<PreparedProviderRequest>;
   /** @deprecated Return a `PreparedProviderRequest` instead. */
@@ -1664,10 +1682,12 @@ export async function tryFallbackProviders({
     provider: t.ProviderName;
     clientOptions?: t.ClientOptions;
     maxContextTokens?: number;
+    contextBudgetMode?: t.ContextBudgetMode;
     config?: RunnableConfig;
   }) => BaseMessage[] | Promise<BaseMessage[]>;
 }): Promise<Partial<t.BaseGraphState> | undefined> {
-  if (primaryError instanceof ProviderTextProtectionError) throw primaryError;
+  if (primaryError instanceof ProviderTextProtectionError || isProviderCancellation(primaryError)) throw primaryError;
+  config?.signal?.throwIfAborted();
   const isOverflow = (
     error: unknown,
     contextOverride = overflowContext
@@ -1685,10 +1705,12 @@ export async function tryFallbackProviders({
     : undefined;
   for (const fb of fallbacks) {
     try {
+      config?.signal?.throwIfAborted();
       const fbModel = initializeModel({
         provider: fb.provider,
         clientOptions: fb.clientOptions,
         tools,
+        ...(disableToolCalling == null ? {} : {disableToolCalling}),
       });
       /**
        * Stamp the fallback's configured model onto callback metadata so
@@ -1714,6 +1736,7 @@ export async function tryFallbackProviders({
         provider: fb.provider,
         clientOptions: fb.clientOptions,
         maxContextTokens: fb.maxContextTokens,
+        contextBudgetMode: fb.contextBudgetMode,
         config: fbConfig,
       };
       const preparedRequest = await prepareFallbackRequest?.(preparationInput);
@@ -1728,14 +1751,7 @@ export async function tryFallbackProviders({
       let fallbackMessages = messages;
       if (preparedRequest == null) {
         fallbackMessages =
-          (await prepareProviderMessages?.({
-            model: fbModel as t.ChatModel,
-            messages,
-            provider: fb.provider,
-            clientOptions: fb.clientOptions,
-            maxContextTokens: fb.maxContextTokens,
-            config: fbConfig,
-          })) ?? messages;
+          (await prepareProviderMessages?.(preparationInput)) ?? messages;
       }
       /** A sibling can trip the breaker while the preparation above is
        * awaited — and the catch below only sees attempts that THROW, so a
@@ -1749,8 +1765,9 @@ export async function tryFallbackProviders({
       ) {
         throw config.signal.reason;
       }
+      config?.signal?.throwIfAborted();
       if (preparedRequest != null) {
-        return await attemptInvoke(
+        return await invokeModel(
           {
             request: preparedRequest,
             context,
@@ -1762,7 +1779,7 @@ export async function tryFallbackProviders({
           fbConfig
         );
       }
-      return await attemptInvoke(
+      return await invokeModel(
         {
           model: fbModel as t.ChatModel,
           messages: fallbackMessages,
@@ -1785,7 +1802,8 @@ export async function tryFallbackProviders({
         e instanceof StreamLimitExceededError ||
         e instanceof PreparedSubagentError ||
         e instanceof InvalidModelToolCallError ||
-        e instanceof ProviderTextProtectionError
+        e instanceof ProviderTextProtectionError ||
+        isProviderCancellation(e)
       ) {
         throw e;
       }
@@ -1801,6 +1819,7 @@ export async function tryFallbackProviders({
       ) {
         throw config.signal.reason;
       }
+      config?.signal?.throwIfAborted();
       lastError = e;
       const fallbackOverflowContext: ContextOverflowContext = {
         provider: fb.provider,

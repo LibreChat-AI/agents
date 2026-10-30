@@ -1823,6 +1823,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
       return;
     }
     throwIfRunBreakerTripped();
+    if (metadata?.summarization === true) return;
 
     const agentContext = graph.getAgentContext(metadata);
 

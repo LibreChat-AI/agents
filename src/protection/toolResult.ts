@@ -15,6 +15,7 @@ import type { BaseMessage } from '@langchain/core/messages';
 import type {
   GenericTool,
   RunStepResumeState,
+  SummarizationNodeInput,
   ToolExecuteResult,
   ToolExecuteBatchRequest,
   ToolCallRequest,
@@ -592,15 +593,22 @@ export function snapshotToolCheckpointConfig<C extends RunnableConfig>(input: C)
   return { ...config, configurable: scope };
 }
 
+export function snapshotToolSummarizationRequest(value: SummarizationNodeInput): SummarizationNodeInput {
+  const request = snapshotToolCheckpointRecord(value, ['windowMessages', 'agentId', 'remainingContextTokens', 'reason']);
+  if (request.windowMessages != null) request.windowMessages = snapshotToolInputMessages(request.windowMessages);
+  return request;
+}
+
 export function snapshotToolSend(input: unknown): Send {
   if (input == null || typeof input !== 'object') throw new ToolResultProtectionError('unsupported');
   const packet = snapshotToolCheckpointRecord(input as Send, ['node', 'args', 'timeout']);
   if (typeof packet.node !== 'string' || packet.node === '' || packet.args == null || typeof packet.args !== 'object') throw new ToolResultProtectionError('unsupported');
-  const args = snapshotToolCheckpointRecord(packet.args as { messages?: BaseMessage[]; agentMessages?: BaseMessage[]; runStepState?: RunStepResumeState }, ['messages', 'agentMessages', 'runStepState', '__pregel_tasks']);
+  const args = snapshotToolCheckpointRecord(packet.args as { messages?: BaseMessage[]; agentMessages?: BaseMessage[]; runStepState?: RunStepResumeState; summarizationRequest?: SummarizationNodeInput }, ['messages', 'agentMessages', 'runStepState', 'summarizationRequest', '__pregel_tasks']);
   if (Object.hasOwn(args, '__pregel_tasks')) throw new ToolResultProtectionError('unsupported');
   if (args.messages != null) args.messages = snapshotToolInputMessages(args.messages);
   if (args.agentMessages != null) args.agentMessages = snapshotToolInputMessages(args.agentMessages);
   if (args.runStepState != null) args.runStepState = snapshotToolRunStepState(args.runStepState);
+  if (args.summarizationRequest != null) args.summarizationRequest = snapshotToolSummarizationRequest(args.summarizationRequest);
   return Object.assign(Object.create(Send.prototype) as Send, packet, { args, timeout: snapshotToolCheckpointData(packet.timeout) });
 }
 

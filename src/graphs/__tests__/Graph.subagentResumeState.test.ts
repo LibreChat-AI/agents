@@ -1,19 +1,20 @@
 import { describe, it, expect } from '@jest/globals';
 import type { SubagentToolNodeResumeState } from '@/tools/subagent/SubagentReplay';
 import { StandardGraph } from '../Graph';
-import { Providers } from '@/common';
+import { Constants, Providers } from '@/common';
 
 type ResumeToolNode = {
   createSubagentResumeState(): SubagentToolNodeResumeState;
   restoreSubagentResumeState(state: SubagentToolNodeResumeState): void;
 };
 
-const makeGraph = (runId: string): StandardGraph =>
+const makeGraph = (runId: string, codeSessionKey?: string): StandardGraph =>
   new StandardGraph({
     runId,
     agents: [
       {
         agentId: 'child-agent',
+        codeSessionKey,
         provider: Providers.OPENAI,
         instructions: 'Test child state restoration.',
       },
@@ -75,6 +76,61 @@ describe('subagent graph resume state', () => {
     ).toBe(3);
     expect(target.eagerEventToolSuppressions).toEqual(
       new Set(['unstable_search'])
+    );
+  });
+
+  it('keeps the legacy default partition identity', () => {
+    const implicit = initializeToolNode(makeGraph('implicit'));
+    const explicit = initializeToolNode(
+      makeGraph('explicit', Constants.EXECUTE_CODE)
+    );
+    expect(explicit.createSubagentResumeState().stateKey).toBe(
+      implicit.createSubagentResumeState().stateKey
+    );
+  });
+
+  it.each([undefined, 'partition-B'])(
+    'rejects partition-A restoration into %s before replacing state',
+    (codeSessionKey) => {
+      const source = makeGraph('source', 'partition-A');
+      initializeToolNode(source);
+      source.sessions.set('partition-A', {
+        session_id: 'session-A',
+        lastUpdated: 1,
+      });
+      const target = makeGraph('target', codeSessionKey);
+      initializeToolNode(target);
+      target.sessions.set('sentinel', {
+        session_id: 'unchanged',
+        lastUpdated: 2,
+      });
+      target.toolCallStepIds.set('existing', 'unchanged-step');
+      const before = target.createSubagentResumeState('target-scope');
+      expect(() =>
+        target.restoreSubagentResumeState(
+          source.createSubagentResumeState('source-scope'),
+          'target-scope'
+        )
+      ).toThrow('Cannot restore subagent tool state');
+      expect(target.createSubagentResumeState('target-scope')).toEqual(before);
+    }
+  );
+
+  it('restores an unchanged custom partition', () => {
+    const source = makeGraph('source', 'partition-A');
+    initializeToolNode(source);
+    source.sessions.set('partition-A', {
+      session_id: 'session-A',
+      lastUpdated: 1,
+    });
+    const target = makeGraph('target', 'partition-A');
+    initializeToolNode(target);
+    target.restoreSubagentResumeState(
+      source.createSubagentResumeState('source-scope'),
+      'target-scope'
+    );
+    expect(target.sessions.get('partition-A')).toEqual(
+      source.sessions.get('partition-A')
     );
   });
 });
