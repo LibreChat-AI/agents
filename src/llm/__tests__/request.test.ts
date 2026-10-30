@@ -32,6 +32,28 @@ describe('getConfiguredCompletionTokens', () => {
     }
   );
 
+  it('reserves the max_tokens sent through invocationKwargs', () => {
+    expect(
+      getConfiguredCompletionTokens(
+        Providers.ANTHROPIC,
+        options({
+          model: 'claude-sonnet-5-5',
+          invocationKwargs: { max_tokens: 2048 },
+        })
+      )
+    ).toBe(2048);
+    expect(
+      getConfiguredCompletionTokens(
+        Providers.ANTHROPIC,
+        options({
+          model: 'claude-sonnet-5-5',
+          maxTokens: 8192,
+          invocationKwargs: { max_tokens: 2048 },
+        })
+      )
+    ).toBe(2048);
+  });
+
   it('reads the model through the modelName alias', () => {
     expect(
       getConfiguredCompletionTokens(

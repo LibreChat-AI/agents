@@ -2278,6 +2278,15 @@ describe('default max_tokens', () => {
     expect(defaultMaxTokens('claude-sonnet-5-5', 2048)).toBe(2048);
     expect(defaultMaxTokens('claude-haiku-5-5', 64000)).toBe(64000);
   });
+
+  test('sends a max_tokens set through invocationKwargs', () => {
+    const model = new ChatAnthropic({
+      model: 'claude-sonnet-5-5',
+      apiKey: 'testing',
+      invocationKwargs: { max_tokens: 2048 },
+    });
+    expect(model.invocationParams({}).max_tokens).toBe(2048);
+  });
 });
 
 describe('Opus 4.7', () => {
