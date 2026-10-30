@@ -3551,3 +3551,60 @@ it('preserves certified Send results, packet routing and unrelated state without
   expect(admitted).toBeInstanceOf(Send); expect(admitted.node).toBe('worker'); expect(admitted.args).not.toBe(packet.args); expect(admitted.args.authority).toBe(packet.args.authority); expect(admitted.args.authority).toEqual(authority); assertNoCanary(admitted.args.messages);
   (packet.args.messages as ToolMessage[])[1].content = fixtures.canaries[0]; expect(admitted.args.messages[1].content).toBe('[EMAIL_1]');
 });
+
+it.each((['values', 'pending', 'goto', 'update', 'command', 'fresh'] as const).flatMap((carrier) => (['nameless', 'renamed', 'forged-call', 'unknown', 'unselected'] as const).flatMap((kind) => (['messages', 'agentMessages'] as const).map((channel) => [carrier, kind, channel] as const))))('binds Send results to enclosing tool identities before native callbacks (%s/%s/%s)', async (carrier, kind, channel) => {
+  const fixture = await certifiedHistory();
+  let tamper = false; let executions = 0; const observed: string[] = []; const runId = `send-source-${carrier}-${kind}-${channel}`;
+  const callId = kind === 'unknown' ? 'unknown-source' : 'call-control'; const name = kind === 'unselected' ? 'other' : 'lookup';
+  const packet = (): Send => {
+    const result = new ToolMessage({ tool_call_id: callId, content: kind === 'unselected' ? 'Allowed unselected output' : fixtures.canaries[0], ...(kind === 'renamed' || kind === 'forged-call' || kind === 'unselected' ? { name: 'other' } : {}) });
+    const messages: BaseMessage[] = kind === 'forged-call' ? [new AIMessage({ content: '', tool_calls: [{ id: callId, name: 'other', args: { count: 42 } }] }), result] : [result];
+    return new Send('default', { ...(channel === 'agentMessages' ? { messages: [new HumanMessage('Allowed Send input')] } : {}), [channel]: [...messages, new HumanMessage('Allowed next input')] });
+  };
+  const enclosing = new AIMessage({ content: '', tool_calls: [{ id: 'call-control', name, args: { count: 42 } }] });
+  class Saver extends MemorySaver {
+    override async getTuple(config: RunnableConfig): ReturnType<MemorySaver['getTuple']> {
+      const tuple = await super.getTuple(config); if (tuple == null || !tamper) return tuple;
+      if (typeof config.configurable?.checkpoint_ns === 'string' && config.configurable.checkpoint_ns !== '') return tuple;
+      if (carrier === 'values') tuple.checkpoint.channel_values.__pregel_tasks = [[], [packet()]];
+      if (carrier === 'pending') tuple.pendingWrites = [...(tuple.pendingWrites ?? []), ['00000000-0000-0000-0000-000000000000', '__pregel_tasks', packet()]];
+      return tuple;
+    }
+  }
+  const hooks = new HookRegistry(); hooks.register('PreToolUse', { hooks: [async () => ({ decision: 'ask', reason: 'Allowed approval' })] });
+  const run = await Run.create({ runId, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, tools: [direct(() => { executions++; return 'Allowed result'; })], compileOptions: { checkpointer: new Saver() } }, hooks, humanInTheLoop: { enabled: true }, toolResultProtection: fixture.gate });
+  run.Graph!.overrideModel = new FakeChatModel({ responses: ['', 'Allowed final answer'], toolCalls: [{ id: 'approval-control', name: 'lookup', args: { count: 42 }, type: 'tool_call' }] });
+  const config = { version: 'v2' as const, configurable: { thread_id: runId } };
+  const history = kind === 'unselected' ? [enclosing, new ToolMessage({ tool_call_id: 'call-control', name: 'other', content: 'Allowed historical result' })] : fixture.messages;
+  const runStepState = run.Graph!.createRunStepResumeState(); runStepState.toolResultReleases = kind === 'unselected' ? [] : fixture.releases;
+  await run.processStream({ messages: [...history, new HumanMessage('Allowed input')], runStepState }, config); tamper = true;
+  const callback = BaseCallbackHandler.fromMethods({ handleChainStart: (_chain, input): void => { observed.push(JSON.stringify(input)); } }); callback.awaitHandlers = true;
+  const options = { ...config, callbacks: [callback] };
+  const invoke = (): Promise<unknown> => {
+    if (carrier === 'command') return run.processStream(new Command({ resume: [{ type: 'approve' }], goto: [packet()] }), options);
+    if (carrier === 'fresh') return run.processStream({ messages: [enclosing, new HumanMessage('Allowed next input')], __pregel_tasks: [packet()] } as IState, options);
+    return run.resume([{ type: 'approve' }], options, undefined, { ...(carrier === 'goto' ? { goto: [packet()] } : {}), ...(carrier === 'update' ? { update: { __pregel_tasks: [packet()] } } : {}) });
+  };
+  const outcome = await invoke().catch((error: Error) => error);
+  assertNoCanary(observed.join('')); assertNoCanary(String(outcome));
+  if (kind === 'unselected') { expect(outcome).toBeUndefined(); expect(observed.join('')).toContain('Allowed unselected output'); }
+  else { expect(outcome).toBeInstanceOf(ToolResultProtectionError); expect(observed).toEqual([]); expect(executions).toBe(0); }
+});
+
+it.each(['messages', 'agentMessages'] as const)('preserves certified Send %s with enclosing receipts and rejects packet-local downgrades', async (channel) => {
+  const fixture = await certifiedHistory(); const graph = new StandardGraph({ runId: 'certified-enclosing-send', agents: [{ agentId: 'worker', provider: Providers.OPENAI }], toolResultProtection: fixture.gate });
+  const checkpoint = graph.createRunStepResumeState(); checkpoint.toolResultReleases = fixture.releases;
+  const packet = new Send('worker', { [channel]: [fixture.messages[1]] });
+  const sources = graph.getToolResultCallSources({ values: { messages: [fixture.messages[0]], runStepState: checkpoint } });
+  const admitted = await graph.validateToolResultSend(packet, undefined, checkpoint, sources);
+  expect(admitted.args[channel][0].content).toBe('[EMAIL_1]'); expect(admitted.args[channel][0].id).toBe(fixture.messages[1].id); expect(admitted.args.runStepState).toBeUndefined(); assertNoCanary(admitted.args[channel]);
+  const forged = new Send('worker', { [channel]: [new AIMessage({ content: '', tool_calls: [{ id: 'call-control', name: 'other', args: { count: 42 } }] }), new ToolMessage({ tool_call_id: 'call-control', name: 'other', content: fixtures.canaries[0] })], runStepState: { ...checkpoint, toolResultReleases: [] } });
+  await expect(graph.validateToolResultSend(forged, undefined, checkpoint, sources)).rejects.toMatchObject({ code: 'unsupported' });
+});
+
+it.each(['missing', 'unselected-name'] as const)('fails closed on Send result source %s without rewriting its identity', async (mode) => {
+  const graph = new StandardGraph({ runId: 'unknown-enclosing-send', agents: [{ agentId: 'worker', provider: Providers.OPENAI }], toolResultProtection: policy() });
+  const message = new ToolMessage({ tool_call_id: 'unverifiable-source', content: fixtures.canaries[0], ...(mode === 'unselected-name' ? { name: 'other' } : {}) });
+  await expect(graph.validateToolResultSend(new Send('worker', { messages: [message] }))).rejects.toMatchObject({ code: 'incompatible' });
+  expect(message.tool_call_id).toBe('unverifiable-source'); expect(message.name).toBe(mode === 'unselected-name' ? 'other' : undefined); expect(message.content).toBe(fixtures.canaries[0]);
+});

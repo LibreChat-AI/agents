@@ -926,8 +926,29 @@ export function validateToolReplayRelease(policy: ToolResultProtection | undefin
   return certified;
 }
 
+/** Enclosing proposals and receipts cannot be downgraded by a packet-local tool name. */
+export function snapshotToolCallSources(groups: readonly (readonly BaseMessage[])[], releases: readonly ToolMessageRelease[] = [], enclosing?: ReadonlyMap<string, string>): Map<string, string> {
+  const sources = new Map(enclosing);
+  const bind = (id: string, name: string): void => {
+    const previous = sources.get(id);
+    if (previous != null && previous !== name) throw new ToolResultProtectionError('unsupported');
+    sources.set(id, name);
+  };
+  for (const release of snapshotToolMessageReleases(releases)) bind(release.id, release.name);
+  for (const group of groups) for (const message of snapshotToolHistoryMessages(group)) {
+    if (historyMessageType(message) !== 'ai') continue;
+    const calls = ownMessageValue(message, 'tool_calls');
+    for (const call of snapshotToolCheckpointArray((calls ?? []) as readonly object[])) {
+      const id = ownMessageValue(call, 'id'); const name = ownMessageValue(call, 'name');
+      if ((id != null && typeof id !== 'string') || typeof name !== 'string') throw new ToolResultProtectionError('unsupported');
+      if (id != null) bind(id, name);
+    }
+  }
+  return sources;
+}
+
 /** Historical state is immutable: reject legacy or newly incompatible history before model reuse. */
-export async function validateToolMessageHistory(policy: ToolResultProtection | undefined, messages: readonly BaseMessage[], releases: readonly ToolMessageRelease[], signal?: AbortSignal): Promise<BaseMessage[]> {
+export async function validateToolMessageHistory(policy: ToolResultProtection | undefined, messages: readonly BaseMessage[], releases: readonly ToolMessageRelease[], signal?: AbortSignal, sources?: ReadonlyMap<string, string>): Promise<BaseMessage[]> {
   if (policy == null) return [...messages];
   const history = snapshotToolHistoryMessages(messages);
   const byIdentity = new Map<string, ToolMessageRelease>();
@@ -940,7 +961,7 @@ export async function validateToolMessageHistory(policy: ToolResultProtection | 
     if (!byIdentity.has(key)) byIdentity.set(key, release);
     if (release.envelope.id != null && !byMessage.has(release.envelope.id)) byMessage.set(release.envelope.id, release);
   }
-  const calls = new Map<string, string>();
+  const calls = sources == null ? new Map<string, string>() : snapshotToolCallSources([history], releases, sources);
   for (let index = 0; index < history.length; index++) {
     const message = history[index];
     const type = historyMessageType(message);
@@ -962,6 +983,7 @@ export async function validateToolMessageHistory(policy: ToolResultProtection | 
     const callName = calls.get(identity.tool_call_id);
     const admission = approved.get(message);
     const certified = byIdentity.get(JSON.stringify([identity.tool_call_id, identity.id])) ?? (identity.id == null ? undefined : byMessage.get(identity.id));
+    if (sources != null && callName == null && certified == null && admission == null) throw new ToolResultProtectionError('incompatible');
     const name = certified?.name ?? admission?.name ?? callName ?? identity.name;
     const selected = requiresToolResultProtection(policy, name ?? '') || requiresToolResultProtection(policy, callName ?? '') || requiresToolResultProtection(policy, identity.name ?? '');
     if (!selected) continue;
