@@ -901,9 +901,11 @@ export abstract class Graph<
     const primary = snapshotToolHistoryMessages((values.messages ?? []) as BaseMessage[]);
     const alternate = snapshotToolHistoryMessages((values.agentMessages ?? []) as BaseMessage[]);
     const state = { toolResultReleases: releases };
-    const history = await this.validateToolResultHistory([...primary, ...alternate], state, signal);
     const namespace = tuple.config.configurable?.checkpoint_ns ?? '';
-    const local = snapshotToolCallSources([history], (values.runStepState as t.RunStepResumeState | undefined)?.toolResultReleases ?? [], undefined, namespace);
+    const retained = scopes?.get(namespace);
+    const previous = retained == null ? undefined : mergeToolCallSources(scopes!.values());
+    const history = await this.validateToolResultHistory([...primary, ...alternate], state, signal, previous);
+    const local = snapshotToolCallSources([history], (values.runStepState as t.RunStepResumeState | undefined)?.toolResultReleases ?? [], retained, namespace);
     scopes?.set(namespace, local);
     const owned = scopes == null ? local : mergeToolCallSources(scopes.values());
     const admitted = await this.validateToolResultHistory(outputs, state, signal, owned);

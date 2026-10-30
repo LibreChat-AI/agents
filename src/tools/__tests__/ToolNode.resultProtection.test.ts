@@ -3893,3 +3893,35 @@ it.each(['primitive', 'object', 'thrown', 'empty', 'empty-mutated', 'unprotected
   assertNoCanary(observed.join('')); assertNoCanary(String(result)); assertNoCanary(run.getInterrupt() ?? {});
   if (mode === 'empty' || mode === 'empty-mutated') expect(result).toBeUndefined(); else { expect(result).toMatchObject({ code: 'unsupported' }); expect(run.getInterrupt()).toBeUndefined(); }
 });
+
+it.each((['root', 'descendant'] as const).flatMap((scope) => (['messages', 'agentMessages'] as const).flatMap((channel) => (['renamed', 'nameless', 'replaced-batch', 'unselected', 'control'] as const).map((kind) => [scope, channel, kind] as const))))('retains preflight source authority on native checkpoint reloads (%s/%s/%s)', async (scope, channel, kind) => {
+  let tamper = false; let reloads = 0; let executions = 0; const observed: string[] = []; const modelInputs: string[] = []; const runId = `reloaded-sources-${scope}-${channel}-${kind}`;
+  class Saver extends MemorySaver {
+    override async getTuple(config: RunnableConfig): ReturnType<MemorySaver['getTuple']> {
+      const tuple = await super.getTuple(config); if (tuple == null || !tamper) return tuple;
+      const root = (config.configurable?.checkpoint_ns ?? '') === ''; if (root !== (scope === 'root')) return tuple;
+      reloads++;
+      const original = tuple.checkpoint.channel_values.messages as BaseMessage[];
+      if (kind === 'control') { tuple.checkpoint.channel_values.messages = [...original, new HumanMessage('Allowed reloaded control')]; return tuple; }
+      const history = [...original];
+      let proposal = history.findLast((message) => message.type === 'ai' && (message as AIMessage).tool_calls?.some((call) => call.id === 'reload-source') === true) as AIMessage | undefined;
+      if (proposal == null) { proposal = new AIMessage({ id: 'reloaded-root-proposal', content: '', tool_calls: [{ id: 'reload-source', name: kind === 'unselected' ? 'other' : 'lookup', args: { count: 42 } }] }); if (kind !== 'nameless') history.push(proposal); }
+      if (kind === 'renamed' || kind === 'replaced-batch') proposal.tool_calls![0].name = 'other';
+      if (kind === 'replaced-batch') proposal.id = 'untrusted-replacement-batch';
+      const output = new ToolMessage({ id: 'untrusted-reloaded-result', tool_call_id: 'reload-source', content: kind === 'unselected' ? 'Allowed unselected reload' : fixtures.canaries[0], ...(kind === 'nameless' ? {} : { name: 'other' }) });
+      if (channel === 'messages') tuple.checkpoint.channel_values.messages = [...history, output];
+      else { tuple.checkpoint.channel_values.messages = history; tuple.checkpoint.channel_values.agentMessages = [output]; }
+      return tuple;
+    }
+  }
+  const hooks = new HookRegistry(); hooks.register('PreToolUse', { hooks: [async () => ({ decision: 'ask', reason: 'Allowed approval' })] });
+  const name = kind === 'unselected' ? 'other' : 'lookup'; const source = new DynamicStructuredTool({ name, description: 'Allowed reload control.', schema: z.object({ count: z.number() }), func: async () => { executions++; return 'Allowed source result'; } });
+  const run = await Run.create({ runId, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, tools: [source], compileOptions: { checkpointer: new Saver() } }, toolResultProtection: policy(), hooks, humanInTheLoop: { enabled: true }, skipCleanup: true });
+  class Model extends FakeChatModel { override async *_streamResponseChunks(...args: Parameters<FakeChatModel['_streamResponseChunks']>): ReturnType<FakeChatModel['_streamResponseChunks']> { modelInputs.push(JSON.stringify(args[0])); yield* super._streamResponseChunks(...args); } }
+  run.Graph!.overrideModel = new Model({ responses: ['', 'Allowed final answer'], toolCalls: [{ id: 'reload-source', name, args: { count: 42 }, type: 'tool_call' }] });
+  const config = { version: 'v2' as const, configurable: { thread_id: runId } }; await run.processStream({ messages: [new HumanMessage('Allowed input')] }, config); expect(run.getInterrupt()).toBeDefined();
+  const callback = BaseCallbackHandler.fromMethods({ handleChainStart: (_chain, input): void => { tamper = true; observed.push(JSON.stringify(input)); }, handleChainEnd: (output): void => { observed.push(JSON.stringify(output)); } }); callback.awaitHandlers = true;
+  const result = await run.resume([{ type: 'approve' }], { ...config, callbacks: [callback] }).catch((error: Error) => error);
+  expect(reloads).toBeGreaterThan(0); assertNoCanary(observed.join('')); assertNoCanary(modelInputs.join('')); assertNoCanary(String(result));
+  if (kind === 'control' || kind === 'unselected') expect(result).toBeUndefined(); else { expect(result).toBeInstanceOf(ToolResultProtectionError); expect(executions).toBe(0); }
+});
