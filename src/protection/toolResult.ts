@@ -926,29 +926,87 @@ export function validateToolReplayRelease(policy: ToolResultProtection | undefin
   return certified;
 }
 
-/** Enclosing proposals and receipts cannot be downgraded by a packet-local tool name. */
-export function snapshotToolCallSources(groups: readonly (readonly BaseMessage[])[], releases: readonly ToolMessageRelease[] = [], enclosing?: ReadonlyMap<string, string>): Map<string, string> {
+export type ToolCallSource = {
+  readonly name: string;
+  readonly namespace: string;
+  readonly batch: string;
+  readonly batchId?: string;
+  readonly resultIds: readonly string[];
+  readonly completed: boolean;
+};
+export type ToolCallSources = ReadonlyMap<string, readonly ToolCallSource[]>;
+
+/** Provider call IDs are unique within a batch, not across history or graph namespaces. */
+export function snapshotToolCallSources(groups: readonly (readonly BaseMessage[])[], releases: readonly ToolMessageRelease[] = [], enclosing?: ToolCallSources, namespace = ''): Map<string, readonly ToolCallSource[]> {
   const sources = new Map(enclosing);
-  const bind = (id: string, name: string): void => {
-    const previous = sources.get(id);
-    if (previous != null && previous !== name) throw new ToolResultProtectionError('unsupported');
-    sources.set(id, name);
+  const add = (id: string, source: ToolCallSource): void => {
+    const entries = sources.get(id) ?? [];
+    const index = entries.findIndex((entry) => entry.namespace === source.namespace && entry.batch === source.batch);
+    const previous: ToolCallSource | undefined = index < 0 ? undefined : entries[index];
+    if (previous != null && previous.name !== source.name) throw new ToolResultProtectionError('unsupported');
+    const merged = previous == null ? source : { ...source, completed: previous.completed || source.completed, resultIds: [...new Set([...previous.resultIds, ...source.resultIds])] };
+    sources.set(id, index < 0 ? [...entries, merged] : entries.map((entry, position) => position === index ? merged : entry));
   };
-  for (const release of snapshotToolMessageReleases(releases)) bind(release.id, release.name);
-  for (const group of groups) for (const message of snapshotToolHistoryMessages(group)) {
-    if (historyMessageType(message) !== 'ai') continue;
-    const calls = ownMessageValue(message, 'tool_calls');
-    for (const call of snapshotToolCheckpointArray((calls ?? []) as readonly object[])) {
-      const id = ownMessageValue(call, 'id'); const name = ownMessageValue(call, 'name');
-      if ((id != null && typeof id !== 'string') || typeof name !== 'string') throw new ToolResultProtectionError('unsupported');
-      if (id != null) bind(id, name);
+  for (let groupIndex = 0; groupIndex < groups.length; groupIndex++) {
+    const current = new Map<string, ToolCallSource>();
+    const history = snapshotToolHistoryMessages(groups[groupIndex]);
+    for (let index = 0; index < history.length; index++) {
+      const message = history[index]; const type = historyMessageType(message);
+      const messageId = ownMessageValue(message, 'id');
+      if (messageId != null && typeof messageId !== 'string') throw new ToolResultProtectionError('unsupported');
+      if (type === 'human') current.clear();
+      if (type === 'ai') {
+        const calls = ownMessageValue(message, 'tool_calls');
+        const batch = messageId == null ? `position:${groupIndex}:${index}` : `message:${messageId}`;
+        const ids = new Set<string>();
+        for (const call of snapshotToolCheckpointArray((calls ?? []) as readonly object[])) {
+          const id = ownMessageValue(call, 'id'); const name = ownMessageValue(call, 'name');
+          if ((id != null && typeof id !== 'string') || typeof name !== 'string') throw new ToolResultProtectionError('unsupported');
+          if (id == null) continue;
+          if (ids.has(id)) throw new ToolResultProtectionError('unsupported');
+          ids.add(id);
+          const source = { name, namespace, batch, batchId: messageId ?? undefined, resultIds: [], completed: false };
+          add(id, source); current.set(id, source);
+        }
+      }
+      if (type !== 'tool') continue;
+      const identity = historyIdentity(message); const source = current.get(identity.tool_call_id);
+      if (source == null) continue;
+      const completed = { ...source, resultIds: identity.id == null ? [] : [identity.id], completed: true };
+      add(identity.tool_call_id, completed); current.set(identity.tool_call_id, completed);
     }
+  }
+  for (const release of snapshotToolMessageReleases(releases)) {
+    const resultId = release.envelope.id;
+    const candidates = sources.get(release.id) ?? [];
+    const matched = resultId == null ? undefined : candidates.find((source) => source.namespace === namespace && source.resultIds.includes(resultId));
+    if (matched != null) { if (matched.name !== release.name) throw new ToolResultProtectionError('unsupported'); continue; }
+    add(release.id, { name: release.name, namespace, batch: `receipt:${resultId ?? release.name}`, resultIds: resultId == null ? [] : [resultId], completed: true });
   }
   return sources;
 }
 
+function toolSourceName(sources: ToolCallSources, id: string, messageId: string | undefined, batchId: string | undefined): string | undefined {
+  const candidates = sources.get(id) ?? [];
+  const results = messageId == null ? [] : candidates.filter((source) => source.resultIds.includes(messageId));
+  const batches = batchId == null ? [] : candidates.filter((source) => source.batchId === batchId);
+  const pending = candidates.filter((source) => !source.completed);
+  let matches = candidates;
+  if (pending.length > 0) matches = pending;
+  if (batches.length > 0) matches = batches;
+  if (results.length > 0) matches = results;
+  if (results.length > 0 && batches.length > 0) {
+    matches = results.filter((source) => batches.includes(source));
+    if (matches.length === 0) throw new ToolResultProtectionError('unsupported');
+  }
+  if (results.length === 0 && batches.length > 0 && pending.length > 0 && !batches.some((source) => pending.includes(source))) throw new ToolResultProtectionError('unsupported');
+  const names = new Set(matches.map((source) => source.name));
+  if (names.size > 1) throw new ToolResultProtectionError('unsupported');
+  return matches[0]?.name;
+}
+
 /** Historical state is immutable: reject legacy or newly incompatible history before model reuse. */
-export async function validateToolMessageHistory(policy: ToolResultProtection | undefined, messages: readonly BaseMessage[], releases: readonly ToolMessageRelease[], signal?: AbortSignal, sources?: ReadonlyMap<string, string>): Promise<BaseMessage[]> {
+export async function validateToolMessageHistory(policy: ToolResultProtection | undefined, messages: readonly BaseMessage[], releases: readonly ToolMessageRelease[], signal?: AbortSignal, sources?: ToolCallSources, requireSource = false): Promise<BaseMessage[]> {
   if (policy == null) return [...messages];
   const history = snapshotToolHistoryMessages(messages);
   const byIdentity = new Map<string, ToolMessageRelease>();
@@ -961,7 +1019,7 @@ export async function validateToolMessageHistory(policy: ToolResultProtection | 
     if (!byIdentity.has(key)) byIdentity.set(key, release);
     if (release.envelope.id != null && !byMessage.has(release.envelope.id)) byMessage.set(release.envelope.id, release);
   }
-  const calls = sources == null ? new Map<string, string>() : snapshotToolCallSources([history], releases, sources);
+  const calls = new Map<string, { name: string; batchId?: string }>();
   for (let index = 0; index < history.length; index++) {
     const message = history[index];
     const type = historyMessageType(message);
@@ -974,16 +1032,19 @@ export async function validateToolMessageHistory(policy: ToolResultProtection | 
       for (const call of snapshotDataArray((toolCalls ?? []) as readonly { id?: string; name: string }[], Number.MAX_SAFE_INTEGER, true)) {
         const id = ownMessageValue(call, 'id'); const name = ownMessageValue(call, 'name');
         if ((id != null && typeof id !== 'string') || typeof name !== 'string') throw new ToolResultProtectionError('unsupported');
-        if (id != null) calls.set(id, name);
+        if (id != null) calls.set(id, { name, batchId: messageId ?? undefined });
       }
       continue;
     }
     if (type !== 'tool') continue;
     const identity = historyIdentity(message);
-    const callName = calls.get(identity.tool_call_id);
+    const local = calls.get(identity.tool_call_id);
+    const sourceName = sources == null ? undefined : toolSourceName(sources, identity.tool_call_id, identity.id, local?.batchId);
+    if (sourceName != null && local != null && local.name !== sourceName) throw new ToolResultProtectionError('unsupported');
+    const callName = sourceName ?? local?.name;
     const admission = approved.get(message);
     const certified = byIdentity.get(JSON.stringify([identity.tool_call_id, identity.id])) ?? (identity.id == null ? undefined : byMessage.get(identity.id));
-    if (sources != null && callName == null && certified == null && admission == null) throw new ToolResultProtectionError('incompatible');
+    if (requireSource && sources != null && sourceName == null && certified == null && admission == null) throw new ToolResultProtectionError('incompatible');
     const name = certified?.name ?? admission?.name ?? callName ?? identity.name;
     const selected = requiresToolResultProtection(policy, name ?? '') || requiresToolResultProtection(policy, callName ?? '') || requiresToolResultProtection(policy, identity.name ?? '');
     if (!selected) continue;

@@ -1,4 +1,4 @@
-import type { ToolMessageRelease } from '@/protection/toolResult';
+import type { ToolMessageRelease, ToolCallSources } from '@/protection/toolResult';
 /* eslint-disable no-console */
 import { v4 } from 'uuid';
 import { nanoid } from 'nanoid';
@@ -757,7 +757,7 @@ export abstract class Graph<
     currentTools?: t.GraphTools;
     currentToolMap?: t.ToolMap;
   }): CustomToolNode<T> | ToolNode<T>;
-  async validateToolResultHistory(messages: BaseMessage[], _state?: Pick<t.RunStepResumeState, 'toolResultReleases'>, _signal?: AbortSignal, _sources?: ReadonlyMap<string, string>): Promise<BaseMessage[]> { return messages; }
+  async validateToolResultHistory(messages: BaseMessage[], _state?: Pick<t.RunStepResumeState, 'toolResultReleases'>, _signal?: AbortSignal, _sources?: ToolCallSources, _requireSource = false): Promise<BaseMessage[]> { return messages; }
   commitToolResultMessages(_messages: BaseMessage[]): void {}
   async validateToolResultCheckpoint<S extends ToolResultCheckpoint>(input: S, signal?: AbortSignal): Promise<S> {
     const active = new WeakSet<object>();
@@ -800,30 +800,30 @@ export abstract class Graph<
     };
     return visit(input);
   }
-  getToolResultCallSources(snapshot: ToolResultCheckpoint, enclosing?: ReadonlyMap<string, string>): Map<string, string> {
-    let sources = snapshotToolCallSources([snapshot.values?.messages ?? [], snapshot.values?.agentMessages ?? []], snapshot.values?.runStepState?.toolResultReleases ?? [], enclosing);
+  getToolResultCallSources(snapshot: ToolResultCheckpoint, enclosing?: ToolCallSources): ToolCallSources {
+    let sources: ToolCallSources = snapshotToolCallSources([snapshot.values?.messages ?? [], snapshot.values?.agentMessages ?? []], snapshot.values?.runStepState?.toolResultReleases ?? [], enclosing, snapshot.config?.configurable?.checkpoint_ns ?? '');
     for (const task of snapshot.tasks ?? []) if (task.state != null && Object.hasOwn(task.state, 'values')) sources = this.getToolResultCallSources(task.state as ToolResultCheckpoint, sources);
     return sources;
   }
 
-  async validateToolResultSend(input: unknown, signal?: AbortSignal, fallback?: Pick<t.RunStepResumeState, 'toolResultReleases'>, sources: ReadonlyMap<string, string> = new Map()): Promise<Send> {
+  async validateToolResultSend(input: unknown, signal?: AbortSignal, fallback?: Pick<t.RunStepResumeState, 'toolResultReleases'>, sources: ToolCallSources = new Map()): Promise<Send> {
     const packet = snapshotToolSend(input);
     const args = packet.args as NonNullable<ToolResultCheckpoint['values']>;
     const primary = args.messages ?? []; const alternate = args.agentMessages ?? [];
     const state = { toolResultReleases: [...fallback?.toolResultReleases ?? [], ...args.runStepState?.toolResultReleases ?? []] };
-    const canonical = await this.validateToolResultHistory([...primary, ...alternate], state, signal, sources);
+    const canonical = await this.validateToolResultHistory([...primary, ...alternate], state, signal, sources, true);
     if (args.messages != null) args.messages = canonical.slice(0, primary.length);
     if (args.agentMessages != null) args.agentMessages = canonical.slice(primary.length);
     return Object.assign(Object.create(Send.prototype) as Send, packet, { args });
   }
 
-  async validateToolResultGoto(input: Command['goto'], signal?: AbortSignal, sources?: ReadonlyMap<string, string>): Promise<Command['goto']> {
+  async validateToolResultGoto(input: Command['goto'], signal?: AbortSignal, sources?: ToolCallSources): Promise<Command['goto']> {
     if (typeof input === 'string') return input;
     const entries = Array.isArray(input) ? snapshotToolCheckpointArray(input) : [input];
     return Promise.all(entries.map((entry) => typeof entry === 'string' ? entry : this.validateToolResultSend(entry, signal, undefined, sources)));
   }
 
-  async validateToolResultTaskWrites(input: unknown, signal?: AbortSignal, sources?: ReadonlyMap<string, string>): Promise<Send | Send[]> {
+  async validateToolResultTaskWrites(input: unknown, signal?: AbortSignal, sources?: ToolCallSources): Promise<Send | Send[]> {
     if (Array.isArray(input)) return Promise.all(snapshotToolCheckpointArray(input).map((packet) => this.validateToolResultSend(packet, signal, undefined, sources)));
     return this.validateToolResultSend(input, signal, undefined, sources);
   }
@@ -880,7 +880,7 @@ export abstract class Graph<
     }
     const primary = snapshotToolHistoryMessages((values.messages ?? []) as BaseMessage[]);
     const alternate = snapshotToolHistoryMessages((values.agentMessages ?? []) as BaseMessage[]);
-    const sources = snapshotToolCallSources([primary, alternate, outputs], releases);
+    const sources = snapshotToolCallSources([primary, alternate, outputs], releases, undefined, tuple.config.configurable?.checkpoint_ns ?? '');
     const fallback = { toolResultReleases: releases };
     const admitTasks = async (value: unknown): Promise<Send | Send[]> => Array.isArray(value)
       ? Promise.all(value.map((packet) => this.validateToolResultSend(packet, signal, fallback, sources)))
@@ -1983,13 +1983,13 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     for (const receipt of before) this.toolResultHistoryReleases.delete(JSON.stringify([receipt.name, receipt.id, receipt.envelope.id]));
   }
 
-  override async validateToolResultHistory(messages: BaseMessage[], state?: Pick<t.RunStepResumeState, 'toolResultReleases'>, signal?: AbortSignal, sources?: ReadonlyMap<string, string>): Promise<BaseMessage[]> {
+  override async validateToolResultHistory(messages: BaseMessage[], state?: Pick<t.RunStepResumeState, 'toolResultReleases'>, signal?: AbortSignal, sources?: ToolCallSources, requireSource = false): Promise<BaseMessage[]> {
     if (this.toolResultProtection == null) return messages;
     const breaker = this.breakerAbort;
     try {
       const checkpointState = state == null ? undefined : snapshotToolCheckpointRecord(state, ['toolResultReleases']);
       const persisted = snapshotToolMessageReleases(checkpointState?.toolResultReleases ?? []);
-      const canonical = await validateToolMessageHistory(this.toolResultProtection, messages, [...this.toolResultHistoryReleases.values(), ...persisted], signal, sources);
+      const canonical = await validateToolMessageHistory(this.toolResultProtection, messages, [...this.toolResultHistoryReleases.values(), ...persisted], signal, sources, requireSource);
       for (const release of retainToolMessageReleases(canonical, persisted)) {
         const key = JSON.stringify([release.name, release.id, release.envelope.id]);
         if (!this.toolResultHistoryReleases.has(key)) this.toolResultHistoryReleases.set(key, release);

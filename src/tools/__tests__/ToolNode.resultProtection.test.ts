@@ -37,7 +37,7 @@ import type {
 } from '@/protection/toolResult';
 import type { ToolOutputReferenceState } from '@/tools/toolOutputReferences';
 import type { SettledToolBatchResult } from '@/tools/toolBatchReplay';
-import { admitToolResultCheckpoints, snapshotToolRunStepState, snapshotToolMessageRemoval, validateToolMessageHistory, getToolMessageRelease, ToolResultProtectionError   } from '@/protection/toolResult';
+import { snapshotToolCallSources, admitToolResultCheckpoints, snapshotToolRunStepState, snapshotToolMessageRemoval, validateToolMessageHistory, getToolMessageRelease, ToolResultProtectionError   } from '@/protection/toolResult';
 import {
   createCloudflareProgrammaticToolCallingTool,
   createCloudflareBashProgrammaticToolCallingTool,
@@ -3607,4 +3607,85 @@ it.each(['missing', 'unselected-name'] as const)('fails closed on Send result so
   const message = new ToolMessage({ tool_call_id: 'unverifiable-source', content: fixtures.canaries[0], ...(mode === 'unselected-name' ? { name: 'other' } : {}) });
   await expect(graph.validateToolResultSend(new Send('worker', { messages: [message] }))).rejects.toMatchObject({ code: 'incompatible' });
   expect(message.tool_call_id).toBe('unverifiable-source'); expect(message.name).toBe(mode === 'unselected-name' ? 'other' : undefined); expect(message.content).toBe(fixtures.canaries[0]);
+});
+
+it.each((['warm', 'rebuilt'] as const).flatMap((runtime) => (['resume', 'command'] as const).flatMap((entry) => (['messages', 'agentMessages'] as const).flatMap((channel) => (['nameless', 'renamed', 'forged', 'unselected'] as const).map((kind) => [runtime, entry, channel, kind] as const)))))('binds ordinary resume writes to pending descendant sources (%s/%s/%s/%s)', async (runtime, entry, channel, kind) => {
+  let executions = 0; const observed: string[] = []; const runId = `ordinary-source-${runtime}-${entry}-${channel}-${kind}`; const saver = new MemorySaver();
+  const create = async (resumed: boolean): Promise<Run<IState>> => {
+    const hooks = new HookRegistry(); hooks.register('PreToolUse', { hooks: [async () => ({ decision: 'ask', reason: 'Allowed approval' })] });
+    const run = await Run.create({ runId, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, tools: [direct(() => { executions++; return 'Allowed result'; })], compileOptions: { checkpointer: saver } }, hooks, humanInTheLoop: { enabled: true }, toolResultProtection: policy({ toolNames: kind === 'unselected' ? ['other'] : ['lookup'] }), skipCleanup: true });
+    run.Graph!.overrideModel = new FakeChatModel({ responses: resumed ? ['Allowed final answer'] : ['', 'Allowed final answer'], toolCalls: resumed ? [] : [{ id: 'descendant-call', name: 'lookup', args: { count: 42 }, type: 'tool_call' }] }); return run;
+  };
+  const config = { version: 'v2' as const, configurable: { thread_id: runId } }; const first = await create(false); await first.processStream({ messages: [new HumanMessage('Allowed initial input')] }, config); expect(first.getInterrupt()).toBeDefined();
+  const next = runtime === 'warm' ? first : await create(true);
+  const result = new ToolMessage({ tool_call_id: 'descendant-call', content: kind === 'unselected' ? 'Allowed supplied control' : fixtures.canaries[0], ...(kind === 'renamed' || kind === 'forged' ? { name: 'other' } : {}) });
+  const messages: BaseMessage[] = kind === 'forged' ? [new AIMessage({ id: 'forged-batch', content: '', tool_calls: [{ id: 'descendant-call', name: 'other', args: { count: 42 } }] }), result] : [result];
+  const update = { [channel]: messages };
+  const callback = BaseCallbackHandler.fromMethods({ handleChainStart: (_chain, input): void => { observed.push(JSON.stringify(input)); } }); callback.awaitHandlers = true;
+  const options = { ...config, callbacks: [callback] };
+  const outcome = await (entry === 'resume' ? next.resume([{ type: 'approve' }], options, undefined, { update }) : next.processStream(new Command({ resume: [{ type: 'approve' }], update }), options)).catch((error: Error) => error);
+  assertNoCanary(observed.join('')); assertNoCanary(String(outcome));
+  if (kind === 'unselected') { expect(outcome).toBeUndefined(); expect(observed.join('')).toContain('Allowed supplied control'); expect(executions).toBe(1); }
+  else { expect(outcome).toBeInstanceOf(ToolResultProtectionError); expect(observed).toEqual([]); expect(executions).toBe(0); }
+});
+
+it.each(['fresh', 'checkpoint', 'resume'] as const)('preserves reused provider call IDs across distinct unselected assistant batches (%s)', async (mode) => {
+  const messages: BaseMessage[] = [new HumanMessage('Allowed first input'), new AIMessage({ id: 'first-batch', content: '', tool_calls: [{ id: 'reused', name: 'first_tool', args: { count: 42 } }] }), new ToolMessage({ id: 'first-result', tool_call_id: 'reused', content: 'Allowed first result' }), new HumanMessage('Allowed next input'), new AIMessage({ id: 'second-batch', content: '', tool_calls: [{ id: 'reused', name: 'second_tool', args: { count: 42 } }] }), new ToolMessage({ id: 'second-result', tool_call_id: 'reused', content: 'Allowed second result' })];
+  const saver = new MemorySaver(); const runId = `reused-provider-${mode}`; const config = { version: 'v2' as const, configurable: { thread_id: runId } };
+  if (mode === 'checkpoint') {
+    const seed = await Run.create({ runId: `seed-${runId}`, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, compileOptions: { checkpointer: saver } } }); seed.Graph!.overrideModel = new FakeChatModel({ responses: ['Allowed seed answer'] }); await seed.processStream({ messages }, config);
+  }
+  const hooks = new HookRegistry(); hooks.register('PreToolUse', { hooks: [async () => ({ decision: 'ask', reason: 'Allowed approval' })] });
+  const run = await Run.create({ runId, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, tools: [direct(() => 'Allowed approval result')], compileOptions: { checkpointer: saver } }, toolResultProtection: policy(), hooks, humanInTheLoop: { enabled: true } });
+  run.Graph!.overrideModel = new FakeChatModel({ responses: mode === 'resume' ? ['', 'Allowed final answer'] : ['Allowed final answer'], toolCalls: mode === 'resume' ? [{ id: 'approval-control', name: 'lookup', args: { count: 42 }, type: 'tool_call' }] : [] });
+  const outcome = await run.processStream({ messages: mode === 'checkpoint' ? [new HumanMessage('Allowed current input')] : messages }, config).catch((error: Error) => error);
+  expect(outcome).toBeUndefined();
+  if (mode === 'resume') { expect(run.getInterrupt()).toBeDefined(); await expect(run.resume([{ type: 'approve' }], config)).resolves.toBeUndefined(); }
+});
+
+it.each(['selected-first', 'selected-last'] as const)('preserves chronological selected and unselected reused call IDs through checkpoint replay (%s)', async (order) => {
+  const saver = new MemorySaver(); const runId = `mixed-reused-${order}`; const config = { version: 'v2' as const, configurable: { thread_id: runId } }; const gate = policy(); let executions = 0;
+  const combined: BaseMessage[] = []; const releases: NonNullable<RunStepResumeState['toolResultReleases']> = [];
+  const names = order === 'selected-first' ? ['lookup', 'other'] : ['other', 'lookup'];
+  for (const name of names) {
+    const source = new DynamicStructuredTool({ name, description: 'Allowed reuse control.', schema: z.object({ count: z.number() }), func: async () => { executions++; return name === 'lookup' ? fixtures.canaries[0] : 'Allowed unselected result'; } });
+    const run = await Run.create({ runId: `${runId}-${name}`, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, tools: [source], compileOptions: { checkpointer: saver } }, toolResultProtection: gate });
+    run.Graph!.overrideModel = new FakeChatModel({ responses: ['', 'Allowed final answer'], toolCalls: [{ id: 'reused', name, args: { count: 42 }, type: 'tool_call' }] });
+    const sourceConfig = { ...config, configurable: { thread_id: `${runId}-${name}` } };
+    await run.processStream({ messages: [new HumanMessage(`Allowed ${name} input`)] }, sourceConfig);
+    const sourceTuple = (await saver.getTuple(sourceConfig))!; combined.push(...sourceTuple.checkpoint.channel_values.messages as BaseMessage[]); releases.push(...(sourceTuple.checkpoint.channel_values.runStepState as RunStepResumeState).toolResultReleases ?? []);
+  }
+  const seed = await Run.create({ runId, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, compileOptions: { checkpointer: saver } }, toolResultProtection: gate }); seed.Graph!.overrideModel = new FakeChatModel({ responses: ['Allowed merged answer'] });
+  const suppliedState = seed.Graph!.createRunStepResumeState(); suppliedState.toolResultReleases = releases;
+  await seed.processStream({ messages: combined, runStepState: suppliedState }, config);
+  const before = (await saver.getTuple(config))!; const messages = before.checkpoint.channel_values.messages as BaseMessage[]; const state = before.checkpoint.channel_values.runStepState as RunStepResumeState;
+  const graph = new StandardGraph({ runId: 'reused-send-control', agents: [{ agentId: 'worker', provider: Providers.OPENAI }], toolResultProtection: gate });
+  const sources = graph.getToolResultCallSources({ config: before.config, values: { messages, runStepState: state } });
+  const packet = await graph.validateToolResultSend(new Send('worker', { messages, runStepState: state }), undefined, state, sources); assertNoCanary(packet.args.messages); expect(packet.args.messages.map((message: BaseMessage) => message.id)).toEqual(messages.map((message) => message.id));
+  const resumed = await Run.create({ runId: `${runId}-next`, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, compileOptions: { checkpointer: saver } }, toolResultProtection: gate }); resumed.Graph!.overrideModel = new FakeChatModel({ responses: ['Allowed next answer'] });
+  await resumed.processStream({ messages: [new HumanMessage('Allowed current input')] }, config); expect(executions).toBe(2); assertNoCanary((await saver.getTuple(config))!.checkpoint.channel_values.messages);
+});
+
+it('scopes sibling pending call IDs by namespace and rejects ambiguous unattached results', async () => {
+  const graph = new StandardGraph({ runId: 'sibling-source-scope', agents: [{ agentId: 'worker', provider: Providers.OPENAI }], toolResultProtection: policy() });
+  const first = new AIMessage({ id: 'left-batch', content: '', tool_calls: [{ id: 'reused', name: 'lookup', args: { count: 42 } }] });
+  const second = new AIMessage({ id: 'right-batch', content: '', tool_calls: [{ id: 'reused', name: 'other', args: { count: 42 } }] });
+  const sources = graph.getToolResultCallSources({ values: { messages: [] }, tasks: [{ state: { config: { configurable: { checkpoint_ns: 'left:task' } }, values: { messages: [first] } } }, { state: { config: { configurable: { checkpoint_ns: 'right:task' } }, values: { messages: [second] } } }] });
+  expect(sources.get('reused')?.map((source) => source.namespace)).toEqual(['left:task', 'right:task']);
+  await expect(graph.validateToolResultSend(new Send('worker', { messages: [new ToolMessage({ tool_call_id: 'reused', name: 'other', content: fixtures.canaries[0] })] }), undefined, undefined, sources)).rejects.toMatchObject({ code: 'unsupported' });
+  const allowed = await graph.validateToolResultSend(new Send('worker', { messages: [second, new ToolMessage({ tool_call_id: 'reused', content: 'Allowed right result' })] }), undefined, undefined, sources); expect(allowed.args.messages[1].content).toBe('Allowed right result');
+  const changed = new AIMessage({ id: 'right-batch', content: '', tool_calls: [{ id: 'reused', name: 'renamed', args: { count: 42 } }] });
+  expect(() => snapshotToolCallSources([[changed]], [], sources, 'right:task')).toThrow(ToolResultProtectionError);
+});
+
+it('replays an identified completed occurrence without letting its batch downgrade a newer pending call', async () => {
+  const graph = new StandardGraph({ runId: 'completed-versus-pending', agents: [{ agentId: 'worker', provider: Providers.OPENAI }], toolResultProtection: policy() });
+  const previous = new AIMessage({ id: 'completed-batch', content: '', tool_calls: [{ id: 'reused', name: 'other', args: { count: 42 } }] });
+  const result = new ToolMessage({ id: 'completed-result', tool_call_id: 'reused', content: 'Allowed previous output' });
+  const pending = new AIMessage({ id: 'pending-batch', content: '', tool_calls: [{ id: 'reused', name: 'lookup', args: { count: 42 } }] });
+  const sources = graph.getToolResultCallSources({ values: { messages: [previous, result, new HumanMessage('Allowed next input'), pending] } });
+  const replayed = await graph.validateToolResultSend(new Send('worker', { messages: [previous, result] }), undefined, undefined, sources); expect(replayed.args.messages[1].content).toBe('Allowed previous output');
+  const forged = new ToolMessage({ tool_call_id: 'reused', name: 'other', content: fixtures.canaries[0] });
+  await expect(graph.validateToolResultHistory([previous, forged], undefined, undefined, sources)).rejects.toMatchObject({ code: 'unsupported' });
+  await expect(graph.validateToolResultHistory([forged], undefined, undefined, sources)).rejects.toMatchObject({ code: 'unsupported' });
 });

@@ -1,3 +1,4 @@
+import type { ToolCallSources } from '@/protection/toolResult';
 import { snapshotToolCallSources, snapshotToolCommand, protectToolApprovalResume, snapshotToolInputMessages, snapshotToolRunStepState, snapshotToolCheckpointRecord, admitToolResultCheckpoints, getToolResultCheckpointLookup, bindToolResultCheckpoint, snapshotToolMessageRemoval, snapshotToolResumeUpdates, snapshotToolResumeMessages, snapshotToolHistoryMessages, normalizeToolResultError, hasRequiredToolExecuteProtection, ToolResultProtectionError } from '@/protection/toolResult';
 import { messagesStateReducer } from '@/messages/reducer';
 // src/run.ts
@@ -488,7 +489,7 @@ export class Run<_T extends t.BaseGraphState> {
   private preemption?: t.StreamPreemption;
   private maxStopContinuations: number;
   private toolResultProtection?: t.StandardGraphInput['toolResultProtection'];
-  private protectedSendSources = new Map<string, string>();
+  private protectedSendSources: ToolCallSources = new Map();
   private readonly protectedApprovals = new Map<string, t.ToolApprovalInterruptPayload | undefined>();
   private readonly preparedToolResumes = new WeakSet<Command>();
   private providerTextProtection?: t.StandardGraphInput['providerTextProtection'];
@@ -2273,13 +2274,15 @@ export class Run<_T extends t.BaseGraphState> {
     return { ...result, agentMessages: canonical.slice(admitted.messages.length) } as t.IState;
   }
 
-  private async validateToolResultMessageWrite(current: BaseMessage[], update: BaseMessage[], state?: t.RunStepResumeState, signal?: AbortSignal, overwrite = false, removalControls = true): Promise<{ update: BaseMessage[]; messages: BaseMessage[] }> {
+  private async validateToolResultMessageWrite(current: BaseMessage[], update: BaseMessage[], state?: t.RunStepResumeState, signal?: AbortSignal, overwrite = false, removalControls = true, sources?: ToolCallSources): Promise<{ update: BaseMessage[]; messages: BaseMessage[] }> {
     const messages = snapshotToolHistoryMessages(update);
     const removals = messages.map(snapshotToolMessageRemoval);
     if ((!removalControls || overwrite) && removals.some((control) => control != null)) throw new ToolResultProtectionError('unsupported');
     const outputs = messages.filter((_message, index) => removals[index] == null);
     // Validate each supplied result before reduction, including writes removed later.
-    const canonical = (await this.Graph!.validateToolResultHistory([...current, ...outputs], state, signal)).slice(current.length);
+    const canonical = sources == null
+      ? (await this.Graph!.validateToolResultHistory([...current, ...outputs], state, signal)).slice(current.length)
+      : await this.Graph!.validateToolResultHistory(outputs, state, signal, sources);
     this.Graph!.commitToolResultMessages(canonical);
     let position = 0;
     const effective = messages.map((_message, index) => removals[index] ?? canonical[position++]);
@@ -2294,14 +2297,13 @@ export class Run<_T extends t.BaseGraphState> {
     let alternate = snapshotToolHistoryMessages(snapshot.values?.agentMessages ?? []);
     const writes = snapshotToolResumeUpdates(update);
     if (writes.length === 0) return { update, messages };
-    const proposalGroups = writes.filter(([key]) => key === 'messages' || key === 'agentMessages').map(([, value]) => snapshotToolInputMessages(snapshotToolResumeMessages(value).messages));
-    this.protectedSendSources = snapshotToolCallSources(proposalGroups, snapshot.values?.runStepState?.toolResultReleases ?? [], this.protectedSendSources);
     const admitted: Array<[string, unknown]> = [];
     for (const [key, value] of writes) {
       if (key === '__pregel_tasks' || key === '__pregel_push') { admitted.push([key, await graph.validateToolResultTaskWrites(value, signal, this.protectedSendSources)]); continue; }
       if (key !== 'messages' && key !== 'agentMessages') { admitted.push([key, value]); continue; }
       const change = snapshotToolResumeMessages(value);
-      const validated = await this.validateToolResultMessageWrite(messages, change.messages, snapshot.values?.runStepState, signal, change.overwrite, key === 'messages');
+      change.messages = snapshotToolInputMessages(change.messages);
+      const validated = await this.validateToolResultMessageWrite(messages, change.messages, snapshot.values?.runStepState, signal, change.overwrite, key === 'messages', this.protectedSendSources);
       if (key === 'agentMessages') alternate = validated.update;
       else messages = validated.messages;
       admitted.push([key, change.overwrite ? new Overwrite(validated.update) : validated.update]);
