@@ -3897,19 +3897,24 @@ it.each(['primitive', 'object', 'thrown', 'empty', 'empty-mutated', 'unprotected
   if (mode === 'empty' || mode === 'empty-mutated') expect(result).toBeUndefined(); else { expect(result).toMatchObject({ code: 'unsupported' }); expect(run.getInterrupt()).toBeUndefined(); }
 });
 
-it.each((['root', 'descendant'] as const).flatMap((scope) => (['messages', 'agentMessages'] as const).flatMap((channel) => (['renamed', 'nameless', 'replaced-batch', 'unselected', 'control'] as const).map((kind) => [scope, channel, kind] as const))))('retains preflight source authority on native checkpoint reloads (%s/%s/%s)', async (scope, channel, kind) => {
+it.each((['root', 'descendant'] as const).flatMap((scope) => (['messages', 'agentMessages'] as const).flatMap((channel) => (['renamed', 'nameless', 'replaced-batch', 'namespace-swap', 'thread-swap', 'config-id', 'body-id', 'both-ids', 'parent-swap', 'unselected', 'control'] as const).map((kind) => [scope, channel, kind] as const))))('retains preflight source authority on native checkpoint reloads (%s/%s/%s)', async (scope, channel, kind) => {
   let tamper = false; let reloads = 0; let executions = 0; const observed: string[] = []; const modelInputs: string[] = []; const runId = `reloaded-sources-${scope}-${channel}-${kind}`;
   class Saver extends MemorySaver {
     override async getTuple(config: RunnableConfig): ReturnType<MemorySaver['getTuple']> {
       const tuple = await super.getTuple(config); if (tuple == null || !tamper) return tuple;
       const root = (config.configurable?.checkpoint_ns ?? '') === ''; if (root !== (scope === 'root')) return tuple;
       reloads++;
+      if (kind === 'namespace-swap') tuple.config = { configurable: { ...tuple.config.configurable, checkpoint_ns: 'unadmitted:namespace' } };
+      if (kind === 'thread-swap') tuple.config = { configurable: { ...tuple.config.configurable, thread_id: 'unadmitted-thread' } };
+      if (kind === 'config-id' || kind === 'both-ids') tuple.config = { configurable: { ...tuple.config.configurable, checkpoint_id: 'unadmitted-checkpoint' } };
+      if (kind === 'body-id' || kind === 'both-ids') tuple.checkpoint.id = 'unadmitted-checkpoint';
+      if (kind === 'parent-swap') tuple.parentConfig = { configurable: { thread_id: 'foreign-parent', checkpoint_ns: 'foreign:parent', checkpoint_id: 'foreign-parent-id' } };
       const original = tuple.checkpoint.channel_values.messages as BaseMessage[];
       if (kind === 'control') { tuple.checkpoint.channel_values.messages = [...original, new HumanMessage('Allowed reloaded control')]; return tuple; }
       const history = [...original];
       let proposal = history.findLast((message) => message.type === 'ai' && (message as AIMessage).tool_calls?.some((call) => call.id === 'reload-source') === true) as AIMessage | undefined;
       if (proposal == null) { proposal = new AIMessage({ id: 'reloaded-root-proposal', content: '', tool_calls: [{ id: 'reload-source', name: kind === 'unselected' ? 'other' : 'lookup', args: { count: 42 } }] }); if (kind !== 'nameless') history.push(proposal); }
-      if (kind === 'renamed' || kind === 'replaced-batch') proposal.tool_calls![0].name = 'other';
+      if (kind !== 'nameless' && kind !== 'unselected') proposal.tool_calls![0].name = 'other';
       if (kind === 'replaced-batch') proposal.id = 'untrusted-replacement-batch';
       const output = new ToolMessage({ id: 'untrusted-reloaded-result', tool_call_id: 'reload-source', content: kind === 'unselected' ? 'Allowed unselected reload' : fixtures.canaries[0], ...(kind === 'nameless' ? {} : { name: 'other' }) });
       if (channel === 'messages') tuple.checkpoint.channel_values.messages = [...history, output];

@@ -11,6 +11,7 @@ import {
 import { BaseCheckpointSaver, GraphInterrupt, ParentCommand, Send, Overwrite } from '@langchain/langgraph';
 import type { CallbackManagerForToolRun } from '@langchain/core/callbacks/manager';
 import type { RunnableConfig } from '@langchain/core/runnables';
+import type { CheckpointTuple } from '@langchain/langgraph';
 import type { BaseMessage } from '@langchain/core/messages';
 import type {
   GenericTool,
@@ -604,7 +605,36 @@ export function snapshotToolSummarizationRequest(value: SummarizationNodeInput):
   return request;
 }
 
+function checkpointReadId(scope: RunnableConfig['configurable']): string | undefined {
+  const id: unknown = scope?.checkpoint_id;
+  const legacy: unknown = scope?.thread_ts;
+  if ((id != null && (typeof id !== 'string' || id === '')) || (legacy != null && (typeof legacy !== 'string' || legacy === '')) || (id != null && legacy != null && id !== legacy)) throw new ToolResultProtectionError('incompatible');
+  return (id ?? legacy) as string | undefined;
+}
+
 export const toolCheckpointSafety: ToolCheckpointSafety = {
+  identify: (config, history) => {
+    const snapshot = snapshotToolCheckpointConfig(config);
+    const scope = snapshot.configurable;
+    const namespace: unknown = scope?.checkpoint_ns;
+    if (namespace != null && typeof namespace !== 'string') throw new ToolResultProtectionError('incompatible');
+    return { config: snapshot, threadId: scope?.thread_id, namespace: namespace ?? (history === true ? undefined : ''), checkpointId: checkpointReadId(scope) };
+  },
+  read: (input, expected): CheckpointTuple => {
+    const tuple = snapshotToolCheckpointRecord(input, ['config', 'checkpoint', 'parentConfig']);
+    tuple.config = snapshotToolCheckpointConfig(tuple.config);
+    tuple.checkpoint = snapshotToolCheckpointRecord(tuple.checkpoint, ['id']);
+    const scope = tuple.config.configurable;
+    const id = checkpointReadId(scope);
+    const namespace: unknown = scope?.checkpoint_ns ?? '';
+    if (typeof scope?.thread_id !== 'string' || scope.thread_id === '' || typeof namespace !== 'string' || id == null || tuple.checkpoint.id !== id || (expected.threadId != null && scope.thread_id !== expected.threadId) || (expected.namespace != null && namespace !== expected.namespace) || (expected.checkpointId != null && id !== expected.checkpointId)) throw new ToolResultProtectionError('incompatible');
+    if (tuple.parentConfig != null) {
+      tuple.parentConfig = snapshotToolCheckpointConfig(tuple.parentConfig);
+      const parent = tuple.parentConfig.configurable;
+      if (parent?.thread_id !== scope.thread_id || (parent.checkpoint_ns ?? '') !== namespace || checkpointReadId(parent) == null) throw new ToolResultProtectionError('incompatible');
+    }
+    return tuple;
+  },
   write: (config, expected): RunnableConfig => {
     const snapshot = snapshotToolCheckpointConfig(config);
     const scope = snapshot.configurable;

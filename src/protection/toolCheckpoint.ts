@@ -14,7 +14,15 @@ export type ToolCheckpointWriteIdentity = {
   namespace: unknown;
   checkpointId: string;
 };
+export type ToolCheckpointReadIdentity = {
+  config: RunnableConfig;
+  threadId: unknown;
+  namespace?: unknown;
+  checkpointId?: unknown;
+};
 export type ToolCheckpointSafety = {
+  identify: (config: RunnableConfig, history?: boolean) => ToolCheckpointReadIdentity;
+  read: (tuple: CheckpointTuple, expected: ToolCheckpointReadIdentity) => CheckpointTuple;
   write: (config: RunnableConfig, expected: ToolCheckpointWriteIdentity) => RunnableConfig;
   delta: (channels: readonly string[]) => void;
 };
@@ -37,9 +45,13 @@ export class ToolCheckpointSaver extends BaseCheckpointSaver {
   }
 
   override async getTuple(config: RunnableConfig): ReturnType<BaseCheckpointSaver['getTuple']> {
-    const lookup = this.selectCursor(config);
-    const tuple = await this.source.getTuple(lookup);
-    return tuple == null || this.admit == null ? tuple : this.admit(tuple);
+    const selected = this.safety.identify(config);
+    const lookup = this.selectCursor(selected.config);
+    const expected = { ...selected, checkpointId: lookup.configurable?.checkpoint_id ?? selected.checkpointId };
+    const returned = await this.source.getTuple(lookup);
+    if (returned == null) return returned;
+    const tuple = this.safety.read(returned, expected);
+    return this.admit == null ? tuple : this.admit(tuple);
   }
 
   private selectCursor(config: RunnableConfig): RunnableConfig {
@@ -51,7 +63,11 @@ export class ToolCheckpointSaver extends BaseCheckpointSaver {
   }
 
   override async *list(...args: Parameters<BaseCheckpointSaver['list']>): ReturnType<BaseCheckpointSaver['list']> {
-    for await (const tuple of this.source.list(...args)) yield this.admit == null ? tuple : await this.admit(tuple);
+    const expected = this.safety.identify(args[0], true);
+    for await (const returned of this.source.list(expected.config, args[1])) {
+      const tuple = this.safety.read(returned, expected);
+      yield this.admit == null ? tuple : await this.admit(tuple);
+    }
   }
 
   override async put(...args: Parameters<BaseCheckpointSaver['put']>): ReturnType<BaseCheckpointSaver['put']> {
@@ -74,7 +90,7 @@ export class ToolCheckpointSaver extends BaseCheckpointSaver {
 
   override getDeltaChannelHistory(...args: Parameters<BaseCheckpointSaver['getDeltaChannelHistory']>): ReturnType<BaseCheckpointSaver['getDeltaChannelHistory']> {
     this.safety.delta(args[0].channels);
-    return this.source.getDeltaChannelHistory({ ...args[0], config: this.selectCursor(args[0].config) });
+    return this.source.getDeltaChannelHistory({ ...args[0], config: this.selectCursor(this.safety.identify(args[0].config).config) });
   }
 
 }

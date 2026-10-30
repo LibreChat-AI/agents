@@ -120,3 +120,92 @@ it('routes ordinary delta reads through the admitted cursor without rewriting ba
   expect(source).toHaveBeenCalledWith({ config: config('', '001'), channels: ['control'] });
   expect(read).toEqual(await saver.getDeltaChannelHistory({ config: config('', '001'), channels: ['control'] }));
 });
+
+it.each((['explicit', 'latest', 'list'] as const).flatMap((route) => (['thread', 'namespace', 'config-id', 'body-id', 'both-ids', 'missing-id', 'id-getter', 'parent-thread', 'parent-namespace', 'mutate-lookup', 'control'] as const).map((change) => [route, change] as const)))('binds returned tuples before content admission (%s/%s)', async (route, change) => {
+  let reads = 0;
+  const alter = (tuple: NonNullable<Awaited<ReturnType<MemorySaver['getTuple']>>>): typeof tuple => {
+    const scope = { ...tuple.config.configurable }; tuple.config = { ...tuple.config, configurable: scope };
+    if (change === 'thread') scope.thread_id = 'foreign-thread';
+    if (change === 'namespace') scope.checkpoint_ns = 'foreign:namespace';
+    if (change === 'config-id' || change === 'both-ids') scope.checkpoint_id = 'foreign-id';
+    if (change === 'body-id' || change === 'both-ids') tuple.checkpoint.id = 'foreign-id';
+    if (change === 'missing-id') Reflect.deleteProperty(scope, 'checkpoint_id');
+    if (change === 'id-getter') Object.defineProperty(tuple.checkpoint, 'id', { get: () => { reads++; throw new Error('Unreleased checkpoint diagnostic'); } });
+    if (change === 'parent-thread') tuple.parentConfig = { configurable: { thread_id: 'foreign-thread', checkpoint_ns: 'agent:task', checkpoint_id: 'parent-id' } };
+    if (change === 'parent-namespace') tuple.parentConfig = { configurable: { thread_id: thread, checkpoint_ns: 'foreign:namespace', checkpoint_id: 'parent-id' } };
+    return tuple;
+  };
+  class Saver extends MemorySaver {
+    override async getTuple(lookup: RunnableConfig): ReturnType<MemorySaver['getTuple']> {
+      const tuple = await super.getTuple(lookup);
+      if (tuple == null) return tuple;
+      if (change === 'mutate-lookup') { lookup.configurable!.thread_id = 'mutated-thread'; tuple.config = lookup; }
+      return alter(tuple);
+    }
+    override async *list(...args: Parameters<MemorySaver['list']>): ReturnType<MemorySaver['list']> {
+      for await (const tuple of super.list(...args)) {
+        if (change === 'mutate-lookup') { args[0].configurable!.thread_id = 'mutated-thread'; tuple.config = args[0]; }
+        yield alter(tuple);
+      }
+    }
+  }
+  const saver = new Saver(); await put(saver, 'agent:task', '001');
+  let admissions = 0; const scoped = new ToolCheckpointSaver(saver, thread, new Map(), toolCheckpointSafety, async (tuple) => { admissions++; return tuple; });
+  const lookup = config('agent:task', route === 'latest' ? undefined : '001');
+  const operation = async (): Promise<void> => { if (route !== 'list') { expect(await scoped.getTuple(lookup)).toBeDefined(); return; } for await (const tuple of scoped.list(lookup)) expect(tuple).toBeDefined(); };
+  const result = await operation().catch((error: Error) => error);
+  const valid = change === 'control' || (route === 'latest' && change === 'both-ids');
+  if (valid) { expect(result).toBeUndefined(); expect(admissions).toBe(1); }
+  else { expect(result).toBeInstanceOf(ToolResultProtectionError); expect(admissions).toBe(0); }
+  expect(reads).toBe(0); expect(lookup.configurable?.thread_id).toBe(thread);
+});
+
+it('preserves unconstrained history within a thread, explicit selection, latest and absent results', async () => {
+  const saver = new MemorySaver();
+  for (const namespace of ['', 'agent:task']) { await put(saver, namespace, '001'); await put(saver, namespace, '002', '001'); }
+  const scoped = new ToolCheckpointSaver(saver, thread, new Map(), toolCheckpointSafety);
+  expect((await scoped.getTuple(config()))?.checkpoint.id).toBe('002');
+  expect((await scoped.getTuple(config('', '001')))?.checkpoint.id).toBe('001');
+  expect(await scoped.getTuple(config('', 'absent'))).toBeUndefined();
+  const history = [];
+  for await (const tuple of scoped.list({ configurable: { thread_id: thread } })) history.push([tuple.config.configurable?.checkpoint_ns, tuple.checkpoint.id]);
+  expect(history).toEqual(expect.arrayContaining([['', '001'], ['', '002'], ['agent:task', '001'], ['agent:task', '002']])); expect(history).toHaveLength(4);
+});
+
+it.each(['thread_id', 'checkpoint_ns', 'checkpoint_id', 'thread_ts', 'checkpoint', 'config', 'parentConfig'] as const)('rejects returned %s identity accessors before content admission', async (field) => {
+  let reads = 0; let admissions = 0;
+  class Saver extends MemorySaver {
+    override async getTuple(lookup: RunnableConfig): ReturnType<MemorySaver['getTuple']> {
+      const tuple = await super.getTuple(lookup); if (tuple == null) return tuple;
+      const object = ['checkpoint', 'config', 'parentConfig'].includes(field) ? tuple : tuple.config.configurable!;
+      Object.defineProperty(object, field, { get: () => { reads++; throw new Error('Unreleased identity diagnostic'); } }); return tuple;
+    }
+  }
+  const saver = new Saver(); await put(saver, '', '001');
+  const scoped = new ToolCheckpointSaver(saver, thread, new Map(), toolCheckpointSafety, async (tuple) => { admissions++; return tuple; });
+  await expect(scoped.getTuple(config())).rejects.toMatchObject({ code: 'unsupported' }); expect(reads).toBe(0); expect(admissions).toBe(0);
+});
+
+it('matches a legacy checkpoint selector and rejects conflicting returned aliases', async () => {
+  let tamper = false;
+  class Saver extends MemorySaver { override async getTuple(lookup: RunnableConfig): ReturnType<MemorySaver['getTuple']> { const tuple = await super.getTuple(lookup); if (tuple != null && tamper) tuple.config = { configurable: { ...tuple.config.configurable, checkpoint_id: 'different' } }; return tuple; } }
+  const saver = new Saver(); await put(saver, '', '001'); const scoped = new ToolCheckpointSaver(saver, thread, new Map(), toolCheckpointSafety);
+  const lookup = { configurable: { thread_id: thread, checkpoint_ns: '', thread_ts: '001' } };
+  expect((await scoped.getTuple(lookup))?.checkpoint.id).toBe('001'); tamper = true;
+  await expect(scoped.getTuple(lookup)).rejects.toMatchObject({ code: 'incompatible' });
+});
+
+it.each(['read', 'history', 'delta'] as const)('keeps saver-side lookup mutation detached from caller identity (%s)', async (route) => {
+  const caller = { configurable: { thread_id: thread, checkpoint_ns: '', checkpoint_id: '001', user_id: 'allowed-principal', checkpoint_map: { 'agent:task': 'admitted-child' } } };
+  const mutate = (lookup: RunnableConfig): void => { lookup.configurable!.user_id = 'untrusted-principal'; (lookup.configurable!.checkpoint_map as Record<string, string>)['agent:task'] = 'untrusted-child'; };
+  class Saver extends MemorySaver {
+    override async getTuple(lookup: RunnableConfig): ReturnType<MemorySaver['getTuple']> { const tuple = await super.getTuple(lookup); mutate(lookup); return tuple; }
+    override async *list(...args: Parameters<MemorySaver['list']>): ReturnType<MemorySaver['list']> { for await (const tuple of super.list(...args)) { mutate(args[0]); yield tuple; } }
+    override async getDeltaChannelHistory(options: Parameters<MemorySaver['getDeltaChannelHistory']>[0]): ReturnType<MemorySaver['getDeltaChannelHistory']> { mutate(options.config); return super.getDeltaChannelHistory(options); }
+  }
+  const saver = new Saver(); await put(saver, '', '001'); const scoped = new ToolCheckpointSaver(saver, thread, new Map(), toolCheckpointSafety);
+  if (route === 'read') expect(await scoped.getTuple(caller)).toBeDefined();
+  if (route === 'history') for await (const tuple of scoped.list(caller)) expect(tuple).toBeDefined();
+  if (route === 'delta') await scoped.getDeltaChannelHistory({ config: caller, channels: ['control'] });
+  expect(caller.configurable).toEqual({ thread_id: thread, checkpoint_ns: '', checkpoint_id: '001', user_id: 'allowed-principal', checkpoint_map: { 'agent:task': 'admitted-child' } });
+});
