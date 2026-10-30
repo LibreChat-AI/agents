@@ -102,7 +102,7 @@ import type {
 import type { RunBreakerScope } from '@/llm/streamLimits';
 import type { GraphFactory } from '@/graphs/graphFactory';
 import type { StandardGraph } from '@/graphs/Graph';
-import { admitToolResultCheckpoints, getToolResultCheckpointLookup, bindToolResultCheckpoint, normalizeToolResultError, hasRequiredToolExecuteProtection, ToolResultProtectionError } from '@/protection/toolResult';
+import { protectToolApprovalResume, admitToolResultCheckpoints, getToolResultCheckpointLookup, bindToolResultCheckpoint, normalizeToolResultError, hasRequiredToolExecuteProtection, ToolResultProtectionError } from '@/protection/toolResult';
 import {
   getSubagentApprovalExecutionScope,
   SubagentDefinitionBindingError,
@@ -124,16 +124,17 @@ import {
   getSubagentHostArgumentFailureMessage,
 } from './diagnostics';
 import {
+  rebindToolBatchReplayScope,
+  rebindToolBatchReplayPayload,
+  getPublicToolInterruptPayload,
+  restoreToolReplayConfig,
+} from '@/tools/toolBatchReplay';
+import {
   getSubagentHostArgSpecs,
   resolveSubagentHostArgs,
   pickSubagentHostArgInput,
   getSubagentHostArgsDigest,
 } from './hostArgs';
-import {
-  rebindToolBatchReplayScope,
-  rebindToolBatchReplayPayload,
-  restoreToolReplayConfig,
-} from '@/tools/toolBatchReplay';
 import {
   executeHooks,
   HookRegistry,
@@ -158,6 +159,7 @@ import {
   createChildGraphPlan,
   isGraphSubagentConfig,
 } from './childGraphConfig';
+import { createToolApprovalReviewEvidence } from '@/hitl/approvalReview';
 import { ProviderTextProtectionError } from '@/protection/providerText';
 import { stripRunStepResumeState } from '@/tools/runStepResume';
 import { seedAgentInitialSessions } from '@/utils/toolSessions';
@@ -3231,7 +3233,13 @@ export class SubagentExecutor {
             approvalExecutionScope,
             childThreadId
           );
-          childInput = new Command({ resume: childResumeMap });
+          const approvals = new Map<string, ToolApprovalInterruptPayload | undefined>();
+          if (this.toolResultProtection != null) for (const entry of activeChildRun.pendingInterrupts) {
+            const evidence = createToolApprovalReviewEvidence(entry.id, getPublicToolInterruptPayload(entry.value));
+            if (entry.id != null) approvals.set(entry.id, evidence?.payload);
+          }
+          const resume = this.toolResultProtection == null ? childResumeMap : await protectToolApprovalResume(this.toolResultProtection, childResumeMap, approvals, pending.id, childSignal);
+          childInput = new Command({ resume });
         } else if (recoveredInProgress) {
           childInput = null;
         } else {

@@ -1,7 +1,8 @@
 import { nanoid } from 'nanoid';
 import { types } from 'node:util';
 import { RemoveMessage, ToolMessage } from '@langchain/core/messages';
-import { BaseCheckpointSaver, GraphInterrupt, ParentCommand } from '@langchain/langgraph';
+import { AsyncLocalStorageProviderSingleton } from '@langchain/core/singletons';
+import { BaseCheckpointSaver, GraphInterrupt, ParentCommand, Send } from '@langchain/langgraph';
 import {
   StructuredTool,
   DynamicStructuredTool,
@@ -12,17 +13,18 @@ import type { CallbackManagerForToolRun } from '@langchain/core/callbacks/manage
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { BaseMessage } from '@langchain/core/messages';
 import type {
-  ProviderTextProtection,
-  ProviderTextProtectionResult,
-  ProviderTextProtectionErrorCode,
-} from './providerText';
-import type {
   GenericTool,
   RunStepResumeState,
   ToolExecuteResult,
   ToolExecuteBatchRequest,
   ToolCallRequest,
+  ToolApprovalInterruptPayload,
 } from '@/types';
+import type {
+  ProviderTextProtection,
+  ProviderTextProtectionResult,
+  ProviderTextProtectionErrorCode,
+} from './providerText';
 import type {
   ToolOutputReferenceRegistry,
   ToolOutputReferenceState,
@@ -581,6 +583,69 @@ export function snapshotToolCheckpointConfig<C extends RunnableConfig>(input: C)
   const scope = snapshotToolCheckpointRecord(config.configurable, ['checkpoint_id', 'checkpoint_ns', 'thread_id', 'thread_ts', 'checkpoint_map']);
   if (scope.checkpoint_map != null) scope.checkpoint_map = snapshotToolCheckpointData(scope.checkpoint_map);
   return { ...config, configurable: scope };
+}
+
+export function snapshotToolSend(input: unknown): Send {
+  if (input == null || typeof input !== 'object') throw new ToolResultProtectionError('unsupported');
+  const packet = snapshotToolCheckpointRecord(input as Send, ['node', 'args', 'timeout']);
+  if (typeof packet.node !== 'string' || packet.node === '' || packet.args == null || typeof packet.args !== 'object') throw new ToolResultProtectionError('unsupported');
+  const args = snapshotToolCheckpointRecord(packet.args as { messages?: BaseMessage[]; agentMessages?: BaseMessage[]; runStepState?: RunStepResumeState }, ['messages', 'agentMessages', 'runStepState', '__pregel_tasks']);
+  if (Object.hasOwn(args, '__pregel_tasks')) throw new ToolResultProtectionError('unsupported');
+  if (args.messages != null) args.messages = snapshotToolInputMessages(args.messages);
+  if (args.agentMessages != null) args.agentMessages = snapshotToolInputMessages(args.agentMessages);
+  if (args.runStepState != null) args.runStepState = snapshotToolRunStepState(args.runStepState);
+  return Object.assign(Object.create(Send.prototype) as Send, packet, { args, timeout: snapshotToolCheckpointData(packet.timeout) });
+}
+
+export function snapshotToolCommand<C extends object>(input: C): C {
+  if (types.isProxy(input)) throw new ToolResultProtectionError('unsupported');
+  return Object.fromEntries(['resume', 'goto', 'update', 'graph', 'lc_direct_tool_output'].map((field) => [field, ownMessageValue(input, field)])) as C;
+}
+
+/** Resume decisions bind to checkpoint-owned proposals, never caller-supplied names. */
+export async function protectToolApprovalResume(policy: ToolResultProtection, value: unknown, approvals: ReadonlyMap<string, ToolApprovalInterruptPayload | undefined>, interruptId?: string, signal?: AbortSignal): Promise<unknown> {
+  const decide = async (input: unknown, request: ToolApprovalInterruptPayload['action_requests'][number] | undefined): Promise<unknown> => {
+    if (input == null || typeof input !== 'object') throw new ToolResultProtectionError('unsupported');
+    const decision = snapshotToolCheckpointRecord(input as { type?: string; responseText?: string; reason?: string }, ['type', 'responseText', 'reason', 'updatedInput']);
+    const fields = { approve: ['type'], reject: ['type', 'reason'], edit: ['type', 'updatedInput'], respond: ['type', 'responseText'] };
+    const allowed: string[] | undefined = Object.getOwnPropertyDescriptor(fields, decision.type ?? '')?.value;
+    if (allowed == null || Object.keys(decision).some((key) => !allowed.includes(key))) throw new ToolResultProtectionError('unsupported');
+    if (decision.type !== 'respond' && decision.type !== 'reject') return decision;
+    if (request == null) throw new ToolResultProtectionError('unsupported');
+    if (!requiresToolResultProtection(policy, request.name)) return decision;
+    const field = decision.type === 'respond' ? 'responseText' : 'reason';
+    const text = decision[field];
+    if (text == null && field === 'reason') return decision;
+    if (typeof text !== 'string') throw new ToolResultProtectionError('unsupported');
+    return { ...decision, [field]: await protectToolText(policy, request.name, request.tool_call_id, text, field === 'reason' ? 'error' : 'success', signal) };
+  };
+  const batch = async (input: unknown, payload: ToolApprovalInterruptPayload): Promise<unknown> => {
+    const requests = snapshotToolCheckpointArray(payload.action_requests).map((request) => snapshotToolCheckpointRecord(request, ['name', 'tool_call_id']));
+    for (const request of requests) if (typeof request.name !== 'string' || request.name === '' || typeof request.tool_call_id !== 'string' || request.tool_call_id === '') throw new ToolResultProtectionError('incompatible');
+    if (Array.isArray(input)) {
+      const decisions = snapshotToolCheckpointArray(input);
+      if (decisions.length !== requests.length) throw new ToolResultProtectionError('unsupported');
+      return Promise.all(decisions.map((decision, index) => decide(decision, requests[index])));
+    }
+    if (input == null || typeof input !== 'object') throw new ToolResultProtectionError('unsupported');
+    const decisions = snapshotToolCheckpointRecord(input, []);
+    const byId = new Map(requests.map((request) => [request.tool_call_id, request]));
+    return Object.fromEntries(await Promise.all(Object.entries(decisions).map(async ([id, decision]) => [id, await decide(decision, byId.get(id))])));
+  };
+  if (approvals.size === 0) throw new ToolResultProtectionError('unsupported');
+  if (value != null && typeof value === 'object' && !Array.isArray(value)) {
+    const record = snapshotToolCheckpointRecord(value, []);
+    if (Object.keys(record).some((key) => approvals.has(key))) {
+      return Object.fromEntries(await Promise.all(Object.entries(record).map(async ([id, decisions]) => {
+        const payload = approvals.get(id);
+        if (!approvals.has(id)) throw new ToolResultProtectionError('unsupported');
+        return [id, payload == null ? decisions : await batch(decisions, payload)];
+      })));
+    }
+  }
+  const payload = interruptId == null ? undefined : approvals.get(interruptId);
+  if (interruptId == null || !approvals.has(interruptId) || approvals.size !== 1) throw new ToolResultProtectionError('unsupported');
+  return payload == null ? value : batch(value, payload);
 }
 
 export function getToolResultCheckpointLookup<C extends RunnableConfig>(config: C): C {
@@ -1425,12 +1490,10 @@ export function withToolResultBoundary(
         let raw: unknown;
         let status: 'success' | 'error' = 'success';
         try {
+          const producerConfig = { ...effective, callbacks: [] };
           raw = await attempt.wait(
-            Promise.resolve(
-              invoke.call(tool, input, toolBodyCallbacks(manager), {
-                ...effective,
-                callbacks: [],
-              })
+            AsyncLocalStorageProviderSingleton.runWithConfig(producerConfig, () =>
+              invoke.call(tool, input, toolBodyCallbacks(manager), producerConfig)
             )
           );
         } catch (error) {

@@ -1,11 +1,13 @@
 import { z } from 'zod';
 import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
+import { RunnableLambda } from '@langchain/core/runnables';
 import { DynamicStructuredTool } from '@langchain/core/tools';
 import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
 import { RemoveMessage, AIMessage, HumanMessage, ToolMessage  } from '@langchain/core/messages';
 import {
   GraphInterrupt,
+  Send,
   Command,
   Overwrite,
   StateGraph,
@@ -3470,4 +3472,82 @@ it.each((['lookup', 'history'] as const).flatMap((route) => (['config', 'inherit
   const error = await operation().catch((value: Error) => value);
   if (field === 'control') expect(error).toBeUndefined(); else expect(error).toMatchObject({ code: 'unsupported' });
   expect(reads).toBe(0); assertNoCanary(String(error));
+});
+
+it.each(['release', 'block', 'unprotected'] as const)('isolates implicit nested runnable callbacks inside selected producers (%s)', async (mode) => {
+  const observed: string[] = []; let nested = 0;
+  const lookup = new DynamicStructuredTool({ name: 'lookup', description: 'Allowed nested control.', schema: z.object({ count: z.number() }), func: async (_input, _manager, config) => {
+    expect(config?.configurable?.user_id).toBe('allowed-principal'); expect(config?.signal).toBeDefined();
+    return await RunnableLambda.from(async (_value: string, inherited?: RunnableConfig) => { nested++; if (mode !== 'unprotected') expect(inherited?.configurable?.user_id).toBe('allowed-principal'); return fixtures.canaries[0]; }).invoke('Allowed input');
+  } });
+  const callback = BaseCallbackHandler.fromMethods({ handleChainEnd: (output): void => { observed.push(JSON.stringify(output)); }, handleToolEnd: (output): void => { observed.push(JSON.stringify(output)); } }); callback.awaitHandlers = true;
+  const node = new ToolNode({ tools: [lookup], toolResultProtection: mode === 'unprotected' ? undefined : policy({ inspect: ({ content }) => mode === 'block' ? { version: 1, ok: false, error: { code: 'blocked' } } : approve(content.replaceAll(fixtures.canaries[0], '[EMAIL_1]')) }) });
+  const graph = new StateGraph(MessagesAnnotation).addNode('tools', node).addEdge(START, 'tools').addEdge('tools', END).compile();
+  const result = await graph.invoke(state(), { signal: new AbortController().signal, callbacks: [callback], configurable: { user_id: 'allowed-principal' } }).catch((error: Error) => error);
+  expect(nested).toBe(1);
+  if (mode === 'unprotected') { expect(observed.join('')).toContain(fixtures.canaries[0]); return; }
+  assertNoCanary(observed.join('')); assertNoCanary(String(result));
+  if (mode === 'block') expect(result).toMatchObject({ code: 'blocked' }); else { assertNoCanary(result); expect(JSON.stringify(result)).toContain('[EMAIL_1]'); }
+});
+
+it.each((['resume', 'command'] as const).flatMap((entry) => (['array', 'map', 'interrupt-map', 'block', 'timeout', 'cancelled', 'reject', 'unselected'] as const).map((mode) => [entry, mode] as const)))('protects approval responses before native resume input callbacks (%s/%s)', async (entry, mode) => {
+  const observed: string[] = []; const inspected: string[] = []; let executions = 0; const runId = `response-native-${entry}-${mode}`; const abort = new AbortController();
+  const hooks = new HookRegistry(); hooks.register('PreToolUse', { hooks: [async () => ({ decision: 'ask', reason: 'Allowed approval' })] });
+  const run = await Run.create({ runId, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, tools: [direct(() => { executions++; return 'Must not run'; })], compileOptions: { checkpointer: new MemorySaver() } }, hooks, humanInTheLoop: { enabled: true }, toolResultProtection: policy({ timeoutMs: mode === 'timeout' ? 20 : 10000, toolNames: mode === 'unselected' ? ['other'] : ['lookup'], inspect: ({ content }) => { inspected.push(content); if (mode === 'cancelled') abort.abort(); if (mode === 'timeout' || mode === 'cancelled') return new Promise<ToolResultProtectionResult>(() => {}); return mode === 'block' ? { version: 1, ok: false, error: { code: 'blocked' } } : approve(content.replaceAll(fixtures.canaries[0], '[EMAIL_1]')); } }) });
+  run.Graph!.overrideModel = new FakeChatModel({ responses: ['', 'Allowed final answer'], toolCalls: [{ id: 'respond-control', name: 'lookup', args: { count: 42 }, type: 'tool_call' }] });
+  const config = { version: 'v2' as const, configurable: { thread_id: runId } }; await run.processStream({ messages: [new HumanMessage('Allowed input')] }, config); expect(run.getInterrupt()).toBeDefined();
+  const decision = mode === 'reject' ? { type: 'reject' as const, reason: fixtures.canaries[0] } : { type: 'respond' as const, responseText: fixtures.canaries[0] };
+  let resume: object = [decision]; if (mode === 'map') resume = { 'respond-control': decision }; if (mode === 'interrupt-map') resume = { [run.getInterrupt()!.interruptId]: [decision] };
+  const callback = BaseCallbackHandler.fromMethods({ handleChainStart: (_chain, input): void => { observed.push(JSON.stringify(input)); } }); callback.awaitHandlers = true;
+  const outcome = await (entry === 'resume' ? run.resume(resume, { ...config, callbacks: [callback], signal: abort.signal }) : run.processStream(new Command({ resume }), { ...config, callbacks: [callback], signal: abort.signal })).catch((error: Error) => error);
+  expect(executions).toBe(0); expect('responseText' in decision ? decision.responseText : decision.reason).toBe(fixtures.canaries[0]);
+  if (mode === 'unselected') { expect(observed.join('')).toContain(fixtures.canaries[0]); expect(inspected).toEqual([]); return; }
+  assertNoCanary(observed.join('')); assertNoCanary(String(outcome)); expect(inspected[0]).toBe(fixtures.canaries[0]);
+  if (mode === 'block' || mode === 'timeout' || mode === 'cancelled') { expect(outcome).toMatchObject({ code: mode === 'block' ? 'blocked' : mode }); expect(observed).toEqual([]); } else { expect(outcome).toBeUndefined(); expect(observed.join('')).toContain('[EMAIL_1]'); }
+});
+
+it.each((['values', 'pending', 'goto', 'update', 'command', 'fresh'] as const).flatMap((carrier) => (['messages', 'agentMessages', 'allowed'] as const).map((channel) => [carrier, channel] as const)))('admits Send message state before native consumption (%s/%s)', async (carrier, channel) => {
+  let tamper = false; const observed: string[] = []; const runId = `send-native-${carrier}-${channel}`;
+  const packets = (): Send => new Send('default', { [channel === 'allowed' ? 'messages' : channel]: channel === 'allowed' ? [new HumanMessage('Allowed Send control')] : [new ToolMessage({ name: 'lookup', tool_call_id: 'uncertified-send', content: fixtures.canaries[0] })] });
+  class Saver extends MemorySaver { override async getTuple(config: RunnableConfig): ReturnType<MemorySaver['getTuple']> { const tuple = await super.getTuple(config); if (tuple == null || !tamper) return tuple; if (carrier === 'values') tuple.checkpoint.channel_values.__pregel_tasks = [[], [packets()]]; if (carrier === 'pending') tuple.pendingWrites = [...(tuple.pendingWrites ?? []), ['00000000-0000-0000-0000-000000000000', '__pregel_tasks', packets()]]; return tuple; } }
+  const saver = new Saver(); const hooks = new HookRegistry(); hooks.register('PreToolUse', { hooks: [async () => ({ decision: 'ask', reason: 'Allowed approval' })] });
+  const run = await Run.create({ runId, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, tools: [direct(() => 'Allowed result')], compileOptions: { checkpointer: saver } }, hooks, humanInTheLoop: { enabled: true }, toolResultProtection: policy() });
+  run.Graph!.overrideModel = new FakeChatModel({ responses: ['', 'Allowed final answer'], toolCalls: [{ id: 'send-approval', name: 'lookup', args: { count: 42 }, type: 'tool_call' }] });
+  const config = { version: 'v2' as const, configurable: { thread_id: runId } }; await run.processStream({ messages: [new HumanMessage('Allowed initial input')] }, config); tamper = true;
+  const callback = BaseCallbackHandler.fromMethods({ handleChainStart: (_chain, input): void => { observed.push(JSON.stringify(input)); } }); callback.awaitHandlers = true;
+  const options = carrier === 'goto' ? { goto: [packets()] } : { update: carrier === 'update' ? { __pregel_tasks: [packets()] } : undefined };
+  const invoke = (): Promise<unknown> => {
+    if (carrier === 'command') return run.processStream(new Command({ resume: [{ type: 'approve' }], goto: [packets()] }), { ...config, callbacks: [callback] });
+    if (carrier === 'fresh') return run.processStream({ messages: [new HumanMessage('Allowed next input')], __pregel_tasks: [packets()] } as IState, { ...config, callbacks: [callback] });
+    return run.resume([{ type: 'approve' }], { ...config, callbacks: [callback] }, undefined, options);
+  };
+  const result = await invoke().catch((error: Error) => error);
+  assertNoCanary(observed.join('')); assertNoCanary(String(result));
+  if (channel !== 'allowed') { expect(result).toBeInstanceOf(ToolResultProtectionError); expect(observed).toEqual([]); }
+  else expect(result).toBeUndefined();
+});
+
+it.each(['warm', 'rebuilt'] as const)('admits foreground-child approval responses before root and child Commands (%s)', async (runtime) => {
+  const saver = new MemorySaver(); const runId = `child-response-${runtime}`; const observed: string[] = []; const modelInputs: string[] = []; let executions = 0;
+  const create = async (resumed: boolean): Promise<Run<IState>> => {
+    const hooks = new HookRegistry(); hooks.register('PreToolUse', { hooks: [async (input) => ({ decision: input.toolName === 'lookup' ? 'ask' : 'allow', reason: 'Allowed child approval' })] });
+    const run = await Run.create({ runId, graphConfig: { type: 'standard', agents: [{ agentId: 'parent', provider: Providers.OPENAI, instructions: 'Allowed parent.', subagentConfigs: [{ type: 'worker', name: 'Worker', description: 'Allowed child.', agentInputs: { agentId: 'child', provider: Providers.OPENAI, instructions: 'Allowed child.', tools: [direct(() => { executions++; return 'Must not run'; })] } }] }], compileOptions: { checkpointer: saver } }, hooks, humanInTheLoop: { enabled: true }, toolResultProtection: policy(), skipCleanup: true });
+    run.Graph!.overrideModel = new FakeChatModel({ responses: resumed ? ['Allowed parent final answer'] : ['', 'Allowed parent final answer'], toolCalls: resumed ? [] : [{ id: 'child-respond-parent', name: Constants.SUBAGENT, args: { description: 'Allowed task.', subagent_type: 'worker' }, type: 'tool_call' }] });
+    class ChildModel extends FakeChatModel { override async *_streamResponseChunks(...args: Parameters<FakeChatModel['_streamResponseChunks']>): ReturnType<FakeChatModel['_streamResponseChunks']> { modelInputs.push(JSON.stringify(args[0])); yield* super._streamResponseChunks(...args); } }
+    run.Graph!.setSubagentModelOverride(new ChildModel({ responses: resumed ? ['Allowed child final answer'] : ['', 'Allowed child final answer'], toolCalls: resumed ? [] : [{ id: 'child-response-call', name: 'lookup', args: { count: 42 }, type: 'tool_call' }] })); return run;
+  };
+  const config = { version: 'v2' as const, configurable: { thread_id: runId } }; const first = await create(false); await first.processStream({ messages: [new HumanMessage('Allowed input')] }, config); expect(first.getInterrupt()).toBeDefined();
+  const next = runtime === 'warm' ? first : await create(true);
+  const callback = BaseCallbackHandler.fromMethods({ handleChainStart: (_chain, input): void => { observed.push(JSON.stringify(input)); } }); callback.awaitHandlers = true;
+  await next.resume([{ type: 'respond', responseText: fixtures.canaries[0] }], { ...config, callbacks: [callback] });
+  expect(executions).toBe(0); assertNoCanary(observed.join('')); assertNoCanary(modelInputs.join('')); expect(modelInputs.join('')).toContain('[EMAIL_1]');
+});
+
+it('preserves certified Send results, packet routing and unrelated state without rerunning producers', async () => {
+  const fixture = await certifiedHistory(); const graph = new StandardGraph({ runId: 'certified-send', agents: [{ agentId: 'worker', provider: Providers.OPENAI }], toolResultProtection: fixture.gate });
+  const state = graph.createRunStepResumeState(); state.toolResultReleases = fixture.releases; const authority = { user_id: 'allowed-principal', resource: 'allowed-resource' };
+  const packet = new Send('worker', { messages: fixture.messages, runStepState: state, authority });
+  const admitted = await graph.validateToolResultSend(packet);
+  expect(admitted).toBeInstanceOf(Send); expect(admitted.node).toBe('worker'); expect(admitted.args).not.toBe(packet.args); expect(admitted.args.authority).toBe(packet.args.authority); expect(admitted.args.authority).toEqual(authority); assertNoCanary(admitted.args.messages);
+  (packet.args.messages as ToolMessage[])[1].content = fixtures.canaries[0]; expect(admitted.args.messages[1].content).toBe('[EMAIL_1]');
 });

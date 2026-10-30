@@ -6,7 +6,7 @@ import { tool } from '@langchain/core/tools';
 import { ToolNode } from '@langchain/langgraph/prebuilt';
 import { ContextOverflowError } from '@langchain/core/errors';
 import { Runnable, RunnableConfig } from '@langchain/core/runnables';
-import { START, END, StateGraph, Annotation, Overwrite } from '@langchain/langgraph';
+import { START, END, StateGraph, Annotation, Overwrite, Send } from '@langchain/langgraph';
 import {
   ToolMessage,
   HumanMessage,
@@ -17,7 +17,7 @@ import type {
   BaseMessage,
   MessageContent,
 } from '@langchain/core/messages';
-import type { BaseChannel, OverwriteValue, CheckpointTuple } from '@langchain/langgraph';
+import type { BaseChannel, OverwriteValue, CheckpointTuple, Command } from '@langchain/langgraph';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type {
   ReplayableSubagentTool,
@@ -116,7 +116,7 @@ import {
   disposeLangfuseHandler,
   isLangfuseCallbackHandler,
 } from '@/langfuse';
-import { snapshotToolCheckpointConfig, snapshotToolCheckpointData, snapshotToolRunStepState, snapshotToolResumeMessages, snapshotToolMessageRemoval, snapshotToolCheckpointRecord, snapshotToolCheckpointArray, snapshotToolHistoryMessages, retainToolMessageReleases, normalizeToolResultError, getLiveToolMessageRelease, commitToolMessageRelease, snapshotToolMessageReleases, validateToolMessageHistory, requiresToolResultProtection, ToolResultProtectionError, validateToolResultProtection } from '@/protection/toolResult';
+import { snapshotToolSend, snapshotToolInputMessages, snapshotToolCheckpointConfig, snapshotToolCheckpointData, snapshotToolRunStepState, snapshotToolResumeMessages, snapshotToolMessageRemoval, snapshotToolCheckpointRecord, snapshotToolCheckpointArray, snapshotToolHistoryMessages, retainToolMessageReleases, normalizeToolResultError, getLiveToolMessageRelease, commitToolMessageRelease, snapshotToolMessageReleases, validateToolMessageHistory, requiresToolResultProtection, ToolResultProtectionError, validateToolResultProtection } from '@/protection/toolResult';
 import {
   getBlindRecoveryBudget,
   planContextOverflowRecovery,
@@ -771,6 +771,8 @@ export abstract class Graph<
           const values = snapshotToolCheckpointRecord(snapshot.values, ['messages', 'agentMessages', 'runStepState', 'handoffState']);
           snapshot.values = values;
           if (values.runStepState != null) values.runStepState = snapshotToolRunStepState(values.runStepState);
+          if (values.messages != null) values.messages = snapshotToolInputMessages(values.messages);
+          if (values.agentMessages != null) values.agentMessages = snapshotToolInputMessages(values.agentMessages);
           if (values.messages != null) values.messages = await this.validateToolResultHistory(values.messages, values.runStepState, signal);
           if (values.agentMessages != null) {
             const current = snapshotToolHistoryMessages(values.messages ?? []);
@@ -798,6 +800,25 @@ export abstract class Graph<
     };
     return visit(input);
   }
+  async validateToolResultSend(input: unknown, signal?: AbortSignal, fallback?: t.RunStepResumeState): Promise<Send> {
+    const packet = snapshotToolSend(input);
+    const args = packet.args as NonNullable<ToolResultCheckpoint['values']>;
+    const state = await this.validateToolResultCheckpoint({ values: { ...args, runStepState: args.runStepState ?? fallback } }, signal);
+    if (args.runStepState == null) delete state.values.runStepState;
+    return Object.assign(Object.create(Send.prototype) as Send, packet, { args: state.values });
+  }
+
+  async validateToolResultGoto(input: Command['goto'], signal?: AbortSignal): Promise<Command['goto']> {
+    if (typeof input === 'string') return input;
+    const entries = Array.isArray(input) ? snapshotToolCheckpointArray(input) : [input];
+    return Promise.all(entries.map((entry) => typeof entry === 'string' ? entry : this.validateToolResultSend(entry, signal)));
+  }
+
+  async validateToolResultTaskWrites(input: unknown, signal?: AbortSignal): Promise<Send | Send[]> {
+    if (Array.isArray(input)) return Promise.all(snapshotToolCheckpointArray(input).map((packet) => this.validateToolResultSend(packet, signal)));
+    return this.validateToolResultSend(input, signal);
+  }
+
   async validateToolResultCheckpointTuple(input: CheckpointTuple, signal?: AbortSignal): Promise<CheckpointTuple> {
     const tuple = snapshotToolCheckpointRecord(input, ['checkpoint', 'pendingWrites', 'config', 'parentConfig', 'metadata']);
     tuple.config = snapshotToolCheckpointConfig(tuple.config);
@@ -806,7 +827,18 @@ export abstract class Graph<
     const checkpoint = snapshotToolCheckpointRecord(tuple.checkpoint, ['channel_values', 'channel_versions', 'versions_seen', 'v', 'id', 'ts']);
     checkpoint.channel_versions = snapshotToolCheckpointData(checkpoint.channel_versions);
     checkpoint.versions_seen = snapshotToolCheckpointData(checkpoint.versions_seen);
-    const values = snapshotToolCheckpointRecord(checkpoint.channel_values, ['messages', 'agentMessages', 'runStepState']);
+    const values = snapshotToolCheckpointRecord(checkpoint.channel_values, ['messages', 'agentMessages', 'runStepState', '__pregel_tasks']);
+    if (values.messages != null) values.messages = snapshotToolInputMessages(values.messages as BaseMessage[]);
+    if (values.agentMessages != null) values.agentMessages = snapshotToolInputMessages(values.agentMessages as BaseMessage[]);
+    const tasks = values.__pregel_tasks;
+    if (tasks != null) {
+      const topic = snapshotToolCheckpointArray(tasks as readonly unknown[]);
+      if (topic.length !== 2) throw new ToolResultProtectionError('unsupported');
+      const seen = snapshotToolCheckpointArray(topic[0] as readonly unknown[]);
+      if (seen.length !== 0) throw new ToolResultProtectionError('unsupported');
+      values.__pregel_tasks = [seen, snapshotToolCheckpointArray(topic[1] as readonly unknown[]).map(snapshotToolSend)];
+    }
+    if (Object.hasOwn(checkpoint, 'pending_sends')) throw new ToolResultProtectionError('incompatible');
     const pending = snapshotToolCheckpointArray(tuple.pendingWrites ?? []).map((entry) => {
       const write = snapshotToolCheckpointArray(entry);
       if (write.length !== 3 || typeof write[0] !== 'string' || typeof write[1] !== 'string') throw new ToolResultProtectionError('unsupported');
@@ -826,8 +858,10 @@ export abstract class Graph<
     const updates: Array<{ write: NonNullable<CheckpointTuple['pendingWrites']>[number]; change: ReturnType<typeof snapshotToolResumeMessages>; controls: Array<ReturnType<typeof snapshotToolMessageRemoval>> }> = [];
     for (const write of pending) {
       if (write[1] === 'runStepState') write[2] = addState(write[2]);
+      if (write[1] === '__pregel_tasks' || write[1] === '__pregel_push') write[2] = Array.isArray(write[2]) ? snapshotToolCheckpointArray(write[2]).map(snapshotToolSend) : snapshotToolSend(write[2]);
       if (write[1] !== 'messages' && write[1] !== 'agentMessages') continue;
       const change = snapshotToolResumeMessages(write[2]);
+      change.messages = snapshotToolInputMessages(change.messages);
       const controls = change.messages.map(snapshotToolMessageRemoval);
       for (let index = 0; index < change.messages.length; index++) {
         if (controls[index] == null) outputs.push(change.messages[index]);
@@ -835,6 +869,15 @@ export abstract class Graph<
       }
       updates.push({ write, change, controls });
     }
+    const fallback = values.runStepState as t.RunStepResumeState | undefined;
+    const admitTasks = async (value: unknown): Promise<Send | Send[]> => Array.isArray(value)
+      ? Promise.all(value.map((packet) => this.validateToolResultSend(packet, signal, fallback)))
+      : this.validateToolResultSend(value, signal, fallback);
+    if (values.__pregel_tasks != null) {
+      const topic = values.__pregel_tasks as [unknown[], Send[]];
+      values.__pregel_tasks = [topic[0], await admitTasks(topic[1])];
+    }
+    for (const write of pending) if (write[1] === '__pregel_tasks' || write[1] === '__pregel_push') write[2] = await admitTasks(write[2]);
     const primary = snapshotToolHistoryMessages((values.messages ?? []) as BaseMessage[]);
     const alternate = snapshotToolHistoryMessages((values.agentMessages ?? []) as BaseMessage[]);
     const canonical = await this.validateToolResultHistory([...primary, ...alternate, ...outputs], { toolResultReleases: releases }, signal);
