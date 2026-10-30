@@ -18,8 +18,7 @@ import type * as e from '@/common/enum';
 import type * as g from '@/types/graph';
 import type * as l from '@/types/llm';
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-export type ZodObjectAny = z.ZodObject<any, any, any, any>;
+export type ZodObjectAny = z.ZodObject;
 export type BaseGraphConfig = {
   llmConfig: l.LLMConfig;
   provider?: l.ProviderName;
@@ -35,7 +34,11 @@ export type LegacyGraphConfig = BaseGraphConfig & {
      * via the top-level `RunConfig.streamLimits`; accepting the field here
      * would type-check but be silently ignored by `createLegacyGraph`.
      * Required provider-text protection also belongs only to RunConfig. */
-    'provider' | 'clientOptions' | 'agents' | 'streamLimits' | 'providerTextProtection'
+    | 'provider'
+    | 'clientOptions'
+    | 'agents'
+    | 'streamLimits'
+    | 'providerTextProtection'
   > &
   Omit<g.AgentInputs, 'provider' | 'clientOptions' | 'agentId'>;
 
