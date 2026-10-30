@@ -157,7 +157,7 @@ function commandWithEnv(
 
 async function collectReadableStream(
   stream: ReadableStream<Uint8Array>
-): Promise<Uint8Array> {
+): Promise<ReturnType<typeof Uint8Array.from>> {
   const reader = stream.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
@@ -183,7 +183,7 @@ async function collectReadableStream(
 async function normalizeWriteBody(
   content: string | ReadableStream<Uint8Array>,
   options?: { encoding?: string }
-): Promise<Uint8Array> {
+): Promise<ReturnType<typeof Uint8Array.from>> {
   if (typeof content !== 'string') {
     return collectReadableStream(content);
   }
