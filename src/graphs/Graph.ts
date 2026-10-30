@@ -116,7 +116,7 @@ import {
   disposeLangfuseHandler,
   isLangfuseCallbackHandler,
 } from '@/langfuse';
-import { snapshotToolResumeMessages, snapshotToolMessageRemoval, snapshotToolCheckpointRecord, snapshotToolCheckpointArray, snapshotToolHistoryMessages, retainToolMessageReleases, normalizeToolResultError, getLiveToolMessageRelease, commitToolMessageRelease, snapshotToolMessageReleases, validateToolMessageHistory, requiresToolResultProtection, ToolResultProtectionError, validateToolResultProtection } from '@/protection/toolResult';
+import { snapshotToolRunStepState, snapshotToolResumeMessages, snapshotToolMessageRemoval, snapshotToolCheckpointRecord, snapshotToolCheckpointArray, snapshotToolHistoryMessages, retainToolMessageReleases, normalizeToolResultError, getLiveToolMessageRelease, commitToolMessageRelease, snapshotToolMessageReleases, validateToolMessageHistory, requiresToolResultProtection, ToolResultProtectionError, validateToolResultProtection } from '@/protection/toolResult';
 import {
   getBlindRecoveryBudget,
   planContextOverflowRecovery,
@@ -773,7 +773,7 @@ export abstract class Graph<
         if (snapshot.values != null) {
           const values = snapshotToolCheckpointRecord(snapshot.values, ['messages', 'agentMessages', 'runStepState', 'handoffState']);
           snapshot.values = values;
-          if (values.runStepState != null) values.runStepState = snapshotToolCheckpointRecord(values.runStepState, ['toolResultReleases']);
+          if (values.runStepState != null) values.runStepState = snapshotToolRunStepState(values.runStepState);
           if (values.messages != null) values.messages = await this.validateToolResultHistory(values.messages, values.runStepState, signal);
           if (values.agentMessages != null) {
             const current = snapshotToolHistoryMessages(values.messages ?? []);
@@ -811,17 +811,19 @@ export abstract class Graph<
       return [write[0], write[1], write[2]] as NonNullable<CheckpointTuple['pendingWrites']>[number];
     });
     const releases: ToolMessageRelease[] = [];
-    const addState = (value: unknown): void => {
-      if (value == null) return;
+    const addState = (value: unknown): unknown => {
+      if (value == null) return value;
       const carrier = snapshotToolCheckpointRecord(value as t.RunStepResumeState & { __overwrite__?: t.RunStepResumeState }, ['__overwrite__', 'toolResultReleases']);
-      const state = Object.hasOwn(carrier, '__overwrite__') ? snapshotToolCheckpointRecord(carrier.__overwrite__!, ['toolResultReleases']) : carrier;
-      releases.push(...snapshotToolMessageReleases(state.toolResultReleases ?? []));
+      const overwrite = Object.hasOwn(carrier, '__overwrite__');
+      const state = snapshotToolRunStepState(overwrite ? carrier.__overwrite__! : carrier);
+      releases.push(...state.toolResultReleases ?? []);
+      return overwrite ? new Overwrite(state) : state;
     };
-    addState(values.runStepState);
+    if (values.runStepState != null) values.runStepState = addState(values.runStepState);
     const outputs: BaseMessage[] = [];
     const updates: Array<{ write: NonNullable<CheckpointTuple['pendingWrites']>[number]; change: ReturnType<typeof snapshotToolResumeMessages>; controls: Array<ReturnType<typeof snapshotToolMessageRemoval>> }> = [];
     for (const write of pending) {
-      if (write[1] === 'runStepState') addState(write[2]);
+      if (write[1] === 'runStepState') write[2] = addState(write[2]);
       if (write[1] !== 'messages' && write[1] !== 'agentMessages') continue;
       const change = snapshotToolResumeMessages(write[2]);
       const controls = change.messages.map(snapshotToolMessageRemoval);

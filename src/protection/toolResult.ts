@@ -17,15 +17,16 @@ import type {
   ProviderTextProtectionErrorCode,
 } from './providerText';
 import type {
-  ToolOutputReferenceRegistry,
-  ToolOutputReferenceState,
-} from '@/tools/toolOutputReferences';
-import type {
   GenericTool,
+  RunStepResumeState,
   ToolExecuteResult,
   ToolExecuteBatchRequest,
   ToolCallRequest,
 } from '@/types';
+import type {
+  ToolOutputReferenceRegistry,
+  ToolOutputReferenceState,
+} from '@/tools/toolOutputReferences';
 import type { ToolCheckpointAdmission } from './toolCheckpoint';
 import {
   ProviderTextAttempt,
@@ -35,6 +36,7 @@ import {
 } from './providerText';
 import { PreparedSubagentError } from '@/tools/preparedSubagents';
 import { StreamLimitExceededError } from '@/llm/streamLimits';
+import { isRunStepResumeState } from '@/tools/runStepResume';
 import { ToolCheckpointSaver } from './toolCheckpoint';
 
 export const TOOL_RESULT_PROTECTION_VERSION = 1;
@@ -527,6 +529,50 @@ export function snapshotToolCheckpointRecord<T extends object>(value: T, fields:
   plainObject(value, Object.getOwnPropertyNames(value), true);
   for (const field of fields) ownMessageValue(value, field);
   return Object.fromEntries(Object.entries(Object.getOwnPropertyDescriptors(value)).map(([key, descriptor]) => [key, descriptor.value])) as T;
+}
+
+function snapshotToolCheckpointData<T>(input: T, active = new WeakSet<object>(), depth = 0): T {
+  if (typeof input === 'function' || typeof input === 'symbol' || depth > 64) throw new ToolResultProtectionError('unsupported');
+  if (input == null || typeof input !== 'object') return input;
+  if (types.isProxy(input) || active.has(input)) throw new ToolResultProtectionError('unsupported');
+  active.add(input);
+  try {
+    if (Array.isArray(input)) return snapshotToolCheckpointArray(input).map((value) => snapshotToolCheckpointData(value, active, depth + 1)) as T;
+    const prototype = Object.getPrototypeOf(input);
+    if (prototype != null && (types.isProxy(prototype) || Object.getPrototypeOf(prototype) !== null)) throw new ToolResultProtectionError('unsupported');
+    const record = snapshotToolCheckpointRecord(input, []);
+    return Object.fromEntries(Object.entries(record).map(([key, value]) => [key, snapshotToolCheckpointData(value, active, depth + 1)])) as T;
+  } finally { active.delete(input); }
+}
+
+export function snapshotToolRunStepState(value: RunStepResumeState): RunStepResumeState {
+  const carrier = snapshotToolCheckpointRecord(value, ['toolResultReleases']);
+  if (carrier.toolResultReleases != null) carrier.toolResultReleases = snapshotToolMessageReleases(carrier.toolResultReleases);
+  const state = snapshotToolCheckpointData(carrier);
+  if (!isRunStepResumeState(state)) throw new ToolResultProtectionError('incompatible');
+  return state;
+}
+
+/** Detach routing identities, not arguments or opaque unselected payloads. */
+export function snapshotToolInputMessages(messages: readonly BaseMessage[]): BaseMessage[] {
+  return snapshotToolHistoryMessages(messages).map((message) => {
+    ownMessageValue(message, 'type');
+    const descriptors = Object.getOwnPropertyDescriptors(message);
+    for (const key of Reflect.ownKeys(descriptors)) if (!('value' in descriptors[key as keyof typeof descriptors])) throw new ToolResultProtectionError('unsupported');
+    for (const key of ['additional_kwargs', 'response_metadata', 'lc_kwargs']) {
+      if (Object.hasOwn(descriptors, key) && descriptors[key].value != null) descriptors[key] = { ...descriptors[key], value: snapshotToolCheckpointRecord(descriptors[key].value as object, []) };
+    }
+    const calls = ownMessageValue(message, 'tool_calls');
+    if (calls != null) {
+      const detached = snapshotToolCheckpointArray(calls as readonly object[]).map((call) => snapshotToolCheckpointRecord(call, ['id', 'name', 'args']));
+      descriptors.tool_calls = { ...descriptors.tool_calls, value: detached };
+      if (Object.hasOwn(descriptors, 'lc_kwargs') && descriptors.lc_kwargs.value != null && Object.hasOwn(descriptors.lc_kwargs.value as object, 'tool_calls')) Object.defineProperty(descriptors.lc_kwargs.value, 'tool_calls', { value: detached, enumerable: true, writable: true, configurable: true });
+    }
+    const copy = Object.create(Object.getPrototypeOf(message), descriptors) as BaseMessage;
+    const admission = approved.get(message);
+    if (admission != null) approved.set(copy, admission);
+    return copy;
+  });
 }
 
 export function getToolResultCheckpointLookup<C extends RunnableConfig>(config: C): C {

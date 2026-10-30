@@ -35,11 +35,11 @@ import type {
 } from '@/protection/toolResult';
 import type { ToolOutputReferenceState } from '@/tools/toolOutputReferences';
 import type { SettledToolBatchResult } from '@/tools/toolBatchReplay';
+import { snapshotToolRunStepState, snapshotToolMessageRemoval, validateToolMessageHistory, getToolMessageRelease, ToolResultProtectionError   } from '@/protection/toolResult';
 import {
   createCloudflareProgrammaticToolCallingTool,
   createCloudflareBashProgrammaticToolCallingTool,
 } from '@/tools/cloudflare/CloudflareProgrammaticToolCalling';
-import { snapshotToolMessageRemoval, validateToolMessageHistory, getToolMessageRelease, ToolResultProtectionError   } from '@/protection/toolResult';
 import { createLocalProgrammaticToolCallingTool } from '@/tools/local/LocalProgrammaticToolCalling';
 import {
   createProgrammaticToolCallingTool,
@@ -53,11 +53,11 @@ import {
 import { messagesStateReducer, createRemoveAllMessage } from '@/messages/reducer';
 import { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import { ProviderTextProtectionError } from '@/protection/providerText';
+import { Constants, GraphEvents, Providers, StepTypes } from '@/common';
 import { PreparedSubagentError } from '@/tools/preparedSubagents';
 import fixtures from '@/protection/__tests__/fixtures/a1.json';
 import { stableStringify } from '@/tools/eagerEventExecution';
 import { StreamLimitExceededError } from '@/llm/streamLimits';
-import { Constants, GraphEvents, Providers } from '@/common';
 import { ChatModelStreamHandler } from '@/stream';
 import { StandardGraph } from '@/graphs/Graph';
 import { ToolNode } from '@/tools/ToolNode';
@@ -3354,4 +3354,74 @@ it('admits certified pending results and preserves own writes, identities, remov
   tuple.pendingWrites = [['task-control', 'messages', [createRemoveAllMessage(), new HumanMessage('Allowed compaction control')]]];
   const compacted = await graph.validateToolResultCheckpointTuple(tuple);
   expect((compacted.pendingWrites![0][2] as BaseMessage[])[0]).toBeInstanceOf(RemoveMessage);
+});
+
+it.each(['values', 'pending', 'overwrite'] as const)('detaches admitted run-step %s carriers before awaited inspection', async (location) => {
+  let receipts: NonNullable<RunStepResumeState['toolResultReleases']> = []; let tamper = false; let retained: RunStepResumeState | undefined; let reads = 0; let mutations = 0;
+  class Saver extends MemorySaver {
+    override async getTuple(config: RunnableConfig): ReturnType<MemorySaver['getTuple']> {
+      const tuple = await super.getTuple(config); if (tuple == null || !tamper) return tuple;
+      const state = { version: 1 as const, revision: 1, nextIndex: 0, toolCallSteps: [], steps: [], toolResultReleases: structuredClone(receipts) }; retained = state;
+      if (location === 'values') tuple.checkpoint.channel_values.runStepState = state;
+      else tuple.pendingWrites = [...(tuple.pendingWrites ?? []), ['00000000-0000-0000-0000-000000000000', 'runStepState', location === 'overwrite' ? new Overwrite(state) : state]];
+      return tuple;
+    }
+  }
+  const saver = new Saver(); const config = { version: 'v2' as const, configurable: { thread_id: `carrier-alias-${location}` } };
+  const seed = await Run.create({ runId: `carrier-seed-${location}`, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, tools: [direct(() => fixtures.canaries[0])], compileOptions: { checkpointer: saver } }, toolResultProtection: policy() });
+  seed.Graph!.overrideModel = new FakeChatModel({ responses: ['', 'Allowed seed answer'], toolCalls: [{ id: 'carrier-source', name: 'lookup', args: { count: 42 }, type: 'tool_call' }] });
+  await seed.processStream({ messages: [new HumanMessage('Allowed seed input')] }, config);
+  receipts = ((await saver.getTuple(config))!.checkpoint.channel_values.runStepState as RunStepResumeState).toolResultReleases!; tamper = true;
+  const gate = policy({ inspect: async ({ content }) => {
+    if (retained != null) { mutations++; Object.defineProperty(retained, 'revision', { configurable: true, get: () => { reads++; throw new Error(fixtures.canaries[0]); } }); retained.toolResultReleases!.push({ ...receipts[0], version: 2 } as unknown as NonNullable<RunStepResumeState['toolResultReleases']>[number]); }
+    await Promise.resolve(); return approve(content);
+  } });
+  const run = await Run.create({ runId: `carrier-alias-${location}`, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, compileOptions: { checkpointer: saver } }, toolResultProtection: gate });
+  run.Graph!.overrideModel = new FakeChatModel({ responses: ['Allowed final answer'] });
+  const outcome = await run.processStream({ messages: [new HumanMessage('Allowed input')] }, config).catch((error: Error) => error);
+  expect(reads).toBe(0); assertNoCanary(String(outcome)); expect(outcome).toBeUndefined(); expect(mutations).toBeGreaterThan(0); assertNoCanary(run.Graph!.getRunMessages());
+});
+
+it.each(['mutate', 'append', 'late-message', 'late-array', 'late-routing', 'control', 'unprotected'] as const)('readmits and detaches startup hook messages before native callbacks (%s)', async (mode) => {
+  const fixture = await certifiedHistory(); let retained: BaseMessage[] | undefined; let mutations = 0; const observed: string[] = []; const models: string[] = [];
+  const hooks = new HookRegistry(); hooks.register('RunStart', { hooks: [async (input) => {
+    retained = input.messages;
+    if (mode === 'mutate' || mode === 'unprotected') (retained[1] as ToolMessage).content = fixtures.canaries[0];
+    if (mode === 'append') retained.push(new ToolMessage({ name: 'lookup', tool_call_id: 'uncertified-hook', content: fixtures.canaries[0] }));
+    return { additionalContext: 'Allowed hook context' };
+  }] });
+  class Model extends FakeChatModel { override async *_streamResponseChunks(...args: Parameters<FakeChatModel['_streamResponseChunks']>): ReturnType<FakeChatModel['_streamResponseChunks']> { models.push(JSON.stringify(args[0])); yield* super._streamResponseChunks(...args); } }
+  const run = await Run.create({ runId: `hook-alias-${mode}`, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI } }, toolResultProtection: mode === 'unprotected' ? undefined : fixture.gate, hooks });
+  run.Graph!.overrideModel = new Model({ responses: ['Allowed final answer'] });
+  const state = run.Graph!.createRunStepResumeState(); state.toolResultReleases = fixture.releases;
+  const callback = BaseCallbackHandler.fromMethods({ handleChainStart: (_chain, input): void => {
+    if (retained != null && mutations === 0 && (mode === 'late-message' || mode === 'late-array' || mode === 'late-routing')) { mutations++; if (mode === 'late-message') retained[1].content = fixtures.canaries[0]; else if (mode === 'late-routing') (retained[0] as AIMessage).tool_calls![0].name = 'other'; else retained.push(new ToolMessage({ name: 'lookup', tool_call_id: 'late-hook', content: fixtures.canaries[0] })); }
+    observed.push(JSON.stringify(input));
+  }, handleChainEnd: (output): void => { observed.push(JSON.stringify(output)); } }); callback.awaitHandlers = true;
+  const outcome = await run.processStream({ messages: [...fixture.messages, new HumanMessage('Allowed input')], runStepState: state }, { version: 'v2', callbacks: [callback], configurable: { thread_id: `hook-alias-${mode}` } }).catch((error: Error) => error);
+  if (mode === 'unprotected') { expect(models.join('')).toContain(fixtures.canaries[0]); return; }
+  assertNoCanary(observed.join('')); assertNoCanary(models.join('')); assertNoCanary(String(outcome));
+  if (mode === 'mutate' || mode === 'append') { expect(outcome).toBeInstanceOf(ToolResultProtectionError); expect(observed).toEqual([]); expect(models).toEqual([]); }
+  else { expect(outcome).toBeUndefined(); expect(models).toHaveLength(1); expect(models[0]).toContain('Allowed hook context'); if (mode !== 'control') expect(mutations).toBe(1); }
+});
+
+it('detaches run-step nested entries and receipt collections without mutating frozen carriers', async () => {
+  const fixture = await certifiedHistory();
+  const graph = new StandardGraph({ runId: 'nested-state-alias', agents: [{ agentId: 'worker', provider: Providers.OPENAI }], toolResultProtection: fixture.gate });
+  const state = graph.createRunStepResumeState(); state.toolResultReleases = fixture.releases;
+  state.toolCallSteps = [{ toolCallId: 'allowed-call', stepId: 'allowed-step' }];
+  state.steps = [{ step: { id: 'allowed-step', index: 0, type: StepTypes.TOOL_CALLS, stepDetails: { type: StepTypes.TOOL_CALLS, tool_calls: [{ id: 'allowed-call', name: 'lookup', args: { count: 42 }, type: 'tool_call' }] }, usage: null }, pendingToolCallIds: ['allowed-call'], openMessageStep: false }];
+  const frozen = Object.freeze(state); const admitted = snapshotToolRunStepState(frozen);
+  expect(admitted).toEqual(state); expect(admitted).not.toBe(state); expect(admitted.steps[0].step).not.toBe(state.steps[0].step); expect(admitted.toolResultReleases![0].envelope).not.toBe(state.toolResultReleases![0].envelope);
+  state.toolCallSteps[0].stepId = 'changed'; state.steps[0].pendingToolCallIds.push('changed'); Object.defineProperty(state.toolResultReleases![0], 'name', { value: 'changed' });
+  expect(admitted.toolCallSteps[0].stepId).toBe('allowed-step'); expect(admitted.steps[0].pendingToolCallIds).toEqual(['allowed-call']); expect(admitted.toolResultReleases![0].name).toBe('lookup');
+});
+
+it.each(['revision', 'nested', 'cycle'] as const)('rejects hostile run-step %s data without executing accessors', (mode) => {
+  const graph = new StandardGraph({ runId: 'hostile-step-state', agents: [{ agentId: 'worker', provider: Providers.OPENAI }], toolResultProtection: policy() });
+  const state = graph.createRunStepResumeState(); let reads = 0;
+  if (mode === 'revision') Object.defineProperty(state, 'revision', { get: () => { reads++; throw new Error(fixtures.canaries[0]); } });
+  if (mode === 'nested') Object.defineProperty(state.toolCallSteps, '0', { configurable: true, get: () => { reads++; throw new Error(fixtures.canaries[0]); } });
+  if (mode === 'cycle') Object.defineProperty(state, 'cycle', { value: state, enumerable: true });
+  expect(() => snapshotToolRunStepState(state)).toThrow(ToolResultProtectionError); expect(reads).toBe(0);
 });

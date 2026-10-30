@@ -1,4 +1,4 @@
-import { admitToolResultCheckpoints, getToolResultCheckpointLookup, bindToolResultCheckpoint, snapshotToolMessageRemoval, snapshotToolResumeUpdates, snapshotToolResumeMessages, snapshotToolHistoryMessages, normalizeToolResultError, hasRequiredToolExecuteProtection, ToolResultProtectionError } from '@/protection/toolResult';
+import { snapshotToolInputMessages, snapshotToolRunStepState, snapshotToolCheckpointRecord, admitToolResultCheckpoints, getToolResultCheckpointLookup, bindToolResultCheckpoint, snapshotToolMessageRemoval, snapshotToolResumeUpdates, snapshotToolResumeMessages, snapshotToolHistoryMessages, normalizeToolResultError, hasRequiredToolExecuteProtection, ToolResultProtectionError } from '@/protection/toolResult';
 import { messagesStateReducer } from '@/messages/reducer';
 // src/run.ts
 import { nanoid } from 'nanoid';
@@ -1423,14 +1423,7 @@ export class Run<_T extends t.BaseGraphState> {
     }
     if (stateInputs != null) {
       if (this.toolResultProtection != null) {
-        const current = snapshotToolHistoryMessages(inputCheckpoint?.values?.messages ?? []);
-        const admitted = await this.validateToolResultMessageWrite(current, stateInputs.messages, stateInputs.runStepState ?? inputCheckpoint?.values?.runStepState, callerConfig.signal);
-        stateInputs = { ...stateInputs, messages: admitted.update };
-        if ('agentMessages' in stateInputs && stateInputs.agentMessages != null) {
-          const alternate = snapshotToolHistoryMessages(stateInputs.agentMessages as BaseMessage[]);
-          const canonical = await graph.validateToolResultHistory([...admitted.messages, ...alternate], stateInputs.runStepState ?? inputCheckpoint?.values?.runStepState, callerConfig.signal);
-          stateInputs = { ...stateInputs, agentMessages: canonical.slice(admitted.messages.length) } as t.IState;
-        }
+        stateInputs = await this.validateToolResultStateInputs(stateInputs, inputCheckpoint, callerConfig.signal);
         inputs = stateInputs;
       }
       this.activityPhaseTraceInput = findActivityPhaseTraceInput(stateInputs.messages);
@@ -1544,6 +1537,10 @@ export class Run<_T extends t.BaseGraphState> {
       );
       if (shouldHalt) {
         return undefined;
+      }
+      if (this.toolResultProtection != null) {
+        stateInputs = await this.validateToolResultStateInputs(stateInputs, inputCheckpoint, callerConfig.signal);
+        inputs = stateInputs;
       }
     }
 
@@ -2241,6 +2238,20 @@ export class Run<_T extends t.BaseGraphState> {
     }
 
     return { config: manifestConfig, update };
+  }
+
+  private async validateToolResultStateInputs(input: t.IState, checkpoint?: InterruptStateSnapshot, signal?: AbortSignal): Promise<t.IState> {
+    const source = snapshotToolCheckpointRecord(input, ['messages', 'agentMessages', 'runStepState']);
+    const runStepState = source.runStepState == null ? undefined : snapshotToolRunStepState(source.runStepState);
+    const state = runStepState ?? checkpoint?.values?.runStepState;
+    const messages = snapshotToolInputMessages(source.messages);
+    const alternate = 'agentMessages' in source && source.agentMessages != null ? snapshotToolInputMessages(source.agentMessages as BaseMessage[]) : undefined;
+    const current = snapshotToolHistoryMessages(checkpoint?.values?.messages ?? []);
+    const admitted = await this.validateToolResultMessageWrite(current, messages, state, signal);
+    const result = { ...source, messages: admitted.update, ...(runStepState == null ? {} : { runStepState }) };
+    if (alternate == null) return result;
+    const canonical = await this.Graph!.validateToolResultHistory([...admitted.messages, ...alternate], state, signal);
+    return { ...result, agentMessages: canonical.slice(admitted.messages.length) } as t.IState;
   }
 
   private async validateToolResultMessageWrite(current: BaseMessage[], update: BaseMessage[], state?: t.RunStepResumeState, signal?: AbortSignal, overwrite = false, removalControls = true): Promise<{ update: BaseMessage[]; messages: BaseMessage[] }> {
