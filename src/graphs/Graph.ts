@@ -116,7 +116,7 @@ import {
   disposeLangfuseHandler,
   isLangfuseCallbackHandler,
 } from '@/langfuse';
-import { snapshotToolHistoryMessages, retainToolMessageReleases, normalizeToolResultError, getLiveToolMessageRelease, commitToolMessageRelease, snapshotToolMessageReleases, validateToolMessageHistory, requiresToolResultProtection, ToolResultProtectionError, validateToolResultProtection } from '@/protection/toolResult';
+import { snapshotToolCheckpointRecord, snapshotToolCheckpointArray, snapshotToolHistoryMessages, retainToolMessageReleases, normalizeToolResultError, getLiveToolMessageRelease, commitToolMessageRelease, snapshotToolMessageReleases, validateToolMessageHistory, requiresToolResultProtection, ToolResultProtectionError, validateToolResultProtection } from '@/protection/toolResult';
 import {
   getBlindRecoveryBudget,
   planContextOverflowRecovery,
@@ -734,8 +734,9 @@ function buildRunStepStateAnnotation(): RunStepStateChannel {
 }
 
 type ToolResultCheckpoint = {
+  config?: RunnableConfig;
   values?: { messages?: BaseMessage[]; agentMessages?: BaseMessage[]; runStepState?: t.RunStepResumeState };
-  tasks?: readonly { state?: ToolResultCheckpoint | RunnableConfig }[];
+  tasks?: readonly { state?: ToolResultCheckpoint | RunnableConfig; interrupts?: readonly { id?: string; value?: unknown }[] }[];
 };
 
 export abstract class Graph<
@@ -758,19 +759,47 @@ export abstract class Graph<
   }): CustomToolNode<T> | ToolNode<T>;
   async validateToolResultHistory(messages: BaseMessage[], _state?: t.RunStepResumeState, _signal?: AbortSignal): Promise<BaseMessage[]> { return messages; }
   commitToolResultMessages(_messages: BaseMessage[]): void {}
-  async validateToolResultCheckpoint(snapshot: ToolResultCheckpoint, signal?: AbortSignal): Promise<void> {
-    const messages = snapshot.values?.messages;
-    if (messages != null && snapshot.values != null) snapshot.values.messages = await this.validateToolResultHistory(messages, snapshot.values.runStepState, signal);
-    if (snapshot.values?.agentMessages != null) {
-      const current = snapshotToolHistoryMessages(snapshot.values.messages ?? []);
-      const alternate = snapshotToolHistoryMessages(snapshot.values.agentMessages);
-      const canonical = await this.validateToolResultHistory([...current, ...alternate], snapshot.values.runStepState, signal);
-      snapshot.values.agentMessages = canonical.slice(current.length);
-    }
-    for (const task of snapshot.tasks ?? []) {
-      const nested = task.state;
-      if (nested != null && 'tasks' in nested && Array.isArray(nested.tasks)) await this.validateToolResultCheckpoint(nested, signal);
-    }
+  async validateToolResultCheckpoint<S extends ToolResultCheckpoint>(input: S, signal?: AbortSignal): Promise<S> {
+    const active = new WeakSet<object>();
+    const visit = async <C extends ToolResultCheckpoint>(candidate: C): Promise<C> => {
+      const snapshot = snapshotToolCheckpointRecord(candidate, ['values', 'tasks', 'config']);
+      if (active.has(candidate)) throw new ToolResultProtectionError('unsupported');
+      active.add(candidate);
+      try {
+        if (snapshot.config != null) {
+          snapshot.config = snapshotToolCheckpointRecord(snapshot.config, ['configurable']);
+          if (snapshot.config.configurable != null) snapshot.config.configurable = snapshotToolCheckpointRecord(snapshot.config.configurable, ['checkpoint_id', 'checkpoint_ns', 'thread_id']);
+        }
+        if (snapshot.values != null) {
+          const values = snapshotToolCheckpointRecord(snapshot.values, ['messages', 'agentMessages', 'runStepState', 'handoffState']);
+          snapshot.values = values;
+          if (values.runStepState != null) values.runStepState = snapshotToolCheckpointRecord(values.runStepState, ['toolResultReleases']);
+          if (values.messages != null) values.messages = await this.validateToolResultHistory(values.messages, values.runStepState, signal);
+          if (values.agentMessages != null) {
+            const current = snapshotToolHistoryMessages(values.messages ?? []);
+            const alternate = snapshotToolHistoryMessages(values.agentMessages);
+            const canonical = await this.validateToolResultHistory([...current, ...alternate], values.runStepState, signal);
+            values.agentMessages = canonical.slice(current.length);
+          }
+        }
+        if (snapshot.tasks != null) {
+          const tasks = snapshotToolCheckpointArray(snapshot.tasks);
+          const admittedTasks: typeof tasks = [];
+          for (const entry of tasks) {
+            const task = snapshotToolCheckpointRecord(entry, ['state', 'interrupts']);
+            if (task.interrupts != null) task.interrupts = snapshotToolCheckpointArray(task.interrupts).map((interrupt) => snapshotToolCheckpointRecord(interrupt, ['id', 'value']));
+            if (task.state != null) {
+              const state = snapshotToolCheckpointRecord(task.state, ['values', 'tasks', 'config']);
+              task.state = Object.hasOwn(state, 'values') || Object.hasOwn(state, 'tasks') ? await visit(task.state as ToolResultCheckpoint) : state;
+            }
+            admittedTasks.push(task);
+          }
+          snapshot.tasks = admittedTasks;
+        }
+        return snapshot;
+      } finally { active.delete(candidate); }
+    };
+    return visit(input);
   }
   abstract getRunMessages(): BaseMessage[] | undefined;
   /** Returns a snapshot of deferred tools discovered by this graph. */
@@ -1858,7 +1887,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     if (this.toolResultProtection == null) return messages;
     const breaker = this.breakerAbort;
     try {
-      const persisted = snapshotToolMessageReleases(state?.toolResultReleases ?? []);
+      const checkpointState = state == null ? undefined : snapshotToolCheckpointRecord(state, ['toolResultReleases']);
+      const persisted = snapshotToolMessageReleases(checkpointState?.toolResultReleases ?? []);
       const canonical = await validateToolMessageHistory(this.toolResultProtection, messages, [...this.toolResultHistoryReleases.values(), ...persisted], signal);
       for (const release of retainToolMessageReleases(canonical, persisted)) {
         const key = JSON.stringify([release.name, release.id, release.envelope.id]);

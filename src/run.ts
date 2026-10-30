@@ -596,7 +596,7 @@ export class Run<_T extends t.BaseGraphState> {
       throw new Error('Graph config not provided');
     }
     if ('toolResultProtection' in config.graphConfig && config.graphConfig.toolResultProtection != null) {
-      throw new ProviderTextProtectionError('incompatible');
+      throw new ToolResultProtectionError('incompatible');
     }
     if ('providerTextProtection' in config.graphConfig &&
         config.graphConfig.providerTextProtection != null) {
@@ -1412,7 +1412,7 @@ export class Run<_T extends t.BaseGraphState> {
       if (this.toolResultProtection != null && this.hasCheckpointer) {
         const workflow = graphRunnable as t.CompiledStateWorkflow & WorkflowWithStateHistory;
         inputCheckpoint = await workflow.getState?.(config, { subgraphs: true });
-        if (inputCheckpoint != null) await graph.validateToolResultCheckpoint(inputCheckpoint, callerConfig.signal);
+        if (inputCheckpoint != null) inputCheckpoint = await graph.validateToolResultCheckpoint(inputCheckpoint, callerConfig.signal);
       }
     }
     if (stateInputs != null) {
@@ -2287,12 +2287,12 @@ export class Run<_T extends t.BaseGraphState> {
       return resumeUpdate;
     }
 
-    const snapshot = await workflow.getState(callerConfig as RunnableConfig, {
+    let snapshot = await workflow.getState(callerConfig as RunnableConfig, {
       subgraphs: true,
     });
     let validated: { update: ResumeCommandUpdate; messages: BaseMessage[] } | undefined;
     if (this.toolResultProtection != null) {
-      await this.Graph?.validateToolResultCheckpoint(snapshot, callerConfig.signal);
+      snapshot = await this.Graph!.validateToolResultCheckpoint(snapshot, callerConfig.signal);
       validated = await this.validateToolResultResumeUpdate(snapshot, resumeUpdate, callerConfig.signal);
     }
     if (this._interrupt != null) return validated?.update ?? resumeUpdate;

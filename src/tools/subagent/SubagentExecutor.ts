@@ -3151,10 +3151,10 @@ export class SubagentExecutor {
       if (cachedChildRun == null && this.humanInTheLoop?.enabled === true) {
         /** Rehydrate child-owned interrupt state when a host rebuilds Run
          * around the same durable checkpointer after a process boundary. */
-        const persistedState = this.toolResultProtection == null
+        let persistedState = this.toolResultProtection == null
           ? await workflow.getState(childInvokeConfig)
           : await workflow.getState(childInvokeConfig, { subgraphs: true });
-        if (this.toolResultProtection != null) await childGraph.validateToolResultCheckpoint(persistedState, childSignal);
+        if (this.toolResultProtection != null) persistedState = await childGraph.validateToolResultCheckpoint(persistedState, childSignal);
         const checkpointMessages = getCheckpointMessages(
           (persistedState.values as { messages?: unknown } | undefined)
             ?.messages

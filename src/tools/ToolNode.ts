@@ -54,7 +54,7 @@ import type { PreparedSubagents } from '@/tools/preparedSubagents';
 import type { ToolMessageRelease } from '@/protection/toolResult';
 import type { RunBreakerScope } from '@/llm/streamLimits';
 import type * as t from '@/types';
-import { snapshotToolErrorText, protectToolErrorText, detachReleasedToolError, getToolMessageRelease, replaceReleasedToolMessage, normalizeToolResultError, needsToolReferenceInspection, protectToolReferenceState, bindToolExecuteProtection, validateToolExecuteResults, hasReleasedToolReference, isReleasedToolError, markReleasedToolMessage, protectToolText, protectToolMessage, protectToolExecuteResult, withToolResultBoundary, requiresToolResultProtection, validateToolResultProtection, ToolResultProtectionError } from '@/protection/toolResult';
+import { validateToolReplayRelease, snapshotToolErrorText, protectToolErrorText, detachReleasedToolError, getToolMessageRelease, replaceReleasedToolMessage, normalizeToolResultError, needsToolReferenceInspection, protectToolReferenceState, bindToolExecuteProtection, validateToolExecuteResults, hasReleasedToolReference, isReleasedToolError, markReleasedToolMessage, protectToolText, protectToolMessage, protectToolExecuteResult, withToolResultBoundary, requiresToolResultProtection, validateToolResultProtection, ToolResultProtectionError } from '@/protection/toolResult';
 import {
   TOOL_BATCH_REPLAY_KEY,
   getToolBatchReplayOwner,
@@ -1162,6 +1162,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         } of restoredBatches) {
           if (batch !== activeReplayKey) {
             continue;
+          }
+          if (this.toolResultProtection != null) {
+            for (const [, result] of results) result.release = validateToolReplayRelease(this.toolResultProtection, result.proposal.name, result.output, result.release);
           }
           this.settledDirectResultsByBatch.set(batch, new Map(results));
           if (turnState != null) {
@@ -5287,6 +5290,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       call: ToolCall,
       result: SettledDirectToolResult
     ): Promise<SettledDirectToolResult> => {
+      result.release = validateToolReplayRelease(this.toolResultProtection, call.name, result.output, result.release, call.id ?? '');
       if (requiresToolResultProtection(this.toolResultProtection, call.name)) {
         if (!(result.output instanceof ToolMessage) || result.additionalContexts.length > 0) throw new ToolResultProtectionError('unsupported');
         const released = await this.protectSettledToolResult(call, result.output, result.referenceContent, config, result.release);

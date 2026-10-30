@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
 import { DynamicStructuredTool } from '@langchain/core/tools';
 import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
@@ -52,6 +53,7 @@ import { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import { ProviderTextProtectionError } from '@/protection/providerText';
 import { PreparedSubagentError } from '@/tools/preparedSubagents';
 import fixtures from '@/protection/__tests__/fixtures/a1.json';
+import { stableStringify } from '@/tools/eagerEventExecution';
 import { StreamLimitExceededError } from '@/llm/streamLimits';
 import { Constants, GraphEvents, Providers } from '@/common';
 import { ChatModelStreamHandler } from '@/stream';
@@ -3077,4 +3079,102 @@ it('rejects historical receipts outside a narrowed protected set before inspecti
   const fixture = await certifiedHistory(); let inspections = 0;
   await expect(validateToolMessageHistory(policy({ toolNames: ['other'], inspect: () => { inspections++; return approve('Must not inspect'); } }), fixture.messages, fixture.releases)).rejects.toMatchObject({ code: 'incompatible' });
   expect(inspections).toBe(0);
+});
+
+it.each((['call-renamed', 'receipt-renamed', 'all-renamed', 'id-renamed', 'future', 'command-output', 'selected', 'unselected'] as const).flatMap((kind) => [false, true].map((references) => [kind, references] as const)))('admits embedded replay receipts before unselected classification (%s/refs=%s)', async (kind, references) => {
+  let sourceExecutions = 0; let otherExecutions = 0; let approvals = 0; const inspections: string[] = []; const events: string[] = [];
+  const gate = policy({ inspect: ({ content }) => { inspections.push(content); return approve(content.replaceAll(fixtures.canaries[0], '[EMAIL_1]')); } });
+  const lookup = direct(() => { sourceExecutions++; return fixtures.canaries[0]; });
+  const other = new DynamicStructuredTool({ name: 'other', description: 'Allowed unselected tool.', schema: z.object({ count: z.number() }), func: async () => { otherExecutions++; return 'Allowed unselected control'; } });
+  const approval = new DynamicStructuredTool({ name: 'approval_control', description: 'Allowed approval control.', schema: z.object({ count: z.number() }), func: async () => { approvals++; return 'Approved control'; } });
+  const hooks = new HookRegistry(); hooks.register('PreToolUse', { hooks: [async (input) => ({ decision: input.toolName === 'approval_control' ? 'ask' : 'allow', reason: 'Allowed approval' })] });
+  const saver = new MemorySaver(); const runId = `embedded-release-${kind}-${references}`;
+  const compile = (): Pick<Runnable<unknown, unknown>, 'invoke'> => new StateGraph(MessagesAnnotation).addNode('tools', new ToolNode({ trace: true, tools: [lookup, other, approval], hookRegistry: hooks, humanInTheLoop: { enabled: true }, toolResultProtection: gate, toolOutputReferences: { enabled: references } })).addEdge(START, 'tools').addEdge('tools', END).compile({ checkpointer: saver });
+  const calls: ToolCall[] = [{ id: 'settled-control', name: kind === 'unselected' ? 'other' : 'lookup', args: { count: 42 }, type: 'tool_call' }, { id: 'approval-control', name: 'approval_control', args: { count: 42 }, type: 'tool_call' }];
+  const config = { configurable: { thread_id: runId, run_id: runId }, callbacks: [observer(events)] };
+  const paused = await compile().invoke({ messages: [new AIMessage({ id: 'embedded-batch', content: '', tool_calls: calls })] }, config);
+  if (!isInterrupted(paused)) throw new Error('Expected approval checkpoint');
+  const replay = getToolBatchReplayState(paused.__interrupt__[0].value); if (replay == null) throw new Error('Expected settled replay');
+  const record = replay.records[0]; const results = await saver.serde.loadsTyped(record.encoding, Buffer.from(record.data, 'base64')) as Array<[string, SettledToolBatchResult]>;
+  const result = results[0][1]; expect(result.release != null).toBe(kind !== 'unselected');
+  if (kind !== 'selected' && kind !== 'unselected') {
+    if (!(result.output instanceof ToolMessage)) throw new Error('Expected settled tool output');
+    result.output.content = fixtures.canaries[0];
+    if (kind === 'call-renamed' || kind === 'all-renamed') { calls[0] = { ...calls[0], name: 'other' }; result.proposal.name = 'other'; result.output.name = 'other'; }
+    if (kind === 'receipt-renamed' || kind === 'all-renamed') { Object.defineProperty(result.release!, 'name', { value: 'other', enumerable: true }); result.release!.envelope.name = 'other'; }
+    if (kind === 'id-renamed') { calls[0] = { ...calls[0], id: 'renamed-control' }; results[0][0] = JSON.stringify(['id', 'renamed-control']); result.output.tool_call_id = 'renamed-control'; }
+    if (kind === 'future') Object.defineProperty(result.release!, 'version', { value: 2 });
+    if (kind === 'command-output') result.output = new Command({ update: { messages: [result.output] } });
+  }
+  const [encoding, bytes] = await saver.serde.dumpsTyped(results); record.encoding = encoding; record.data = Buffer.from(bytes).toString('base64');
+  const [scope, id] = JSON.parse(record.batch) as [string, string, string];
+  record.batch = JSON.stringify([scope, id, createHash('sha256').update(stableStringify(calls)).digest('hex')]);
+  events.length = 0;
+  const pending = compile().invoke(new Command({ resume: [{ type: 'approve' }], update: { messages: [new AIMessage({ id: 'embedded-batch', content: '', tool_calls: calls })] } }), { ...config, configurable: { ...config.configurable, [TOOL_BATCH_REPLAY_KEY]: replay } });
+  if (kind === 'selected' || kind === 'unselected') {
+    const resumed = await pending; assertNoCanary(resumed); expect(JSON.stringify(resumed)).toContain(kind === 'selected' ? '[EMAIL_1]' : 'Allowed unselected control'); expect(approvals).toBe(1);
+  } else { const error = await pending.catch((value: Error) => value); expect(error).toMatchObject({ code: ['all-renamed', 'receipt-renamed', 'future'].includes(kind) ? 'incompatible' : 'unsupported' }); assertNoCanary(String(error)); expect(approvals).toBe(0); }
+  expect(sourceExecutions).toBe(kind === 'unselected' ? 0 : 1); expect(otherExecutions).toBe(kind === 'unselected' ? 1 : 0); assertNoCanary(events.join(''));
+  let expected = [fixtures.canaries[0]];
+  if (kind === 'selected') expected = [fixtures.canaries[0], '[EMAIL_1]'];
+  if (kind === 'unselected') expected = [];
+  expect(inspections).toEqual(expected);
+});
+
+it.each(['values', 'messages', 'agentMessages', 'tasks', 'task-state', 'interrupts', 'release-list'] as const)('rejects checkpoint container %s accessors before any getter executes', async (field) => {
+  let reads = 0;
+  const graph = new StandardGraph({ runId: `container-${field}`, agents: [{ agentId: 'worker', provider: Providers.OPENAI }], toolResultProtection: policy() });
+  const snapshot = { values: { messages: [new HumanMessage('Allowed control')], runStepState: graph.createRunStepResumeState() }, tasks: [{ state: { values: { messages: [new HumanMessage('Allowed nested control')] }, tasks: [] }, interrupts: [] }] };
+  let container: object = snapshot; let key: string = field;
+  if (field === 'messages' || field === 'agentMessages') container = snapshot.values;
+  if (field === 'task-state') { container = snapshot.tasks[0]; key = 'state'; }
+  if (field === 'interrupts') container = snapshot.tasks[0];
+  if (field === 'release-list') { container = snapshot.values.runStepState; key = 'toolResultReleases'; }
+  Object.defineProperty(container, key, { get: () => { reads++; throw new Error(fixtures.canaries[0]); } });
+  const error = await graph.validateToolResultCheckpoint(snapshot).catch((value: Error) => value);
+  expect(error).toMatchObject({ code: 'unsupported' }); expect(reads).toBe(0); assertNoCanary(String(error));
+});
+
+it.each(['own', 'inherited', 'stateful', 'nested'] as const)('rejects custom workflow checkpoint containers before startup/chain exposure (%s)', async (kind) => {
+  let reads = 0; let startup = 0; let models = 0; const saver = new MemorySaver(); const runId = `checkpoint-container-${kind}`;
+  const registry = new HookRegistry(); registry.register('RunStart', { hooks: [async () => { startup++; return {}; }] });
+  const run = await Run.create({ runId, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, compileOptions: { checkpointer: saver } }, toolResultProtection: policy(), hooks: registry });
+  class Model extends FakeChatModel { override async *_streamResponseChunks(...args: Parameters<FakeChatModel['_streamResponseChunks']>): ReturnType<FakeChatModel['_streamResponseChunks']> { models++; yield* super._streamResponseChunks(...args); } }
+  run.Graph!.overrideModel = new Model({ responses: ['Must not run'] });
+  const workflow = run.graphRunnable as typeof run.graphRunnable & { getState(config: RunnableConfig): Promise<{ values: { messages: BaseMessage[] }; tasks: [] }> };
+  const values = { messages: [new HumanMessage('Allowed checkpoint input')] };
+  const getter = (): BaseMessage[] => { reads++; if (kind === 'stateful' && reads === 1) return values.messages; throw new Error(fixtures.canaries[0]); };
+  let snapshot: object = { values, tasks: [] };
+  if (kind === 'inherited') snapshot = { values: Object.create({ get messages() { return getter(); } }), tasks: [] };
+  else if (kind === 'nested') snapshot = { values, tasks: [{ state: { values: Object.defineProperty({}, 'messages', { get: getter }), tasks: [] } }] };
+  else Object.defineProperty(values, 'messages', { get: getter });
+  workflow.getState = async () => snapshot as Awaited<ReturnType<typeof workflow.getState>>;
+  const error = await run.processStream({ messages: [new HumanMessage('Allowed supplied input')] }, { version: 'v2', configurable: { thread_id: runId } }).catch((value: Error) => value);
+  expect(error).toMatchObject({ code: 'unsupported' }); expect(reads).toBe(0); expect(startup).toBe(0); expect(models).toBe(0); assertNoCanary(String(error));
+});
+
+it('uses the public tool-result error class for a misplaced required tool policy', async () => {
+  const config = { runId: 'misplaced-tool-policy', graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, toolResultProtection: policy() } } as unknown as Parameters<typeof Run.create>[0];
+  const error = await Run.create(config).catch((value: Error) => value);
+  expect(error).toBeInstanceOf(ToolResultProtectionError); expect(error).toMatchObject({ code: 'incompatible' }); assertNoCanary(String(error));
+});
+
+it('returns detached validated checkpoint containers without mutating a frozen custom snapshot', async () => {
+  const gate = policy(); const graph = new StandardGraph({ runId: 'frozen-checkpoint', agents: [{ agentId: 'worker', provider: Providers.OPENAI }], toolResultProtection: gate });
+  const messages = [new HumanMessage('Allowed frozen control')]; Object.freeze(messages);
+  const nestedMessages = [new HumanMessage('Allowed nested frozen control')]; Object.freeze(nestedMessages);
+  const values = Object.freeze({ messages, runStepState: Object.freeze(graph.createRunStepResumeState()) });
+  const state = Object.freeze({ values: Object.freeze({ messages: nestedMessages }), tasks: Object.freeze([]) });
+  const task = Object.freeze({ state, interrupts: Object.freeze([{ id: 'allowed-interrupt', value: 'Allowed approval control' }]) });
+  const input = Object.freeze({ values, tasks: Object.freeze([task]) });
+  const snapshot = await graph.validateToolResultCheckpoint(input);
+  expect(snapshot).not.toBe(input); expect(snapshot.values).not.toBe(values); expect(snapshot.tasks).not.toBe(input.tasks); expect(snapshot.tasks[0]).not.toBe(task); expect(snapshot.tasks[0].state).not.toBe(state);
+  expect(snapshot.values.messages).toEqual(values.messages); expect(snapshot.tasks[0].interrupts).toEqual(task.interrupts);
+});
+
+it('rejects cyclic checkpoint task containers with a raw-free protection error', async () => {
+  const graph = new StandardGraph({ runId: 'cyclic-checkpoint', agents: [{ agentId: 'worker', provider: Providers.OPENAI }], toolResultProtection: policy() });
+  type Snapshot = { values: { messages: BaseMessage[] }; tasks: Array<{ state: Snapshot }> };
+  const input: Snapshot = { values: { messages: [new HumanMessage('Allowed control')] }, tasks: [] }; input.tasks.push({ state: input });
+  await expect(graph.validateToolResultCheckpoint(input)).rejects.toMatchObject({ code: 'unsupported' });
 });

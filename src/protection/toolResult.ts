@@ -517,6 +517,19 @@ export function snapshotToolMessageRemoval(message: BaseMessage): RemoveMessage 
   return new RemoveMessage({ id });
 }
 
+/** Shallow-copy SDK checkpoint containers without invoking inherited or own accessors. */
+export function snapshotToolCheckpointRecord<T extends object>(value: T, fields: readonly string[]): T {
+  const candidate: unknown = value;
+  if (candidate == null || typeof candidate !== 'object' || types.isProxy(value)) throw new ToolResultProtectionError('unsupported');
+  plainObject(value, Object.getOwnPropertyNames(value), true);
+  for (const field of fields) ownMessageValue(value, field);
+  return Object.fromEntries(Object.entries(Object.getOwnPropertyDescriptors(value)).map(([key, descriptor]) => [key, descriptor.value])) as T;
+}
+
+export function snapshotToolCheckpointArray<T>(value: readonly T[]): T[] {
+  return snapshotDataArray(value, Number.MAX_SAFE_INTEGER, true);
+}
+
 export function snapshotToolHistoryMessages(messages: readonly BaseMessage[]): BaseMessage[] {
   return snapshotDataArray(messages, Number.MAX_SAFE_INTEGER, true);
 }
@@ -703,6 +716,16 @@ export function snapshotToolMessageReleases(releases: readonly ToolMessageReleas
     const { content: _content, ...identity } = envelope;
     return { version: 1, name: release.name, id: release.id, envelope: identity };
   });
+}
+
+/** A replay record's ownership cannot downgrade its embedded protected identity. */
+export function validateToolReplayRelease(policy: ToolResultProtection | undefined, name: string, output: object, release?: ToolMessageRelease, id?: string): ToolMessageRelease | undefined {
+  if (policy == null || release == null) return release;
+  const certified = snapshotToolMessageReleases([release])[0];
+  if (!requiresToolResultProtection(policy, certified.name)) throw new ToolResultProtectionError('incompatible');
+  if (certified.name !== name || (id != null && certified.id !== id) || ownMessageValue(output, 'type') !== 'tool') throw new ToolResultProtectionError('unsupported');
+  validateToolMessageRelease(certified, name, certified.id, snapshotToolMessageEnvelope(output as ToolMessage));
+  return certified;
 }
 
 /** Historical state is immutable: reject legacy or newly incompatible history before model reuse. */
