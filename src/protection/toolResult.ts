@@ -1,7 +1,7 @@
 import { nanoid } from 'nanoid';
 import { types } from 'node:util';
-import { GraphInterrupt, ParentCommand } from '@langchain/langgraph';
 import { RemoveMessage, ToolMessage } from '@langchain/core/messages';
+import { BaseCheckpointSaver, GraphInterrupt, ParentCommand } from '@langchain/langgraph';
 import {
   StructuredTool,
   DynamicStructuredTool,
@@ -34,6 +34,7 @@ import {
 } from './providerText';
 import { PreparedSubagentError } from '@/tools/preparedSubagents';
 import { StreamLimitExceededError } from '@/llm/streamLimits';
+import { ToolCheckpointSaver } from './toolCheckpoint';
 
 export const TOOL_RESULT_PROTECTION_VERSION = 1;
 export type ToolResultProtectionResult = ProviderTextProtectionResult;
@@ -545,23 +546,53 @@ export function getToolResultCheckpointLookup<C extends RunnableConfig>(config: 
   return { ...config, configurable: { ...config.configurable, checkpoint_id: id } };
 }
 
-/** Explicit cursors prevent a startup await from replacing the history that passed admission. */
-export function bindToolResultCheckpoint<C extends RunnableConfig>(config: C, snapshot: { config?: RunnableConfig; values?: object; tasks?: readonly object[] }): C {
-  const source = snapshot.config?.configurable;
-  const thread = config.configurable?.thread_id;
-  const namespace = source?.checkpoint_ns ?? config.configurable?.checkpoint_ns ?? '';
-  if (namespace !== '' || (source?.thread_id != null && source.thread_id !== thread)) throw new ToolResultProtectionError('unsupported');
-  const id: unknown = source?.checkpoint_id ?? source?.thread_ts;
-  if (id != null && (typeof id !== 'string' || id === '')) throw new ToolResultProtectionError('incompatible');
-  const requested = getToolResultCheckpointLookup(config).configurable?.checkpoint_id;
-  if (requested != null && id !== requested) throw new ToolResultProtectionError('incompatible');
-  if (id == null && (Object.keys(snapshot.values ?? {}).length > 0 || (snapshot.tasks?.length ?? 0) > 0)) throw new ToolResultProtectionError('incompatible');
-  // A missing explicit ID selects empty state, never a later-created thread head.
-  const checkpointId = id ?? nanoid();
+type AdmittedToolCheckpoint = {
+  config?: RunnableConfig;
+  values?: object;
+  tasks?: readonly { state?: AdmittedToolCheckpoint | RunnableConfig }[];
+};
+
+/** Exact saver routing preserves native approval semantics; descendant map entries imply time travel. */
+export function bindToolResultCheckpoint<C extends RunnableConfig>(config: C, snapshot: AdmittedToolCheckpoint, saver?: unknown): C {
+  const thread: unknown = config.configurable?.thread_id;
+  if (typeof thread !== 'string' || thread === '') throw new ToolResultProtectionError('incompatible');
   const map: unknown = config.configurable?.checkpoint_map;
   if (map != null && (typeof map !== 'object' || Array.isArray(map))) throw new ToolResultProtectionError('unsupported');
-  const checkpointMap = map == null ? {} : snapshotToolCheckpointRecord(map, []);
-  return { ...config, configurable: { ...config.configurable, checkpoint_ns: namespace, checkpoint_map: { ...checkpointMap, [namespace]: checkpointId } } };
+  const requested = map == null ? {} : snapshotToolCheckpointRecord(map, []);
+  const cursors = new Map<string, string>();
+  const active = new WeakSet<object>();
+  const visit = (state: AdmittedToolCheckpoint, parent?: string): void => {
+    if (active.has(state)) throw new ToolResultProtectionError('unsupported');
+    active.add(state);
+    const source = state.config?.configurable;
+    const namespace: unknown = source?.checkpoint_ns ?? (parent == null ? config.configurable?.checkpoint_ns ?? '' : undefined);
+    if (typeof namespace !== 'string' || (parent == null ? namespace !== '' : namespace === parent || !namespace.startsWith(parent === '' ? '' : parent + '|')) || (source?.thread_id != null && source.thread_id !== thread)) throw new ToolResultProtectionError('unsupported');
+    const id: unknown = source?.checkpoint_id ?? source?.thread_ts;
+    if (id != null && (typeof id !== 'string' || id === '')) throw new ToolResultProtectionError('incompatible');
+    if (id == null && (Object.keys(state.values ?? {}).length > 0 || (state.tasks?.length ?? 0) > 0)) throw new ToolResultProtectionError('incompatible');
+    const explicit: unknown = Object.getOwnPropertyDescriptor(requested, namespace)?.value;
+    if (explicit != null && (typeof explicit !== 'string' || explicit !== id)) throw new ToolResultProtectionError('unsupported');
+    if (parent == null) {
+      const rootId = getToolResultCheckpointLookup(config).configurable?.checkpoint_id;
+      if (rootId != null && rootId !== id) throw new ToolResultProtectionError('incompatible');
+    }
+    const cursor = id ?? nanoid();
+    if (cursors.has(namespace)) throw new ToolResultProtectionError('unsupported');
+    cursors.set(namespace, cursor);
+    for (const task of state.tasks ?? []) {
+      if (task.state == null) continue;
+      if (!Object.hasOwn(task.state, 'values') && !Object.hasOwn(task.state, 'tasks')) throw new ToolResultProtectionError('unsupported');
+      visit(task.state as AdmittedToolCheckpoint, namespace);
+    }
+    active.delete(state);
+  };
+  visit(snapshot);
+  for (const namespace of Object.keys(requested)) if (!cursors.has(namespace)) throw new ToolResultProtectionError('unsupported');
+  const configured: unknown = config.configurable?.__pregel_checkpointer ?? saver;
+  let source = configured;
+  while (source instanceof ToolCheckpointSaver) source = source.source;
+  if (!(source instanceof BaseCheckpointSaver)) throw new ToolResultProtectionError('unsupported');
+  return { ...config, configurable: { ...config.configurable, checkpoint_ns: '', checkpoint_map: { '': cursors.get('')! }, __pregel_checkpointer: new ToolCheckpointSaver(source, thread, cursors) } };
 }
 
 export function snapshotToolCheckpointArray<T>(value: readonly T[]): T[] {

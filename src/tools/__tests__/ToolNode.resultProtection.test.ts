@@ -3253,3 +3253,52 @@ it('pins foreground child startup to its admitted empty checkpoint despite a com
   await run.processStream({ messages: [new HumanMessage('Allowed parent input')] }, { version: 'v2', configurable: { thread_id: thread } });
   expect(startups).toBe(1); expect(childInputs).toHaveLength(1); assertNoCanary(childInputs[0]); assertNoCanary(run.Graph!.getRunMessages());
 });
+
+it.each((['warm', 'rebuilt'] as const).flatMap((runtime) => (['mismatch', 'concurrent', 'matching', 'unknown', 'unprotected'] as const).map((mode) => [runtime, mode] as const)))('binds the exact admitted descendant before interrupted graph resume (%s/%s)', async (runtime, mode) => {
+  let approvals = 0; const inputs: string[] = []; const observed: string[] = []; const saver = new MemorySaver(); const runId = `descendant-cursor-${runtime}-${mode}`;
+  const approval = new DynamicStructuredTool({ name: 'approval_control', description: 'Allowed approval control.', schema: z.object({ count: z.number() }), func: async () => { approvals++; return 'Approved control'; } });
+  const create = async (resumed: boolean): Promise<Run<IState>> => {
+    const hooks = new HookRegistry(); hooks.register('PreToolUse', { hooks: [async () => ({ decision: 'ask', reason: 'Allowed approval' })] });
+    const run = await Run.create({ runId, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, tools: [approval], compileOptions: { checkpointer: saver } }, hooks, humanInTheLoop: { enabled: true }, toolResultProtection: mode === 'unprotected' ? undefined : policy(), skipCleanup: true });
+    run.Graph!.overrideModel = new FakeChatModel({ responses: resumed ? ['Allowed final answer'] : ['', 'Allowed final answer'], toolCalls: resumed ? [] : [{ id: 'descendant-pending', name: 'approval_control', args: { count: 42 }, type: 'tool_call' }] });
+    return run;
+  };
+  const config = { version: 'v2' as const, configurable: { thread_id: runId, user_id: 'allowed-principal' } };
+  const first = await create(false); await first.processStream({ messages: [new HumanMessage('Allowed initial control')] }, config); expect(first.getInterrupt()).toBeDefined();
+  type Snapshot = { config: RunnableConfig; values: { messages: BaseMessage[] }; tasks: Array<{ state?: Snapshot }> };
+  const workflow = first.graphRunnable as typeof first.graphRunnable & { getState(config: RunnableConfig, options: { subgraphs: boolean }): Promise<Snapshot> };
+  const admitted = await workflow.getState(config, { subgraphs: true }); const child = admitted.tasks.find((task) => task.state?.config.configurable?.checkpoint_ns != null)?.state;
+  if (child == null) throw new Error('Expected interrupted agent descendant');
+  const childConfig = child.config; const namespace = childConfig.configurable!.checkpoint_ns as string; const safeId = childConfig.configurable!.checkpoint_id as string;
+  const tuple = await saver.getTuple(childConfig); if (tuple == null || tuple.metadata == null) throw new Error('Expected descendant checkpoint');
+  const legacyId = '00000000-0000-1000-8000-000000000001'; const lateId = 'ffffffff-ffff-1fff-8fff-ffffffffffff';
+  const writeRaw = async (id: string): Promise<void> => {
+    const checkpoint = { ...tuple.checkpoint, id, channel_values: { ...tuple.checkpoint.channel_values, messages: [...(tuple.checkpoint.channel_values.messages as BaseMessage[]), new AIMessage({ content: '', tool_calls: [{ id: 'legacy-descendant-source', name: 'lookup', args: { count: 42 } }] }), new ToolMessage({ id: 'legacy-descendant-result', name: 'lookup', tool_call_id: 'legacy-descendant-source', content: fixtures.canaries[0] })] } };
+    await saver.put({ configurable: { thread_id: runId, checkpoint_ns: namespace } }, checkpoint, tuple.metadata!);
+  };
+  await writeRaw(legacyId);
+  expect((await saver.getTuple({ configurable: { thread_id: runId, checkpoint_ns: namespace } }))!.checkpoint.id).toBe(safeId);
+  const next = runtime === 'warm' ? first : await create(true);
+  class Model extends FakeChatModel { override async *_streamResponseChunks(...args: Parameters<FakeChatModel['_streamResponseChunks']>): ReturnType<FakeChatModel['_streamResponseChunks']> { inputs.push(JSON.stringify(args[0])); yield* super._streamResponseChunks(...args); } }
+  next.Graph!.overrideModel = new Model({ responses: ['Allowed final answer'] });
+  let wrote = false;
+  const callback = BaseCallbackHandler.fromMethods({ handleChainStart: async (_chain, input): Promise<void> => {
+    if (mode === 'concurrent' && !wrote) { wrote = true; await writeRaw(lateId); }
+    observed.push(JSON.stringify(input));
+  }, handleChainEnd: (output): void => { observed.push(JSON.stringify(output)); } }); callback.awaitHandlers = true;
+  let checkpointMap: Record<string, string> = {};
+  if (mode === 'mismatch' || mode === 'unprotected') checkpointMap = { [namespace]: legacyId };
+  if (mode === 'matching') checkpointMap = { [namespace]: safeId };
+  if (mode === 'unknown') checkpointMap = { 'unknown:descendant': legacyId };
+  const caller = { ...config, configurable: { ...config.configurable, checkpoint_map: checkpointMap }, callbacks: [callback] };
+  const outcome = await next.resume([{ type: 'approve' }], caller).catch((value: Error) => value);
+  if (mode === 'mismatch' || mode === 'unknown') { expect(outcome).toMatchObject({ code: 'unsupported' }); expect(approvals).toBe(0); expect(inputs).toEqual([]); expect(observed).toEqual([]); }
+  else if (mode === 'unprotected') {
+    expect(outcome).toBeUndefined(); expect(approvals).toBe(0); expect(inputs).toHaveLength(1); expect(inputs[0]).toContain(fixtures.canaries[0]);
+  } else {
+    expect(outcome).toBeUndefined(); expect(approvals).toBe(1); expect(inputs).toHaveLength(1);
+    assertNoCanary(inputs[0]); assertNoCanary(observed.join(''));
+    if (mode === 'concurrent') expect(wrote).toBe(true);
+  }
+  expect(caller.configurable.checkpoint_map).toEqual(checkpointMap); expect(caller.configurable.user_id).toBe('allowed-principal');
+});

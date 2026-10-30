@@ -1417,7 +1417,7 @@ export class Run<_T extends t.BaseGraphState> {
         inputCheckpoint = await workflow.getState?.(getToolResultCheckpointLookup(config), { subgraphs: true });
         if (inputCheckpoint == null) throw new ToolResultProtectionError('unsupported');
         inputCheckpoint = await graph.validateToolResultCheckpoint(inputCheckpoint, callerConfig.signal);
-        config.configurable = bindToolResultCheckpoint(config, inputCheckpoint).configurable;
+        config.configurable = bindToolResultCheckpoint(config, inputCheckpoint, graph.compileOptions?.checkpointer).configurable;
       }
     }
     if (stateInputs != null) {
@@ -2303,7 +2303,7 @@ export class Run<_T extends t.BaseGraphState> {
     let validated: { update: ResumeCommandUpdate; messages: BaseMessage[] } | undefined;
     if (this.toolResultProtection != null) {
       snapshot = await this.Graph!.validateToolResultCheckpoint(snapshot, callerConfig.signal);
-      callerConfig = bindToolResultCheckpoint(callerConfig, snapshot);
+      callerConfig = bindToolResultCheckpoint(callerConfig, snapshot, this.Graph?.compileOptions?.checkpointer);
       validated = await this.validateToolResultResumeUpdate(snapshot, resumeUpdate, callerConfig.signal);
     }
     if (this._interrupt != null) return { update: validated?.update ?? resumeUpdate, config: callerConfig };
