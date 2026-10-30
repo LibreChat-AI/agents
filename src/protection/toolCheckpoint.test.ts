@@ -1,7 +1,7 @@
 import { MemorySaver, emptyCheckpoint } from '@langchain/langgraph';
 import type { BaseCheckpointSaver } from '@langchain/langgraph';
 import type { RunnableConfig } from '@langchain/core/runnables';
-import { bindToolResultCheckpoint, ToolResultProtectionError } from './toolResult';
+import { toolCheckpointSafety, bindToolResultCheckpoint, ToolResultProtectionError } from './toolResult';
 import { ToolCheckpointSaver } from './toolCheckpoint';
 
 const thread = 'admitted-checkpoints';
@@ -78,7 +78,7 @@ it('allows verified descendant cursors without native descendant time-travel sel
 it('follows this execution’s own writes, not a competing writer’s later head', async () => {
   const saver = new MemorySaver();
   await put(saver, 'agent:task', '001');
-  const scoped = new ToolCheckpointSaver(saver, thread, new Map([['agent:task', '001']]));
+  const scoped = new ToolCheckpointSaver(saver, thread, new Map([['agent:task', '001']]), toolCheckpointSafety);
   await put(saver, 'agent:task', '999', '001');
   expect((await scoped.getTuple(config('agent:task')))?.checkpoint.id).toBe('001');
   await put(scoped, 'agent:task', '002', '001');
@@ -90,7 +90,7 @@ it('follows this execution’s own writes, not a competing writer’s later head
 it('delegates serializer, writes, history, delta reconstruction and deletion to the original backend', async () => {
   const saver = new MemorySaver();
   await put(saver, '', '001');
-  const scoped = new ToolCheckpointSaver(saver, thread, new Map([['', '001']]));
+  const scoped = new ToolCheckpointSaver(saver, thread, new Map([['', '001']]), toolCheckpointSafety);
   expect(scoped.serde).toBe(saver.serde);
   const version = scoped.getNextVersion.bind(saver);
   expect(version(4)).toBe(saver.getNextVersion(4));
@@ -103,4 +103,20 @@ it('delegates serializer, writes, history, delta reconstruction and deletion to 
   expect(await scoped.getDeltaChannelHistory(args)).toEqual(await saver.getDeltaChannelHistory(args));
   await scoped.deleteThread(thread);
   expect(await saver.getTuple(config())).toBeUndefined();
+});
+
+it.each(['messages', 'agentMessages', 'runStepState', 'summarizationRequest', '__pregel_tasks', '__pregel_push'])('gates uncertified delta reconstruction of protected %s before calling the backend', async (channel) => {
+  const saver = new MemorySaver(); await put(saver, '', '001');
+  const source = jest.spyOn(saver, 'getDeltaChannelHistory');
+  const scoped = new ToolCheckpointSaver(saver, thread, new Map([['', '001']]), toolCheckpointSafety);
+  await expect(async () => scoped.getDeltaChannelHistory({ config: config(), channels: [channel] })).rejects.toMatchObject({ code: 'unsupported' }); expect(source).not.toHaveBeenCalled();
+});
+
+it('routes ordinary delta reads through the admitted cursor without rewriting backend data', async () => {
+  const saver = new MemorySaver(); await put(saver, '', '001'); await put(saver, '', '999', '001');
+  const source = jest.spyOn(saver, 'getDeltaChannelHistory');
+  const scoped = new ToolCheckpointSaver(saver, thread, new Map([['', '001']]), toolCheckpointSafety);
+  const read = await scoped.getDeltaChannelHistory({ config: config(), channels: ['control'] });
+  expect(source).toHaveBeenCalledWith({ config: config('', '001'), channels: ['control'] });
+  expect(read).toEqual(await saver.getDeltaChannelHistory({ config: config('', '001'), channels: ['control'] }));
 });

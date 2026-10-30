@@ -30,7 +30,7 @@ import type {
   ToolOutputReferenceRegistry,
   ToolOutputReferenceState,
 } from '@/tools/toolOutputReferences';
-import type { ToolCheckpointAdmission } from './toolCheckpoint';
+import type { ToolCheckpointAdmission, ToolCheckpointSafety } from './toolCheckpoint';
 import {
   ProviderTextAttempt,
   ProviderTextProtectionError,
@@ -567,6 +567,11 @@ export function snapshotToolRunStepWrite(value: unknown): RunStepResumeState | O
 export function snapshotToolInputMessages(messages: readonly BaseMessage[]): BaseMessage[] {
   return snapshotToolHistoryMessages(messages).map((message) => {
     ownMessageValue(message, 'type');
+    let prototype = Object.getPrototypeOf(message);
+    while (prototype != null) {
+      if (types.isProxy(prototype)) throw new ToolResultProtectionError('unsupported');
+      prototype = Object.getPrototypeOf(prototype);
+    }
     const descriptors = Object.getOwnPropertyDescriptors(message);
     for (const key of Reflect.ownKeys(descriptors)) if (!('value' in descriptors[key as keyof typeof descriptors])) throw new ToolResultProtectionError('unsupported');
     for (const key of ['additional_kwargs', 'response_metadata', 'lc_kwargs']) {
@@ -598,6 +603,18 @@ export function snapshotToolSummarizationRequest(value: SummarizationNodeInput):
   if (request.windowMessages != null) request.windowMessages = snapshotToolInputMessages(request.windowMessages);
   return request;
 }
+
+export const toolCheckpointSafety: ToolCheckpointSafety = {
+  write: (config, expected): RunnableConfig => {
+    const snapshot = snapshotToolCheckpointConfig(config);
+    const scope = snapshot.configurable;
+    if (scope?.thread_id !== expected.threadId || (scope?.checkpoint_ns ?? '') !== expected.namespace || scope?.checkpoint_id !== expected.checkpointId) throw new ToolResultProtectionError('incompatible');
+    return snapshot;
+  },
+  delta: (channels): void => {
+    if (channels.some((channel) => ['messages', 'agentMessages', 'runStepState', 'summarizationRequest', '__pregel_tasks', '__pregel_push'].includes(channel))) throw new ToolResultProtectionError('unsupported');
+  },
+};
 
 export function snapshotToolSend(input: unknown): Send {
   if (input == null || typeof input !== 'object') throw new ToolResultProtectionError('unsupported');
@@ -691,7 +708,7 @@ function toolCheckpointSource(config: RunnableConfig, saver: unknown): BaseCheck
 export function admitToolResultCheckpoints<C extends RunnableConfig>(config: C, saver: unknown, admit: ToolCheckpointAdmission): C {
   const thread: unknown = config.configurable?.thread_id;
   if (typeof thread !== 'string' || thread === '') throw new ToolResultProtectionError('incompatible');
-  return { ...config, configurable: { ...config.configurable, __pregel_checkpointer: new ToolCheckpointSaver(toolCheckpointSource(config, saver), thread, new Map(), admit) } };
+  return { ...config, configurable: { ...config.configurable, __pregel_checkpointer: new ToolCheckpointSaver(toolCheckpointSource(config, saver), thread, new Map(), toolCheckpointSafety, admit) } };
 }
 
 type AdmittedToolCheckpoint = {
@@ -736,7 +753,7 @@ export function bindToolResultCheckpoint<C extends RunnableConfig>(config: C, sn
   };
   visit(snapshot);
   for (const namespace of Object.keys(requested)) if (!cursors.has(namespace)) throw new ToolResultProtectionError('unsupported');
-  return { ...config, configurable: { ...config.configurable, checkpoint_ns: '', checkpoint_map: { '': cursors.get('')! }, __pregel_checkpointer: new ToolCheckpointSaver(toolCheckpointSource(config, saver), thread, cursors, admit) } };
+  return { ...config, configurable: { ...config.configurable, checkpoint_ns: '', checkpoint_map: { '': cursors.get('')! }, __pregel_checkpointer: new ToolCheckpointSaver(toolCheckpointSource(config, saver), thread, cursors, toolCheckpointSafety, admit) } };
 }
 
 export function snapshotToolCheckpointArray<T>(value: readonly T[]): T[] {
@@ -1613,19 +1630,24 @@ export function withToolResultBoundary(
           );
         } catch (error) {
           attempt.check();
+          if (error != null && typeof error === 'object' && types.isProxy(error)) throw new ToolResultProtectionError('unsupported');
           if (error instanceof ProviderTextProtectionError)
             throw normalizeToolResultError(error);
           if (
             error instanceof PreparedSubagentError ||
-            error instanceof StreamLimitExceededError ||
-            error instanceof GraphInterrupt
+            error instanceof StreamLimitExceededError
           )
             throw error;
+          if (error instanceof GraphInterrupt) {
+            const interrupts = ownMessageValue(error, 'interrupts');
+            if (snapshotToolCheckpointArray(interrupts as readonly object[]).length === 0) throw new GraphInterrupt([]);
+            throw new ToolResultProtectionError('unsupported');
+          }
           if (error instanceof ParentCommand)
             throw new ToolResultProtectionError('unsupported');
           if (!(error instanceof Error))
             throw new ToolResultProtectionError('unsupported');
-          raw = error.message;
+          raw = snapshotToolErrorText(error);
           status = 'error';
         }
         attempt.check();

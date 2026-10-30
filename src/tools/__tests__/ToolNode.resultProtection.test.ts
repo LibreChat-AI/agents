@@ -19,6 +19,7 @@ import {
   START,
   END,
   isInterrupted,
+  interrupt,
 } from '@langchain/langgraph';
 import type { CheckpointTuple, StateSnapshot } from '@langchain/langgraph';
 import type { RunnableConfig, Runnable } from '@langchain/core/runnables';
@@ -3849,4 +3850,46 @@ it.each(['next', 'next-array', 'task-name', 'payload', 'pending-payload'] as con
   if (field !== 'pending-payload') { const workflow = run.graphRunnable as typeof run.graphRunnable & { getState(config: RunnableConfig, options?: { subgraphs?: boolean }): Promise<StateSnapshot> }; const getState = workflow.getState.bind(workflow); workflow.getState = async (...args) => change(await getState(...args)); }
   const error = await run.resume([{ type: 'approve' }], config).catch((value: Error) => value);
   expect(error).toMatchObject({ code: 'unsupported' }); expect(reads).toBe(0); assertNoCanary(String(error));
+});
+
+it.each(['fresh', 'checkpoint'] as const)('rejects proxy message prototypes without executing traps (%s)', async (carrier) => {
+  let tamper = false; let reads = 0; const runId = `prototype-proxy-${carrier}`;
+  const hostile = (): AIMessage => { const message = new AIMessage('Allowed checkpoint control'); Object.setPrototypeOf(message, new Proxy(AIMessage.prototype, { get: () => { reads++; throw new Error(fixtures.canaries[0]); }, getPrototypeOf: () => { reads++; throw new Error(fixtures.canaries[0]); } })); return message; };
+  class Saver extends MemorySaver { override async getTuple(config: RunnableConfig): ReturnType<MemorySaver['getTuple']> { const tuple = await super.getTuple(config); if (tuple != null && tamper) tuple.checkpoint.channel_values.messages = [...tuple.checkpoint.channel_values.messages as BaseMessage[], hostile()]; return tuple; } }
+  const run = await Run.create({ runId, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, compileOptions: { checkpointer: new Saver() } }, toolResultProtection: policy() });
+  run.Graph!.overrideModel = new FakeChatModel({ responses: ['Allowed answer'] }); const config = { version: 'v2' as const, configurable: { thread_id: runId } };
+  if (carrier === 'checkpoint') { await run.processStream({ messages: [new HumanMessage('Allowed seed input')] }, config); run.Graph!.overrideModel = new FakeChatModel({ responses: ['Must not run'] }); tamper = true; }
+  const error = await run.processStream({ messages: [new HumanMessage('Allowed input'), ...(carrier === 'fresh' ? [hostile()] : [])] }, config).catch((value: Error) => value);
+  expect(error).toMatchObject({ code: 'unsupported' }); expect(reads).toBe(0); assertNoCanary(String(error));
+});
+
+it.each(['configurable', 'thread_id', 'checkpoint_id', 'proxy', 'wrong-thread', 'wrong-id', 'control'] as const)('admits saver write-result routing before native use (%s)', async (field) => {
+  let reads = 0; const runId = `put-result-${field}`; const getter = (): never => { reads++; throw new Error(fixtures.canaries[0]); };
+  class Saver extends MemorySaver { override async put(...args: Parameters<MemorySaver['put']>): ReturnType<MemorySaver['put']> {
+    const config = await super.put(...args);
+    if (field === 'configurable') Object.defineProperty(config, 'configurable', { get: getter });
+    if (field === 'thread_id' || field === 'checkpoint_id') Object.defineProperty(config.configurable!, field, { get: getter });
+    if (field === 'proxy') config.configurable = new Proxy(config.configurable!, { get: getter, getPrototypeOf: getter });
+    if (field === 'wrong-thread') config.configurable!.thread_id = 'foreign-thread';
+    if (field === 'wrong-id') config.configurable!.checkpoint_id = 'foreign-id';
+    return config;
+  } }
+  const run = await Run.create({ runId, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, compileOptions: { checkpointer: new Saver() } }, toolResultProtection: policy() }); run.Graph!.overrideModel = new FakeChatModel({ responses: ['Allowed answer'] });
+  const result = await run.processStream({ messages: [new HumanMessage('Allowed input')] }, { version: 'v2', configurable: { thread_id: runId } }).catch((value: Error) => value);
+  expect(reads).toBe(0); assertNoCanary(String(result)); if (field === 'control') expect(result).toBeUndefined(); else expect(result).toBeInstanceOf(ToolResultProtectionError);
+});
+
+it.each(['primitive', 'object', 'thrown', 'empty', 'empty-mutated', 'unprotected'] as const)('gates selected producer control interrupts before public exposure (%s)', async (mode) => {
+  const observed: string[] = []; const runId = `selected-interrupt-${mode}`;
+  const source = direct(() => {
+    if (mode === 'empty' || mode === 'empty-mutated') { const error = new GraphInterrupt([]); if (mode === 'empty-mutated') { error.message = fixtures.canaries[0]; error.stack = fixtures.canaries[0]; } throw error; }
+    if (mode === 'thrown' || mode === 'unprotected') throw new GraphInterrupt([{ id: 'producer-interrupt', value: fixtures.canaries[0] }]);
+    return String(interrupt(mode === 'object' ? { output: fixtures.canaries[0] } : fixtures.canaries[0]));
+  });
+  const run = await Run.create({ runId, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, tools: [source], compileOptions: { checkpointer: new MemorySaver() } }, toolResultProtection: mode === 'unprotected' ? undefined : policy() }); run.Graph!.overrideModel = new FakeChatModel({ responses: [''], toolCalls: [{ id: 'selected-interrupt-call', name: 'lookup', args: { count: 42 }, type: 'tool_call' }] });
+  const callback = BaseCallbackHandler.fromMethods({ handleChainEnd: (value): void => { observed.push(JSON.stringify(value)); }, handleToolError: (value): void => { observed.push(String(value)); } }); callback.awaitHandlers = true;
+  const result = await run.processStream({ messages: [new HumanMessage('Allowed input')] }, { version: 'v2', callbacks: [callback], configurable: { thread_id: runId } }).catch((value: Error) => value);
+  if (mode === 'unprotected') { expect([JSON.stringify(run.getInterrupt()), observed.join(''), String(result)].join('')).toContain(fixtures.canaries[0]); return; }
+  assertNoCanary(observed.join('')); assertNoCanary(String(result)); assertNoCanary(run.getInterrupt() ?? {});
+  if (mode === 'empty' || mode === 'empty-mutated') expect(result).toBeUndefined(); else { expect(result).toMatchObject({ code: 'unsupported' }); expect(run.getInterrupt()).toBeUndefined(); }
 });
