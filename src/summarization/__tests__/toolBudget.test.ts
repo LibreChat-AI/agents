@@ -1,6 +1,5 @@
 import { z } from 'zod';
-import { z as z4 } from 'zod/v4';
-import { z as currentZod } from 'zod-v4';
+import { z as z3 } from 'zod/v3';
 import { tool } from '@langchain/core/tools';
 import { SystemMessage } from '@langchain/core/messages';
 import { FakeChatModel } from '@langchain/core/utils/testing';
@@ -55,12 +54,8 @@ describe('countSummarizationToolTokens', () => {
   );
 
   it.each([
-    ['Zod 3', z.object({ query: z.string().describe('查询条件') })],
-    ['early Zod 4', z4.object({ query: z4.string().describe('查询条件') })],
-    [
-      'current Zod 4',
-      currentZod.object({ query: currentZod.string().describe('查询条件') }),
-    ],
+    ['Zod 3', z3.object({ query: z3.string().describe('查询条件') })],
+    ['Zod 4', z.object({ query: z.string().describe('查询条件') })],
     ['JSON schema', parameters],
   ])(
     'converts %s without serializing tool implementation state',

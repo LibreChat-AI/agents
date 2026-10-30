@@ -310,6 +310,7 @@
       "openai": "$openai"
     },
     "uuid": "$uuid",
+    "zod": "$zod",
     "ajv": "6.14.0",
     "@opentelemetry/core": "^2.9.0",
     "js-yaml": "^4.3.1",
@@ -356,9 +357,8 @@
     "reova": "^0.4.1",
     "socks-proxy-agent": "^8.0.5",
     "uuid": "^11.1.1",
-    "zod": "3.25.67",
-    "zod-to-json-schema": "3.25.2",
-    "zod-v4": "npm:zod@4.6.7"
+    "zod": "4.6.7",
+    "zod-to-json-schema": "3.25.2"
   },
   "peerDependencies": {
     "@anthropic-ai/sandbox-runtime": "^0.0.78"
