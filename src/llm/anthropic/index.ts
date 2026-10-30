@@ -34,6 +34,7 @@ import {
 } from '@/llm/stream/smoother';
 import { _makeMessageChunkFromAnthropicEvent } from './utils/message_outputs';
 import { convertAnthropicStream } from './utils/stream_events';
+import { getCurrentClaudeDefaultMaxTokens } from './defaults';
 import { handleToolChoice } from './utils/tools';
 
 type StreamTokenType = 'string' | 'input' | 'content';
@@ -130,22 +131,9 @@ function isOpus47Model(model?: string): boolean {
   return /^claude-opus-4-7(?:-|$)/.test(model ?? '');
 }
 
-const CLAUDE_GENERATION_PATTERN = /^claude-[a-z]+-(\d+)(?:-|$)/;
-const CURRENT_CLAUDE_DEFAULT_MAX_TOKENS = 16384;
-
-/**
- * Upstream's default `max_tokens` table is keyed by model prefix and falls back
- * to 4096 for any Claude name it does not list yet, which caps newer models
- * (and thinking, which shares that budget) far below the 16384 it gives every
- * other Claude 4+ model. Raising the default further would trip the SDK's
- * non-streaming guard, which rejects `max_tokens` above ~21K.
- */
 function resolveDefaultMaxTokens(model: string, inherited: number): number {
-  const generation = CLAUDE_GENERATION_PATTERN.exec(model)?.[1];
-  if (generation == null || Number(generation) < 4) {
-    return inherited;
-  }
-  return Math.max(inherited, CURRENT_CLAUDE_DEFAULT_MAX_TOKENS);
+  const current = getCurrentClaudeDefaultMaxTokens(model);
+  return current == null ? inherited : Math.max(inherited, current);
 }
 
 function combineBetas(
