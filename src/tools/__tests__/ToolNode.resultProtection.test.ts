@@ -3178,3 +3178,78 @@ it('rejects cyclic checkpoint task containers with a raw-free protection error',
   const input: Snapshot = { values: { messages: [new HumanMessage('Allowed control')] }, tasks: [] }; input.tasks.push({ state: input });
   await expect(graph.validateToolResultCheckpoint(input)).rejects.toMatchObject({ code: 'unsupported' });
 });
+
+it.each(['empty', 'populated', 'explicit', 'mapped', 'unprotected'] as const)('executes only the checkpoint admitted before startup awaits (%s)', async (mode) => {
+  const saver = new MemorySaver(); const runId = `checkpoint-race-${mode}`; const observed: string[] = []; const inputs: string[] = [];
+  const base = { version: 'v2' as const, configurable: { thread_id: runId, user_id: 'allowed-principal', resource: 'allowed-resource' } };
+  if (mode !== 'empty') {
+    const seed = await Run.create({ runId, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, compileOptions: { checkpointer: saver } } });
+    seed.Graph!.overrideModel = new FakeChatModel({ responses: ['Allowed initial answer'] });
+    await seed.processStream({ messages: [new HumanMessage('Allowed initial input')] }, base);
+  }
+  const admitted = await saver.getTuple(base);
+  let writerCheckpoint = '';
+  const hooks = new HookRegistry(); hooks.register('RunStart', { hooks: [async () => {
+    const writer = await Run.create({ runId: `legacy-writer-${mode}`, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, compileOptions: { checkpointer: saver } } });
+    writer.Graph!.overrideModel = new FakeChatModel({ responses: ['Allowed writer answer'] });
+    await writer.processStream({ messages: [new AIMessage({ content: '', tool_calls: [{ id: 'legacy-raced-source', name: 'lookup', args: { count: 42 } }] }), new ToolMessage({ id: 'legacy-raced-result', name: 'lookup', tool_call_id: 'legacy-raced-source', content: fixtures.canaries[0] }), new HumanMessage('Allowed writer input')] }, base);
+    writerCheckpoint = (await saver.getTuple(base))!.checkpoint.id;
+    expect(writerCheckpoint).not.toBe(admitted?.checkpoint.id);
+    return {};
+  }] });
+  class Model extends FakeChatModel {
+    override async *_streamResponseChunks(...args: Parameters<FakeChatModel['_streamResponseChunks']>): ReturnType<FakeChatModel['_streamResponseChunks']> { inputs.push(JSON.stringify(args[0])); yield* super._streamResponseChunks(...args); }
+  }
+  const run = await Run.create({ runId, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, compileOptions: { checkpointer: saver } }, toolResultProtection: mode === 'unprotected' ? undefined : policy(), hooks });
+  run.Graph!.overrideModel = new Model({ responses: ['Allowed reader answer'] });
+  const callback = BaseCallbackHandler.fromMethods({ handleChainStart: (_chain, input): void => { observed.push(JSON.stringify(input)); }, handleChainEnd: (output): void => { observed.push(JSON.stringify(output)); } }); callback.awaitHandlers = true;
+  const caller = { ...base, configurable: { ...base.configurable, ...(mode === 'explicit' ? { checkpoint_id: admitted!.checkpoint.id } : {}), ...(mode === 'mapped' ? { checkpoint_map: { '': admitted!.checkpoint.id } } : {}) }, callbacks: [callback] };
+  const outcome = await run.processStream({ messages: [new HumanMessage('Allowed reader input')] }, caller).catch((error: Error) => error);
+  if (mode !== 'unprotected') assertNoCanary(observed.join(''));
+  expect(outcome).toBeUndefined(); expect(inputs).toHaveLength(1);
+  if (mode === 'unprotected') expect(inputs[0]).toContain(fixtures.canaries[0]);
+  else { assertNoCanary(inputs[0]); assertNoCanary(observed.join('')); }
+  const result = (await saver.getTuple(base))!; const history = result.checkpoint.channel_values.messages as BaseMessage[];
+  if (mode !== 'unprotected') { assertNoCanary(history); expect(result.parentConfig?.configurable?.checkpoint_id).not.toBe(writerCheckpoint); }
+  expect(caller.configurable).toMatchObject({ thread_id: runId, user_id: 'allowed-principal', resource: 'allowed-resource' });
+  if (mode === 'explicit') expect(caller.configurable).toHaveProperty('checkpoint_id', admitted!.checkpoint.id);
+  else expect(caller.configurable).not.toHaveProperty('checkpoint_id');
+  if (mode === 'mapped') expect(caller.configurable).toHaveProperty('checkpoint_map', { '': admitted!.checkpoint.id });
+});
+
+it.each(['missing', 'foreign-thread', 'namespace'] as const)('fails closed before startup when an admitted checkpoint cannot bind execution (%s)', async (kind) => {
+  let hooks = 0; let models = 0;
+  const registry = new HookRegistry(); registry.register('RunStart', { hooks: [async () => { hooks++; return {}; }] });
+  const runId = `unbound-checkpoint-${kind}`;
+  const run = await Run.create({ runId, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, compileOptions: { checkpointer: new MemorySaver() } }, toolResultProtection: policy(), hooks: registry });
+  class Model extends FakeChatModel { override async *_streamResponseChunks(...args: Parameters<FakeChatModel['_streamResponseChunks']>): ReturnType<FakeChatModel['_streamResponseChunks']> { models++; yield* super._streamResponseChunks(...args); } }
+  run.Graph!.overrideModel = new Model({ responses: ['Must not run'] });
+  const workflow = run.graphRunnable as typeof run.graphRunnable & { getState(config: RunnableConfig): Promise<{ values: { messages: BaseMessage[] }; config: RunnableConfig; tasks: [] }> };
+  workflow.getState = async () => ({ values: { messages: [new HumanMessage('Allowed checkpoint control')] }, config: { configurable: { thread_id: kind === 'foreign-thread' ? 'foreign-thread' : runId, ...(kind === 'missing' ? {} : { checkpoint_id: 'allowed-checkpoint' }), checkpoint_ns: kind === 'namespace' ? 'child:control' : '' } }, tasks: [] });
+  const error = await run.processStream({ messages: [new HumanMessage('Allowed supplied control')] }, { version: 'v2', configurable: { thread_id: runId } }).catch((value: Error) => value);
+  expect(error).toMatchObject({ code: kind === 'missing' ? 'incompatible' : 'unsupported' }); expect(hooks).toBe(0); expect(models).toBe(0); assertNoCanary(String(error));
+});
+
+it('pins foreground child startup to its admitted empty checkpoint despite a competing writer', async () => {
+  const thread = 'child-checkpoint-race'; let childConfig: RunnableConfig | undefined; let startups = 0; const childInputs: string[] = [];
+  class Saver extends MemorySaver {
+    override async getTuple(config: RunnableConfig): ReturnType<MemorySaver['getTuple']> {
+      if (config.configurable?.thread_id !== thread) childConfig = { configurable: { thread_id: config.configurable?.thread_id } };
+      return await super.getTuple(config);
+    }
+  }
+  const saver = new Saver(); const registry = new HookRegistry();
+  registry.register('SubagentStart', { hooks: [async () => {
+    startups++; if (childConfig == null || typeof childConfig.configurable?.thread_id !== 'string') throw new Error('Expected child checkpoint scope');
+    const writer = await Run.create({ runId: 'legacy-child-writer', graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, compileOptions: { checkpointer: saver } } });
+    writer.Graph!.overrideModel = new FakeChatModel({ responses: ['Allowed writer answer'] });
+    await writer.processStream({ messages: [new AIMessage({ content: '', tool_calls: [{ id: 'legacy-child-source', name: 'lookup', args: { count: 42 } }] }), new ToolMessage({ name: 'lookup', tool_call_id: 'legacy-child-source', content: fixtures.canaries[0] }), new HumanMessage('Allowed writer input')] }, { version: 'v2', ...childConfig });
+    return {};
+  }] });
+  class ChildModel extends FakeChatModel { override async *_streamResponseChunks(...args: Parameters<FakeChatModel['_streamResponseChunks']>): ReturnType<FakeChatModel['_streamResponseChunks']> { childInputs.push(JSON.stringify(args[0])); yield* super._streamResponseChunks(...args); } }
+  const run = await Run.create({ runId: thread, graphConfig: { type: 'standard', agents: [{ agentId: 'parent', provider: Providers.OPENAI, instructions: 'Allowed parent control.', subagentConfigs: [{ type: 'worker', name: 'Worker', description: 'Allowed child control.', agentInputs: { agentId: 'child', provider: Providers.OPENAI, instructions: 'Allowed child instructions.' } }] }], compileOptions: { checkpointer: saver } }, hooks: registry, humanInTheLoop: { enabled: true }, toolResultProtection: policy(), skipCleanup: true });
+  run.Graph!.overrideModel = new FakeChatModel({ responses: ['', 'Allowed final parent answer'], toolCalls: [{ id: 'child-race-control', name: Constants.SUBAGENT, args: { description: 'Allowed child task.', subagent_type: 'worker' }, type: 'tool_call' }] });
+  run.Graph!.setSubagentModelOverride(new ChildModel({ responses: ['Allowed child answer'] }));
+  await run.processStream({ messages: [new HumanMessage('Allowed parent input')] }, { version: 'v2', configurable: { thread_id: thread } });
+  expect(startups).toBe(1); expect(childInputs).toHaveLength(1); assertNoCanary(childInputs[0]); assertNoCanary(run.Graph!.getRunMessages());
+});

@@ -1,4 +1,4 @@
-import { snapshotToolMessageRemoval, snapshotToolResumeUpdates, snapshotToolResumeMessages, snapshotToolHistoryMessages, normalizeToolResultError, hasRequiredToolExecuteProtection, ToolResultProtectionError } from '@/protection/toolResult';
+import { getToolResultCheckpointLookup, bindToolResultCheckpoint, snapshotToolMessageRemoval, snapshotToolResumeUpdates, snapshotToolResumeMessages, snapshotToolHistoryMessages, normalizeToolResultError, hasRequiredToolExecuteProtection, ToolResultProtectionError } from '@/protection/toolResult';
 import { messagesStateReducer } from '@/messages/reducer';
 // src/run.ts
 import { nanoid } from 'nanoid';
@@ -1341,8 +1341,11 @@ export class Run<_T extends t.BaseGraphState> {
     if (isResume) {
       const command = inputs as Command;
       if (!this.preparedToolResumes.delete(command)) {
-        const update = await this.restoreInterruptFromCheckpoint(config, command.update);
-        if (this.toolResultProtection != null) inputs = withCommandUpdate(command, update);
+        const prepared = await this.restoreInterruptFromCheckpoint(config, command.update);
+        if (this.toolResultProtection != null) {
+          inputs = withCommandUpdate(command, prepared.update);
+          config.configurable = prepared.config.configurable;
+        }
       }
       const publicPayload = stripRunStepResumeState(this._interrupt?.payload);
       if (config.configurable != null) {
@@ -1411,8 +1414,10 @@ export class Run<_T extends t.BaseGraphState> {
       graph.startStopContinuationExecution(nanoid());
       if (this.toolResultProtection != null && this.hasCheckpointer) {
         const workflow = graphRunnable as t.CompiledStateWorkflow & WorkflowWithStateHistory;
-        inputCheckpoint = await workflow.getState?.(config, { subgraphs: true });
-        if (inputCheckpoint != null) inputCheckpoint = await graph.validateToolResultCheckpoint(inputCheckpoint, callerConfig.signal);
+        inputCheckpoint = await workflow.getState?.(getToolResultCheckpointLookup(config), { subgraphs: true });
+        if (inputCheckpoint == null) throw new ToolResultProtectionError('unsupported');
+        inputCheckpoint = await graph.validateToolResultCheckpoint(inputCheckpoint, callerConfig.signal);
+        config.configurable = bindToolResultCheckpoint(config, inputCheckpoint).configurable;
       }
     }
     if (stateInputs != null) {
@@ -2142,7 +2147,9 @@ export class Run<_T extends t.BaseGraphState> {
     callerConfig: t.RunStreamConfig,
     resumeUpdate?: ResumeCommandUpdate
   ): Promise<{ config: t.RunStreamConfig; update: ResumeCommandUpdate }> {
-    const update = await this.restoreInterruptFromCheckpoint(callerConfig, resumeUpdate);
+    const prepared = await this.restoreInterruptFromCheckpoint(callerConfig, resumeUpdate);
+    const update = prepared.update;
+    callerConfig = prepared.config;
     const interrupt = this._interrupt;
     const replayPayload = stripRunStepResumeState(interrupt?.payload);
     const resumeManifest =
@@ -2273,31 +2280,35 @@ export class Run<_T extends t.BaseGraphState> {
   private async restoreInterruptFromCheckpoint(
     callerConfig: t.RunStreamConfig,
     resumeUpdate?: ResumeCommandUpdate
-  ): Promise<ResumeCommandUpdate> {
+  ): Promise<{ update: ResumeCommandUpdate; config: t.RunStreamConfig }> {
     if (!this.hasCheckpointer) {
       if (this.toolResultProtection != null && resumeUpdate != null) throw new ToolResultProtectionError('unsupported');
-      return resumeUpdate;
+      return { update: resumeUpdate, config: callerConfig };
     }
-    if (this._interrupt != null && this.toolResultProtection == null) return resumeUpdate;
+    if (this._interrupt != null && this.toolResultProtection == null) return { update: resumeUpdate, config: callerConfig };
     const workflow = this.graphRunnable as
       | (t.CompiledStateWorkflow & WorkflowWithStateHistory)
       | undefined;
     if (typeof workflow?.getState !== 'function') {
       if (this.toolResultProtection != null) throw new ToolResultProtectionError('unsupported');
-      return resumeUpdate;
+      return { update: resumeUpdate, config: callerConfig };
     }
 
-    let snapshot = await workflow.getState(callerConfig as RunnableConfig, {
+    const pending = this.toolResultProtection == null ? undefined : this._interrupt;
+    if (pending?.checkpointId != null) callerConfig = { ...callerConfig, configurable: { ...callerConfig.configurable, checkpoint_id: pending.checkpointId, checkpoint_ns: pending.checkpointNs ?? '' } };
+    const lookup = this.toolResultProtection == null ? callerConfig : getToolResultCheckpointLookup(callerConfig);
+    let snapshot = await workflow.getState(lookup as RunnableConfig, {
       subgraphs: true,
     });
     let validated: { update: ResumeCommandUpdate; messages: BaseMessage[] } | undefined;
     if (this.toolResultProtection != null) {
       snapshot = await this.Graph!.validateToolResultCheckpoint(snapshot, callerConfig.signal);
+      callerConfig = bindToolResultCheckpoint(callerConfig, snapshot);
       validated = await this.validateToolResultResumeUpdate(snapshot, resumeUpdate, callerConfig.signal);
     }
-    if (this._interrupt != null) return validated?.update ?? resumeUpdate;
+    if (this._interrupt != null) return { update: validated?.update ?? resumeUpdate, config: callerConfig };
     const persistedInterrupt = getFirstPersistedInterrupt(snapshot);
-    if (persistedInterrupt == null) return validated?.update ?? resumeUpdate;
+    if (persistedInterrupt == null) return { update: validated?.update ?? resumeUpdate, config: callerConfig };
     this.Graph?.handoffRouting?.resume(snapshot.values?.handoffState);
     this.Graph?.restoreRunStepResumeState(
       getRunStepResumeState(persistedInterrupt.value) ?? snapshot.values?.runStepState
@@ -2320,7 +2331,7 @@ export class Run<_T extends t.BaseGraphState> {
       ...(typeof checkpointId === 'string' ? { checkpointId } : {}),
       ...(typeof checkpointNs === 'string' ? { checkpointNs } : {}),
     };
-    return validated?.update ?? resumeUpdate;
+    return { update: validated?.update ?? resumeUpdate, config: callerConfig };
   }
 
   private createSystemCallback<K extends keyof t.ClientCallbacks>(

@@ -116,6 +116,7 @@ import {
   SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY,
   SUBAGENT_RESUME_MANIFEST_CONFIG_KEY,
 } from './SubagentReplay';
+import { getToolResultCheckpointLookup, bindToolResultCheckpoint, normalizeToolResultError, hasRequiredToolExecuteProtection, ToolResultProtectionError } from '@/protection/toolResult';
 import {
   logSubagentResolutionFailure,
   SubagentResolutionError,
@@ -128,7 +129,6 @@ import {
   pickSubagentHostArgInput,
   getSubagentHostArgsDigest,
 } from './hostArgs';
-import { normalizeToolResultError, hasRequiredToolExecuteProtection, ToolResultProtectionError } from '@/protection/toolResult';
 import {
   rebindToolBatchReplayScope,
   rebindToolBatchReplayPayload,
@@ -3148,13 +3148,15 @@ export class SubagentExecutor {
         configurable: childConfigurable,
       };
       activeChildRun.invokeConfig = childInvokeConfig;
+      let admittedChildCheckpoint: StateSnapshot | undefined;
+      if (this.toolResultProtection != null && this.humanInTheLoop?.enabled === true) {
+        admittedChildCheckpoint = await childGraph.validateToolResultCheckpoint(await workflow.getState(getToolResultCheckpointLookup(childInvokeConfig), { subgraphs: true }), childSignal);
+        Object.assign(childConfigurable, bindToolResultCheckpoint(childInvokeConfig, admittedChildCheckpoint).configurable);
+      }
       if (cachedChildRun == null && this.humanInTheLoop?.enabled === true) {
         /** Rehydrate child-owned interrupt state when a host rebuilds Run
          * around the same durable checkpointer after a process boundary. */
-        let persistedState = this.toolResultProtection == null
-          ? await workflow.getState(childInvokeConfig)
-          : await workflow.getState(childInvokeConfig, { subgraphs: true });
-        if (this.toolResultProtection != null) persistedState = await childGraph.validateToolResultCheckpoint(persistedState, childSignal);
+        const persistedState = admittedChildCheckpoint ?? await workflow.getState(childInvokeConfig);
         const checkpointMessages = getCheckpointMessages(
           (persistedState.values as { messages?: unknown } | undefined)
             ?.messages

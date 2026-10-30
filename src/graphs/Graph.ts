@@ -768,7 +768,7 @@ export abstract class Graph<
       try {
         if (snapshot.config != null) {
           snapshot.config = snapshotToolCheckpointRecord(snapshot.config, ['configurable']);
-          if (snapshot.config.configurable != null) snapshot.config.configurable = snapshotToolCheckpointRecord(snapshot.config.configurable, ['checkpoint_id', 'checkpoint_ns', 'thread_id']);
+          if (snapshot.config.configurable != null) snapshot.config.configurable = snapshotToolCheckpointRecord(snapshot.config.configurable, ['checkpoint_id', 'checkpoint_ns', 'thread_id', 'thread_ts']);
         }
         if (snapshot.values != null) {
           const values = snapshotToolCheckpointRecord(snapshot.values, ['messages', 'agentMessages', 'runStepState', 'handoffState']);
