@@ -4,8 +4,62 @@ import {
   OutputTruncationError,
   assertNotTruncatedToolCall,
   getTruncationStopReason,
+  getProviderStopReasons,
 } from '@/llm/truncation';
 import { Providers } from '@/common';
+
+describe('getProviderStopReasons', () => {
+  it.each([
+    { stopReason: ' STOP_SEQUENCE ' },
+    { messageStop: { stopReason: ' STOP_SEQUENCE ' } },
+    { stop_reason: ' STOP_SEQUENCE ' },
+    { finish_reason: ' STOP_SEQUENCE ' },
+    { finishReason: ' STOP_SEQUENCE ' },
+    { incomplete_details: { reason: ' STOP_SEQUENCE ' } },
+  ])('normalizes native metadata: %j', (response_metadata) => {
+    expect(
+      getProviderStopReasons(new AIMessage({ content: '', response_metadata }))
+    ).toEqual(['stop_sequence']);
+  });
+
+  it('reads Anthropic streamed stop reasons', () => {
+    expect(
+      getProviderStopReasons(
+        new AIMessageChunk({
+          content: '',
+          additional_kwargs: { stop_reason: ' REFUSAL ' },
+        })
+      )
+    ).toEqual(['refusal']);
+  });
+
+  it('does not let a normal reason hide a terminal reason in another field', () => {
+    expect(
+      getProviderStopReasons(
+        new AIMessageChunk({
+          content: '',
+          response_metadata: {
+            stopReason: 'end_turn',
+            messageStop: { stopReason: 'stop_sequence' },
+          },
+        })
+      )
+    ).toEqual(['end_turn', 'stop_sequence']);
+  });
+
+  it('ignores absent, empty, and non-string fields', () => {
+    expect(getProviderStopReasons(undefined)).toEqual([]);
+    expect(getProviderStopReasons(null)).toEqual([]);
+    expect(
+      getProviderStopReasons(
+        new AIMessage({
+          content: '',
+          response_metadata: { stopReason: 1, finishReason: ' ' },
+        })
+      )
+    ).toEqual([]);
+  });
+});
 
 describe('getTruncationStopReason', () => {
   it('returns null when there is no response metadata', () => {

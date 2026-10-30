@@ -43,6 +43,46 @@ function normalizeStopValue(value: unknown): TruncationStopReason | null {
   return null;
 }
 
+/** Normalizes native invoke and stream stop reasons without hiding conflicting fields. */
+export function getProviderStopReasons(
+  message:
+    | Pick<BaseMessage, 'response_metadata' | 'additional_kwargs'>
+    | undefined
+    | null
+): string[] {
+  const meta = message?.response_metadata as
+    | Record<string, unknown>
+    | undefined;
+  const additionalKwargs = message?.additional_kwargs as
+    | Record<string, unknown>
+    | undefined;
+  if (meta == null && additionalKwargs == null) {
+    return [];
+  }
+
+  const messageStop = meta?.messageStop as { stopReason?: unknown } | undefined;
+  const incompleteDetails = meta?.incomplete_details as
+    | { reason?: unknown }
+    | undefined;
+  const candidates: unknown[] = [
+    meta?.stopReason,
+    meta?.stop_reason,
+    meta?.finish_reason,
+    meta?.finishReason,
+    messageStop?.stopReason,
+    incompleteDetails?.reason,
+    additionalKwargs?.stop_reason,
+  ];
+
+  const reasons: string[] = [];
+  for (const candidate of candidates) {
+    if (typeof candidate !== 'string') continue;
+    const reason = candidate.trim().toLowerCase();
+    if (reason !== '') reasons.push(reason);
+  }
+  return reasons;
+}
+
 /**
  * Reads the truncation stop reason off a message, covering every provider
  * shape we stream:
@@ -63,31 +103,7 @@ export function getTruncationStopReason(
     | undefined
     | null
 ): TruncationStopReason | null {
-  const meta = message?.response_metadata as
-    | Record<string, unknown>
-    | undefined;
-  const additionalKwargs = message?.additional_kwargs as
-    | Record<string, unknown>
-    | undefined;
-  if (meta == null && additionalKwargs == null) {
-    return null;
-  }
-
-  const messageStop = meta?.messageStop as { stopReason?: unknown } | undefined;
-  const incompleteDetails = meta?.incomplete_details as
-    | { reason?: unknown }
-    | undefined;
-  const candidates: unknown[] = [
-    meta?.stopReason,
-    meta?.stop_reason,
-    meta?.finish_reason,
-    meta?.finishReason,
-    messageStop?.stopReason,
-    incompleteDetails?.reason,
-    additionalKwargs?.stop_reason,
-  ];
-
-  for (const candidate of candidates) {
+  for (const candidate of getProviderStopReasons(message)) {
     const normalized = normalizeStopValue(candidate);
     if (normalized != null) {
       return normalized;
