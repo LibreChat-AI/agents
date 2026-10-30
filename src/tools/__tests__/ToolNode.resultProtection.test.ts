@@ -11,12 +11,14 @@ import {
   StateGraph,
   MessagesAnnotation,
   MemorySaver,
+  emptyCheckpoint,
   START,
   END,
   isInterrupted,
 } from '@langchain/langgraph';
 import type { RunnableConfig, Runnable } from '@langchain/core/runnables';
 import type { ToolCall } from '@langchain/core/messages/tool';
+import type { CheckpointTuple } from '@langchain/langgraph';
 import type { BaseMessage } from '@langchain/core/messages';
 import type { AddressInfo } from 'node:net';
 import type {
@@ -3254,7 +3256,7 @@ it('pins foreground child startup to its admitted empty checkpoint despite a com
   expect(startups).toBe(1); expect(childInputs).toHaveLength(1); assertNoCanary(childInputs[0]); assertNoCanary(run.Graph!.getRunMessages());
 });
 
-it.each((['warm', 'rebuilt'] as const).flatMap((runtime) => (['mismatch', 'concurrent', 'matching', 'unknown', 'unprotected'] as const).map((mode) => [runtime, mode] as const)))('binds the exact admitted descendant before interrupted graph resume (%s/%s)', async (runtime, mode) => {
+it.each((['warm', 'rebuilt'] as const).flatMap((runtime) => (['mismatch', 'concurrent', 'matching', 'unknown', 'pending-root', 'pending-child', 'pending-allowed', 'unprotected'] as const).map((mode) => [runtime, mode] as const)))('binds the exact admitted descendant before interrupted graph resume (%s/%s)', async (runtime, mode) => {
   let approvals = 0; const inputs: string[] = []; const observed: string[] = []; const saver = new MemorySaver(); const runId = `descendant-cursor-${runtime}-${mode}`;
   const approval = new DynamicStructuredTool({ name: 'approval_control', description: 'Allowed approval control.', schema: z.object({ count: z.number() }), func: async () => { approvals++; return 'Approved control'; } });
   const create = async (resumed: boolean): Promise<Run<IState>> => {
@@ -3284,6 +3286,13 @@ it.each((['warm', 'rebuilt'] as const).flatMap((runtime) => (['mismatch', 'concu
   let wrote = false;
   const callback = BaseCallbackHandler.fromMethods({ handleChainStart: async (_chain, input): Promise<void> => {
     if (mode === 'concurrent' && !wrote) { wrote = true; await writeRaw(lateId); }
+    if (mode === 'pending-allowed' && !wrote) {
+      wrote = true; await saver.putWrites(childConfig, [['messages', [new HumanMessage('Allowed concurrent message')]]], '00000000-0000-0000-0000-000000000000');
+    }
+    if ((mode === 'pending-root' || mode === 'pending-child') && !wrote) {
+      wrote = true;
+      await saver.putWrites(mode === 'pending-root' ? admitted.config : childConfig, [['messages', [new AIMessage({ content: '', tool_calls: [{ id: 'pending-raw-source', name: 'lookup', args: { count: 42 } }] }), new ToolMessage({ name: 'lookup', tool_call_id: 'pending-raw-source', content: fixtures.canaries[0] })]]], '00000000-0000-0000-0000-000000000000');
+    }
     observed.push(JSON.stringify(input));
   }, handleChainEnd: (output): void => { observed.push(JSON.stringify(output)); } }); callback.awaitHandlers = true;
   let checkpointMap: Record<string, string> = {};
@@ -3293,12 +3302,56 @@ it.each((['warm', 'rebuilt'] as const).flatMap((runtime) => (['mismatch', 'concu
   const caller = { ...config, configurable: { ...config.configurable, checkpoint_map: checkpointMap }, callbacks: [callback] };
   const outcome = await next.resume([{ type: 'approve' }], caller).catch((value: Error) => value);
   if (mode === 'mismatch' || mode === 'unknown') { expect(outcome).toMatchObject({ code: 'unsupported' }); expect(approvals).toBe(0); expect(inputs).toEqual([]); expect(observed).toEqual([]); }
+  else if (mode === 'pending-root' || mode === 'pending-child') {
+    assertNoCanary(observed.join('')); expect(outcome).toMatchObject({ code: 'incompatible' }); expect(approvals).toBe(0); expect(inputs).toEqual([]); expect(wrote).toBe(true);
+  }
   else if (mode === 'unprotected') {
     expect(outcome).toBeUndefined(); expect(approvals).toBe(0); expect(inputs).toHaveLength(1); expect(inputs[0]).toContain(fixtures.canaries[0]);
   } else {
     expect(outcome).toBeUndefined(); expect(approvals).toBe(1); expect(inputs).toHaveLength(1);
     assertNoCanary(inputs[0]); assertNoCanary(observed.join(''));
     if (mode === 'concurrent') expect(wrote).toBe(true);
+    if (mode === 'pending-allowed') { expect(wrote).toBe(true); expect(inputs[0]).toContain('Allowed concurrent message'); }
   }
   expect(caller.configurable.checkpoint_map).toEqual(checkpointMap); expect(caller.configurable.user_id).toBe('allowed-principal');
+});
+
+it.each(['messages', 'agentMessages'] as const)('rejects uncertified pending %s before native channel reduction', async (channel) => {
+  const graph = new StandardGraph({ runId: 'pending-channel', agents: [{ agentId: 'worker', provider: Providers.OPENAI }], toolResultProtection: policy() });
+  const checkpoint = emptyCheckpoint(); checkpoint.channel_values = { messages: [new HumanMessage('Allowed checkpoint control')] };
+  const tuple: CheckpointTuple = { config: { configurable: { thread_id: 'pending-channel' } }, checkpoint, pendingWrites: [['task-control', channel, [new ToolMessage({ name: 'lookup', tool_call_id: 'unadmitted-pending', content: fixtures.canaries[0] })]]] };
+  await expect(graph.validateToolResultCheckpointTuple(tuple)).rejects.toMatchObject({ code: 'incompatible' });
+});
+
+it.each(['values', 'writes', 'entry', 'message-array'] as const)('rejects native checkpoint tuple %s getters without executing them', async (kind) => {
+  const graph = new StandardGraph({ runId: 'pending-getter', agents: [{ agentId: 'worker', provider: Providers.OPENAI }], toolResultProtection: policy() });
+  let reads = 0; const getter = (): never => { reads++; throw new Error(fixtures.canaries[0]); };
+  const tuple: CheckpointTuple = { config: {}, checkpoint: emptyCheckpoint(), pendingWrites: [['task-control', 'messages', [new HumanMessage('Allowed pending control')]]] };
+  if (kind === 'values') Object.defineProperty(tuple.checkpoint, 'channel_values', { get: getter });
+  if (kind === 'writes') Object.defineProperty(tuple, 'pendingWrites', { get: getter });
+  if (kind === 'entry') Object.defineProperty(tuple.pendingWrites!, '0', { get: getter });
+  if (kind === 'message-array') Object.defineProperty(tuple.pendingWrites![0][2] as BaseMessage[], '0', { get: getter });
+  await expect(graph.validateToolResultCheckpointTuple(tuple)).rejects.toMatchObject({ code: 'unsupported' }); expect(reads).toBe(0);
+});
+
+it('admits certified pending results and preserves own writes, identities, removal controls and other channels', async () => {
+  const saver = new MemorySaver(); let executions = 0;
+  const source = new DynamicStructuredTool({ name: 'lookup', description: 'Allowed source control.', schema: z.object({ count: z.number() }), func: async () => { executions++; return fixtures.canaries[0]; } });
+  const gate = policy(); const run = await Run.create({ runId: 'certified-pending', graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, tools: [source], compileOptions: { checkpointer: saver } }, toolResultProtection: gate });
+  run.Graph!.overrideModel = new FakeChatModel({ responses: ['', 'Allowed final answer'], toolCalls: [{ id: 'certified-source', name: 'lookup', args: { count: 42 }, type: 'tool_call' }] });
+  await run.processStream({ messages: [new HumanMessage('Allowed initial control')] }, { version: 'v2', configurable: { thread_id: 'certified-pending' } });
+  const tuple = (await saver.getTuple({ configurable: { thread_id: 'certified-pending' } }))!;
+  const values = tuple.checkpoint.channel_values; const history = values.messages as BaseMessage[]; const result = history.find((message) => message.getType() === 'tool')!;
+  const current = history.filter((message) => message !== result);
+  const opaque = { count: 42, status: 'allowed-control' };
+  tuple.checkpoint.channel_values = { ...values, messages: current };
+  tuple.pendingWrites = [['task-control', 'messages', [result]], ['task-control', 'runStepState', new Overwrite(values.runStepState)], ['task-control', 'opaque', opaque]];
+  const graph = new StandardGraph({ runId: 'certified-restored', agents: [{ agentId: 'worker', provider: Providers.OPENAI }], toolResultProtection: gate });
+  const admitted = await graph.validateToolResultCheckpointTuple(tuple);
+  const messages = admitted.pendingWrites![0][2] as BaseMessage[];
+  expect(messages[0].id).toBe(result.id); expect(messages[0].content).toBe('[EMAIL_1]'); assertNoCanary(messages); expect(admitted.pendingWrites![2][2]).toBe(opaque); expect(executions).toBe(1);
+  expect(tuple.checkpoint.channel_values.messages).toBe(current); expect(tuple.pendingWrites[0][2]).toEqual([result]);
+  tuple.pendingWrites = [['task-control', 'messages', [createRemoveAllMessage(), new HumanMessage('Allowed compaction control')]]];
+  const compacted = await graph.validateToolResultCheckpointTuple(tuple);
+  expect((compacted.pendingWrites![0][2] as BaseMessage[])[0]).toBeInstanceOf(RemoveMessage);
 });

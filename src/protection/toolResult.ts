@@ -26,6 +26,7 @@ import type {
   ToolExecuteBatchRequest,
   ToolCallRequest,
 } from '@/types';
+import type { ToolCheckpointAdmission } from './toolCheckpoint';
 import {
   ProviderTextAttempt,
   ProviderTextProtectionError,
@@ -546,6 +547,19 @@ export function getToolResultCheckpointLookup<C extends RunnableConfig>(config: 
   return { ...config, configurable: { ...config.configurable, checkpoint_id: id } };
 }
 
+function toolCheckpointSource(config: RunnableConfig, saver: unknown): BaseCheckpointSaver {
+  let source: unknown = config.configurable?.__pregel_checkpointer ?? saver;
+  while (source instanceof ToolCheckpointSaver) source = source.source;
+  if (!(source instanceof BaseCheckpointSaver)) throw new ToolResultProtectionError('unsupported');
+  return source;
+}
+
+export function admitToolResultCheckpoints<C extends RunnableConfig>(config: C, saver: unknown, admit: ToolCheckpointAdmission): C {
+  const thread: unknown = config.configurable?.thread_id;
+  if (typeof thread !== 'string' || thread === '') throw new ToolResultProtectionError('incompatible');
+  return { ...config, configurable: { ...config.configurable, __pregel_checkpointer: new ToolCheckpointSaver(toolCheckpointSource(config, saver), thread, new Map(), admit) } };
+}
+
 type AdmittedToolCheckpoint = {
   config?: RunnableConfig;
   values?: object;
@@ -553,7 +567,7 @@ type AdmittedToolCheckpoint = {
 };
 
 /** Exact saver routing preserves native approval semantics; descendant map entries imply time travel. */
-export function bindToolResultCheckpoint<C extends RunnableConfig>(config: C, snapshot: AdmittedToolCheckpoint, saver?: unknown): C {
+export function bindToolResultCheckpoint<C extends RunnableConfig>(config: C, snapshot: AdmittedToolCheckpoint, saver?: unknown, admit?: ToolCheckpointAdmission): C {
   const thread: unknown = config.configurable?.thread_id;
   if (typeof thread !== 'string' || thread === '') throw new ToolResultProtectionError('incompatible');
   const map: unknown = config.configurable?.checkpoint_map;
@@ -588,11 +602,7 @@ export function bindToolResultCheckpoint<C extends RunnableConfig>(config: C, sn
   };
   visit(snapshot);
   for (const namespace of Object.keys(requested)) if (!cursors.has(namespace)) throw new ToolResultProtectionError('unsupported');
-  const configured: unknown = config.configurable?.__pregel_checkpointer ?? saver;
-  let source = configured;
-  while (source instanceof ToolCheckpointSaver) source = source.source;
-  if (!(source instanceof BaseCheckpointSaver)) throw new ToolResultProtectionError('unsupported');
-  return { ...config, configurable: { ...config.configurable, checkpoint_ns: '', checkpoint_map: { '': cursors.get('')! }, __pregel_checkpointer: new ToolCheckpointSaver(source, thread, cursors) } };
+  return { ...config, configurable: { ...config.configurable, checkpoint_ns: '', checkpoint_map: { '': cursors.get('')! }, __pregel_checkpointer: new ToolCheckpointSaver(toolCheckpointSource(config, saver), thread, cursors, admit) } };
 }
 
 export function snapshotToolCheckpointArray<T>(value: readonly T[]): T[] {

@@ -6,7 +6,7 @@ import { tool } from '@langchain/core/tools';
 import { ToolNode } from '@langchain/langgraph/prebuilt';
 import { ContextOverflowError } from '@langchain/core/errors';
 import { Runnable, RunnableConfig } from '@langchain/core/runnables';
-import { START, END, StateGraph, Annotation } from '@langchain/langgraph';
+import { START, END, StateGraph, Annotation, Overwrite } from '@langchain/langgraph';
 import {
   ToolMessage,
   HumanMessage,
@@ -17,7 +17,7 @@ import type {
   BaseMessage,
   MessageContent,
 } from '@langchain/core/messages';
-import type { BaseChannel, OverwriteValue } from '@langchain/langgraph';
+import type { BaseChannel, OverwriteValue, CheckpointTuple } from '@langchain/langgraph';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type {
   ReplayableSubagentTool,
@@ -116,7 +116,7 @@ import {
   disposeLangfuseHandler,
   isLangfuseCallbackHandler,
 } from '@/langfuse';
-import { snapshotToolCheckpointRecord, snapshotToolCheckpointArray, snapshotToolHistoryMessages, retainToolMessageReleases, normalizeToolResultError, getLiveToolMessageRelease, commitToolMessageRelease, snapshotToolMessageReleases, validateToolMessageHistory, requiresToolResultProtection, ToolResultProtectionError, validateToolResultProtection } from '@/protection/toolResult';
+import { snapshotToolResumeMessages, snapshotToolMessageRemoval, snapshotToolCheckpointRecord, snapshotToolCheckpointArray, snapshotToolHistoryMessages, retainToolMessageReleases, normalizeToolResultError, getLiveToolMessageRelease, commitToolMessageRelease, snapshotToolMessageReleases, validateToolMessageHistory, requiresToolResultProtection, ToolResultProtectionError, validateToolResultProtection } from '@/protection/toolResult';
 import {
   getBlindRecoveryBudget,
   planContextOverflowRecovery,
@@ -757,7 +757,7 @@ export abstract class Graph<
     currentTools?: t.GraphTools;
     currentToolMap?: t.ToolMap;
   }): CustomToolNode<T> | ToolNode<T>;
-  async validateToolResultHistory(messages: BaseMessage[], _state?: t.RunStepResumeState, _signal?: AbortSignal): Promise<BaseMessage[]> { return messages; }
+  async validateToolResultHistory(messages: BaseMessage[], _state?: Pick<t.RunStepResumeState, 'toolResultReleases'>, _signal?: AbortSignal): Promise<BaseMessage[]> { return messages; }
   commitToolResultMessages(_messages: BaseMessage[]): void {}
   async validateToolResultCheckpoint<S extends ToolResultCheckpoint>(input: S, signal?: AbortSignal): Promise<S> {
     const active = new WeakSet<object>();
@@ -800,6 +800,49 @@ export abstract class Graph<
       } finally { active.delete(candidate); }
     };
     return visit(input);
+  }
+  async validateToolResultCheckpointTuple(input: CheckpointTuple, signal?: AbortSignal): Promise<CheckpointTuple> {
+    const tuple = snapshotToolCheckpointRecord(input, ['checkpoint', 'pendingWrites']);
+    const checkpoint = snapshotToolCheckpointRecord(tuple.checkpoint, ['channel_values']);
+    const values = snapshotToolCheckpointRecord(checkpoint.channel_values, ['messages', 'agentMessages', 'runStepState']);
+    const pending = snapshotToolCheckpointArray(tuple.pendingWrites ?? []).map((entry) => {
+      const write = snapshotToolCheckpointArray(entry);
+      if (write.length !== 3 || typeof write[0] !== 'string' || typeof write[1] !== 'string') throw new ToolResultProtectionError('unsupported');
+      return [write[0], write[1], write[2]] as NonNullable<CheckpointTuple['pendingWrites']>[number];
+    });
+    const releases: ToolMessageRelease[] = [];
+    const addState = (value: unknown): void => {
+      if (value == null) return;
+      const carrier = snapshotToolCheckpointRecord(value as t.RunStepResumeState & { __overwrite__?: t.RunStepResumeState }, ['__overwrite__', 'toolResultReleases']);
+      const state = Object.hasOwn(carrier, '__overwrite__') ? snapshotToolCheckpointRecord(carrier.__overwrite__!, ['toolResultReleases']) : carrier;
+      releases.push(...snapshotToolMessageReleases(state.toolResultReleases ?? []));
+    };
+    addState(values.runStepState);
+    const outputs: BaseMessage[] = [];
+    const updates: Array<{ write: NonNullable<CheckpointTuple['pendingWrites']>[number]; change: ReturnType<typeof snapshotToolResumeMessages>; controls: Array<ReturnType<typeof snapshotToolMessageRemoval>> }> = [];
+    for (const write of pending) {
+      if (write[1] === 'runStepState') addState(write[2]);
+      if (write[1] !== 'messages' && write[1] !== 'agentMessages') continue;
+      const change = snapshotToolResumeMessages(write[2]);
+      const controls = change.messages.map(snapshotToolMessageRemoval);
+      for (let index = 0; index < change.messages.length; index++) {
+        if (controls[index] == null) outputs.push(change.messages[index]);
+        else if (change.overwrite || write[1] === 'agentMessages') throw new ToolResultProtectionError('unsupported');
+      }
+      updates.push({ write, change, controls });
+    }
+    const primary = snapshotToolHistoryMessages((values.messages ?? []) as BaseMessage[]);
+    const alternate = snapshotToolHistoryMessages((values.agentMessages ?? []) as BaseMessage[]);
+    const canonical = await this.validateToolResultHistory([...primary, ...alternate, ...outputs], { toolResultReleases: releases }, signal);
+    if (values.messages != null) values.messages = canonical.slice(0, primary.length);
+    if (values.agentMessages != null) values.agentMessages = canonical.slice(primary.length, primary.length + alternate.length);
+    let position = primary.length + alternate.length;
+    for (const { write, change, controls } of updates) {
+      const messages = change.messages.map((_message, index) => controls[index] ?? canonical[position++]);
+      const content = Array.isArray(write[2]) ? messages : messages[0];
+      write[2] = change.overwrite ? new Overwrite(messages) : content;
+    }
+    return { ...tuple, checkpoint: { ...checkpoint, channel_values: values }, pendingWrites: pending };
   }
   abstract getRunMessages(): BaseMessage[] | undefined;
   /** Returns a snapshot of deferred tools discovered by this graph. */
@@ -1883,7 +1926,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     for (const receipt of before) this.toolResultHistoryReleases.delete(JSON.stringify([receipt.name, receipt.id, receipt.envelope.id]));
   }
 
-  override async validateToolResultHistory(messages: BaseMessage[], state?: t.RunStepResumeState, signal?: AbortSignal): Promise<BaseMessage[]> {
+  override async validateToolResultHistory(messages: BaseMessage[], state?: Pick<t.RunStepResumeState, 'toolResultReleases'>, signal?: AbortSignal): Promise<BaseMessage[]> {
     if (this.toolResultProtection == null) return messages;
     const breaker = this.breakerAbort;
     try {

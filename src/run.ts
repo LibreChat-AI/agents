@@ -1,4 +1,4 @@
-import { getToolResultCheckpointLookup, bindToolResultCheckpoint, snapshotToolMessageRemoval, snapshotToolResumeUpdates, snapshotToolResumeMessages, snapshotToolHistoryMessages, normalizeToolResultError, hasRequiredToolExecuteProtection, ToolResultProtectionError } from '@/protection/toolResult';
+import { admitToolResultCheckpoints, getToolResultCheckpointLookup, bindToolResultCheckpoint, snapshotToolMessageRemoval, snapshotToolResumeUpdates, snapshotToolResumeMessages, snapshotToolHistoryMessages, normalizeToolResultError, hasRequiredToolExecuteProtection, ToolResultProtectionError } from '@/protection/toolResult';
 import { messagesStateReducer } from '@/messages/reducer';
 // src/run.ts
 import { nanoid } from 'nanoid';
@@ -1414,10 +1414,11 @@ export class Run<_T extends t.BaseGraphState> {
       graph.startStopContinuationExecution(nanoid());
       if (this.toolResultProtection != null && this.hasCheckpointer) {
         const workflow = graphRunnable as t.CompiledStateWorkflow & WorkflowWithStateHistory;
+        config.configurable = admitToolResultCheckpoints(config, graph.compileOptions?.checkpointer, (tuple) => graph.validateToolResultCheckpointTuple(tuple, callerConfig.signal)).configurable;
         inputCheckpoint = await workflow.getState?.(getToolResultCheckpointLookup(config), { subgraphs: true });
         if (inputCheckpoint == null) throw new ToolResultProtectionError('unsupported');
         inputCheckpoint = await graph.validateToolResultCheckpoint(inputCheckpoint, callerConfig.signal);
-        config.configurable = bindToolResultCheckpoint(config, inputCheckpoint, graph.compileOptions?.checkpointer).configurable;
+        config.configurable = bindToolResultCheckpoint(config, inputCheckpoint, graph.compileOptions?.checkpointer, (tuple) => graph.validateToolResultCheckpointTuple(tuple, callerConfig.signal)).configurable;
       }
     }
     if (stateInputs != null) {
@@ -2296,6 +2297,7 @@ export class Run<_T extends t.BaseGraphState> {
 
     const pending = this.toolResultProtection == null ? undefined : this._interrupt;
     if (pending?.checkpointId != null) callerConfig = { ...callerConfig, configurable: { ...callerConfig.configurable, checkpoint_id: pending.checkpointId, checkpoint_ns: pending.checkpointNs ?? '' } };
+    if (this.toolResultProtection != null) callerConfig = admitToolResultCheckpoints(callerConfig, this.Graph?.compileOptions?.checkpointer, (tuple) => this.Graph!.validateToolResultCheckpointTuple(tuple, callerConfig.signal));
     const lookup = this.toolResultProtection == null ? callerConfig : getToolResultCheckpointLookup(callerConfig);
     let snapshot = await workflow.getState(lookup as RunnableConfig, {
       subgraphs: true,
@@ -2303,7 +2305,7 @@ export class Run<_T extends t.BaseGraphState> {
     let validated: { update: ResumeCommandUpdate; messages: BaseMessage[] } | undefined;
     if (this.toolResultProtection != null) {
       snapshot = await this.Graph!.validateToolResultCheckpoint(snapshot, callerConfig.signal);
-      callerConfig = bindToolResultCheckpoint(callerConfig, snapshot, this.Graph?.compileOptions?.checkpointer);
+      callerConfig = bindToolResultCheckpoint(callerConfig, snapshot, this.Graph?.compileOptions?.checkpointer, (tuple) => this.Graph!.validateToolResultCheckpointTuple(tuple, callerConfig.signal));
       validated = await this.validateToolResultResumeUpdate(snapshot, resumeUpdate, callerConfig.signal);
     }
     if (this._interrupt != null) return { update: validated?.update ?? resumeUpdate, config: callerConfig };

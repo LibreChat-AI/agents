@@ -1,5 +1,8 @@
 import { BaseCheckpointSaver } from '@langchain/langgraph';
 import type { RunnableConfig } from '@langchain/core/runnables';
+import type { CheckpointTuple } from '@langchain/langgraph';
+
+export type ToolCheckpointAdmission = (tuple: CheckpointTuple) => Promise<CheckpointTuple>;
 
 /** Routes implicit reads to admitted state, then to checkpoints written by this execution. */
 export class ToolCheckpointSaver extends BaseCheckpointSaver {
@@ -9,20 +12,22 @@ export class ToolCheckpointSaver extends BaseCheckpointSaver {
   constructor(
     readonly source: BaseCheckpointSaver,
     private readonly thread: string,
-    cursors: ReadonlyMap<string, string>
+    cursors: ReadonlyMap<string, string>,
+    private readonly admit?: ToolCheckpointAdmission
   ) {
     super(source.serde);
     this.cursors = new Map(cursors);
     this.getNextVersion = source.getNextVersion.bind(source);
   }
 
-  override getTuple(config: RunnableConfig): ReturnType<BaseCheckpointSaver['getTuple']> {
+  override async getTuple(config: RunnableConfig): ReturnType<BaseCheckpointSaver['getTuple']> {
     const scope = config.configurable;
     const cursor = this.cursors.get(scope?.checkpoint_ns ?? '');
     const lookup = scope?.thread_id === this.thread && scope.checkpoint_id == null && scope.thread_ts == null && cursor != null
       ? { ...config, configurable: { ...scope, checkpoint_id: cursor } }
       : config;
-    return this.source.getTuple(lookup);
+    const tuple = await this.source.getTuple(lookup);
+    return tuple == null || this.admit == null ? tuple : this.admit(tuple);
   }
 
   override list(...args: Parameters<BaseCheckpointSaver['list']>): ReturnType<BaseCheckpointSaver['list']> {

@@ -102,6 +102,7 @@ import type {
 import type { RunBreakerScope } from '@/llm/streamLimits';
 import type { GraphFactory } from '@/graphs/graphFactory';
 import type { StandardGraph } from '@/graphs/Graph';
+import { admitToolResultCheckpoints, getToolResultCheckpointLookup, bindToolResultCheckpoint, normalizeToolResultError, hasRequiredToolExecuteProtection, ToolResultProtectionError } from '@/protection/toolResult';
 import {
   getSubagentApprovalExecutionScope,
   SubagentDefinitionBindingError,
@@ -116,7 +117,6 @@ import {
   SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY,
   SUBAGENT_RESUME_MANIFEST_CONFIG_KEY,
 } from './SubagentReplay';
-import { getToolResultCheckpointLookup, bindToolResultCheckpoint, normalizeToolResultError, hasRequiredToolExecuteProtection, ToolResultProtectionError } from '@/protection/toolResult';
 import {
   logSubagentResolutionFailure,
   SubagentResolutionError,
@@ -3150,8 +3150,9 @@ export class SubagentExecutor {
       activeChildRun.invokeConfig = childInvokeConfig;
       let admittedChildCheckpoint: StateSnapshot | undefined;
       if (this.toolResultProtection != null && this.humanInTheLoop?.enabled === true) {
+        Object.assign(childConfigurable, admitToolResultCheckpoints(childInvokeConfig, this.checkpointer, (tuple) => childGraph.validateToolResultCheckpointTuple(tuple, childSignal)).configurable);
         admittedChildCheckpoint = await childGraph.validateToolResultCheckpoint(await workflow.getState(getToolResultCheckpointLookup(childInvokeConfig), { subgraphs: true }), childSignal);
-        Object.assign(childConfigurable, bindToolResultCheckpoint(childInvokeConfig, admittedChildCheckpoint, this.checkpointer).configurable);
+        Object.assign(childConfigurable, bindToolResultCheckpoint(childInvokeConfig, admittedChildCheckpoint, this.checkpointer, (tuple) => childGraph.validateToolResultCheckpointTuple(tuple, childSignal)).configurable);
       }
       if (cachedChildRun == null && this.humanInTheLoop?.enabled === true) {
         /** Rehydrate child-owned interrupt state when a host rebuilds Run
