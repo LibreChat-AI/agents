@@ -1,5 +1,7 @@
+import { FakeChatModel } from '@langchain/core/utils/testing';
 import type * as t from '@/types';
 import { getConfiguredCompletionTokens } from '@/llm/request';
+import { registerProvider } from '@/llm/providers';
 import { Providers } from '@/common';
 
 const options = (fields: Record<string, unknown>): t.ClientOptions =>
@@ -55,6 +57,31 @@ describe('getConfiguredCompletionTokens', () => {
     expect(
       getConfiguredCompletionTokens(Providers.ANTHROPIC, undefined)
     ).toBeUndefined();
+  });
+
+  it('reserves nothing for a host provider in the Anthropic family', () => {
+    const provider = 'anthropic-family-completion-test';
+    const unregister = registerProvider({
+      provider,
+      model: FakeChatModel,
+      family: 'anthropic',
+    });
+    try {
+      expect(
+        getConfiguredCompletionTokens(
+          provider,
+          options({ model: 'claude-sonnet-5-5' })
+        )
+      ).toBeUndefined();
+      expect(
+        getConfiguredCompletionTokens(
+          provider,
+          options({ model: 'claude-sonnet-5-5', maxTokens: 4096 })
+        )
+      ).toBe(4096);
+    } finally {
+      unregister();
+    }
   });
 
   it('does not substitute the default for an explicit non-positive value', () => {

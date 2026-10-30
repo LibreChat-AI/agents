@@ -87,8 +87,10 @@ export function getMaxOutputTokensKey(
  * The completion allowance the provider will reserve, under whichever key its
  * client uses. Providers count it against the same ceiling as the prompt, so
  * overflow recovery has to reserve it when the error did not itemize the
- * total. Without an explicit value, Anthropic clients still send their model
- * default, so that default is reserved instead.
+ * total. Without an explicit value, the built-in Anthropic client still sends
+ * its model default, so that default is reserved instead. Host providers in the
+ * Anthropic family may wrap a client with a different default, so they keep
+ * reserving nothing they did not configure.
  */
 export function getConfiguredCompletionTokens(
   provider: t.ProviderName,
@@ -105,8 +107,7 @@ export function getConfiguredCompletionTokens(
   if (
     options?.maxTokens != null ||
     options?.maxOutputTokens != null ||
-    (provider !== Providers.ANTHROPIC &&
-      getProviderFamily(provider) !== 'anthropic')
+    provider !== Providers.ANTHROPIC
   ) {
     return undefined;
   }
