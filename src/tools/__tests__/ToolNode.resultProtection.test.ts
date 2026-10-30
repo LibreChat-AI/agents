@@ -3761,7 +3761,7 @@ it.each(['plain', 'overwrite'] as const)('rejects accessor-backed resume run-ste
   expect(error).toMatchObject({ code: 'unsupported' }); expect(reads).toBe(0); expect(observed).toEqual([]); assertNoCanary(String(error));
 });
 
-it.each((['root', 'graph-child'] as const).flatMap((scope) => (['warm', 'rebuilt'] as const).flatMap((runtime) => [false, true].flatMap((eventDriven) => (['approve', 'respond'] as const).map((decision) => [scope, runtime, eventDriven, decision] as const)))))('keeps mandatory tool protection across parallel approval scopes (%s/%s/event=%s/%s)', async (scope, runtime, eventDriven, decision) => {
+it.each((['root', 'graph-child'] as const).flatMap((scope) => (['warm', 'rebuilt'] as const).flatMap((runtime) => [false, true].flatMap((eventDriven) => (['approve', 'respond', 'partial', 'mixed'] as const).map((decision) => [scope, runtime, eventDriven, decision] as const)))))('keeps mandatory tool protection across parallel approval scopes (%s/%s/event=%s/%s)', async (scope, runtime, eventDriven, decision) => {
   const saver = new MemorySaver(); const runId = `protected-parallel-${scope}-${runtime}-${eventDriven}-${decision}`; const observed: string[] = []; const modelInputs: string[] = []; const executions: string[] = [];
   class Model extends FakeListChatModel {
     private readonly owners: Map<string, string>;
@@ -3782,7 +3782,7 @@ it.each((['root', 'graph-child'] as const).flatMap((scope) => (['warm', 'rebuilt
     const hooks = new HookRegistry(); hooks.register('PreToolUse', { pattern: '.*_tool', hooks: [async () => ({ decision: 'ask', reason: 'Allowed member approval' })] });
     const agents: AgentInputs[] = ['entry', 'left', 'right', 'result'].map((id) => ({ agentId: id, provider: Providers.OPENAI, instructions: `Allowed ${id} instructions.`, ...(['left', 'right'].includes(id) ? { tools: [new DynamicStructuredTool({ name: `${id}_tool`, description: 'Allowed member tool.', schema: z.object({ count: z.number() }), func: async ({ count }) => { expect(count).toBe(42); executions.push(id); return fixtures.canaries[0]; } })], ...(eventDriven ? { toolDefinitions: [{ name: `${id}_tool`, description: 'Allowed host member tool.', parameters: { type: 'object' as const, properties: { count: { type: 'number' as const } }, required: ['count'] } }] } : {}) } : {}) }));
     const definition: GraphSubagentConfig = { kind: 'graph', configId: 'protected-parallel-v1', type: 'team', name: 'Team', description: 'Allowed parallel team.', agents, entryAgentId: 'entry', resultAgentId: 'result', edges: [{ from: 'entry', to: ['left', 'right'], edgeType: 'direct' }, { from: ['left', 'right'], to: 'result', edgeType: 'direct' }] };
-    const run = await Run.create({ runId, graphConfig: scope === 'root' ? { type: 'multi-agent', agents, entryAgentId: 'entry', edges: definition.edges, compileOptions: { checkpointer: saver } } : { type: 'standard', agents: [{ agentId: 'parent', provider: Providers.OPENAI, instructions: 'Allowed parent.', subagentConfigs: [definition], maxSubagentDepth: 1 }], compileOptions: { checkpointer: saver } }, toolResultProtection: policy({ toolNames: ['left_tool', 'right_tool'] }), hooks, humanInTheLoop: { enabled: true }, skipCleanup: true, ...(eventDriven ? { customHandlers: { [GraphEvents.ON_TOOL_EXECUTE]: { handle: async (_event, raw): Promise<void> => { const batch = raw as ToolExecuteBatchRequest; batch.resolve(batch.toolCalls.map((call) => { expect(call.args.count).toBe(42); executions.push(call.name); return { toolCallId: call.id, content: fixtures.canaries[0], status: 'success' as const }; })); } } } } : {}) });
+    const run = await Run.create({ runId, graphConfig: scope === 'root' ? { type: 'multi-agent', agents, entryAgentId: 'entry', edges: definition.edges, compileOptions: { checkpointer: saver } } : { type: 'standard', agents: [{ agentId: 'parent', provider: Providers.OPENAI, instructions: 'Allowed parent.', subagentConfigs: [definition], maxSubagentDepth: 1 }], compileOptions: { checkpointer: saver } }, toolResultProtection: policy({ toolNames: decision === 'mixed' ? ['left_tool'] : ['left_tool', 'right_tool'] }), hooks, humanInTheLoop: { enabled: true }, skipCleanup: true, ...(eventDriven ? { customHandlers: { [GraphEvents.ON_TOOL_EXECUTE]: { handle: async (_event, raw): Promise<void> => { const batch = raw as ToolExecuteBatchRequest; batch.resolve(batch.toolCalls.map((call) => { expect(call.args.count).toBe(42); executions.push(call.name); return { toolCallId: call.id, content: fixtures.canaries[0], status: 'success' as const }; })); } } } } : {}) });
     if (scope === 'root') run.Graph!.overrideModel = new Model();
     else { run.Graph!.overrideModel = new FakeChatModel({ responses: resumed ? ['Allowed parent answer'] : ['', 'Allowed parent answer'], toolCalls: resumed ? [] : [{ id: 'parallel-parent', name: Constants.SUBAGENT, args: { description: 'Allowed team task.', subagent_type: 'team' }, type: 'tool_call' }] }); run.Graph!.setSubagentModelOverride(new Model()); }
     return run;
@@ -3790,10 +3790,13 @@ it.each((['root', 'graph-child'] as const).flatMap((scope) => (['warm', 'rebuilt
   const config = { version: 'v2' as const, configurable: { thread_id: runId } }; const first = await create(false); await first.processStream({ messages: [new HumanMessage('Allowed parallel task')] }, config);
   const pending = first.getInterrupt()!.pendingInterrupts!.filter((entry) => isToolApprovalInterrupt(entry.payload)); expect(pending).toHaveLength(2); expect(executions).toEqual([]);
   const next = runtime === 'warm' ? first : await create(true);
-  const decisions = Object.fromEntries(pending.map((entry) => [entry.interruptId, decision === 'respond' ? [{ type: 'respond' as const, responseText: fixtures.canaries[0] }] : [{ type: 'approve' as const }]]));
+  const responseFor = (entry: { payload: unknown }): string => decision === 'mixed' && isToolApprovalInterrupt(entry.payload) && entry.payload.action_requests[0]?.name === 'right_tool' ? 'Allowed unselected response' : fixtures.canaries[0];
+  const addressed = decision === 'partial' || decision === 'mixed' ? pending.slice(0, 1) : pending;
+  const decisions = Object.fromEntries(addressed.map((entry) => [entry.interruptId, decision !== 'approve' ? [{ type: 'respond' as const, responseText: responseFor(entry) }] : [{ type: 'approve' as const }]]));
   const callback = BaseCallbackHandler.fromMethods({ handleChainStart: (_chain, input): void => { observed.push(JSON.stringify(input)); }, handleToolEnd: (output): void => { observed.push(JSON.stringify(output)); } }); callback.awaitHandlers = true;
   await next.resume(decisions, { ...config, callbacks: [callback] });
-  expect(next.getInterrupt()).toBeUndefined(); expect(executions).toHaveLength(decision === 'respond' ? 0 : 2); assertNoCanary(observed.join('')); assertNoCanary(modelInputs.join('')); expect(modelInputs.join('')).toContain('[EMAIL_1]');
+  if (decision === 'partial' || decision === 'mixed') { const remaining = next.getInterrupt()!.pendingInterrupts!.filter((entry) => isToolApprovalInterrupt(entry.payload)); expect(remaining).toHaveLength(1); await next.resume({ [remaining[0].interruptId]: [{ type: 'respond', responseText: responseFor(remaining[0]) }] }, { ...config, callbacks: [callback] }); }
+  expect(next.getInterrupt()).toBeUndefined(); expect(executions).toHaveLength(decision === 'approve' ? 2 : 0); assertNoCanary(observed.join('')); assertNoCanary(modelInputs.join('')); expect(modelInputs.join('')).toContain('[EMAIL_1]');
 });
 
 it.each((['fresh', 'resume', 'values', 'pending', 'send'] as const).flatMap((carrier) => (['nameless', 'renamed', 'forged', 'getter', 'control'] as const).map((kind) => [carrier, kind] as const)))('admits compaction window messages before native loading (%s/%s)', async (carrier, kind) => {
@@ -3924,4 +3927,12 @@ it.each((['root', 'descendant'] as const).flatMap((scope) => (['messages', 'agen
   const result = await run.resume([{ type: 'approve' }], { ...config, callbacks: [callback] }).catch((error: Error) => error);
   expect(reloads).toBeGreaterThan(0); assertNoCanary(observed.join('')); assertNoCanary(modelInputs.join('')); assertNoCanary(String(result));
   if (kind === 'control' || kind === 'unselected') expect(result).toBeUndefined(); else { expect(result).toBeInstanceOf(ToolResultProtectionError); expect(executions).toBe(0); }
+});
+
+it('rejects a completed receipt paired with another occurrence’s tool proposal', async () => {
+  const fixture = await certifiedHistory(); const graph = new StandardGraph({ runId: 'receipt-proposal-mismatch', agents: [{ agentId: 'worker', provider: Providers.OPENAI }], toolResultProtection: fixture.gate });
+  const source = new AIMessage({ id: 'other-retained-batch', content: '', tool_calls: [{ id: 'call-control', name: 'other', args: { count: 42 } }] });
+  const scopes = graph.getToolResultCallSources({ values: { messages: [source] } });
+  const state = graph.createRunStepResumeState(); state.toolResultReleases = fixture.releases;
+  await expect(graph.validateToolResultSend(new Send('worker', { messages: [source, fixture.messages[1]], runStepState: state }), undefined, undefined, scopes)).rejects.toMatchObject({ code: 'unsupported' });
 });

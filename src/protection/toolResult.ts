@@ -1036,6 +1036,7 @@ function toolSourceName(sources: ToolCallSources, id: string, messageId: string 
   if (results.length > 0) matches = results;
   if (results.length > 0 && batches.length > 0) {
     matches = results.filter((source) => batches.includes(source));
+    if (matches.length === 0 && results.every((source) => source.batch.startsWith('receipt:') && batches.every((batch) => batch.name === source.name))) matches = results;
     if (matches.length === 0) throw new ToolResultProtectionError('unsupported');
   }
   if (results.length === 0 && batches.length > 0 && pending.length > 0 && !batches.some((source) => pending.includes(source))) throw new ToolResultProtectionError('unsupported');
@@ -1057,14 +1058,17 @@ export async function validateToolMessageHistory(policy: ToolResultProtection | 
   const history = snapshotToolHistoryMessages(messages);
   const byIdentity = new Map<string, ToolMessageRelease>();
   const byMessage = new Map<string, ToolMessageRelease>();
+  const certifiedNames = new Map<string, Set<string>>();
   for (const release of snapshotToolMessageReleases(releases)) {
     if (!requiresToolResultProtection(policy, release.name)) throw new ToolResultProtectionError('incompatible');
+    const names = certifiedNames.get(release.id) ?? new Set<string>(); names.add(release.name); certifiedNames.set(release.id, names);
     const key = JSON.stringify([release.id, release.envelope.id]);
     const existing = byIdentity.get(key);
     if (existing != null && existing.name !== release.name) throw new ToolResultProtectionError('incompatible');
     if (!byIdentity.has(key)) byIdentity.set(key, release);
     if (release.envelope.id != null && !byMessage.has(release.envelope.id)) byMessage.set(release.envelope.id, release);
   }
+  const boundSources = sources == null ? undefined : snapshotToolCallSources([], releases, sources);
   const calls = new Map<string, { name: string; batchId?: string }>();
   for (let index = 0; index < history.length; index++) {
     const message = history[index];
@@ -1079,7 +1083,7 @@ export async function validateToolMessageHistory(policy: ToolResultProtection | 
         const id = ownMessageValue(call, 'id'); const name = ownMessageValue(call, 'name');
         if ((id != null && typeof id !== 'string') || typeof name !== 'string') throw new ToolResultProtectionError('unsupported');
         if (id != null) {
-          if (sources != null) assertToolProposalSource(sources, id, name, messageId ?? undefined);
+          if (boundSources != null && certifiedNames.get(id)?.has(name) !== true) assertToolProposalSource(boundSources, id, name, messageId ?? undefined);
           calls.set(id, { name, batchId: messageId ?? undefined });
         }
       }
@@ -1088,7 +1092,7 @@ export async function validateToolMessageHistory(policy: ToolResultProtection | 
     if (type !== 'tool') continue;
     const identity = historyIdentity(message);
     const local = calls.get(identity.tool_call_id);
-    const sourceName = sources == null ? undefined : toolSourceName(sources, identity.tool_call_id, identity.id, local?.batchId, local != null);
+    const sourceName = boundSources == null ? undefined : toolSourceName(boundSources, identity.tool_call_id, identity.id, local?.batchId, local != null);
     if (sourceName != null && local != null && local.name !== sourceName) throw new ToolResultProtectionError('unsupported');
     const callName = sourceName ?? local?.name;
     const admission = approved.get(message);
