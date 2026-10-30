@@ -35,7 +35,7 @@ import type {
 } from '@/protection/toolResult';
 import type { ToolOutputReferenceState } from '@/tools/toolOutputReferences';
 import type { SettledToolBatchResult } from '@/tools/toolBatchReplay';
-import { snapshotToolRunStepState, snapshotToolMessageRemoval, validateToolMessageHistory, getToolMessageRelease, ToolResultProtectionError   } from '@/protection/toolResult';
+import { admitToolResultCheckpoints, snapshotToolRunStepState, snapshotToolMessageRemoval, validateToolMessageHistory, getToolMessageRelease, ToolResultProtectionError   } from '@/protection/toolResult';
 import {
   createCloudflareProgrammaticToolCallingTool,
   createCloudflareBashProgrammaticToolCallingTool,
@@ -3424,4 +3424,50 @@ it.each(['revision', 'nested', 'cycle'] as const)('rejects hostile run-step %s d
   if (mode === 'nested') Object.defineProperty(state.toolCallSteps, '0', { configurable: true, get: () => { reads++; throw new Error(fixtures.canaries[0]); } });
   if (mode === 'cycle') Object.defineProperty(state, 'cycle', { value: state, enumerable: true });
   expect(() => snapshotToolRunStepState(state)).toThrow(ToolResultProtectionError); expect(reads).toBe(0);
+});
+
+it.each(['own', 'inherited', 'proxy', 'prototype-proxy'] as const)('rejects fresh input %s containers before reading messages', async (mode) => {
+  let reads = 0; let hooks = 0; const registry = new HookRegistry(); registry.register('RunStart', { hooks: [async () => { hooks++; return {}; }] });
+  const run = await Run.create({ runId: 'hostile-fresh-input', graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI } }, toolResultProtection: policy(), hooks: registry });
+  run.Graph!.overrideModel = new FakeChatModel({ responses: ['Must not run'] });
+  const getter = (): never => { reads++; throw new Error(fixtures.canaries[0]); };
+  let input: IState = { messages: [new HumanMessage('Allowed control')] };
+  if (mode === 'own') Object.defineProperty(input, 'messages', { get: getter });
+  if (mode === 'inherited') input = Object.create({ get messages() { return getter(); } }) as IState;
+  if (mode === 'proxy') input = new Proxy(input, { get: getter });
+  if (mode === 'prototype-proxy') input = new Proxy(input, { getPrototypeOf: getter });
+  const error = await run.processStream(input, { version: 'v2' }).catch((value: Error) => value);
+  expect(error).toMatchObject({ code: 'unsupported' }); expect(reads).toBe(0); expect(hooks).toBe(0); assertNoCanary(String(error));
+});
+
+it.each((['lookup', 'history'] as const).flatMap((route) => (['config', 'inherited', 'proxy', 'parent', 'map', 'versions', 'metadata', 'control'] as const).map((field) => [route, field] as const)))('admits native checkpoint %s configuration containers before reads (%s)', async (route, field) => {
+  let tamper = false; let reads = 0; const runId = `tuple-config-${route}-${field}`;
+  const getter = (): never => { reads++; throw new Error(fixtures.canaries[0]); };
+  const change = (tuple: CheckpointTuple): CheckpointTuple => {
+    if (!tamper || field === 'control') return tuple;
+    if (field === 'config') Object.defineProperty(tuple.config, 'configurable', { get: getter });
+    if (field === 'inherited') { const scope = tuple.config.configurable!; Reflect.deleteProperty(scope, 'checkpoint_id'); Object.setPrototypeOf(scope, { get checkpoint_id() { return getter(); } }); }
+    if (field === 'proxy') tuple.config.configurable = new Proxy(tuple.config.configurable!, { get: getter, getPrototypeOf: getter });
+    if (field === 'parent') tuple.parentConfig = Object.defineProperty({}, 'configurable', { get: getter });
+    if (field === 'map') tuple.config.configurable!.checkpoint_map = Object.defineProperty({}, '', { get: getter });
+    if (field === 'versions') Object.defineProperty(tuple.checkpoint.versions_seen, 'default', { get: getter });
+    if (field === 'metadata') Object.defineProperty(tuple.metadata!, 'parents', { get: getter });
+    return tuple;
+  };
+  class Saver extends MemorySaver {
+    override async getTuple(config: RunnableConfig): ReturnType<MemorySaver['getTuple']> { const tuple = await super.getTuple(config); return tuple == null ? tuple : change(tuple); }
+    override async *list(...args: Parameters<MemorySaver['list']>): ReturnType<MemorySaver['list']> { for await (const tuple of super.list(...args)) yield change(tuple); }
+  }
+  const saver = new Saver(); const config = { version: 'v2' as const, configurable: { thread_id: runId } };
+  const run = await Run.create({ runId, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, compileOptions: { checkpointer: saver } }, toolResultProtection: policy() });
+  run.Graph!.overrideModel = new FakeChatModel({ responses: ['Allowed seed answer'] }); await run.processStream({ messages: [new HumanMessage('Allowed seed input')] }, config); tamper = true;
+  const operation = async (): Promise<void> => {
+    if (route === 'lookup') { run.Graph!.overrideModel = new FakeChatModel({ responses: ['Allowed final answer'] }); await run.processStream({ messages: [new HumanMessage('Allowed next input')] }, config); return; }
+    const scope = admitToolResultCheckpoints(config, saver, (tuple) => run.Graph!.validateToolResultCheckpointTuple(tuple));
+    const workflow = run.graphRunnable as typeof run.graphRunnable & { getStateHistory(config: RunnableConfig): AsyncIterableIterator<object> };
+    for await (const snapshot of workflow.getStateHistory(scope)) expect(snapshot).toBeDefined();
+  };
+  const error = await operation().catch((value: Error) => value);
+  if (field === 'control') expect(error).toBeUndefined(); else expect(error).toMatchObject({ code: 'unsupported' });
+  expect(reads).toBe(0); assertNoCanary(String(error));
 });

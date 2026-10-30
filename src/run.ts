@@ -2,6 +2,7 @@ import { snapshotToolInputMessages, snapshotToolRunStepState, snapshotToolCheckp
 import { messagesStateReducer } from '@/messages/reducer';
 // src/run.ts
 import { nanoid } from 'nanoid';
+import { isProxy } from 'node:util/types';
 import { PromptTemplate } from '@langchain/core/prompts';
 import { RunnableLambda } from '@langchain/core/runnables';
 import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
@@ -1308,6 +1309,7 @@ export class Run<_T extends t.BaseGraphState> {
      * new prompt to evaluate) and read run-state from the Graph wrapper
      * instead of `inputs.messages`.
      */
+    if (this.toolResultProtection != null && isProxy(inputs)) throw new ToolResultProtectionError('unsupported');
     const isResume = inputs instanceof Command;
     if (!isResume) {
       graph.startFreshLangfuseExecution();

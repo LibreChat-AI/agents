@@ -30,8 +30,8 @@ export class ToolCheckpointSaver extends BaseCheckpointSaver {
     return tuple == null || this.admit == null ? tuple : this.admit(tuple);
   }
 
-  override list(...args: Parameters<BaseCheckpointSaver['list']>): ReturnType<BaseCheckpointSaver['list']> {
-    return this.source.list(...args);
+  override async *list(...args: Parameters<BaseCheckpointSaver['list']>): ReturnType<BaseCheckpointSaver['list']> {
+    for await (const tuple of this.source.list(...args)) yield this.admit == null ? tuple : await this.admit(tuple);
   }
 
   override async put(...args: Parameters<BaseCheckpointSaver['put']>): ReturnType<BaseCheckpointSaver['put']> {

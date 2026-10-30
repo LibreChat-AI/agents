@@ -531,7 +531,7 @@ export function snapshotToolCheckpointRecord<T extends object>(value: T, fields:
   return Object.fromEntries(Object.entries(Object.getOwnPropertyDescriptors(value)).map(([key, descriptor]) => [key, descriptor.value])) as T;
 }
 
-function snapshotToolCheckpointData<T>(input: T, active = new WeakSet<object>(), depth = 0): T {
+export function snapshotToolCheckpointData<T>(input: T, active = new WeakSet<object>(), depth = 0): T {
   if (typeof input === 'function' || typeof input === 'symbol' || depth > 64) throw new ToolResultProtectionError('unsupported');
   if (input == null || typeof input !== 'object') return input;
   if (types.isProxy(input) || active.has(input)) throw new ToolResultProtectionError('unsupported');
@@ -573,6 +573,14 @@ export function snapshotToolInputMessages(messages: readonly BaseMessage[]): Bas
     if (admission != null) approved.set(copy, admission);
     return copy;
   });
+}
+
+export function snapshotToolCheckpointConfig<C extends RunnableConfig>(input: C): C {
+  const config = snapshotToolCheckpointRecord(input, ['configurable']);
+  if (config.configurable == null) return config;
+  const scope = snapshotToolCheckpointRecord(config.configurable, ['checkpoint_id', 'checkpoint_ns', 'thread_id', 'thread_ts', 'checkpoint_map']);
+  if (scope.checkpoint_map != null) scope.checkpoint_map = snapshotToolCheckpointData(scope.checkpoint_map);
+  return { ...config, configurable: scope };
 }
 
 export function getToolResultCheckpointLookup<C extends RunnableConfig>(config: C): C {

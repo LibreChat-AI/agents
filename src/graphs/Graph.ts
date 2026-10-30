@@ -116,7 +116,7 @@ import {
   disposeLangfuseHandler,
   isLangfuseCallbackHandler,
 } from '@/langfuse';
-import { snapshotToolRunStepState, snapshotToolResumeMessages, snapshotToolMessageRemoval, snapshotToolCheckpointRecord, snapshotToolCheckpointArray, snapshotToolHistoryMessages, retainToolMessageReleases, normalizeToolResultError, getLiveToolMessageRelease, commitToolMessageRelease, snapshotToolMessageReleases, validateToolMessageHistory, requiresToolResultProtection, ToolResultProtectionError, validateToolResultProtection } from '@/protection/toolResult';
+import { snapshotToolCheckpointConfig, snapshotToolCheckpointData, snapshotToolRunStepState, snapshotToolResumeMessages, snapshotToolMessageRemoval, snapshotToolCheckpointRecord, snapshotToolCheckpointArray, snapshotToolHistoryMessages, retainToolMessageReleases, normalizeToolResultError, getLiveToolMessageRelease, commitToolMessageRelease, snapshotToolMessageReleases, validateToolMessageHistory, requiresToolResultProtection, ToolResultProtectionError, validateToolResultProtection } from '@/protection/toolResult';
 import {
   getBlindRecoveryBudget,
   planContextOverflowRecovery,
@@ -766,10 +766,7 @@ export abstract class Graph<
       if (active.has(candidate)) throw new ToolResultProtectionError('unsupported');
       active.add(candidate);
       try {
-        if (snapshot.config != null) {
-          snapshot.config = snapshotToolCheckpointRecord(snapshot.config, ['configurable']);
-          if (snapshot.config.configurable != null) snapshot.config.configurable = snapshotToolCheckpointRecord(snapshot.config.configurable, ['checkpoint_id', 'checkpoint_ns', 'thread_id', 'thread_ts']);
-        }
+        if (snapshot.config != null) snapshot.config = snapshotToolCheckpointConfig(snapshot.config);
         if (snapshot.values != null) {
           const values = snapshotToolCheckpointRecord(snapshot.values, ['messages', 'agentMessages', 'runStepState', 'handoffState']);
           snapshot.values = values;
@@ -802,8 +799,13 @@ export abstract class Graph<
     return visit(input);
   }
   async validateToolResultCheckpointTuple(input: CheckpointTuple, signal?: AbortSignal): Promise<CheckpointTuple> {
-    const tuple = snapshotToolCheckpointRecord(input, ['checkpoint', 'pendingWrites']);
-    const checkpoint = snapshotToolCheckpointRecord(tuple.checkpoint, ['channel_values']);
+    const tuple = snapshotToolCheckpointRecord(input, ['checkpoint', 'pendingWrites', 'config', 'parentConfig', 'metadata']);
+    tuple.config = snapshotToolCheckpointConfig(tuple.config);
+    if (tuple.parentConfig != null) tuple.parentConfig = snapshotToolCheckpointConfig(tuple.parentConfig);
+    if (tuple.metadata != null) tuple.metadata = snapshotToolCheckpointData(tuple.metadata);
+    const checkpoint = snapshotToolCheckpointRecord(tuple.checkpoint, ['channel_values', 'channel_versions', 'versions_seen', 'v', 'id', 'ts']);
+    checkpoint.channel_versions = snapshotToolCheckpointData(checkpoint.channel_versions);
+    checkpoint.versions_seen = snapshotToolCheckpointData(checkpoint.versions_seen);
     const values = snapshotToolCheckpointRecord(checkpoint.channel_values, ['messages', 'agentMessages', 'runStepState']);
     const pending = snapshotToolCheckpointArray(tuple.pendingWrites ?? []).map((entry) => {
       const write = snapshotToolCheckpointArray(entry);
