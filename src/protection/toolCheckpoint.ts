@@ -1,8 +1,13 @@
 import { BaseCheckpointSaver } from '@langchain/langgraph';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { CheckpointTuple } from '@langchain/langgraph';
+import type { ToolCallSources } from './toolResult';
 
 export type ToolCheckpointAdmission = (tuple: CheckpointTuple) => Promise<CheckpointTuple>;
+export type ToolCheckpointAdmissionContext = {
+  admit: ToolCheckpointAdmission;
+  finish: () => Promise<ToolCallSources>;
+};
 
 /** Routes implicit reads to admitted state, then to checkpoints written by this execution. */
 export class ToolCheckpointSaver extends BaseCheckpointSaver {

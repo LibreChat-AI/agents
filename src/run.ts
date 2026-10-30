@@ -1,5 +1,5 @@
 import type { ToolCallSources } from '@/protection/toolResult';
-import { snapshotToolCallSources, snapshotToolCommand, protectToolApprovalResume, snapshotToolInputMessages, snapshotToolRunStepState, snapshotToolCheckpointRecord, admitToolResultCheckpoints, getToolResultCheckpointLookup, bindToolResultCheckpoint, snapshotToolMessageRemoval, snapshotToolResumeUpdates, snapshotToolResumeMessages, snapshotToolHistoryMessages, normalizeToolResultError, hasRequiredToolExecuteProtection, ToolResultProtectionError } from '@/protection/toolResult';
+import { snapshotToolRunStepWrite, snapshotToolCallSources, snapshotToolCommand, protectToolApprovalResume, snapshotToolInputMessages, snapshotToolRunStepState, snapshotToolCheckpointRecord, admitToolResultCheckpoints, getToolResultCheckpointLookup, bindToolResultCheckpoint, snapshotToolMessageRemoval, snapshotToolResumeUpdates, snapshotToolResumeMessages, snapshotToolHistoryMessages, normalizeToolResultError, hasRequiredToolExecuteProtection, ToolResultProtectionError } from '@/protection/toolResult';
 import { messagesStateReducer } from '@/messages/reducer';
 // src/run.ts
 import { nanoid } from 'nanoid';
@@ -1428,11 +1428,12 @@ export class Run<_T extends t.BaseGraphState> {
       graph.startStopContinuationExecution(nanoid());
       if (this.toolResultProtection != null && this.hasCheckpointer) {
         const workflow = graphRunnable as t.CompiledStateWorkflow & WorkflowWithStateHistory;
-        config.configurable = admitToolResultCheckpoints(config, graph.compileOptions?.checkpointer, (tuple) => graph.validateToolResultCheckpointTuple(tuple, callerConfig.signal)).configurable;
+        const admission = graph.createToolResultCheckpointAdmission(callerConfig.signal);
+        config.configurable = admitToolResultCheckpoints(config, graph.compileOptions?.checkpointer, admission.admit).configurable;
         inputCheckpoint = await workflow.getState?.(getToolResultCheckpointLookup(config), { subgraphs: true });
         if (inputCheckpoint == null) throw new ToolResultProtectionError('unsupported');
-        inputCheckpoint = await graph.validateToolResultCheckpoint(inputCheckpoint, callerConfig.signal);
-        config.configurable = bindToolResultCheckpoint(config, inputCheckpoint, graph.compileOptions?.checkpointer, (tuple) => graph.validateToolResultCheckpointTuple(tuple, callerConfig.signal)).configurable;
+        inputCheckpoint = await graph.validateToolResultCheckpoint(inputCheckpoint, callerConfig.signal, await admission.finish());
+        config.configurable = bindToolResultCheckpoint(config, inputCheckpoint, graph.compileOptions?.checkpointer, admission.admit).configurable;
       }
     }
     if (stateInputs != null) {
@@ -2260,18 +2261,23 @@ export class Run<_T extends t.BaseGraphState> {
     const state = runStepState ?? checkpoint?.values?.runStepState;
     const messages = snapshotToolInputMessages(source.messages);
     const alternate = 'agentMessages' in source && source.agentMessages != null ? snapshotToolInputMessages(source.agentMessages as BaseMessage[]) : undefined;
-    const sources = snapshotToolCallSources([messages, alternate ?? []], state?.toolResultReleases ?? [], checkpoint == null ? undefined : this.Graph!.getToolResultCallSources(checkpoint));
+    const owned = checkpoint == null ? undefined : this.Graph!.getToolResultCallSources(checkpoint);
+    const current = snapshotToolHistoryMessages(checkpoint?.values?.messages ?? []);
+    const admitted = await this.validateToolResultMessageWrite(current, messages, state, signal, false, true, owned);
+    let sources = snapshotToolCallSources([admitted.messages], state?.toolResultReleases ?? [], owned);
+    let canonicalAlternate: BaseMessage[] | undefined;
+    if (alternate != null) {
+      canonicalAlternate = await this.Graph!.validateToolResultHistory(alternate, state, signal, sources);
+      const canonical = await this.Graph!.validateToolResultHistory([...admitted.messages, ...canonicalAlternate], state, signal);
+      canonicalAlternate = canonical.slice(admitted.messages.length);
+      sources = snapshotToolCallSources([canonicalAlternate], state?.toolResultReleases ?? [], sources);
+    }
     const taskUpdates: Array<[string, unknown]> = [];
     for (const key of ['__pregel_tasks', '__pregel_push']) {
       const value = Object.getOwnPropertyDescriptor(source, key)?.value;
       if (value != null) taskUpdates.push([key, await this.Graph!.validateToolResultTaskWrites(value, signal, sources)]);
     }
-    const current = snapshotToolHistoryMessages(checkpoint?.values?.messages ?? []);
-    const admitted = await this.validateToolResultMessageWrite(current, messages, state, signal);
-    const result = { ...source, ...Object.fromEntries(taskUpdates), messages: admitted.update, ...(runStepState == null ? {} : { runStepState }) };
-    if (alternate == null) return result;
-    const canonical = await this.Graph!.validateToolResultHistory([...admitted.messages, ...alternate], state, signal);
-    return { ...result, agentMessages: canonical.slice(admitted.messages.length) } as t.IState;
+    return { ...source, ...Object.fromEntries(taskUpdates), messages: admitted.update, ...(runStepState == null ? {} : { runStepState }), ...(canonicalAlternate == null ? {} : { agentMessages: canonicalAlternate }) } as t.IState;
   }
 
   private async validateToolResultMessageWrite(current: BaseMessage[], update: BaseMessage[], state?: t.RunStepResumeState, signal?: AbortSignal, overwrite = false, removalControls = true, sources?: ToolCallSources): Promise<{ update: BaseMessage[]; messages: BaseMessage[] }> {
@@ -2300,6 +2306,7 @@ export class Run<_T extends t.BaseGraphState> {
     const admitted: Array<[string, unknown]> = [];
     for (const [key, value] of writes) {
       if (key === '__pregel_tasks' || key === '__pregel_push') { admitted.push([key, await graph.validateToolResultTaskWrites(value, signal, this.protectedSendSources)]); continue; }
+      if (key === 'runStepState') { admitted.push([key, snapshotToolRunStepWrite(value)]); continue; }
       if (key !== 'messages' && key !== 'agentMessages') { admitted.push([key, value]); continue; }
       const change = snapshotToolResumeMessages(value);
       change.messages = snapshotToolInputMessages(change.messages);
@@ -2332,14 +2339,15 @@ export class Run<_T extends t.BaseGraphState> {
 
     const pending = this.toolResultProtection == null ? undefined : this._interrupt;
     if (pending?.checkpointId != null) callerConfig = { ...callerConfig, configurable: { ...callerConfig.configurable, checkpoint_id: pending.checkpointId, checkpoint_ns: pending.checkpointNs ?? '' } };
-    if (this.toolResultProtection != null) callerConfig = admitToolResultCheckpoints(callerConfig, this.Graph?.compileOptions?.checkpointer, (tuple) => this.Graph!.validateToolResultCheckpointTuple(tuple, callerConfig.signal));
+    const admission = this.toolResultProtection == null ? undefined : this.Graph!.createToolResultCheckpointAdmission(callerConfig.signal);
+    if (admission != null) callerConfig = admitToolResultCheckpoints(callerConfig, this.Graph?.compileOptions?.checkpointer, admission.admit);
     const lookup = this.toolResultProtection == null ? callerConfig : getToolResultCheckpointLookup(callerConfig);
     let snapshot = await workflow.getState(lookup as RunnableConfig, {
       subgraphs: true,
     });
     let validated: { update: ResumeCommandUpdate; messages: BaseMessage[] } | undefined;
     if (this.toolResultProtection != null) {
-      snapshot = await this.Graph!.validateToolResultCheckpoint(snapshot, callerConfig.signal);
+      snapshot = await this.Graph!.validateToolResultCheckpoint(snapshot, callerConfig.signal, await admission!.finish());
       this.protectedApprovals.clear();
       this.protectedSendSources = this.Graph!.getToolResultCallSources(snapshot);
       const collect = (state: InterruptStateSnapshot): void => {
@@ -2352,7 +2360,7 @@ export class Run<_T extends t.BaseGraphState> {
         }
       };
       collect(snapshot);
-      callerConfig = bindToolResultCheckpoint(callerConfig, snapshot, this.Graph?.compileOptions?.checkpointer, (tuple) => this.Graph!.validateToolResultCheckpointTuple(tuple, callerConfig.signal));
+      callerConfig = bindToolResultCheckpoint(callerConfig, snapshot, this.Graph?.compileOptions?.checkpointer, admission!.admit);
       validated = await this.validateToolResultResumeUpdate(snapshot, resumeUpdate, callerConfig.signal);
     }
     if (this._interrupt != null) return { update: validated?.update ?? resumeUpdate, config: callerConfig };

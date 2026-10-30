@@ -1,4 +1,5 @@
 import type { ToolMessageRelease, ToolCallSources } from '@/protection/toolResult';
+import type { ToolCheckpointAdmissionContext } from '@/protection/toolCheckpoint';
 /* eslint-disable no-console */
 import { v4 } from 'uuid';
 import { nanoid } from 'nanoid';
@@ -116,7 +117,7 @@ import {
   disposeLangfuseHandler,
   isLangfuseCallbackHandler,
 } from '@/langfuse';
-import { snapshotToolCallSources, snapshotToolSend, snapshotToolInputMessages, snapshotToolCheckpointConfig, snapshotToolCheckpointData, snapshotToolRunStepState, snapshotToolResumeMessages, snapshotToolMessageRemoval, snapshotToolCheckpointRecord, snapshotToolCheckpointArray, snapshotToolHistoryMessages, retainToolMessageReleases, normalizeToolResultError, getLiveToolMessageRelease, commitToolMessageRelease, snapshotToolMessageReleases, validateToolMessageHistory, requiresToolResultProtection, ToolResultProtectionError, validateToolResultProtection } from '@/protection/toolResult';
+import { snapshotToolRunStepWrite, mergeToolCallSources, snapshotToolCallSources, snapshotToolSend, snapshotToolInputMessages, snapshotToolCheckpointConfig, snapshotToolCheckpointData, snapshotToolRunStepState, snapshotToolResumeMessages, snapshotToolMessageRemoval, snapshotToolCheckpointRecord, snapshotToolCheckpointArray, snapshotToolHistoryMessages, retainToolMessageReleases, normalizeToolResultError, getLiveToolMessageRelease, commitToolMessageRelease, snapshotToolMessageReleases, validateToolMessageHistory, requiresToolResultProtection, ToolResultProtectionError, validateToolResultProtection } from '@/protection/toolResult';
 import {
   getBlindRecoveryBudget,
   planContextOverflowRecovery,
@@ -759,7 +760,7 @@ export abstract class Graph<
   }): CustomToolNode<T> | ToolNode<T>;
   async validateToolResultHistory(messages: BaseMessage[], _state?: Pick<t.RunStepResumeState, 'toolResultReleases'>, _signal?: AbortSignal, _sources?: ToolCallSources, _requireSource = false): Promise<BaseMessage[]> { return messages; }
   commitToolResultMessages(_messages: BaseMessage[]): void {}
-  async validateToolResultCheckpoint<S extends ToolResultCheckpoint>(input: S, signal?: AbortSignal): Promise<S> {
+  async validateToolResultCheckpoint<S extends ToolResultCheckpoint>(input: S, signal?: AbortSignal, sources?: ToolCallSources): Promise<S> {
     const active = new WeakSet<object>();
     const visit = async <C extends ToolResultCheckpoint>(candidate: C): Promise<C> => {
       const snapshot = snapshotToolCheckpointRecord(candidate, ['values', 'tasks', 'config']);
@@ -773,11 +774,11 @@ export abstract class Graph<
           if (values.runStepState != null) values.runStepState = snapshotToolRunStepState(values.runStepState);
           if (values.messages != null) values.messages = snapshotToolInputMessages(values.messages);
           if (values.agentMessages != null) values.agentMessages = snapshotToolInputMessages(values.agentMessages);
-          if (values.messages != null) values.messages = await this.validateToolResultHistory(values.messages, values.runStepState, signal);
+          if (values.messages != null) values.messages = await this.validateToolResultHistory(values.messages, values.runStepState, signal, sources);
           if (values.agentMessages != null) {
             const current = snapshotToolHistoryMessages(values.messages ?? []);
             const alternate = snapshotToolHistoryMessages(values.agentMessages);
-            const canonical = await this.validateToolResultHistory([...current, ...alternate], values.runStepState, signal);
+            const canonical = await this.validateToolResultHistory([...current, ...alternate], values.runStepState, signal, sources);
             values.agentMessages = canonical.slice(current.length);
           }
         }
@@ -828,7 +829,27 @@ export abstract class Graph<
     return this.validateToolResultSend(input, signal, undefined, sources);
   }
 
-  async validateToolResultCheckpointTuple(input: CheckpointTuple, signal?: AbortSignal): Promise<CheckpointTuple> {
+  createToolResultCheckpointAdmission(signal?: AbortSignal): ToolCheckpointAdmissionContext {
+    const scopes = new Map<string, ToolCallSources>();
+    const snapshots: CheckpointTuple[] = [];
+    let recording = true;
+    return {
+      admit: async (tuple): Promise<CheckpointTuple> => {
+        const admitted = await this.validateToolResultCheckpointTuple(tuple, signal, scopes);
+        if (recording) snapshots.push(admitted);
+        return admitted;
+      },
+      finish: async (): Promise<ToolCallSources> => {
+        recording = false;
+        try {
+          for (const snapshot of snapshots) await this.validateToolResultCheckpointTuple(snapshot, signal, scopes);
+          return mergeToolCallSources(scopes.values());
+        } finally { snapshots.length = 0; }
+      },
+    };
+  }
+
+  async validateToolResultCheckpointTuple(input: CheckpointTuple, signal?: AbortSignal, scopes?: Map<string, ToolCallSources>): Promise<CheckpointTuple> {
     const tuple = snapshotToolCheckpointRecord(input, ['checkpoint', 'pendingWrites', 'config', 'parentConfig', 'metadata']);
     tuple.config = snapshotToolCheckpointConfig(tuple.config);
     if (tuple.parentConfig != null) tuple.parentConfig = snapshotToolCheckpointConfig(tuple.parentConfig);
@@ -856,11 +877,10 @@ export abstract class Graph<
     const releases: ToolMessageRelease[] = [];
     const addState = (value: unknown): unknown => {
       if (value == null) return value;
-      const carrier = snapshotToolCheckpointRecord(value as t.RunStepResumeState & { __overwrite__?: t.RunStepResumeState }, ['__overwrite__', 'toolResultReleases']);
-      const overwrite = Object.hasOwn(carrier, '__overwrite__');
-      const state = snapshotToolRunStepState(overwrite ? carrier.__overwrite__! : carrier);
+      const admitted = snapshotToolRunStepWrite(value);
+      const state = admitted instanceof Overwrite ? admitted.value : admitted;
       releases.push(...state.toolResultReleases ?? []);
-      return overwrite ? new Overwrite(state) : state;
+      return admitted;
     };
     if (values.runStepState != null) values.runStepState = addState(values.runStepState);
     const outputs: BaseMessage[] = [];
@@ -880,22 +900,27 @@ export abstract class Graph<
     }
     const primary = snapshotToolHistoryMessages((values.messages ?? []) as BaseMessage[]);
     const alternate = snapshotToolHistoryMessages((values.agentMessages ?? []) as BaseMessage[]);
-    const sources = snapshotToolCallSources([primary, alternate, outputs], releases, undefined, tuple.config.configurable?.checkpoint_ns ?? '');
-    const fallback = { toolResultReleases: releases };
+    const state = { toolResultReleases: releases };
+    const history = await this.validateToolResultHistory([...primary, ...alternate], state, signal);
+    const namespace = tuple.config.configurable?.checkpoint_ns ?? '';
+    const local = snapshotToolCallSources([history], (values.runStepState as t.RunStepResumeState | undefined)?.toolResultReleases ?? [], undefined, namespace);
+    scopes?.set(namespace, local);
+    const owned = scopes == null ? local : mergeToolCallSources(scopes.values());
+    const admitted = await this.validateToolResultHistory(outputs, state, signal, owned);
+    const sources = snapshotToolCallSources([[...history, ...admitted]], releases, owned, namespace);
     const admitTasks = async (value: unknown): Promise<Send | Send[]> => Array.isArray(value)
-      ? Promise.all(value.map((packet) => this.validateToolResultSend(packet, signal, fallback, sources)))
-      : this.validateToolResultSend(value, signal, fallback, sources);
+      ? Promise.all(value.map((packet) => this.validateToolResultSend(packet, signal, state, sources)))
+      : this.validateToolResultSend(value, signal, state, sources);
     if (values.__pregel_tasks != null) {
       const topic = values.__pregel_tasks as [unknown[], Send[]];
       values.__pregel_tasks = [topic[0], await admitTasks(topic[1])];
     }
     for (const write of pending) if (write[1] === '__pregel_tasks' || write[1] === '__pregel_push') write[2] = await admitTasks(write[2]);
-    const canonical = await this.validateToolResultHistory([...primary, ...alternate, ...outputs], { toolResultReleases: releases }, signal);
-    if (values.messages != null) values.messages = canonical.slice(0, primary.length);
-    if (values.agentMessages != null) values.agentMessages = canonical.slice(primary.length, primary.length + alternate.length);
-    let position = primary.length + alternate.length;
+    if (values.messages != null) values.messages = history.slice(0, primary.length);
+    if (values.agentMessages != null) values.agentMessages = history.slice(primary.length);
+    let position = 0;
     for (const { write, change, controls } of updates) {
-      const messages = change.messages.map((_message, index) => controls[index] ?? canonical[position++]);
+      const messages = change.messages.map((_message, index) => controls[index] ?? admitted[position++]);
       const content = Array.isArray(write[2]) ? messages : messages[0];
       write[2] = change.overwrite ? new Overwrite(messages) : content;
     }

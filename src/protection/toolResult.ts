@@ -2,13 +2,13 @@ import { nanoid } from 'nanoid';
 import { types } from 'node:util';
 import { RemoveMessage, ToolMessage } from '@langchain/core/messages';
 import { AsyncLocalStorageProviderSingleton } from '@langchain/core/singletons';
-import { BaseCheckpointSaver, GraphInterrupt, ParentCommand, Send } from '@langchain/langgraph';
 import {
   StructuredTool,
   DynamicStructuredTool,
   DynamicTool,
   Tool,
 } from '@langchain/core/tools';
+import { BaseCheckpointSaver, GraphInterrupt, ParentCommand, Send, Overwrite } from '@langchain/langgraph';
 import type { CallbackManagerForToolRun } from '@langchain/core/callbacks/manager';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { BaseMessage } from '@langchain/core/messages';
@@ -555,6 +555,13 @@ export function snapshotToolRunStepState(value: RunStepResumeState): RunStepResu
   return state;
 }
 
+export function snapshotToolRunStepWrite(value: unknown): RunStepResumeState | Overwrite<RunStepResumeState> {
+  const carrier = snapshotToolCheckpointRecord(value as RunStepResumeState & { __overwrite__?: RunStepResumeState }, ['__overwrite__', 'toolResultReleases']);
+  const overwrite = Object.hasOwn(carrier, '__overwrite__');
+  const state = snapshotToolRunStepState(overwrite ? carrier.__overwrite__! : carrier);
+  return overwrite ? new Overwrite(state) : state;
+}
+
 /** Detach routing identities, not arguments or opaque unselected payloads. */
 export function snapshotToolInputMessages(messages: readonly BaseMessage[]): BaseMessage[] {
   return snapshotToolHistoryMessages(messages).map((message) => {
@@ -936,6 +943,12 @@ export type ToolCallSource = {
 };
 export type ToolCallSources = ReadonlyMap<string, readonly ToolCallSource[]>;
 
+export function mergeToolCallSources(groups: Iterable<ToolCallSources>): ToolCallSources {
+  const result = new Map<string, readonly ToolCallSource[]>();
+  for (const group of groups) for (const [id, entries] of group) result.set(id, [...result.get(id) ?? [], ...entries]);
+  return result;
+}
+
 /** Provider call IDs are unique within a batch, not across history or graph namespaces. */
 export function snapshotToolCallSources(groups: readonly (readonly BaseMessage[])[], releases: readonly ToolMessageRelease[] = [], enclosing?: ToolCallSources, namespace = ''): Map<string, readonly ToolCallSource[]> {
   const sources = new Map(enclosing);
@@ -986,11 +999,12 @@ export function snapshotToolCallSources(groups: readonly (readonly BaseMessage[]
   return sources;
 }
 
-function toolSourceName(sources: ToolCallSources, id: string, messageId: string | undefined, batchId: string | undefined): string | undefined {
+function toolSourceName(sources: ToolCallSources, id: string, messageId: string | undefined, batchId: string | undefined, hasProposal = false): string | undefined {
   const candidates = sources.get(id) ?? [];
   const results = messageId == null ? [] : candidates.filter((source) => source.resultIds.includes(messageId));
   const batches = batchId == null ? [] : candidates.filter((source) => source.batchId === batchId);
   const pending = candidates.filter((source) => !source.completed);
+  if (hasProposal && results.length === 0 && batches.length === 0 && pending.length === 0) return undefined;
   let matches = candidates;
   if (pending.length > 0) matches = pending;
   if (batches.length > 0) matches = batches;
@@ -1003,6 +1017,13 @@ function toolSourceName(sources: ToolCallSources, id: string, messageId: string 
   const names = new Set(matches.map((source) => source.name));
   if (names.size > 1) throw new ToolResultProtectionError('unsupported');
   return matches[0]?.name;
+}
+
+function assertToolProposalSource(sources: ToolCallSources, id: string, name: string, batchId: string | undefined): void {
+  const candidates = sources.get(id) ?? [];
+  const batch = batchId == null ? [] : candidates.filter((source) => source.batchId === batchId);
+  const matches = batch.length > 0 ? batch : candidates.filter((source) => !source.completed);
+  if (matches.some((source) => source.name !== name)) throw new ToolResultProtectionError('unsupported');
 }
 
 /** Historical state is immutable: reject legacy or newly incompatible history before model reuse. */
@@ -1032,14 +1053,17 @@ export async function validateToolMessageHistory(policy: ToolResultProtection | 
       for (const call of snapshotDataArray((toolCalls ?? []) as readonly { id?: string; name: string }[], Number.MAX_SAFE_INTEGER, true)) {
         const id = ownMessageValue(call, 'id'); const name = ownMessageValue(call, 'name');
         if ((id != null && typeof id !== 'string') || typeof name !== 'string') throw new ToolResultProtectionError('unsupported');
-        if (id != null) calls.set(id, { name, batchId: messageId ?? undefined });
+        if (id != null) {
+          if (sources != null) assertToolProposalSource(sources, id, name, messageId ?? undefined);
+          calls.set(id, { name, batchId: messageId ?? undefined });
+        }
       }
       continue;
     }
     if (type !== 'tool') continue;
     const identity = historyIdentity(message);
     const local = calls.get(identity.tool_call_id);
-    const sourceName = sources == null ? undefined : toolSourceName(sources, identity.tool_call_id, identity.id, local?.batchId);
+    const sourceName = sources == null ? undefined : toolSourceName(sources, identity.tool_call_id, identity.id, local?.batchId, local != null);
     if (sourceName != null && local != null && local.name !== sourceName) throw new ToolResultProtectionError('unsupported');
     const callName = sourceName ?? local?.name;
     const admission = approved.get(message);

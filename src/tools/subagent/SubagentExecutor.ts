@@ -3152,9 +3152,11 @@ export class SubagentExecutor {
       activeChildRun.invokeConfig = childInvokeConfig;
       let admittedChildCheckpoint: StateSnapshot | undefined;
       if (this.toolResultProtection != null && this.humanInTheLoop?.enabled === true) {
-        Object.assign(childConfigurable, admitToolResultCheckpoints(childInvokeConfig, this.checkpointer, (tuple) => childGraph.validateToolResultCheckpointTuple(tuple, childSignal)).configurable);
-        admittedChildCheckpoint = await childGraph.validateToolResultCheckpoint(await workflow.getState(getToolResultCheckpointLookup(childInvokeConfig), { subgraphs: true }), childSignal);
-        Object.assign(childConfigurable, bindToolResultCheckpoint(childInvokeConfig, admittedChildCheckpoint, this.checkpointer, (tuple) => childGraph.validateToolResultCheckpointTuple(tuple, childSignal)).configurable);
+        const admission = childGraph.createToolResultCheckpointAdmission(childSignal);
+        Object.assign(childConfigurable, admitToolResultCheckpoints(childInvokeConfig, this.checkpointer, admission.admit).configurable);
+        const snapshot = await workflow.getState(getToolResultCheckpointLookup(childInvokeConfig), { subgraphs: true });
+        admittedChildCheckpoint = await childGraph.validateToolResultCheckpoint(snapshot, childSignal, await admission.finish());
+        Object.assign(childConfigurable, bindToolResultCheckpoint(childInvokeConfig, admittedChildCheckpoint, this.checkpointer, admission.admit).configurable);
       }
       if (cachedChildRun == null && this.humanInTheLoop?.enabled === true) {
         /** Rehydrate child-owned interrupt state when a host rebuilds Run
