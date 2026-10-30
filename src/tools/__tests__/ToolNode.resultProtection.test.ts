@@ -2753,7 +2753,7 @@ it.each([false, true])('preserves validated supplied-history RunStart controls (
   const hooks = new HookRegistry(); hooks.register('RunStart', { hooks: [async (input) => { observed++; assertNoCanary(JSON.stringify(input)); return {}; }] });
   const run = await Run.create({ runId: `safe-supplied-${selected}`, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI } }, toolResultProtection: gate, hooks });
   run.Graph!.overrideModel = new FakeChatModel({ responses: ['Allowed answer'] });
-  const runStepState = run.Graph!.createRunStepResumeState(); runStepState.toolResultReleases = fixture.releases;
+  const runStepState = run.Graph!.createRunStepResumeState(); runStepState.toolResultReleases = selected ? fixture.releases : [];
   await run.processStream({ messages: [...fixture.messages, new HumanMessage('Allowed control')], runStepState }, { version: 'v2', configurable: { thread_id: `safe-supplied-${selected}` } });
   expect(observed).toBe(1);
 });
@@ -3001,4 +3001,80 @@ it.each(['supplied', 'checkpoint'] as const)('validates alternate multi-agent hi
   const state = { messages: [new HumanMessage('Allowed input')], ...(path === 'supplied' ? { agentMessages: [new ToolMessage({ name: 'lookup', tool_call_id: 'raw-alternate', content: fixtures.canaries[0] })] } : {}) };
   const error = await run.processStream(state, config).catch((value: Error) => value);
   expect(error).toMatchObject({ code: 'incompatible' }); expect(hooks).toBe(0); expect(models).toBe(0); assertNoCanary(String(error));
+});
+
+it.each((['same-run', 'rebuilt'] as const).flatMap((runtime) => (['remove', 'all', 'disguised', 'payload'] as const).map((kind) => [runtime, kind] as const)))('admits fresh-turn removal controls separately from retained history (%s/%s)', async (runtime, kind) => {
+  let executions = 0; let startup = 0; const inputs: string[] = []; const saver = new MemorySaver(); const runId = `fresh-removal-${runtime}-${kind}`;
+  const lookup = direct(() => { executions++; return fixtures.canaries[0]; });
+  const create = async (): Promise<Run<IState>> => {
+    const hooks = new HookRegistry(); hooks.register('RunStart', { hooks: [async () => { startup++; return {}; }] });
+    return Run.create({ runId, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, tools: [lookup], toolEnd: true, compileOptions: { checkpointer: saver } }, toolResultProtection: policy(), hooks });
+  };
+  const config = { version: 'v2' as const, configurable: { thread_id: runId } };
+  const first = await create(); first.Graph!.overrideModel = new FakeChatModel({ responses: [''], toolCalls: [{ id: 'fresh-removable', name: 'lookup', args: { count: 42 }, type: 'tool_call' }] });
+  await first.processStream({ messages: [new HumanMessage('Allowed initial control')] }, config);
+  const tuple = await saver.getTuple(config); const source = (tuple!.checkpoint.channel_values.messages as BaseMessage[]).find((message) => message instanceof ToolMessage && message.tool_call_id === 'fresh-removable')!;
+  expect(source.id).toEqual(expect.any(String)); expect(executions).toBe(1); expect(startup).toBe(1);
+  const next = runtime === 'same-run' ? first : await create();
+  class Model extends FakeChatModel { override async *_streamResponseChunks(...args: Parameters<FakeChatModel['_streamResponseChunks']>): ReturnType<FakeChatModel['_streamResponseChunks']> { inputs.push(JSON.stringify(args[0])); yield* super._streamResponseChunks(...args); } }
+  next.Graph!.overrideModel = new Model({ responses: ['Allowed final answer'] });
+  let update: BaseMessage[] = [new HumanMessage({ id: source.id, content: fixtures.canaries[0] })];
+  if (kind === 'remove') update = [new RemoveMessage({ id: source.id! }), new HumanMessage('Allowed deletion control')];
+  if (kind === 'all') update = [createRemoveAllMessage(), new HumanMessage('Allowed compacted control')];
+  if (kind === 'payload') { const removal = new RemoveMessage({ id: source.id! }); removal.content = fixtures.canaries[0]; update = [removal]; }
+  const result = next.processStream({ messages: update }, config);
+  if (kind === 'disguised' || kind === 'payload') { const error = await result.catch((value: Error) => value); expect(error).toMatchObject({ code: 'unsupported' }); assertNoCanary(String(error)); expect(startup).toBe(1); expect(inputs).toEqual([]); }
+  else {
+    await result; expect(startup).toBe(2); expect(inputs).toHaveLength(1); assertNoCanary(inputs[0]); expect(inputs[0]).not.toContain('[EMAIL_1]');
+    const retained = (await saver.getTuple(config))!.checkpoint.channel_values as { messages: BaseMessage[]; runStepState: RunStepResumeState };
+    expect(retained.messages.some((message) => message.id === source.id)).toBe(false); expect(retained.runStepState.toolResultReleases).toEqual([]); assertNoCanary(retained.messages);
+  }
+  expect(executions).toBe(1);
+});
+
+it.each(['renamed', 'additional_kwargs', 'response_metadata', 'own-accessor', 'control'] as const)('admits only own currently selected checkpoint receipts (%s)', async (kind) => {
+  let tamper = false; let reads = 0; let executions = 0; let hooks = 0; let models = 0; const runId = `receipt-admission-${kind}`;
+  class Checkpointer extends MemorySaver {
+    override async getTuple(config: RunnableConfig): ReturnType<MemorySaver['getTuple']> {
+      const tuple = await super.getTuple(config);
+      if (!tamper || tuple == null) return tuple;
+      const values = tuple.checkpoint.channel_values as { messages?: BaseMessage[]; runStepState?: RunStepResumeState };
+      const release = values.runStepState?.toolResultReleases?.[0];
+      if (release == null) return tuple;
+      if (kind === 'renamed') {
+        Object.defineProperty(release, 'name', { value: 'other', enumerable: true }); release.envelope.name = 'other';
+        for (const message of values.messages ?? []) {
+          if (message instanceof AIMessage) for (const call of message.tool_calls ?? []) call.name = 'other';
+          if (message instanceof ToolMessage) { message.name = 'other'; message.content = fixtures.canaries[0]; }
+        }
+      } else if (kind !== 'control') {
+        const field = kind === 'own-accessor' ? 'additional_kwargs' : kind;
+        const getter = (): never => { reads++; throw new Error(fixtures.canaries[0]); };
+        if (kind === 'own-accessor') Object.defineProperty(release.envelope, field, { get: getter });
+        else { Reflect.deleteProperty(release.envelope, field); Object.setPrototypeOf(release.envelope, { get [field]() { return getter(); } }); }
+      }
+      return tuple;
+    }
+  }
+  const saver = new Checkpointer(); const lookup = direct(() => { executions++; return fixtures.canaries[0]; });
+  const create = (): Promise<Run<IState>> => {
+    const registry = new HookRegistry(); registry.register('RunStart', { hooks: [async () => { hooks++; return {}; }] });
+    return Run.create({ runId, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, tools: [lookup], toolEnd: true, compileOptions: { checkpointer: saver } }, toolResultProtection: policy(), hooks: registry });
+  };
+  const config = { version: 'v2' as const, configurable: { thread_id: runId } };
+  const first = await create(); first.Graph!.overrideModel = new FakeChatModel({ responses: [''], toolCalls: [{ id: 'receipt-source', name: 'lookup', args: { count: 42 }, type: 'tool_call' }] });
+  await first.processStream({ messages: [new HumanMessage('Allowed initial control')] }, config); expect(executions).toBe(1); tamper = true;
+  const next = await create();
+  class Model extends FakeChatModel { override async *_streamResponseChunks(...args: Parameters<FakeChatModel['_streamResponseChunks']>): ReturnType<FakeChatModel['_streamResponseChunks']> { models++; assertNoCanary(JSON.stringify(args[0])); yield* super._streamResponseChunks(...args); } }
+  next.Graph!.overrideModel = new Model({ responses: ['Allowed final answer'] });
+  const result = next.processStream({ messages: [new HumanMessage('Allowed next control')] }, config);
+  if (kind === 'control') { await result; expect(hooks).toBe(2); expect(models).toBe(1); }
+  else { const error = await result.catch((value: Error) => value); expect(error).toMatchObject({ code: kind === 'own-accessor' ? 'unsupported' : 'incompatible' }); expect(hooks).toBe(1); expect(models).toBe(0); assertNoCanary(String(error)); }
+  expect(reads).toBe(0); expect(executions).toBe(1);
+});
+
+it('rejects historical receipts outside a narrowed protected set before inspection', async () => {
+  const fixture = await certifiedHistory(); let inspections = 0;
+  await expect(validateToolMessageHistory(policy({ toolNames: ['other'], inspect: () => { inspections++; return approve('Must not inspect'); } }), fixture.messages, fixture.releases)).rejects.toMatchObject({ code: 'incompatible' });
+  expect(inspections).toBe(0);
 });

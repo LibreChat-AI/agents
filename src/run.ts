@@ -1383,6 +1383,7 @@ export class Run<_T extends t.BaseGraphState> {
      * block so the sidecars survive both ends of the interrupt
      * boundary.
      */
+    let inputCheckpoint: InterruptStateSnapshot | undefined;
     if (!isResume) {
       const checkpointThreadId =
         typeof config.configurable?.thread_id === 'string'
@@ -1410,17 +1411,19 @@ export class Run<_T extends t.BaseGraphState> {
       graph.startStopContinuationExecution(nanoid());
       if (this.toolResultProtection != null && this.hasCheckpointer) {
         const workflow = graphRunnable as t.CompiledStateWorkflow & WorkflowWithStateHistory;
-        const checkpoint = await workflow.getState?.(config, { subgraphs: true });
-        if (checkpoint != null) await graph.validateToolResultCheckpoint(checkpoint, callerConfig.signal);
+        inputCheckpoint = await workflow.getState?.(config, { subgraphs: true });
+        if (inputCheckpoint != null) await graph.validateToolResultCheckpoint(inputCheckpoint, callerConfig.signal);
       }
     }
     if (stateInputs != null) {
       if (this.toolResultProtection != null) {
-        stateInputs = { ...stateInputs, messages: await graph.validateToolResultHistory(stateInputs.messages, stateInputs.runStepState, callerConfig.signal) };
+        const current = snapshotToolHistoryMessages(inputCheckpoint?.values?.messages ?? []);
+        const admitted = await this.validateToolResultMessageWrite(current, stateInputs.messages, stateInputs.runStepState ?? inputCheckpoint?.values?.runStepState, callerConfig.signal);
+        stateInputs = { ...stateInputs, messages: admitted.update };
         if ('agentMessages' in stateInputs && stateInputs.agentMessages != null) {
           const alternate = snapshotToolHistoryMessages(stateInputs.agentMessages as BaseMessage[]);
-          const canonical = await graph.validateToolResultHistory([...stateInputs.messages, ...alternate], stateInputs.runStepState, callerConfig.signal);
-          stateInputs = { ...stateInputs, agentMessages: canonical.slice(stateInputs.messages.length) } as t.IState;
+          const canonical = await graph.validateToolResultHistory([...admitted.messages, ...alternate], stateInputs.runStepState ?? inputCheckpoint?.values?.runStepState, callerConfig.signal);
+          stateInputs = { ...stateInputs, agentMessages: canonical.slice(admitted.messages.length) } as t.IState;
         }
         inputs = stateInputs;
       }
@@ -2232,6 +2235,21 @@ export class Run<_T extends t.BaseGraphState> {
     return { config: manifestConfig, update };
   }
 
+  private async validateToolResultMessageWrite(current: BaseMessage[], update: BaseMessage[], state?: t.RunStepResumeState, signal?: AbortSignal, overwrite = false, removalControls = true): Promise<{ update: BaseMessage[]; messages: BaseMessage[] }> {
+    const messages = snapshotToolHistoryMessages(update);
+    const removals = messages.map(snapshotToolMessageRemoval);
+    if ((!removalControls || overwrite) && removals.some((control) => control != null)) throw new ToolResultProtectionError('unsupported');
+    const outputs = messages.filter((_message, index) => removals[index] == null);
+    // Validate each supplied result before reduction, including writes removed later.
+    const canonical = (await this.Graph!.validateToolResultHistory([...current, ...outputs], state, signal)).slice(current.length);
+    this.Graph!.commitToolResultMessages(canonical);
+    let position = 0;
+    const effective = messages.map((_message, index) => removals[index] ?? canonical[position++]);
+    const reduced = overwrite ? effective : messagesStateReducer(current, effective);
+    await this.Graph!.validateToolResultHistory(reduced, state, signal);
+    return { update: effective, messages: reduced };
+  }
+
   private async validateToolResultResumeUpdate(snapshot: InterruptStateSnapshot, update: ResumeCommandUpdate, signal?: AbortSignal): Promise<{ update: ResumeCommandUpdate; messages: BaseMessage[] }> {
     const graph = this.Graph!;
     let messages = snapshotToolHistoryMessages(snapshot.values?.messages ?? []);
@@ -2242,18 +2260,10 @@ export class Run<_T extends t.BaseGraphState> {
     for (const [key, value] of writes) {
       if (key !== 'messages' && key !== 'agentMessages') { admitted.push([key, value]); continue; }
       const change = snapshotToolResumeMessages(value);
-      const removals = change.messages.map(snapshotToolMessageRemoval);
-      if ((key === 'agentMessages' || change.overwrite) && removals.some((control) => control != null)) throw new ToolResultProtectionError('unsupported');
-      const outputs = change.messages.filter((_message, index) => removals[index] == null);
-      // Validate all result writes before applying control reduction, including later-removed writes.
-      const history = await graph.validateToolResultHistory([...messages, ...outputs], snapshot.values?.runStepState, signal);
-      const canonical = history.slice(messages.length);
-      graph.commitToolResultMessages(canonical);
-      let position = 0;
-      const effective = change.messages.map((_message, index) => removals[index] ?? canonical[position++]);
-      if (key === 'agentMessages') alternate = effective;
-      else messages = change.overwrite ? effective : messagesStateReducer(messages, effective);
-      admitted.push([key, change.overwrite ? new Overwrite(effective) : effective]);
+      const validated = await this.validateToolResultMessageWrite(messages, change.messages, snapshot.values?.runStepState, signal, change.overwrite, key === 'messages');
+      if (key === 'agentMessages') alternate = validated.update;
+      else messages = validated.messages;
+      admitted.push([key, change.overwrite ? new Overwrite(validated.update) : validated.update]);
     }
     messages = await graph.validateToolResultHistory(messages, snapshot.values?.runStepState, signal);
     if (alternate.length > 0) await graph.validateToolResultHistory([...messages, ...alternate], snapshot.values?.runStepState, signal);

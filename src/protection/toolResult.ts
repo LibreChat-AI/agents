@@ -658,15 +658,21 @@ export function getToolMessageRelease(policy: ToolResultProtection | undefined, 
   return { version: 1, name, id, envelope: identity };
 }
 
+function validateToolReleaseEnvelope(envelope: ToolMessageRelease['envelope']): void {
+  plainObject(envelope, ['artifact', 'name', 'id', 'tool_call_id', 'status', 'additional_kwargs', 'response_metadata'], true);
+  for (const field of ['tool_call_id', 'status', 'additional_kwargs', 'response_metadata']) {
+    if (!Object.hasOwn(envelope, field)) throw new ToolResultProtectionError('incompatible');
+  }
+  plainObject(envelope.additional_kwargs, ['_refKey', '_refScope', '_unresolvedRefs'], true);
+  plainObject(envelope.response_metadata, [], true);
+}
+
 function validateToolMessageRelease(release: ToolMessageRelease, name: string, id: string, envelope: ToolMessageEnvelope): void {
   plainObject(release, ['version', 'name', 'id', 'envelope'], true);
   for (const field of ['version', 'name', 'id', 'envelope']) if (!Object.hasOwn(release, field)) throw new ToolResultProtectionError('incompatible');
   const version: number = release.version;
   if (version !== 1 || release.name !== name || release.id !== id) throw new ToolResultProtectionError('incompatible');
-  plainObject(release.envelope, ['artifact', 'name', 'id', 'tool_call_id', 'status', 'additional_kwargs', 'response_metadata'], true);
-  for (const field of ['tool_call_id', 'status', 'additional_kwargs', 'response_metadata']) if (!Object.hasOwn(release.envelope, field)) throw new ToolResultProtectionError('incompatible');
-  plainObject(release.envelope.additional_kwargs, ['_refKey', '_refScope', '_unresolvedRefs'], true);
-  plainObject(release.envelope.response_metadata, [], true);
+  validateToolReleaseEnvelope(release.envelope);
   const certified = snapshotToolMessageEnvelope({ ...release.envelope, content: envelope.content, additional_kwargs: { ...release.envelope.additional_kwargs }, response_metadata: {} });
   if (!matchesToolMessageEnvelope(envelope, certified)) throw new ToolResultProtectionError('unsupported');
 }
@@ -691,9 +697,7 @@ export function snapshotToolMessageReleases(releases: readonly ToolMessageReleas
     for (const field of ['version', 'name', 'id', 'envelope']) if (!Object.hasOwn(release, field)) throw new ToolResultProtectionError('incompatible');
     const version: number = release.version;
     if (version !== 1 || typeof release.name !== 'string' || typeof release.id !== 'string') throw new ToolResultProtectionError('incompatible');
-    plainObject(release.envelope, ['artifact', 'name', 'id', 'tool_call_id', 'status', 'additional_kwargs', 'response_metadata'], true);
-    plainObject(release.envelope.additional_kwargs, ['_refKey', '_refScope', '_unresolvedRefs'], true);
-    plainObject(release.envelope.response_metadata, [], true);
+    validateToolReleaseEnvelope(release.envelope);
     const envelope = snapshotToolMessageEnvelope({ ...release.envelope, content: '', additional_kwargs: { ...release.envelope.additional_kwargs }, response_metadata: {} });
     validateToolMessageRelease(release, release.name, release.id, envelope);
     const { content: _content, ...identity } = envelope;
@@ -708,6 +712,7 @@ export async function validateToolMessageHistory(policy: ToolResultProtection | 
   const byIdentity = new Map<string, ToolMessageRelease>();
   const byMessage = new Map<string, ToolMessageRelease>();
   for (const release of snapshotToolMessageReleases(releases)) {
+    if (!requiresToolResultProtection(policy, release.name)) throw new ToolResultProtectionError('incompatible');
     const key = JSON.stringify([release.id, release.envelope.id]);
     const existing = byIdentity.get(key);
     if (existing != null && existing.name !== release.name) throw new ToolResultProtectionError('incompatible');
