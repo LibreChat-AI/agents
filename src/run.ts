@@ -22,10 +22,21 @@ import type {
 } from '@langchain/core/messages';
 import type { StringPromptValue } from '@langchain/core/prompt_values';
 import type { RunnableConfig } from '@langchain/core/runnables';
+import type { SubagentResumeManifest } from '@/tools/subagent/SubagentReplay';
 import type { AggregatedHookResult, HookRegistry } from '@/hooks';
 import type { MultiAgentGraph } from '@/graphs/MultiAgentGraph';
 import type { StandardGraph } from '@/graphs/Graph';
 import type * as t from '@/types';
+import {
+  TOOL_BATCH_REPLAY_KEY,
+  TOOL_REPLAY_CONFIGS_KEY,
+  TOOL_PENDING_APPROVAL_KEY,
+  restoreToolReplayConfig,
+  restoreToolReplayConfigs,
+  getToolBatchReplayScope,
+  stripToolBatchReplayState,
+  getPublicToolInterruptPayload,
+} from '@/tools/toolBatchReplay';
 import {
   Callback,
   GraphEvents,
@@ -64,12 +75,6 @@ import {
   buildReasoningLabelPrompt,
   normalizeReasoningLabel,
 } from '@/prompts/reasoningLabel';
-import {
-  TOOL_BATCH_REPLAY_KEY,
-  restoreToolReplayConfig,
-  stripToolBatchReplayState,
-  getPublicToolInterruptPayload,
-} from '@/tools/toolBatchReplay';
 import {
   hasToolOutputTracingConfig,
   resolveLangfuseConfig,
@@ -268,12 +273,17 @@ function getToolCompletion(
 
 function isLangGraphResumeMapForInterrupt(
   value: unknown,
-  interruptId: string
+  interruptId: string,
+  pendingIds: ReadonlySet<string>
 ): value is Record<string, unknown> {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
     return false;
   }
-  return Object.prototype.hasOwnProperty.call(value, interruptId);
+  if (Object.prototype.hasOwnProperty.call(value, interruptId)) return true;
+  for (const id of pendingIds) {
+    if (Object.prototype.hasOwnProperty.call(value, id)) return true;
+  }
+  return false;
 }
 
 function getInterruptHookSessionId(payload: unknown): string | undefined {
@@ -294,12 +304,14 @@ function getInterruptHookSessionId(payload: unknown): string | undefined {
 
 type InterruptStateSnapshot = {
   config?: RunnableConfig;
+  next?: string[];
   values?: {
     handoffState?: t.HandoffState;
     messages?: BaseMessage[];
     runStepState?: t.RunStepResumeState;
   };
   tasks?: Array<{
+    name?: string;
     interrupts?: Array<{ id?: string; value?: unknown }>;
     state?: RunnableConfig | InterruptStateSnapshot;
   }>;
@@ -386,29 +398,28 @@ async function resolveCompletedSegmentConfig(
 
 function getFirstPersistedInterrupt(
   snapshot: InterruptStateSnapshot
-): { id: string; value: unknown } | undefined {
+): { id: string; value: unknown; pending: Array<{ id: string; value: unknown }> } | undefined {
+  const pending: Array<{ id: string; value: unknown }> = [];
+  const nestedStates: InterruptStateSnapshot[] = [];
+  const next = snapshot.next == null ? undefined : new Set(snapshot.next);
   for (const task of snapshot.tasks ?? []) {
-    for (const pendingInterrupt of task.interrupts ?? []) {
-      if (
-        typeof pendingInterrupt.id === 'string' &&
-        pendingInterrupt.id.length > 0
-      ) {
-        return { id: pendingInterrupt.id, value: pendingInterrupt.value };
+    if (next != null && (task.name == null || !next.has(task.name))) continue;
+    for (const entry of task.interrupts ?? []) {
+      if (typeof entry.id === 'string' && entry.id.length > 0) {
+        pending.push({ id: entry.id, value: entry.value });
       }
     }
     const nestedState = task.state;
-    if (
-      nestedState != null &&
-      'tasks' in nestedState &&
-      Array.isArray(nestedState.tasks)
-    ) {
-      const nestedInterrupt = getFirstPersistedInterrupt(nestedState);
-      if (nestedInterrupt != null) {
-        return nestedInterrupt;
-      }
+    if (nestedState != null && 'tasks' in nestedState && Array.isArray(nestedState.tasks)) {
+      nestedStates.push(nestedState);
     }
   }
-  return undefined;
+  for (const nestedState of nestedStates) {
+    const nested = getFirstPersistedInterrupt(nestedState);
+    if (nested != null) pending.push(...nested.pending);
+  }
+  const unique = [...new Map(pending.map((entry) => [entry.id, entry])).values()];
+  return unique.length === 0 ? undefined : { ...unique[0], pending: unique };
 }
 
 function getPersistedMessages(
@@ -434,11 +445,19 @@ function overwriteResumeRunStepState(
         ['runStepState', overwrite] as [string, unknown],
     ]
     : { ...(command.update ?? {}), runStepState: overwrite };
+  return copyResumeCommand(command, { update });
+}
+
+function copyResumeCommand(
+  command: Command,
+  overrides: Pick<ConstructorParameters<typeof Command>[0], 'resume' | 'update'>
+): Command {
   const resumed = new Command({
     ...(command.graph == null ? {} : { graph: command.graph }),
     ...(command.resume === undefined ? {} : { resume: command.resume }),
-    update,
+    ...(command.update === undefined ? {} : { update: command.update }),
     ...(command.goto === undefined ? {} : { goto: command.goto }),
+    ...overrides,
   });
   resumed.lc_direct_tool_output = command.lc_direct_tool_output;
   return resumed;
@@ -1307,30 +1326,41 @@ export class Run<_T extends t.BaseGraphState> {
       (callerConfig.recursionLimit ?? DEFAULT_RECURSION_LIMIT) +
       (this.preemption != null ? resolveMaxSeals(this.preemption.maxSeals) : 0);
 
-    const config: t.RunStreamConfig = {
+    let config: t.RunStreamConfig = {
       ...callerConfig,
       recursionLimit,
       configurable: { ...callerConfig.configurable },
     };
     delete config.configurable?.[TOOL_APPROVAL_REVIEW_CONFIG_KEY];
     delete config.configurable?.[TOOL_BATCH_REPLAY_KEY];
+    delete config.configurable?.[TOOL_REPLAY_CONFIGS_KEY];
+    delete config.configurable?.[TOOL_PENDING_APPROVAL_KEY];
     if (!isResume) {
       delete config.configurable?.[SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY];
       delete config.configurable?.[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY];
     }
     let overwriteLegacyResumeState = false;
     if (isResume) {
-      await this.restoreInterruptFromCheckpoint(
+      config = await this.resolveInterruptResumeConfig(
         config,
-        (inputs as Command).update
+        (inputs as Command).update,
+        (inputs as Command).resume
       );
-      const publicPayload = stripRunStepResumeState(this._interrupt?.payload);
-      if (config.configurable != null) {
-        restoreToolReplayConfig(
-          config.configurable,
-          this._interrupt?.interruptId,
-          publicPayload
-        );
+      const interruptId = this._interrupt?.interruptId;
+      const command = inputs as Command;
+      if (
+        command.resume !== undefined &&
+        typeof interruptId === 'string' &&
+        interruptId.length > 0 &&
+        !isLangGraphResumeMapForInterrupt(
+          command.resume,
+          interruptId,
+          this.getPendingInterruptState().ids
+        )
+      ) {
+        inputs = copyResumeCommand(command, {
+          resume: { [interruptId]: command.resume },
+        });
       }
       if (graph.getStopContinuationExecutionId() === '') {
         graph.startStopContinuationExecution(nanoid());
@@ -1570,17 +1600,25 @@ export class Run<_T extends t.BaseGraphState> {
           }
 
           if (
-            this._interrupt == null &&
             data.chunk != null &&
             isInterrupted<unknown>(data.chunk)
           ) {
             const interrupts = data.chunk[INTERRUPT];
             if (interrupts.length > 0) {
-              const first = interrupts[0];
+              const pending = new Map(
+                (this._interrupt?.pendingInterrupts ?? []).map((entry) => [entry.interruptId, entry])
+              );
+              for (const entry of interrupts) pending.set(entry.id ?? '', {
+                interruptId: entry.id ?? '', payload: entry.value,
+              });
+              const first = this._interrupt ?? {
+                interruptId: interrupts[0].id ?? '',
+                payload: cloneToolApprovalInterruptPayload(interrupts[0].value),
+              };
               this._interrupt = {
-                interruptId: first.id ?? '',
+                ...first,
                 threadId,
-                payload: cloneToolApprovalInterruptPayload(first.value),
+                pendingInterrupts: [...pending.values()],
               };
             }
           }
@@ -1933,6 +1971,38 @@ export class Run<_T extends t.BaseGraphState> {
     return this._streamResult;
   }
 
+  private getPendingInterruptState(): {
+    pending: NonNullable<t.RunInterruptResult<unknown>['pendingInterrupts']>;
+    ids: Set<string>;
+    } {
+    const roots = this._interrupt?.pendingInterrupts ??
+      (this._interrupt == null ? [] : [this._interrupt]);
+    const pending = new Map<
+      string, Pick<t.RunInterruptResult<unknown>, 'interruptId' | 'payload'>
+    >();
+    const ids = new Set<string>();
+    const executions: SubagentResumeManifest['executions'] = [];
+    for (const root of roots) {
+      pending.set(root.interruptId, root);
+      ids.add(root.interruptId);
+      const payload = stripRunStepResumeState(root.payload);
+      const manifest =
+        requireValidSubagentResumeManifest(payload) ??
+        requireValidSubagentResumeManifest(stripToolBatchReplayState(payload));
+      executions.push(...(manifest?.executions ?? []));
+    }
+    for (let index = 0; index < executions.length; index++) {
+      const execution = executions[index];
+      for (const id of execution.pendingInterruptIds ?? []) ids.add(id);
+      for (const entry of execution.pendingInterrupts ?? []) {
+        ids.add(entry.interruptId);
+        pending.set(entry.interruptId, entry);
+      }
+      executions.push(...(execution.descendant?.executions ?? []));
+    }
+    return { pending: [...pending.values()], ids };
+  }
+
   /**
    * Returns the pending interrupt captured during the most recent
    * `processStream` (or `resume`) invocation. `undefined` when the run
@@ -1960,11 +2030,16 @@ export class Run<_T extends t.BaseGraphState> {
     if (this._interrupt == null) {
       return undefined;
     }
+    const { pending } = this.getPendingInterruptState();
     return {
       ...this._interrupt,
       payload: cloneToolApprovalInterruptPayload(
         getPublicToolInterruptPayload(this._interrupt.payload)
       ),
+      pendingInterrupts: pending.map((pending) => ({
+        interruptId: pending.interruptId,
+        payload: cloneToolApprovalInterruptPayload(getPublicToolInterruptPayload(pending.payload)),
+      })),
     } as t.RunInterruptResult<TPayload>;
   }
 
@@ -2076,22 +2151,15 @@ export class Run<_T extends t.BaseGraphState> {
       'update' | 'goto'
     >
   ): Promise<MessageContentComplex[] | undefined> {
-    const resumeConfig = await this.resolveInterruptResumeConfig(
+    await this.restoreInterruptFromCheckpoint(
       callerConfig,
       commandOptions?.update
     );
-    const interruptId = this._interrupt?.interruptId;
-    const scopedResume =
-      typeof interruptId === 'string' &&
-      interruptId.length > 0 &&
-      !isLangGraphResumeMapForInterrupt(resumeValue, interruptId)
-        ? { [interruptId]: resumeValue }
-        : resumeValue;
     // langgraph 1.4.5 applies resume + state update + reroute in one superstep
     // (single checkpoint). `update`/`goto` are omitted unless the caller sets them.
     return this.processStream(
       new Command({
-        resume: scopedResume,
+        resume: resumeValue,
         ...(commandOptions?.update !== undefined
           ? { update: commandOptions.update }
           : {}),
@@ -2099,14 +2167,68 @@ export class Run<_T extends t.BaseGraphState> {
           ? { goto: commandOptions.goto }
           : {}),
       }),
-      resumeConfig,
+      callerConfig,
       streamOptions
     );
   }
 
+  private restoreRootReplayConfig(
+    configurable: NonNullable<RunnableConfig['configurable']>,
+    resumeValue?: unknown
+  ): void {
+    const interrupt = this._interrupt;
+    const pending = interrupt?.pendingInterrupts;
+    if (pending == null || pending.length <= 1) {
+      restoreToolReplayConfig(
+        configurable,
+        interrupt?.interruptId,
+        stripRunStepResumeState(interrupt?.payload)
+      );
+      return;
+    }
+    const addressed = new Set(pending.flatMap((entry) =>
+      resumeValue != null && typeof resumeValue === 'object' &&
+        Object.prototype.hasOwnProperty.call(resumeValue, entry.interruptId)
+        ? [entry.interruptId] : []
+    ));
+    if (addressed.size === 0 && interrupt != null) addressed.add(interrupt.interruptId);
+    const scope = getToolBatchReplayScope({ configurable }) ?? '';
+    const thread = typeof configurable.thread_id === 'string' ? configurable.thread_id : '';
+    restoreToolReplayConfigs(
+      configurable,
+      pending.map((entry) => ({ id: entry.interruptId, value: entry.payload })),
+      scope,
+      scope,
+      thread,
+      addressed
+    );
+  }
+
+  private selectInterruptCheckpoint(
+    config: t.RunStreamConfig,
+    checkpointId: string,
+    checkpointNs?: string
+  ): t.RunStreamConfig {
+    const configurable: NonNullable<RunnableConfig['configurable']> = {
+      ...config.configurable,
+      checkpoint_id: checkpointId,
+      ...(checkpointNs == null ? {} : { checkpoint_ns: checkpointNs }),
+    };
+    if ((this.Graph?.agentContexts.size ?? 0) > 1) {
+      /** A pinned checkpoint_id replays completed Pregel tasks; the map selects it without replay. */
+      delete configurable.checkpoint_id;
+      configurable.checkpoint_map = {
+        ...configurable.checkpoint_map,
+        [checkpointNs ?? '']: checkpointId,
+      };
+    }
+    return { ...config, configurable };
+  }
+
   private async resolveInterruptResumeConfig(
     callerConfig: t.RunStreamConfig,
-    resumeUpdate?: ResumeCommandUpdate
+    resumeUpdate?: ResumeCommandUpdate,
+    resumeValue?: unknown
   ): Promise<t.RunStreamConfig> {
     await this.restoreInterruptFromCheckpoint(callerConfig, resumeUpdate);
     const interrupt = this._interrupt;
@@ -2119,42 +2241,32 @@ export class Run<_T extends t.BaseGraphState> {
     const resumeConfigurable = { ...callerConfig.configurable };
     delete resumeConfigurable[TOOL_APPROVAL_REVIEW_CONFIG_KEY];
     delete resumeConfigurable[TOOL_BATCH_REPLAY_KEY];
+    delete resumeConfigurable[TOOL_REPLAY_CONFIGS_KEY];
+    delete resumeConfigurable[TOOL_PENDING_APPROVAL_KEY];
     delete resumeConfigurable[SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY];
     delete resumeConfigurable[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY];
     resumeConfigurable[SUBAGENT_RESUME_ATTEMPT_CONFIG_KEY] = nanoid();
     if (resumeManifest != null) {
       resumeConfigurable[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY] = resumeManifest;
     }
-    const publicPayload = stripRunStepResumeState(interrupt?.payload);
-    restoreToolReplayConfig(
-      resumeConfigurable,
-      interrupt?.interruptId,
-      publicPayload
-    );
+    this.restoreRootReplayConfig(resumeConfigurable, resumeValue);
     const manifestConfig = {
       ...callerConfig,
       configurable: resumeConfigurable,
     };
-    const hookSessionId = getInterruptHookSessionId(interrupt?.payload);
-    if (hookSessionId != null) {
-      this.hookRegistry?.copySession(hookSessionId, this.id);
-    }
+    const hookSessions = new Set(
+      (interrupt?.pendingInterrupts ?? (interrupt == null ? [] : [interrupt]))
+        .map((entry) => getInterruptHookSessionId(entry.payload))
+        .filter((id): id is string => id != null)
+    );
+    for (const hookSessionId of hookSessions) this.hookRegistry?.copySession(hookSessionId, this.id);
     const interruptId = interrupt?.interruptId;
     const workflow = this.graphRunnable as
       | (t.CompiledStateWorkflow & WorkflowWithStateHistory)
       | undefined;
     const stateHistory = workflow?.getStateHistory;
     if (interrupt?.checkpointId != null && interrupt.checkpointId.length > 0) {
-      return {
-        ...manifestConfig,
-        configurable: {
-          ...manifestConfig.configurable,
-          checkpoint_id: interrupt.checkpointId,
-          ...(typeof interrupt.checkpointNs === 'string'
-            ? { checkpoint_ns: interrupt.checkpointNs }
-            : {}),
-        },
-      };
+      return this.selectInterruptCheckpoint(manifestConfig, interrupt.checkpointId, interrupt.checkpointNs);
     }
     if (
       interrupt == null ||
@@ -2189,16 +2301,12 @@ export class Run<_T extends t.BaseGraphState> {
           checkpointId,
           ...(typeof checkpointNs === 'string' ? { checkpointNs } : {}),
         };
-        return {
-          ...manifestConfig,
-          configurable: {
-            ...manifestConfig.configurable,
-            checkpoint_id: checkpointId,
-            ...(typeof checkpointNs === 'string'
-              ? { checkpoint_ns: checkpointNs }
-              : {}),
-          },
-        };
+        this.restoreRootReplayConfig(resumeConfigurable, resumeValue);
+        return this.selectInterruptCheckpoint(
+          manifestConfig,
+          checkpointId,
+          typeof checkpointNs === 'string' ? checkpointNs : undefined
+        );
       }
     }
 
@@ -2249,6 +2357,7 @@ export class Run<_T extends t.BaseGraphState> {
     this._interrupt = {
       interruptId: persistedInterrupt.id,
       payload: cloneToolApprovalInterruptPayload(persistedInterrupt.value),
+      pendingInterrupts: persistedInterrupt.pending.map((entry) => ({ interruptId: entry.id, payload: entry.value })),
       ...(typeof threadId === 'string' ? { threadId } : {}),
       ...(typeof checkpointId === 'string' ? { checkpointId } : {}),
       ...(typeof checkpointNs === 'string' ? { checkpointNs } : {}),

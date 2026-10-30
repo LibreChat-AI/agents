@@ -457,4 +457,8 @@ export interface RunInterruptResult<TPayload = HumanInterruptPayload> {
   checkpointNs?: string;
   /** Structured payload describing what needs human input. */
   payload: TPayload;
+  /** All pending proposals keyed by the interrupt IDs accepted by `Run.resume()`. */
+  pendingInterrupts?: Array<
+    Pick<RunInterruptResult<TPayload>, 'interruptId' | 'payload'>
+  >;
 }

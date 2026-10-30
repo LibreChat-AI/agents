@@ -1,17 +1,18 @@
-import { Command, MemorySaver, isCommand } from '@langchain/langgraph';
 import { isBaseMessage } from '@langchain/core/messages';
-import type { BaseMessage } from '@langchain/core/messages';
+import { Command, MemorySaver, isCommand } from '@langchain/langgraph';
 import type { RunnableConfig } from '@langchain/core/runnables';
-import type { SubagentToolNodeResumeState } from '@/tools/subagent/SubagentReplay';
+import type { BaseMessage } from '@langchain/core/messages';
+import type { Interrupt } from '@langchain/langgraph';
+import type { SubagentResumeManifest, SubagentToolNodeResumeState } from '@/tools/subagent/SubagentReplay';
 import type { ToolOutputReferenceState } from '@/tools/toolOutputReferences';
+import type { ToolApprovalReviewEvidence } from '@/hitl/approvalReview';
 import {
   isToolNodeResumeState,
   isToolOutputReferenceState,
   stripSubagentResumeManifest,
   requireValidSubagentResumeManifest,
+  SUBAGENT_RESUME_MANIFEST_CONFIG_KEY,
 } from '@/tools/subagent/SubagentReplay';
-import { isToolApprovalInterrupt } from '@/types/hitl';
-import { TOOL_APPROVAL_EXECUTION_SCOPE_CONFIG_KEY } from '@/hooks/types';
 import {
   TOOL_APPROVAL_REVIEW_CONFIG_KEY,
   getToolApprovalReviewEvidence,
@@ -22,8 +23,13 @@ import {
   getRunStepResumeState,
   stripRunStepResumeState,
 } from '@/tools/runStepResume';
+import { TOOL_APPROVAL_EXECUTION_SCOPE_CONFIG_KEY } from '@/hooks/types';
+import { stableStringify } from '@/tools/eagerEventExecution';
+import { isToolApprovalInterrupt } from '@/types/hitl';
 
 export const TOOL_BATCH_REPLAY_KEY = '__librechat_tool_batch_replay';
+export const TOOL_REPLAY_CONFIGS_KEY = '__librechat_tool_replay_configs';
+export const TOOL_PENDING_APPROVAL_KEY = '__librechat_tool_pending_approval';
 const TOOL_BATCH_PAYLOAD_KEY = '__librechat_tool_batch_payload';
 const TOOL_BATCH_WRAPPER_KEY = '__librechat_tool_batch_wrapper';
 
@@ -58,6 +64,21 @@ interface ToolBatchReplayState {
   records: ToolBatchReplayRecord[];
   wrappedPayload?: boolean;
 }
+
+interface CheckpointPendingApproval extends ToolApprovalReviewEvidence {
+  value: Interrupt['value'];
+}
+
+export function getCheckpointPendingApproval(config: RunnableConfig): CheckpointPendingApproval | undefined {
+  return config.configurable?.[TOOL_PENDING_APPROVAL_KEY] as CheckpointPendingApproval | undefined;
+}
+
+type ToolReplayConfig = {
+  [TOOL_PENDING_APPROVAL_KEY]?: CheckpointPendingApproval;
+  [TOOL_BATCH_REPLAY_KEY]?: ToolBatchReplayState;
+  [TOOL_APPROVAL_REVIEW_CONFIG_KEY]?: ToolApprovalReviewEvidence;
+  [SUBAGENT_RESUME_MANIFEST_CONFIG_KEY]?: SubagentResumeManifest;
+};
 
 /** Use the same message/Command codec as LangGraph checkpoints. */
 const serializer = new MemorySaver().serde;
@@ -112,6 +133,7 @@ export function restoreToolReplayConfig(
 ): void {
   delete configurable[TOOL_BATCH_REPLAY_KEY];
   delete configurable[TOOL_APPROVAL_REVIEW_CONFIG_KEY];
+  delete configurable[TOOL_PENDING_APPROVAL_KEY];
   const state = bindLegacyReplayState(
     getToolBatchReplayState(payload),
     configurable
@@ -131,7 +153,204 @@ export function restoreToolReplayConfig(
   }
   if (review != null) {
     configurable[TOOL_APPROVAL_REVIEW_CONFIG_KEY] = review;
+    configurable[TOOL_PENDING_APPROVAL_KEY] = { ...review, value: payload } satisfies CheckpointPendingApproval;
   }
+}
+
+/** Several child proposals can carry the same parent's checkpointed batch. */
+function mergeParentReplayConfig(
+  left: ToolReplayConfig,
+  right: ToolReplayConfig
+): ToolReplayConfig {
+  const leftState = left[TOOL_BATCH_REPLAY_KEY];
+  const rightState = right[TOOL_BATCH_REPLAY_KEY];
+  const records = new Map<string, ToolBatchReplayRecord>();
+  for (const record of [...(leftState?.records ?? []), ...(rightState?.records ?? [])]) {
+    const key = JSON.stringify([record.owner, record.batch]);
+    const previous = records.get(key);
+    if (previous != null && stableStringify(previous) !== stableStringify(record)) {
+      throw new Error('Conflicting parent tool replay checkpoint records');
+    }
+    records.set(key, record);
+  }
+  const manifest = left[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY];
+  const other = right[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY];
+  const executions = new Map<string, SubagentResumeManifest['executions'][number]>();
+  for (const execution of [...(manifest?.executions ?? []), ...(other?.executions ?? [])]) {
+    const key = JSON.stringify([execution.parentToolCallId, execution.childRunId]);
+    const previous = executions.get(key);
+    if (previous != null && stableStringify(previous) !== stableStringify(execution)) {
+      throw new Error('Conflicting parent subagent checkpoint manifests');
+    }
+    executions.set(key, execution);
+  }
+  const review = left[TOOL_APPROVAL_REVIEW_CONFIG_KEY] ?? right[TOOL_APPROVAL_REVIEW_CONFIG_KEY];
+  return {
+    [TOOL_APPROVAL_REVIEW_CONFIG_KEY]: review,
+    [TOOL_BATCH_REPLAY_KEY]: {
+      ...(leftState ?? rightState),
+      version: 1,
+      records: [...records.values()],
+      approvalOwner: review?.owner,
+      interruptId: review?.interruptId ?? leftState?.interruptId ?? rightState?.interruptId,
+    },
+    [SUBAGENT_RESUME_MANIFEST_CONFIG_KEY]: executions.size === 0
+      ? undefined : { version: 1, executions: [...executions.values()] },
+  };
+}
+
+/** Restore each checkpointed interrupt without sharing member authorization. */
+export function restoreToolReplayConfigs(
+  configurable: NonNullable<RunnableConfig['configurable']>,
+  interrupts: readonly Interrupt[],
+  sourceScope: string,
+  destinationScope: string,
+  destinationThreadId: string,
+  resumedInterruptIds: ReadonlySet<string>
+): void {
+  delete configurable[TOOL_REPLAY_CONFIGS_KEY];
+  delete configurable[TOOL_PENDING_APPROVAL_KEY];
+  const configs = new Map<string, ToolReplayConfig>();
+  const parents = new Map<string, ToolReplayConfig>();
+  let first: ToolReplayConfig | undefined;
+  for (const pending of interrupts) {
+    const restored: ToolReplayConfig &
+      NonNullable<RunnableConfig['configurable']> = {
+        user_id: configurable.user_id,
+        thread_id: configurable.thread_id,
+      };
+    restoreToolReplayConfig(restored, pending.id, pending.value);
+    rebindToolBatchReplayScope(
+      restored,
+      sourceScope,
+      destinationScope,
+      destinationThreadId
+    );
+    const replay = restored[TOOL_BATCH_REPLAY_KEY];
+    const review = restored[TOOL_APPROVAL_REVIEW_CONFIG_KEY];
+    const resumed = pending.id != null && resumedInterruptIds.has(pending.id);
+    const payload = stripRunStepResumeState(pending.value);
+    const manifest =
+      requireValidSubagentResumeManifest(payload) ??
+      requireValidSubagentResumeManifest(stripToolBatchReplayState(payload));
+    const evidence: ToolReplayConfig = {
+      [TOOL_PENDING_APPROVAL_KEY]: getCheckpointPendingApproval({ configurable: restored }),
+      [SUBAGENT_RESUME_MANIFEST_CONFIG_KEY]: manifest,
+      [TOOL_BATCH_REPLAY_KEY]: resumed || replay == null
+        ? replay
+        : { ...replay, approvalOwner: undefined },
+      [TOOL_APPROVAL_REVIEW_CONFIG_KEY]: resumed ? review : undefined,
+    };
+    if (resumed) first ??= evidence;
+    const childScopes = new Set<string>();
+    const executions = [...(manifest?.executions ?? [])];
+    while (executions.length > 0) {
+      const execution = executions.pop()!;
+      if (execution.descendant == null) {
+        childScopes.add(execution.approvalExecutionScope);
+      } else executions.push(...execution.descendant.executions);
+    }
+    const memberRecords = manifest == null
+      ? replay?.records ?? []
+      : (replay?.records ?? []).filter((record) => {
+        const identity: unknown = JSON.parse(record.owner);
+        return Array.isArray(identity) && childScopes.has(identity[0]);
+      });
+    const owner = review?.owner ?? replay?.approvalOwner;
+    if (owner == null && memberRecords.length === 0) configs.set('', {
+      [TOOL_PENDING_APPROVAL_KEY]: undefined,
+      [SUBAGENT_RESUME_MANIFEST_CONFIG_KEY]: undefined,
+      [TOOL_BATCH_REPLAY_KEY]: undefined,
+      [TOOL_APPROVAL_REVIEW_CONFIG_KEY]: undefined,
+    });
+    const owners = owner == null
+      ? new Set(memberRecords.map(record => record.owner))
+      : new Set([owner]);
+    for (const owner of owners) {
+      if (configs.has(owner)) {
+        throw new Error('Ambiguous tool replay checkpoint owner');
+      }
+      configs.set(owner, evidence);
+    }
+    if (manifest != null) {
+      for (const record of replay?.records ?? []) {
+        if (owners.has(record.owner)) continue;
+        const previous = parents.get(record.owner);
+        parents.set(
+          record.owner,
+          previous == null ? evidence : mergeParentReplayConfig(previous, evidence)
+        );
+      }
+    }
+  }
+  for (const [owner, evidence] of parents) {
+    if (!configs.has(owner)) configs.set(owner, evidence);
+  }
+  delete configurable[TOOL_BATCH_REPLAY_KEY];
+  delete configurable[TOOL_APPROVAL_REVIEW_CONFIG_KEY];
+  Object.assign(configurable, first);
+  if (first != null && first[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY] === undefined) {
+    delete configurable[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY];
+  }
+  if (configs.size > 1) configurable[TOOL_REPLAY_CONFIGS_KEY] = configs;
+}
+
+export function matchesToolReplayBatch(saved: string, current: string | undefined, messageId?: string): boolean {
+  if (saved === current) return true;
+  if (messageId == null || messageId === '') return false;
+  const identity: unknown = JSON.parse(saved);
+  return Array.isArray(identity) && identity[1] === messageId;
+}
+
+/** Select a member's evidence before the unchanged owner/proposal safeguards. */
+export function getToolReplayConfig(
+  config: RunnableConfig,
+  owner: string,
+  batch?: string,
+  messageId?: string
+): RunnableConfig {
+  const candidate = config.configurable?.[TOOL_REPLAY_CONFIGS_KEY];
+  if (!(candidate instanceof Map)) return config;
+  const configs = candidate as ReadonlyMap<string, ToolReplayConfig>;
+  let evidence = configs.get(owner);
+  if (evidence == null && configs.has('')) {
+    const identity: unknown = JSON.parse(owner);
+    if (Array.isArray(identity)) {
+      const execution = JSON.stringify(identity.map((part, index) => index === 2 ? '' : part));
+      for (const key of configs.keys()) {
+        if (key === '') continue;
+        const sibling: unknown = JSON.parse(key);
+        if (Array.isArray(sibling) && execution === JSON.stringify(sibling.map((part, index) => index === 2 ? '' : part))) {
+          evidence = configs.get('');
+          break;
+        }
+      }
+    }
+    if (evidence == null) throw new Error('Tool replay execution identity changed before resume');
+  }
+  if (evidence == null) {
+    let hasApproval = false;
+    let hasCheckpointBatch = false;
+    for (const pending of configs.values()) {
+      const replay = pending[TOOL_BATCH_REPLAY_KEY];
+      hasApproval ||= pending[TOOL_PENDING_APPROVAL_KEY] != null || pending[TOOL_APPROVAL_REVIEW_CONFIG_KEY] != null || replay?.approvalOwner != null;
+      hasCheckpointBatch ||= batch != null && replay?.records.some((record) => matchesToolReplayBatch(record.batch, batch, messageId)) === true;
+    }
+    if (hasApproval && (hasCheckpointBatch || getToolReplayResumeStatus(config, undefined, false) !== 'stale')) {
+      throw new Error('Tool approval execution owner changed before resume — failing closed');
+    }
+  }
+  const configurable: NonNullable<RunnableConfig['configurable']> = { ...config.configurable };
+  delete configurable[TOOL_REPLAY_CONFIGS_KEY];
+  delete configurable[TOOL_PENDING_APPROVAL_KEY];
+  delete configurable[TOOL_BATCH_REPLAY_KEY];
+  delete configurable[TOOL_APPROVAL_REVIEW_CONFIG_KEY];
+  delete configurable[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY];
+  Object.assign(configurable, evidence);
+  if (configurable[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY] === undefined) {
+    delete configurable[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY];
+  }
+  return { ...config, configurable };
 }
 
 /**
@@ -202,6 +421,8 @@ export function clearStaleToolApprovalConfig(
   batch: string | undefined
 ): void {
   delete configurable[TOOL_APPROVAL_REVIEW_CONFIG_KEY];
+  delete configurable[TOOL_PENDING_APPROVAL_KEY];
+  delete configurable[TOOL_REPLAY_CONFIGS_KEY];
   const state = getToolBatchReplayState(configurable);
   const records = batch == null
     ? []
@@ -273,6 +494,13 @@ export function rebindToolBatchReplayScope(
     configurable[TOOL_APPROVAL_REVIEW_CONFIG_KEY] = {
       ...review,
       owner: rebind(review.owner),
+    };
+  }
+  const pending = getCheckpointPendingApproval(config);
+  if (pending?.owner != null) {
+    configurable[TOOL_PENDING_APPROVAL_KEY] = {
+      ...pending, owner: rebind(pending.owner),
+      value: rebindToolBatchReplayPayload(pending.value, sourceScope, destinationScope, destinationThreadId),
     };
   }
   const state = getToolBatchReplayState(configurable);
@@ -418,8 +646,10 @@ export async function attachToolBatchReplayState(
   if (records.length === 0 && approvalOwner == null) {
     return payload;
   }
+  const inline = isRecord(publicPayload) &&
+    Object.getPrototypeOf(publicPayload) === Object.prototype;
   const result = {
-    ...(isRecord(publicPayload)
+    ...(inline
       ? publicPayload
       : {
         [TOOL_BATCH_WRAPPER_KEY]: 1,
@@ -429,7 +659,7 @@ export async function attachToolBatchReplayState(
       version: 1,
       approvalOwner,
       records,
-      wrappedPayload: previous?.wrappedPayload ?? !isRecord(publicPayload),
+      wrappedPayload: previous?.wrappedPayload ?? !inline,
     } satisfies ToolBatchReplayState,
   };
   const runStepState = getRunStepResumeState(payload);

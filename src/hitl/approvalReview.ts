@@ -27,9 +27,17 @@ export interface ReviewedToolApproval {
 
 const APPROVAL_DECISIONS = new Set(['approve', 'reject', 'edit', 'respond']);
 
-/** Detach approval payloads from host- or transport-owned object graphs. */
+/** Detach approval fields without deep-cloning checkpoint-owned metadata. */
 export function cloneToolApprovalInterruptPayload<T>(payload: T): T {
-  return isToolApprovalInterrupt(payload) ? structuredClone(payload) : payload;
+  if (!isToolApprovalInterrupt(payload)) return payload;
+  return {
+    ...payload,
+    ...structuredClone({
+      action_requests: payload.action_requests,
+      review_configs: payload.review_configs,
+      ...(payload.subagent == null ? {} : { subagent: payload.subagent }),
+    }),
+  };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
