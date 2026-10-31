@@ -63,10 +63,12 @@ import {
 import { messagesStateReducer, createRemoveAllMessage } from '@/messages/reducer';
 import { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import { Constants, GraphEvents, Providers, StepTypes } from '@/common';
+import { SubagentExecutor } from '@/tools/subagent/SubagentExecutor';
 import { PreparedSubagentError } from '@/tools/preparedSubagents';
 import fixtures from '@/protection/__tests__/fixtures/a1.json';
 import { stableStringify } from '@/tools/eagerEventExecution';
 import { StreamLimitExceededError } from '@/llm/streamLimits';
+import { MultiAgentGraph } from '@/graphs/MultiAgentGraph';
 import { isToolApprovalInterrupt } from '@/types/hitl';
 import { ChatModelStreamHandler } from '@/stream';
 import { StandardGraph } from '@/graphs/Graph';
@@ -4235,4 +4237,85 @@ echo 'Allowed program ignored failures'`;
     if (kind === 'restart') expect(error).toBe(marker);
     else { expect(error).toBeInstanceOf(kind === 'prepared' ? PreparedSubagentError : StreamLimitExceededError); expect(error).not.toBe(safety); expect(error).not.toHaveProperty('cause'); }
   } finally { audit.closeAllConnections(); await new Promise<void>((resolve) => audit.close(() => resolve())); }
+});
+
+it.each((['object', 'array'] as const).flatMap((shape) => (['content', 'replace', 'rename', 'append', 'getter', 'control', 'late-alias'] as const).map((mutation) => [shape, mutation] as const)))('readmits standalone tool outcomes after native chain-end callbacks (%s/%s)', async (shape, mutation) => {
+  let reads = 0; let executions = 0; let retained: ToolMessage | undefined;
+  const callback = BaseCallbackHandler.fromMethods({ handleChainEnd: (output): void => {
+    const messages = (Array.isArray(output) ? output : output.messages ?? output.output) as ToolMessage[]; retained = messages[0];
+    if (mutation === 'content') messages[0].content = fixtures.canaries[0];
+    if (mutation === 'replace') messages[0] = new ToolMessage({ name: 'lookup', tool_call_id: 'call-control', content: fixtures.canaries[0] });
+    if (mutation === 'rename') { messages[0].name = 'other'; messages[0].content = fixtures.canaries[0]; }
+    if (mutation === 'append') messages.push(new ToolMessage({ name: 'lookup', tool_call_id: 'new-call', content: fixtures.canaries[0] }));
+    if (mutation === 'getter') Object.defineProperty(messages[0], 'content', { get: () => { reads++; throw new Error(fixtures.canaries[0]); } });
+  } }); callback.awaitHandlers = true;
+  const node = new ToolNode({ trace: true, tools: [direct(() => { executions++; return fixtures.canaries[0]; })], toolResultProtection: policy() });
+  const result = await node.invoke(shape === 'object' ? state() : state().messages, { callbacks: [callback] }).catch((error: Error) => error);
+  expect(reads).toBe(0); expect(executions).toBe(1); assertNoCanary(String(result)); assertNoCanary(JSON.stringify(result));
+  if (mutation !== 'control' && mutation !== 'late-alias') expect(result).toMatchObject({ code: 'unsupported' });
+  else { const messages = (Array.isArray(result) ? result : (result as { messages: ToolMessage[] }).messages) as ToolMessage[]; expect(messages[0].content).toBe('[EMAIL_1]'); expect(messages[0]).not.toBe(retained); retained!.content = fixtures.canaries[0]; retained!.additional_kwargs._refScope = fixtures.canaries[0]; assertNoCanary(messages); }
+});
+
+it.each((['message', 'stack', 'cause', 'accessor', 'control', 'late-alias'] as const).flatMap((mutation) => [false, true].map((signal) => [mutation, signal] as const)))('readmits released ordinary errors after native chain-error callbacks (%s/signal=%s)', async (mutation, withSignal) => {
+  let reads = 0; let retained: Error | undefined; let inspections = 0;
+  const callback = BaseCallbackHandler.fromMethods({ handleChainError: (error): void => {
+    retained = error; expect(error.message).toBe('[EMAIL_1]');
+    if (mutation === 'message') error.message = fixtures.canaries[0];
+    if (mutation === 'stack') error.stack = fixtures.canaries[0];
+    if (mutation === 'cause') Object.defineProperty(error, 'cause', { value: fixtures.canaries[0] });
+    if (mutation === 'accessor') Object.defineProperty(error, 'message', { get: () => { reads++; throw new Error(fixtures.canaries[0]); } });
+  } }); callback.awaitHandlers = true;
+  const node = new ToolNode({ trace: true, tools: [direct(() => { throw new Error(fixtures.canaries[0]); })], toolResultProtection: policy({ inspect: ({ content }) => { inspections++; return approve(content.replaceAll(fixtures.canaries[0], '[EMAIL_1]')); } }), handleToolErrors: false });
+  const error = await node.invoke(state(), { callbacks: [callback], ...(withSignal ? { signal: new AbortController().signal } : {}) }).catch((value: Error) => value);
+  expect(reads).toBe(0); expect(inspections).toBe(1); expect(error).not.toBe(retained); assertNoCanary(String(error)); assertNoCanary(JSON.stringify(error)); expect(error).not.toHaveProperty('cause');
+  if (mutation === 'message' || mutation === 'accessor') expect(error).toMatchObject({ code: 'unsupported' });
+  else { expect((error as Error).message).toBe('[EMAIL_1]'); retained!.message = fixtures.canaries[0]; assertNoCanary(String(error)); }
+});
+
+it.each((['tuple', 'snapshot', 'pending', 'fresh', 'resume', 'send'] as const).flatMap((carrier) => (['tool-method', 'tool-type', 'human', 'container-getter', 'message-getter', 'mismatch', 'control', 'empty'] as const).map((kind) => [carrier, kind] as const)))('admits graph-subagent result messages before recovery (%s/%s)', async (carrier, kind) => {
+  let reads = 0; const ai = new AIMessage({ id: 'designated-result', content: 'Allowed designated answer' });
+  const state = { messages: [new HumanMessage('Allowed worker input'), ai], subagentResult: { agentId: 'result', message: kind === 'empty' ? undefined : ai as BaseMessage } };
+  if (kind === 'tool-method' || kind === 'tool-type') { const message = new ToolMessage({ id: 'forged-result', name: 'lookup', tool_call_id: 'selected-call', content: fixtures.canaries[0] }); if (kind === 'tool-method') Object.defineProperty(message, '_getType', { value: () => { reads++; return 'ai'; } }); else Object.defineProperty(message, 'type', { value: 'ai' }); state.subagentResult.message = message; }
+  if (kind === 'human') state.subagentResult.message = new HumanMessage(fixtures.canaries[0]);
+  if (kind === 'container-getter') Object.defineProperty(state.subagentResult, 'agentId', { get: () => { reads++; throw new Error(fixtures.canaries[0]); } });
+  if (kind === 'message-getter') Object.defineProperty(state.subagentResult, 'message', { get: () => { reads++; throw new Error(fixtures.canaries[0]); } });
+  if (kind === 'mismatch') state.subagentResult.message = new AIMessage({ id: 'different-result', content: fixtures.canaries[0] });
+  const graph = new StandardGraph({ runId: 'graph-result-admission', agents: [{ agentId: 'result', provider: Providers.OPENAI }], toolResultProtection: policy() });
+  const invoke = async (): Promise<unknown> => {
+    if (carrier === 'snapshot') return graph.validateToolResultCheckpoint({ values: state, tasks: [] });
+    if (carrier === 'tuple' || carrier === 'pending') { const checkpoint = emptyCheckpoint(); checkpoint.channel_values = { messages: state.messages, ...(carrier === 'tuple' ? { subagentResult: state.subagentResult } : {}) }; return graph.validateToolResultCheckpointTuple({ config: { configurable: { thread_id: 'graph-result-admission', checkpoint_ns: '', checkpoint_id: checkpoint.id } }, checkpoint, pendingWrites: carrier === 'pending' ? [['task-control', 'subagentResult', state.subagentResult]] : [] }); }
+    const runId = `external-result-${carrier}-${kind}`; const hooks = new HookRegistry(); hooks.register('PreToolUse', { hooks: [async () => ({ decision: 'ask', reason: 'Allowed approval' })] });
+    const run = await Run.create({ runId, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, tools: [direct(() => 'Allowed result')], compileOptions: { checkpointer: new MemorySaver() } }, toolResultProtection: policy(), hooks, humanInTheLoop: { enabled: true } });
+    run.Graph!.overrideModel = new FakeChatModel({ responses: carrier === 'fresh' ? ['Allowed answer'] : ['', 'Allowed answer'], toolCalls: carrier === 'fresh' ? [] : [{ id: 'approval-control', name: 'lookup', args: { count: 42 }, type: 'tool_call' }] });
+    const config = { version: 'v2' as const, configurable: { thread_id: runId } };
+    if (carrier === 'fresh') return run.processStream(state, config);
+    await run.processStream({ messages: [new HumanMessage('Allowed input')] }, config);
+    if (carrier === 'resume') return run.resume([{ type: 'approve' }], config, undefined, { update: state });
+    const packet = new Send('default', { messages: state.messages }); Object.defineProperty(packet.args, 'subagentResult', { value: state.subagentResult, enumerable: true }); return run.resume([{ type: 'approve' }], config, undefined, { goto: [packet] });
+  };
+  const result = await invoke().catch((error: Error) => error); expect(reads).toBe(0); assertNoCanary(String(result));
+  if (kind !== 'control' && kind !== 'empty') expect(result).toBeInstanceOf(ToolResultProtectionError);
+  else { expect(result).not.toBeInstanceOf(Error); if (result != null) assertNoCanary(result); }
+});
+
+it.each(['tool-method', 'tool-type', 'container-getter', 'mismatch', 'wrong-agent', 'control', 'empty'] as const)('gates completed graph-child result recovery before parent publication (%s)', async (kind) => {
+  let reads = 0; let nativeInvocations = 0; const gate = policy(); const final = new AIMessage({ id: 'completed-child-answer', content: 'Allowed designated answer' });
+  const definition: GraphSubagentConfig = { kind: 'graph', type: 'recovered-team', name: 'Recovered Team', description: 'Allowed completed team.', agents: [{ agentId: 'entry', provider: Providers.OPENAI }, { agentId: 'result', provider: Providers.OPENAI }], entryAgentId: 'entry', resultAgentId: 'result', edges: [{ from: 'entry', to: 'result', edgeType: 'direct' }] };
+  const executor = new SubagentExecutor({ configs: new Map([[definition.type, definition]]), parentRunId: 'recovered-parent', parentAgentId: 'parent', humanInTheLoop: { enabled: true }, checkpointer: new MemorySaver(), toolResultProtection: gate, createChildGraph: (input) => new StandardGraph(input), createChildGraphByKind: (request) => {
+    const graph = request.kind === 'multi-agent' ? new MultiAgentGraph(request.input) : new StandardGraph(request.input);
+    const workflow = graph.createWorkflow() as ReturnType<StandardGraph['createWorkflow']> & { getState(config: RunnableConfig): Promise<StateSnapshot>; updateState(config: RunnableConfig, values: object, node: string): Promise<RunnableConfig> };
+    jest.spyOn(workflow, 'getState').mockImplementation(async (config) => {
+      const result: { agentId: string; message?: BaseMessage } = { agentId: kind === 'wrong-agent' ? 'entry' : 'result', ...(kind === 'empty' ? {} : { message: final }) };
+      if (kind === 'tool-method' || kind === 'tool-type') { const message = new ToolMessage({ id: 'untrusted-child-answer', tool_call_id: 'lookup-call', name: 'lookup', content: fixtures.canaries[0] }); if (kind === 'tool-method') Object.defineProperty(message, '_getType', { value: () => { reads++; return 'ai'; } }); else Object.defineProperty(message, 'type', { value: 'ai' }); result.message = message; }
+      if (kind === 'container-getter') Object.defineProperty(result, 'message', { get: () => { reads++; throw new Error(fixtures.canaries[0]); } });
+      if (kind === 'mismatch') result.message = new AIMessage({ id: final.id, content: fixtures.canaries[0] });
+      return { values: { messages: [new HumanMessage('Allowed child input'), final], subagentResult: result }, next: [], tasks: [], config: { ...config, configurable: { ...config.configurable, checkpoint_id: 'completed-child-checkpoint', checkpoint_ns: '' } } };
+    });
+    jest.spyOn(workflow, 'invoke').mockImplementation(async () => { nativeInvocations++; throw new Error('Completed child must not execute'); });
+    jest.spyOn(workflow, 'updateState').mockImplementation(async (config) => config);
+    jest.spyOn(graph, 'createWorkflow').mockReturnValue(workflow); return graph;
+  } });
+  const result = await executor.execute({ description: 'Recover allowed completed team.', subagentType: definition.type, threadId: 'completed-parent-thread', parentToolCallId: 'completed-team-spawn' }).catch((error: Error) => error);
+  expect(nativeInvocations).toBe(0); expect(reads).toBe(0); assertNoCanary(String(result)); assertNoCanary(JSON.stringify(result));
+  if (kind === 'control' || kind === 'empty') expect(result).toMatchObject({ content: kind === 'empty' ? 'Task completed' : 'Allowed designated answer' }); else expect(result).toBeInstanceOf(ToolResultProtectionError);
 });

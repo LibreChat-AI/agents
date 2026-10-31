@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from 'node:util';
 import type { ToolMessageRelease, ToolCallSources } from '@/protection/toolResult';
 import type { ToolCheckpointAdmissionContext } from '@/protection/toolCheckpoint';
 /* eslint-disable no-console */
@@ -9,6 +10,7 @@ import { ContextOverflowError } from '@langchain/core/errors';
 import { Runnable, RunnableConfig } from '@langchain/core/runnables';
 import { START, END, StateGraph, Annotation, Overwrite, Send } from '@langchain/langgraph';
 import {
+  AIMessage,
   ToolMessage,
   HumanMessage,
   AIMessageChunk,
@@ -117,7 +119,7 @@ import {
   disposeLangfuseHandler,
   isLangfuseCallbackHandler,
 } from '@/langfuse';
-import { snapshotToolHandoffState, snapshotToolHandoffWrite, snapshotToolSummarizationRequest, snapshotToolRunStepWrite, mergeToolCallSources, snapshotToolCallSources, snapshotToolSend, snapshotToolInputMessages, snapshotToolCheckpointConfig, snapshotToolCheckpointData, snapshotToolRunStepState, snapshotToolResumeMessages, snapshotToolMessageRemoval, snapshotToolCheckpointRecord, snapshotToolCheckpointArray, snapshotToolHistoryMessages, retainToolMessageReleases, normalizeToolResultError, getLiveToolMessageRelease, commitToolMessageRelease, snapshotToolMessageReleases, validateToolMessageHistory, requiresToolResultProtection, ToolResultProtectionError, validateToolResultProtection } from '@/protection/toolResult';
+import { snapshotToolSubagentResult, snapshotToolHandoffState, snapshotToolHandoffWrite, snapshotToolSummarizationRequest, snapshotToolRunStepWrite, mergeToolCallSources, snapshotToolCallSources, snapshotToolSend, snapshotToolInputMessages, snapshotToolCheckpointConfig, snapshotToolCheckpointData, snapshotToolRunStepState, snapshotToolResumeMessages, snapshotToolMessageRemoval, snapshotToolCheckpointRecord, snapshotToolCheckpointArray, snapshotToolHistoryMessages, retainToolMessageReleases, normalizeToolResultError, getLiveToolMessageRelease, commitToolMessageRelease, snapshotToolMessageReleases, validateToolMessageHistory, requiresToolResultProtection, ToolResultProtectionError, validateToolResultProtection } from '@/protection/toolResult';
 import {
   getBlindRecoveryBudget,
   planContextOverflowRecovery,
@@ -720,7 +722,7 @@ function buildRunStepStateAnnotation(): RunStepStateChannel {
 type ToolResultCheckpoint = {
   config?: RunnableConfig;
   next?: readonly string[];
-  values?: { messages?: BaseMessage[]; agentMessages?: BaseMessage[]; runStepState?: t.RunStepResumeState; handoffState?: t.HandoffState; summarizationRequest?: t.SummarizationNodeInput };
+  values?: { messages?: BaseMessage[]; agentMessages?: BaseMessage[]; runStepState?: t.RunStepResumeState; handoffState?: t.HandoffState; subagentResult?: t.SubagentGraphResult; summarizationRequest?: t.SummarizationNodeInput };
   tasks?: readonly { state?: ToolResultCheckpoint | RunnableConfig; interrupts?: readonly { id?: string; value?: unknown }[] }[];
 };
 
@@ -757,10 +759,11 @@ export abstract class Graph<
           if (snapshot.next.some((name) => typeof name !== 'string')) throw new ToolResultProtectionError('unsupported');
         }
         if (snapshot.values != null) {
-          const values = snapshotToolCheckpointRecord(snapshot.values, ['messages', 'agentMessages', 'runStepState', 'summarizationRequest', 'handoffState']);
+          const values = snapshotToolCheckpointRecord(snapshot.values, ['messages', 'agentMessages', 'runStepState', 'summarizationRequest', 'handoffState', 'subagentResult']);
           snapshot.values = values;
           if (values.runStepState != null) values.runStepState = snapshotToolRunStepState(values.runStepState);
           if (values.handoffState != null) values.handoffState = snapshotToolHandoffState(values.handoffState);
+          if (values.subagentResult != null) values.subagentResult = snapshotToolSubagentResult(values.subagentResult);
           if (values.summarizationRequest != null) values.summarizationRequest = snapshotToolSummarizationRequest(values.summarizationRequest);
           if (values.messages != null) values.messages = snapshotToolInputMessages(values.messages);
           if (values.agentMessages != null) values.agentMessages = snapshotToolInputMessages(values.agentMessages);
@@ -772,6 +775,7 @@ export abstract class Graph<
             values.agentMessages = canonical.slice(current.length);
           }
           if (values.summarizationRequest != null) values.summarizationRequest = await this.validateToolResultWindow(values.summarizationRequest, values.runStepState, signal, sources);
+          if (values.subagentResult != null) values.subagentResult = this.validateToolResultSubagentResult(values.subagentResult, [...values.messages ?? [], ...values.agentMessages ?? []]);
         }
         if (snapshot.tasks != null) {
           const tasks = snapshotToolCheckpointArray(snapshot.tasks);
@@ -792,6 +796,17 @@ export abstract class Graph<
     };
     return visit(input);
   }
+  validateToolResultSubagentResult(input: t.SubagentGraphResult, history: readonly BaseMessage[], resultAgentId?: string): t.SubagentGraphResult {
+    const result = snapshotToolSubagentResult(input);
+    if (resultAgentId != null && result.agentId !== resultAgentId) throw new ToolResultProtectionError('unsupported');
+    if (result.message == null) return result;
+    const candidates = snapshotToolInputMessages(history);
+    const message = result.message;
+    const match = candidates.find((candidate) => candidate.type === 'ai' && candidate.id === message.id && isDeepStrictEqual(candidate.content, message.content) && isDeepStrictEqual((candidate as AIMessage).tool_calls, (message as AIMessage).tool_calls));
+    if (match == null) throw new ToolResultProtectionError('incompatible');
+    return result;
+  }
+
   async validateToolResultWindow(input: t.SummarizationNodeInput, state?: Pick<t.RunStepResumeState, 'toolResultReleases'>, signal?: AbortSignal, sources?: ToolCallSources, requireSource = false): Promise<t.SummarizationNodeInput> {
     const request = snapshotToolSummarizationRequest(input);
     if (request.windowMessages != null) request.windowMessages = await this.validateToolResultHistory(request.windowMessages, state, signal, sources, requireSource);
@@ -813,6 +828,7 @@ export abstract class Graph<
     if (args.messages != null) args.messages = canonical.slice(0, primary.length);
     if (args.agentMessages != null) args.agentMessages = canonical.slice(primary.length);
     if (args.summarizationRequest != null) args.summarizationRequest = await this.validateToolResultWindow(args.summarizationRequest, state, signal, sources, true);
+    if (args.subagentResult != null) args.subagentResult = this.validateToolResultSubagentResult(args.subagentResult, canonical);
     return Object.assign(Object.create(Send.prototype) as Send, packet, { args });
   }
 
@@ -855,10 +871,11 @@ export abstract class Graph<
     const checkpoint = snapshotToolCheckpointRecord(tuple.checkpoint, ['channel_values', 'channel_versions', 'versions_seen', 'v', 'id', 'ts']);
     checkpoint.channel_versions = snapshotToolCheckpointData(checkpoint.channel_versions);
     checkpoint.versions_seen = snapshotToolCheckpointData(checkpoint.versions_seen);
-    const values = snapshotToolCheckpointRecord(checkpoint.channel_values, ['messages', 'agentMessages', 'runStepState', 'handoffState', 'summarizationRequest', '__pregel_tasks']);
+    const values = snapshotToolCheckpointRecord(checkpoint.channel_values, ['messages', 'agentMessages', 'runStepState', 'handoffState', 'subagentResult', 'summarizationRequest', '__pregel_tasks']);
     if (values.messages != null) values.messages = snapshotToolInputMessages(values.messages as BaseMessage[]);
     if (values.agentMessages != null) values.agentMessages = snapshotToolInputMessages(values.agentMessages as BaseMessage[]);
     if (values.handoffState != null) values.handoffState = snapshotToolHandoffState(values.handoffState as t.HandoffState);
+    if (values.subagentResult != null) values.subagentResult = snapshotToolSubagentResult(values.subagentResult as t.SubagentGraphResult);
     if (values.summarizationRequest != null) values.summarizationRequest = snapshotToolSummarizationRequest(values.summarizationRequest as t.SummarizationNodeInput);
     const tasks = values.__pregel_tasks;
     if (tasks != null) {
@@ -888,6 +905,7 @@ export abstract class Graph<
     for (const write of pending) {
       if (write[1] === 'runStepState') write[2] = addState(write[2]);
       if (write[1] === 'handoffState') write[2] = snapshotToolHandoffWrite(write[2]);
+      if (write[1] === 'subagentResult' && write[2] != null) write[2] = snapshotToolSubagentResult(write[2] as t.SubagentGraphResult);
       if (write[1] === 'summarizationRequest' && write[2] != null) write[2] = snapshotToolSummarizationRequest(write[2] as t.SummarizationNodeInput);
       if (write[1] === '__interrupt__') write[2] = snapshotToolCheckpointData(write[2]);
       if (write[1] === '__pregel_tasks' || write[1] === '__pregel_push') write[2] = Array.isArray(write[2]) ? snapshotToolCheckpointArray(write[2]).map(snapshotToolSend) : snapshotToolSend(write[2]);
@@ -913,6 +931,8 @@ export abstract class Graph<
     const owned = scopes == null ? local : mergeToolCallSources(scopes.values());
     const admitted = await this.validateToolResultHistory(outputs, state, signal, owned);
     const sources = snapshotToolCallSources([[...history, ...admitted]], releases, owned, namespace);
+    if (values.subagentResult != null) values.subagentResult = this.validateToolResultSubagentResult(values.subagentResult as t.SubagentGraphResult, history);
+    for (const write of pending) if (write[1] === 'subagentResult' && write[2] != null) write[2] = this.validateToolResultSubagentResult(write[2] as t.SubagentGraphResult, [...history, ...admitted]);
     if (values.summarizationRequest != null) values.summarizationRequest = await this.validateToolResultWindow(values.summarizationRequest as t.SummarizationNodeInput, state, signal, sources);
     for (const write of pending) if (write[1] === 'summarizationRequest' && write[2] != null) write[2] = await this.validateToolResultWindow(write[2] as t.SummarizationNodeInput, state, signal, sources);
     const admitTasks = async (value: unknown): Promise<Send | Send[]> => Array.isArray(value)

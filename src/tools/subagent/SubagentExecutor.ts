@@ -3677,6 +3677,7 @@ export class SubagentExecutor {
     if (result == null) {
       throw new Error('Subagent completed without producing graph state.');
     }
+    if (this.toolResultProtection != null && childPlan.kind === 'graph' && result.subagentResult != null) result.subagentResult = childGraph.validateToolResultSubagentResult(result.subagentResult, result.messages, childPlan.resultAgentId);
     const filteredContent =
       childPlan.kind === 'graph'
         ? filterGraphSubagentResult(result, childPlan.resultAgentId)
