@@ -54,7 +54,7 @@ import type { PreparedSubagents } from '@/tools/preparedSubagents';
 import type { ToolMessageRelease } from '@/protection/toolResult';
 import type { RunBreakerScope } from '@/llm/streamLimits';
 import type * as t from '@/types';
-import { withToolResultSafetySignal, detachToolSafetyError, validateToolReplayRelease, snapshotToolErrorText, protectToolErrorText, detachReleasedToolError, getToolMessageRelease, replaceReleasedToolMessage, normalizeToolResultError, needsToolReferenceInspection, protectToolReferenceState, bindToolExecuteProtection, validateToolExecuteResults, hasReleasedToolReference, isReleasedToolError, markReleasedToolMessage, protectToolText, protectToolMessage, protectToolExecuteResult, withToolResultBoundary, requiresToolResultProtection, validateToolResultProtection, ToolResultProtectionError } from '@/protection/toolResult';
+import { detachToolControlInterrupt, withToolResultSafetySignal, detachToolSafetyError, validateToolReplayRelease, snapshotToolErrorText, protectToolErrorText, detachReleasedToolError, getToolMessageRelease, replaceReleasedToolMessage, normalizeToolResultError, needsToolReferenceInspection, protectToolReferenceState, bindToolExecuteProtection, validateToolExecuteResults, hasReleasedToolReference, isReleasedToolError, markReleasedToolMessage, protectToolText, protectToolMessage, protectToolExecuteResult, withToolResultBoundary, requiresToolResultProtection, validateToolResultProtection, ToolResultProtectionError } from '@/protection/toolResult';
 import {
   TOOL_BATCH_REPLAY_KEY,
   TOOL_REPLAY_CONFIGS_KEY,
@@ -1230,6 +1230,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         try {
           result = await this.run(input, config, referenceReplay);
         } catch (error) {
+          const control = detachToolControlInterrupt(error);
+          if (control != null) throw control;
           if (!isGraphInterrupt(error)) {
             throw error;
           }
@@ -2215,7 +2217,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     } catch (_e: unknown) {
       let e = _e as Error;
       if (this.toolResultProtection != null && e instanceof ProviderTextProtectionError) e = normalizeToolResultError(e);
-      if (requiresToolResultProtection(this.toolResultProtection, call.name)) e = detachToolSafetyError(e) ?? e;
+      if (requiresToolResultProtection(this.toolResultProtection, call.name)) e = detachToolControlInterrupt(e) ?? detachToolSafetyError(e) ?? e;
       if (requiresToolResultProtection(this.toolResultProtection, call.name)) e = detachReleasedToolError(this.toolResultProtection, call.name, call.id ?? '', e) ?? e;
       if (!this.handleToolErrors) {
         if (requiresToolResultProtection(this.toolResultProtection, call.name) && !isReleasedToolError(this.toolResultProtection, call.name, call.id ?? '', e) && !(e instanceof ProviderTextProtectionError) &&
@@ -5645,6 +5647,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     try { return await this.runWithResultProtection(input, config, referenceReplay); }
     catch (error) {
       if (this.toolResultProtection != null) {
+        const control = detachToolControlInterrupt(error);
+        if (control != null) throw control;
         const safety = detachToolSafetyError(error, true);
         if (safety != null) { scope?.controller.abort(safety); throw safety; }
       }

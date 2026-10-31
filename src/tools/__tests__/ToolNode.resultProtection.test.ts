@@ -44,7 +44,7 @@ import type {
 } from '@/protection/toolResult';
 import type { ToolOutputReferenceState } from '@/tools/toolOutputReferences';
 import type { SettledToolBatchResult } from '@/tools/toolBatchReplay';
-import { snapshotToolHandoffState, snapshotToolHandoffWrite, snapshotToolInputMessages, snapshotToolCallSources, admitToolResultCheckpoints, snapshotToolRunStepState, snapshotToolMessageRemoval, validateToolMessageHistory, getToolMessageRelease, ToolResultProtectionError   } from '@/protection/toolResult';
+import { detachToolControlInterrupt, snapshotToolHandoffState, snapshotToolHandoffWrite, snapshotToolInputMessages, snapshotToolCallSources, admitToolResultCheckpoints, snapshotToolRunStepState, snapshotToolMessageRemoval, validateToolMessageHistory, getToolMessageRelease, ToolResultProtectionError   } from '@/protection/toolResult';
 import {
   createCloudflareProgrammaticToolCallingTool,
   createCloudflareBashProgrammaticToolCallingTool,
@@ -4115,4 +4115,80 @@ it('preserves the private SDK restart marker through the protected native abort 
   const marker = createProviderTextRestartCancellation(); const abort = new AbortController();
   const node = new ToolNode({ trace: true, tools: [direct(() => { abort.abort(marker); throw marker; })], toolResultProtection: policy() });
   await expect(node.invoke(state(), { signal: abort.signal })).rejects.toBe(marker);
+});
+
+it.each((['tool', 'chain'] as const).flatMap((callback) => (['append', 'replace', 'getter', 'proxy-array', 'diagnostic', 'control'] as const).flatMap((mutation) => [true, false].map((handling) => [callback, mutation, handling] as const))))('readmits boundary-created empty interrupts after native %s errors (%s/handling=%s)', async (callback, mutation, handleToolErrors) => {
+  let reads = 0; let callbacks = 0; let retained: Error | undefined; const observed: string[] = [];
+  const change = (error: Error): void => {
+    if (!(error instanceof GraphInterrupt)) return;
+    callbacks++; retained = error; observed.push(String(error));
+    if (mutation === 'append') error.interrupts.push({ id: 'callback-injected', value: fixtures.canaries[0] });
+    if (mutation === 'replace') Object.defineProperty(error, 'interrupts', { value: [{ id: 'callback-injected', value: fixtures.canaries[0] }] });
+    if (mutation === 'getter') Object.defineProperty(error, 'interrupts', { get: () => { reads++; throw new Error(fixtures.canaries[0]); } });
+    if (mutation === 'proxy-array') error.interrupts = new Proxy([], { get: () => { reads++; throw new Error(fixtures.canaries[0]); } });
+    if (mutation === 'diagnostic') { error.message = fixtures.canaries[0]; error.stack = fixtures.canaries[0]; error.name = fixtures.canaries[0]; Object.defineProperty(error, 'cause', { value: fixtures.canaries[0] }); }
+  };
+  const observer = BaseCallbackHandler.fromMethods(callback === 'tool' ? { handleToolError: change } : { handleChainError: change }); observer.awaitHandlers = true;
+  const node = new ToolNode({ trace: true, tools: [direct(() => { throw new GraphInterrupt([]); })], toolResultProtection: policy(), handleToolErrors });
+  const result = await node.invoke(state(), { callbacks: [observer] }).catch((error: Error) => error);
+  expect(callbacks).toBe(1); expect(reads).toBe(0); assertNoCanary(observed.join('')); assertNoCanary(String(result)); assertNoCanary(JSON.stringify(result));
+  if (mutation === 'control' || mutation === 'diagnostic') {
+    expect(result).toBeInstanceOf(GraphInterrupt); expect((result as GraphInterrupt).interrupts).toEqual([]); expect(result).not.toBe(retained); expect(result).not.toHaveProperty('cause');
+    retained!.message = fixtures.canaries[0]; expect(String(result)).not.toContain(fixtures.canaries[0]);
+  } else expect(result).toMatchObject({ code: 'unsupported' });
+});
+
+it.each(['append', 'getter', 'diagnostic', 'control'] as const)('keeps callback-mutated producer control interrupts out of Run persistence (%s)', async (mutation) => {
+  let reads = 0; let modelCalls = 0; const saver = new MemorySaver(); const runId = `empty-interrupt-callback-${mutation}`; const observed: string[] = [];
+  const callback = BaseCallbackHandler.fromMethods({ handleToolError: (error): void => {
+    if (!(error instanceof GraphInterrupt)) return;
+    if (mutation === 'append') error.interrupts.push({ id: 'raw-injected-interrupt', value: fixtures.canaries[0] });
+    if (mutation === 'getter') Object.defineProperty(error, 'interrupts', { get: () => { reads++; throw new Error(fixtures.canaries[0]); } });
+    if (mutation === 'diagnostic') { error.message = fixtures.canaries[0]; Object.defineProperty(error, 'cause', { value: fixtures.canaries[0] }); }
+  }, handleChainEnd: (value): void => { observed.push(JSON.stringify(value)); } }); callback.awaitHandlers = true;
+  const run = await Run.create({ runId, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, tools: [direct(() => { throw new GraphInterrupt([]); })], compileOptions: { checkpointer: saver } }, toolResultProtection: policy() });
+  class Model extends FakeChatModel { override async *_streamResponseChunks(...args: Parameters<FakeChatModel['_streamResponseChunks']>): ReturnType<FakeChatModel['_streamResponseChunks']> { modelCalls++; yield* super._streamResponseChunks(...args); } }
+  run.Graph!.overrideModel = new Model({ responses: [''], toolCalls: [{ id: 'empty-control', name: 'lookup', args: { count: 42 }, type: 'tool_call' }] });
+  const config = { version: 'v2' as const, configurable: { thread_id: runId }, callbacks: [callback] };
+  const result = await run.processStream({ messages: [new HumanMessage('Allowed input')] }, config).catch((error: Error) => error);
+  expect(reads).toBe(0); expect(modelCalls).toBe(1); assertNoCanary(String(result)); assertNoCanary(run.getInterrupt() ?? {}); assertNoCanary(observed.join(''));
+  for await (const tuple of saver.list({ configurable: { thread_id: runId } })) { assertNoCanary(tuple.checkpoint.channel_values); assertNoCanary(tuple.pendingWrites ?? []); }
+  if (mutation === 'control' || mutation === 'diagnostic') expect(result).toBeUndefined(); else expect(result).toMatchObject({ code: 'unsupported' });
+});
+
+it.each(['append', 'getter', 'control'] as const)('readmits empty native interrupts in nested selected execution (%s)', async (mutation) => {
+  let reads = 0; const callback = BaseCallbackHandler.fromMethods({ handleToolError: (error): void => {
+    if (!(error instanceof GraphInterrupt)) return;
+    if (mutation === 'append') error.interrupts.push({ value: fixtures.canaries[0] });
+    if (mutation === 'getter') Object.defineProperty(error, 'interrupts', { get: () => { reads++; throw new Error(fixtures.canaries[0]); } });
+  } }); callback.awaitHandlers = true;
+  const source = direct(() => { throw new GraphInterrupt([]); }); source.callbacks = [callback];
+  const result = await executeTools([{ id: 'nested-empty', name: 'lookup', input: { count: 42 } }], new Map([['lookup', source]]), Constants.PROGRAMMATIC_TOOL_CALLING, { policy: policy() }).catch((error: Error) => error);
+  expect(reads).toBe(0); assertNoCanary(String(result)); assertNoCanary(JSON.stringify(result));
+  if (mutation !== 'control') expect(result).toMatchObject({ code: 'unsupported' }); else expect(result).toEqual(expect.any(Array));
+});
+
+it.each(['absent', 'unselected'] as const)('preserves ordinary payload interrupts when result protection is %s', async (mode) => {
+  const callback = BaseCallbackHandler.fromMethods({ handleToolError: (error): void => { if (error instanceof GraphInterrupt) error.interrupts.push({ value: 'Allowed ordinary interrupt' }); } }); callback.awaitHandlers = true;
+  const node = new ToolNode({ trace: true, tools: [direct(() => { throw new GraphInterrupt([]); })], ...(mode === 'unselected' ? { toolResultProtection: policy({ toolNames: ['other'] }) } : {}) });
+  const result = await node.invoke(state(), { callbacks: [callback] }).catch((error: Error) => error);
+  expect(result).toBeInstanceOf(GraphInterrupt); expect((result as GraphInterrupt).interrupts[0].value).toBe('Allowed ordinary interrupt');
+});
+
+it('does not reinterpret genuine SDK approval interrupts as boundary-created controls', () => {
+  const payload = { type: 'tool_approval', action_requests: [{ name: 'lookup', tool_call_id: 'allowed-approval', arguments: { count: 42 } }], review_configs: [{ action_name: 'lookup', tool_call_id: 'allowed-approval', allowed_decisions: ['approve'] }] };
+  const approval = new GraphInterrupt([{ id: 'approval-control', value: payload }]);
+  expect(detachToolControlInterrupt(approval)).toBeUndefined(); expect(approval.interrupts[0].value).toBe(payload);
+  expect(detachToolControlInterrupt(new GraphInterrupt([]))).toBeUndefined();
+});
+
+it('detaches delayed native tool-error aliases without modifying the shared producer implementation', async () => {
+  let retained: GraphInterrupt | undefined;
+  const callback = BaseCallbackHandler.fromMethods({ handleToolError: (error): void => { if (error instanceof GraphInterrupt) retained = error; } }); callback.awaitHandlers = true;
+  const producer = direct(() => { throw new GraphInterrupt([]); }); const invoke = producer.invoke; const call = producer.call;
+  const node = new ToolNode({ trace: true, tools: [producer], toolResultProtection: policy() });
+  const result = await node.invoke(state(), { callbacks: [callback] }).catch((error: Error) => error);
+  expect(result).toBeInstanceOf(GraphInterrupt); expect(result).not.toBe(retained); expect(retained).toBeDefined();
+  await new Promise<void>((resolve) => setImmediate(() => { retained!.interrupts.push({ id: 'late-native-alias', value: fixtures.canaries[0] }); retained!.message = fixtures.canaries[0]; resolve(); }));
+  expect((result as GraphInterrupt).interrupts).toEqual([]); assertNoCanary(String(result)); assertNoCanary(JSON.stringify(result)); expect(producer.invoke).toBe(invoke); expect(producer.call).toBe(call);
 });

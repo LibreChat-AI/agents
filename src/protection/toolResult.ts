@@ -145,6 +145,22 @@ export function normalizeToolResultError(
   );
 }
 
+const emptyToolInterrupts = new WeakSet<object>();
+
+function emptyToolInterrupt(): GraphInterrupt {
+  const error = new GraphInterrupt([]);
+  emptyToolInterrupts.add(error);
+  return error;
+}
+
+/** Only boundary-created empty controls are eligible; SDK approvals carry separate provenance. */
+export function detachToolControlInterrupt(error: unknown): GraphInterrupt | undefined {
+  if (error == null || typeof error !== 'object' || !emptyToolInterrupts.has(error)) return undefined;
+  const interrupts = ownMessageValue(error, 'interrupts');
+  if (snapshotToolCheckpointArray(interrupts as readonly object[]).length !== 0) throw new ToolResultProtectionError('unsupported');
+  return emptyToolInterrupt();
+}
+
 const detachedToolSafetyErrors = new WeakSet<Error>();
 
 /** Public safety-error classes do not certify producer-controlled diagnostics. */
@@ -164,7 +180,7 @@ export function detachToolSafetyError(error: unknown, releasedOnly = false): Pre
 /** Native runnable abort races must observe the same raw-free failures as tool bodies. */
 export async function withToolResultSafetySignal<T>(signal: AbortSignal | undefined, invoke: (signal: AbortSignal | undefined) => Promise<T>): Promise<T> {
   if (signal == null) {
-    try { return await invoke(signal); } catch (error) { throw detachToolSafetyError(error, true) ?? error; }
+    try { return await invoke(signal); } catch (error) { throw detachToolControlInterrupt(error) ?? detachToolSafetyError(error, true) ?? error; }
   }
   const controller = new AbortController();
   const abort = (): void => {
@@ -178,7 +194,7 @@ export async function withToolResultSafetySignal<T>(signal: AbortSignal | undefi
   signal.addEventListener('abort', abort, { once: true });
   if (signal.aborted) abort();
   try { return await invoke(controller.signal); }
-  catch (error) { throw detachToolSafetyError(error, true) ?? error; }
+  catch (error) { throw detachToolControlInterrupt(error) ?? detachToolSafetyError(error, true) ?? error; }
   finally { signal.removeEventListener('abort', abort); }
 }
 
@@ -1764,7 +1780,7 @@ export function withToolResultBoundary(
           if (safety != null) throw safety;
           if (error instanceof GraphInterrupt) {
             const interrupts = ownMessageValue(error, 'interrupts');
-            if (snapshotToolCheckpointArray(interrupts as readonly object[]).length === 0) throw new GraphInterrupt([]);
+            if (snapshotToolCheckpointArray(interrupts as readonly object[]).length === 0) throw emptyToolInterrupt();
             throw new ToolResultProtectionError('unsupported');
           }
           if (error instanceof ParentCommand)
@@ -1825,16 +1841,20 @@ export function withToolResultBoundary(
           throw normalizeToolResultError(error);
         const safety = detachToolSafetyError(error);
         if (safety != null) throw safety;
-        if (
-          error instanceof GraphInterrupt ||
-          (error instanceof Error &&
-            isReleasedToolError(policy, toolName, id, error))
-        )
-          throw error;
+        const control = detachToolControlInterrupt(error);
+        if (control != null) throw control;
+        if (error instanceof Error && isReleasedToolError(policy, toolName, id, error)) throw error;
         throw new ToolResultProtectionError('unavailable');
       } finally {
         attempt.finish();
       }
+    },
+  });
+  const invokeNative = protectedTool.invoke;
+  Object.defineProperty(protectedTool, 'invoke', {
+    value: async (...args: Parameters<StructuredTool['invoke']>): ReturnType<StructuredTool['invoke']> => {
+      try { return await invokeNative.apply(protectedTool, args); }
+      catch (error) { throw detachToolControlInterrupt(error) ?? error; }
     },
   });
   return protectedTool;
