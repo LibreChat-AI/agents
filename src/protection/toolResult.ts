@@ -1243,8 +1243,9 @@ function toolSourceName(sources: ToolCallSources, id: string, messageId: string 
   return matches[0]?.name;
 }
 
-function assertToolProposalSource(sources: ToolCallSources, id: string, name: string, batchId: string | undefined): void {
+function assertToolProposalSource(sources: ToolCallSources, id: string, name: string, batchId: string | undefined, requireBatchIdentity = false): void {
   const candidates = sources.get(id) ?? [];
+  if (requireBatchIdentity && batchId == null && candidates.some((source) => source.name !== name)) throw new ToolResultProtectionError('unsupported');
   const batch = batchId == null ? [] : candidates.filter((source) => source.batchId === batchId);
   const matches = batch.length > 0 ? batch : candidates.filter((source) => !source.completed);
   if (matches.some((source) => source.name !== name)) throw new ToolResultProtectionError('unsupported');
@@ -1286,7 +1287,7 @@ function toolOutcomeGuard(policy: ToolResultProtection, value: unknown, active =
         for (const call of calls!) {
           if (typeof call.name !== 'string' || (call.id != null && (typeof call.id !== 'string' || call.id === '' || ids.has(call.id)))) throw new ToolResultProtectionError('unsupported');
           if (call.id != null) {
-            if (context.sources != null) assertToolProposalSource(context.sources, call.id, call.name, batchId ?? undefined);
+            if (context.sources != null) assertToolProposalSource(context.sources, call.id, call.name, batchId ?? undefined, context.control === true);
             ids.add(call.id); context.proposals?.set(call.id, { name: call.name, batchId: batchId ?? undefined });
           }
         }

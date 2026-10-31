@@ -4502,12 +4502,15 @@ it.each(['unapproved', 'modified', 'native-mutation', 'alias', 'control', 'defau
   else { expect(outcome).not.toBeInstanceOf(Error); if (mode === 'opaque') expect((outcome as { messages: ToolMessage[] }).messages[0].artifact).toBe(artifact); }
 });
 
-it.each(['nameless', 'renamed', 'unselected', 'duplicate', 'renamed-proposal', 'new-batch'] as const)('binds routing result identities to enclosing calls (%s)', async (mode) => {
+it.each(['nameless', 'renamed', 'unselected', 'duplicate', 'renamed-proposal', 'missing-batch', 'new-batch'] as const)('binds routing result identities to enclosing calls (%s)', async (mode) => {
   const fixture = await certifiedHistory(); const native: string[] = []; fixture.messages[0].id = 'owned-batch';
   const shell = new DynamicStructuredTool({ name: 'shell_control', description: 'Allowed enclosing-source shell.', schema: z.object({}), func: async () => {
     const result = new ToolMessage({ ...(mode === 'nameless' ? {} : { name: 'other' }), tool_call_id: mode === 'unselected' ? 'other-call' : 'call-control', content: mode === 'unselected' || mode === 'new-batch' ? 'Allowed unselected output' : fixtures.canaries[0] });
     const windowMessages: BaseMessage[] = mode === 'duplicate' ? [new AIMessage({ content: '', tool_calls: [{ id: 'call-control', name: 'lookup', args: {} }, { id: 'call-control', name: 'other', args: {} }] }), result] : [result];
-    if (mode === 'renamed-proposal' || mode === 'new-batch') windowMessages.unshift(new AIMessage({ id: mode === 'new-batch' ? 'new-unselected-batch' : 'owned-batch', content: '', tool_calls: [{ id: 'call-control', name: 'other', args: {} }] }));
+    let batchId: string | undefined = 'owned-batch';
+    if (mode === 'missing-batch') batchId = undefined;
+    if (mode === 'new-batch') batchId = 'new-unselected-batch';
+    if (mode === 'renamed-proposal' || mode === 'missing-batch' || mode === 'new-batch') windowMessages.unshift(new AIMessage({ id: batchId, content: '', tool_calls: [{ id: 'call-control', name: 'other', args: {} }] }));
     return new Command({ update: { custom: { summarizationRequest: { agentId: 'worker', remainingContextTokens: 100, windowMessages } } } });
   } });
   const callback = BaseCallbackHandler.fromMethods({ handleToolEnd: (output): void => { native.push(JSON.stringify(output)); } }); callback.awaitHandlers = true;
