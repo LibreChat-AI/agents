@@ -26,12 +26,15 @@ import {
 } from '@/tools/CallerCapabilities';
 import {
   addTailCacheControl,
+  addBedrockTailCacheControl,
+  stripBedrockCacheControl,
   stripAnthropicCacheControl,
   addCacheControlToStablePrefixMessages,
   buildAnthropicCacheControl,
   buildBedrockCachePoint,
   resolvePromptCacheTtl,
   resolveBedrockPromptCacheTtl,
+  supportsBedrockToolCache,
   cloneMessage,
   type PromptCacheTtl,
 } from '@/messages/cache';
@@ -78,6 +81,20 @@ type AgentSystemContentBlock =
 
 type PromptCacheProvider = Providers.ANTHROPIC | Providers.OPENROUTER;
 
+/** Anthropic's limit of cache_control blocks per request. */
+const MAX_PROMPT_CACHE_BREAKPOINTS = 4;
+
+function countMarkedBlocks(
+  messages: BaseMessage[],
+  marker: 'cache_control' | 'cachePoint'
+): number {
+  return messages
+    .flatMap((message) =>
+      Array.isArray(message.content) ? message.content : []
+    )
+    .filter((block) => typeof block === 'object' && marker in block).length;
+}
+
 type ProgrammaticToolInstructionTarget = {
   name: string;
   codeGuidance: string;
@@ -120,6 +137,7 @@ export class AgentContext {
       toolDefinitions,
       instructions,
       additional_instructions,
+      conversation_instructions,
       streamBuffer,
       maxContextTokens,
       reasoningKey,
@@ -155,6 +173,7 @@ export class AgentContext {
       toolDefinitions,
       instructions,
       additionalInstructions: additional_instructions,
+      conversationInstructions: conversation_instructions,
       reasoningKey,
       toolEnd,
       instructionTokens: 0,
@@ -341,10 +360,12 @@ export class AgentContext {
     }
   }
 
-  /** Total instruction overhead: system message + tool schemas + pending summary. */
+  /** Total instruction overhead: system message + tool schemas + summary carried as a message. */
   get instructionTokens(): number {
     const summaryOverhead =
-      this._summaryLocation === 'user_message' ? this.summaryTokenCount : 0;
+      this._summaryLocation === 'user_message' || this.summaryAsMessage
+        ? this.summaryTokenCount
+        : 0;
     return (
       this.systemMessageTokens +
       this.dynamicInstructionTokens +
@@ -386,6 +407,8 @@ export class AgentContext {
   instructions?: string;
   /** Additional instructions for this agent */
   additionalInstructions?: string;
+  /** Per-conversation instructions kept at a fixed position after `instructions` */
+  conversationInstructions?: string;
   /** Reasoning key for this agent */
   reasoningKey: 'reasoning_content' | 'reasoning' = 'reasoning_content';
   /** Last token for reasoning detection */
@@ -430,6 +453,8 @@ export class AgentContext {
    * - `'system_prompt'`: cross-run summary, included in the dynamic system tail
    * - `'user_message'`: mid-run compaction, injected as HumanMessage on clean slate
    * - `'none'`: no summary present
+   * With `conversation_instructions` both kinds are injected as the same
+   * message right after the system message (see `summaryAsMessage`).
    */
   private _summaryLocation: 'system_prompt' | 'user_message' | 'none' = 'none';
   /** Whether a mid-run summary must appear before every retained message. */
@@ -513,6 +538,7 @@ export class AgentContext {
     toolDefinitions,
     instructions,
     additionalInstructions,
+    conversationInstructions,
     reasoningKey,
     toolEnd,
     instructionTokens,
@@ -542,6 +568,7 @@ export class AgentContext {
     toolDefinitions?: t.LCTool[];
     instructions?: string;
     additionalInstructions?: string;
+    conversationInstructions?: string;
     reasoningKey?: 'reasoning_content' | 'reasoning';
     toolEnd?: boolean;
     instructionTokens?: number;
@@ -581,6 +608,7 @@ export class AgentContext {
     ) as t.LCTool[] | undefined;
     this.instructions = instructions;
     this.additionalInstructions = additionalInstructions;
+    this.conversationInstructions = conversationInstructions;
     if (reasoningKey) {
       this.reasoningKey = reasoningKey;
     }
@@ -844,6 +872,7 @@ export class AgentContext {
 
     this.cachedSystemRunnable = this.buildSystemRunnable({
       stableInstructions: this.buildStableInstructionsString(),
+      conversationInstructions: this.conversationInstructions ?? '',
       dynamicInstructions: this.buildDynamicInstructionsString(),
     });
     this.systemRunnableStale = false;
@@ -858,6 +887,7 @@ export class AgentContext {
     if (this.systemRunnableStale || this.cachedSystemRunnable === undefined) {
       this.cachedSystemRunnable = this.buildSystemRunnable({
         stableInstructions: this.buildStableInstructionsString(),
+        conversationInstructions: this.conversationInstructions ?? '',
         dynamicInstructions: this.buildDynamicInstructionsString(),
       });
       this.systemRunnableStale = false;
@@ -889,6 +919,17 @@ export class AgentContext {
   }
 
   /**
+   * With `conversation_instructions` the summary is its own message right
+   * after the system message, rendered the same way whether it came from a
+   * compaction in this run or from `initialSummary`, so the requests after a
+   * compaction and the next run share their prefix. Hosts that do not pass
+   * the field keep the earlier placement.
+   */
+  private get summaryAsMessage(): boolean {
+    return this.conversationInstructions != null;
+  }
+
+  /**
    * Builds the dynamic system-tail string (without creating SystemMessage).
    * Keep this out of prompt-cache-marked content so volatile context does not
    * invalidate the stable prefix.
@@ -908,6 +949,7 @@ export class AgentContext {
     // summaries are injected as a HumanMessage on the post-compaction clean
     // slate instead (see buildSystemRunnable).
     if (
+      !this.summaryAsMessage &&
       this._summaryLocation === 'system_prompt' &&
       this.summaryText != null &&
       this.summaryText !== ''
@@ -952,9 +994,11 @@ export class AgentContext {
    */
   private buildSystemRunnable({
     stableInstructions,
+    conversationInstructions,
     dynamicInstructions,
   }: {
     stableInstructions: string;
+    conversationInstructions: string;
     dynamicInstructions: string;
   }):
     | Runnable<
@@ -964,27 +1008,43 @@ export class AgentContext {
       >
     | undefined {
     const hasMidRunSummary =
-      this._summaryLocation === 'user_message' &&
-      this.summaryText != null &&
-      this.summaryText !== '';
+      (this.summaryAsMessage || this._summaryLocation === 'user_message') &&
+      this.hasSummary();
 
-    if (!stableInstructions && !dynamicInstructions && !hasMidRunSummary) {
+    if (
+      !stableInstructions &&
+      !conversationInstructions &&
+      !dynamicInstructions &&
+      !hasMidRunSummary
+    ) {
       this.systemMessageTokens = 0;
       this.dynamicInstructionTokens = 0;
       return undefined;
     }
 
     const promptCacheProvider = this.getPromptCacheProvider();
+    /**
+     * Bedrock reads `tools`, `system` and `messages` in that order, so text after the
+     * last system checkpoint sits in front of the whole history and a changing tail
+     * there misses every message checkpoint. With prompt caching the tail moves behind
+     * the history, as for Anthropic.
+     */
+    const bedrockCache = this.hasBedrockPromptCache();
     const shouldMoveDynamicInstructions =
-      promptCacheProvider != null &&
-      stableInstructions !== '' &&
+      (promptCacheProvider != null || bedrockCache) &&
+      (stableInstructions !== '' || conversationInstructions !== '') &&
       dynamicInstructions !== '';
-    const systemMessage = this.buildSystemMessage({
-      stableInstructions,
-      dynamicInstructions,
-      promptCacheProvider,
-      shouldMoveDynamicInstructions,
-    });
+    const movedBedrockTail = bedrockCache && shouldMoveDynamicInstructions;
+    const buildSystem = (markConversation: boolean): SystemMessage | undefined =>
+      this.buildSystemMessage({
+        stableInstructions,
+        conversationInstructions,
+        dynamicInstructions,
+        promptCacheProvider,
+        shouldMoveDynamicInstructions,
+        markConversation,
+      });
+    const systemMessage = buildSystem(true);
 
     if (this.tokenCounter) {
       this.systemMessageTokens = systemMessage
@@ -996,24 +1056,24 @@ export class AgentContext {
     }
 
     return markProviderTextInput(RunnableLambda.from((messages: BaseMessage[]) => {
-      const prefix: BaseMessage[] = systemMessage ? [systemMessage] : [];
-
       // Build the non-system portion (summary + conversation), then apply
       // cache markers separately so addCacheControl doesn't strip the
       // SystemMessage's own cache_control breakpoint set above.
+      const summaryMessageFirst = this.summaryAsMessage && this.hasSummary();
       const hasSummaryBody =
+        !this.summaryAsMessage &&
         this._summaryLocation === 'user_message' &&
-        this.summaryText != null &&
-        this.summaryText !== '';
+        this.hasSummary();
 
       const bodyWithSummary =
-        hasSummaryBody && promptCacheProvider == null
+        hasSummaryBody && promptCacheProvider == null && !movedBedrockTail
           ? [this.buildSummaryHumanMessage(promptCacheProvider), ...messages]
           : messages;
       const dynamicTail = this.buildPromptCacheDynamicTail({
         dynamicInstructions,
         hasSummaryBody,
-        promptCacheProvider,
+        promptCacheProvider:
+          promptCacheProvider ?? (movedBedrockTail ? Providers.BEDROCK : undefined),
         shouldMoveDynamicInstructions,
       });
       let body = this.buildBodyWithPromptCacheDynamicTail(
@@ -1032,7 +1092,26 @@ export class AgentContext {
           this.getPromptCacheTtl(promptCacheProvider)
         );
       }
-      return [...prefix, ...body];
+
+      if (summaryMessageFirst) {
+        body = [this.buildSummaryHumanMessage(undefined), ...body];
+      }
+      // The conversation block gets a breakpoint only while one is left after
+      // tools, the stable block and the markers already in the body.
+      const toolPoints = bedrockCache
+        ? Number(
+          supportsBedrockToolCache(
+            (this.clientOptions as { model?: string } | undefined)?.model
+          )
+        )
+        : 1;
+      const room =
+        MAX_PROMPT_CACHE_BREAKPOINTS -
+        toolPoints -
+        (stableInstructions !== '' ? 1 : 0) -
+        countMarkedBlocks(body, bedrockCache ? 'cachePoint' : 'cache_control');
+      const system = room >= 1 ? systemMessage : buildSystem(false);
+      return system ? [system, ...body] : body;
     })).withConfig({ runName: 'prompt' });
   }
 
@@ -1066,7 +1145,7 @@ export class AgentContext {
   }: {
     dynamicInstructions: string;
     hasSummaryBody: boolean;
-    promptCacheProvider: PromptCacheProvider | undefined;
+    promptCacheProvider: PromptCacheProvider | Providers.BEDROCK | undefined;
     shouldMoveDynamicInstructions: boolean;
   }): BaseMessage[] {
     if (promptCacheProvider == null) {
@@ -1099,6 +1178,16 @@ export class AgentContext {
         : this.getPromptCacheDynamicTailIndex(messages, promptCacheProvider);
     const stablePrefix = messages.slice(0, tailIndex);
     const trailingMessages = messages.slice(tailIndex);
+    if (this.hasBedrockPromptCache()) {
+      // The opening message is not an anchor, as for Anthropic.
+      const bedrockTtl = this.getBedrockPromptCacheTtl();
+      return [
+        ...stripBedrockCacheControl(stablePrefix.slice(0, 1)),
+        ...addBedrockTailCacheControl(stablePrefix.slice(1), bedrockTtl),
+        ...tail,
+        ...addBedrockTailCacheControl(trailingMessages, bedrockTtl),
+      ];
+    }
     const ttl = this.getPromptCacheTtl(promptCacheProvider);
     const cacheablePrefix = this.addStablePromptCacheMarkers(stablePrefix, ttl);
     // Mark only the conversation suffix: marking the assembled body would strip
@@ -1218,67 +1307,86 @@ export class AgentContext {
 
   private buildSystemMessage({
     stableInstructions,
+    conversationInstructions,
     dynamicInstructions,
     promptCacheProvider,
     shouldMoveDynamicInstructions,
+    markConversation,
   }: {
     stableInstructions: string;
+    conversationInstructions: string;
     dynamicInstructions: string;
     promptCacheProvider: PromptCacheProvider | undefined;
     shouldMoveDynamicInstructions: boolean;
+    markConversation: boolean;
   }): SystemMessage | undefined {
-    if (!stableInstructions && !dynamicInstructions) {
+    if (!stableInstructions && !conversationInstructions && !dynamicInstructions) {
       return undefined;
     }
 
-    if (promptCacheProvider === Providers.ANTHROPIC) {
+    const systemDynamic = shouldMoveDynamicInstructions
+      ? ''
+      : dynamicInstructions;
+
+    if (
+      promptCacheProvider === Providers.OPENROUTER &&
+      !stableInstructions &&
+      !conversationInstructions
+    ) {
+      return new SystemMessage(dynamicInstructions);
+    }
+
+    if (promptCacheProvider != null) {
+      const cacheControl = buildAnthropicCacheControl(
+        this.getPromptCacheTtl(promptCacheProvider)
+      );
       const content: AgentSystemContentBlock[] = [];
       if (stableInstructions) {
         content.push({
           type: 'text',
           text: stableInstructions,
-          cache_control: buildAnthropicCacheControl(
-            this.getPromptCacheTtl(promptCacheProvider)
-          ),
+          cache_control: cacheControl,
         });
       }
-      if (dynamicInstructions && !shouldMoveDynamicInstructions) {
-        content.push({ type: 'text', text: dynamicInstructions });
+      if (conversationInstructions) {
+        content.push({
+          type: 'text',
+          text: conversationInstructions,
+          ...(markConversation && { cache_control: cacheControl }),
+        });
+      }
+      if (systemDynamic) {
+        content.push({ type: 'text', text: systemDynamic });
       }
       return new SystemMessage({ content } as BaseMessageFields);
     }
 
-    if (promptCacheProvider === Providers.OPENROUTER && !stableInstructions) {
-      return new SystemMessage(dynamicInstructions);
-    }
-
-    if (promptCacheProvider === Providers.OPENROUTER) {
-      return new SystemMessage({
-        content: [
-          {
-            type: 'text',
-            text: stableInstructions,
-            cache_control: buildAnthropicCacheControl(
-              this.getPromptCacheTtl(promptCacheProvider)
-            ),
-          },
-        ],
-      } as BaseMessageFields);
-    }
-
-    if (this.hasBedrockPromptCache() && stableInstructions) {
-      const content: AgentSystemContentBlock[] = [
-        { type: 'text', text: stableInstructions },
-        { cachePoint: buildBedrockCachePoint(this.getBedrockPromptCacheTtl()) },
-      ];
-      if (dynamicInstructions) {
-        content.push({ type: 'text', text: dynamicInstructions });
+    if (
+      this.hasBedrockPromptCache() &&
+      (stableInstructions || conversationInstructions)
+    ) {
+      const ttl = this.getBedrockPromptCacheTtl();
+      const content: AgentSystemContentBlock[] = [];
+      if (stableInstructions) {
+        content.push(
+          { type: 'text', text: stableInstructions },
+          { cachePoint: buildBedrockCachePoint(ttl) }
+        );
+      }
+      if (conversationInstructions) {
+        content.push({ type: 'text', text: conversationInstructions });
+        if (markConversation) {
+          content.push({ cachePoint: buildBedrockCachePoint(ttl) });
+        }
+      }
+      if (systemDynamic) {
+        content.push({ type: 'text', text: systemDynamic });
       }
       return new SystemMessage({ content } as BaseMessageFields);
     }
 
     return new SystemMessage(
-      [stableInstructions, dynamicInstructions]
+      [stableInstructions, conversationInstructions, dynamicInstructions]
         .filter((part) => part !== '')
         .join('\n\n')
     );
@@ -1581,7 +1689,8 @@ export class AgentContext {
     this.summaryText = text;
     this.summaryTokenCount = tokenCount;
     this._summaryLocation = 'user_message';
-    this.summaryPrecedesMessages = options?.precedesMessages === true;
+    this.summaryPrecedesMessages =
+      !this.summaryAsMessage && options?.precedesMessages === true;
     this._durableSummaryText = text;
     this._durableSummaryTokenCount = tokenCount;
     this.durableSummaryPrecedesMessages = this.summaryPrecedesMessages;
