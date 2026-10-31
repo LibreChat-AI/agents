@@ -4472,3 +4472,31 @@ it.each(['mutate', 'alias', 'control', 'default-off'] as const)('readmits native
   assertNoCanary(outcome);
   if (mode === 'mutate') expect(outcome).toBeInstanceOf(ToolResultProtectionError); else expect(outcome).not.toBeInstanceOf(Error);
 });
+
+it.each((['send', 'custom'] as const).flatMap((carrier) => (['unapproved', 'modified', 'control'] as const).map((mode) => [carrier, mode] as const)))('admits selected results inside routing compaction snapshots (%s/%s)', async (carrier, mode) => {
+  const fixture = await certifiedHistory(); const native: string[] = [];
+  const selected = mode === 'unapproved' ? new ToolMessage({ name: 'lookup', tool_call_id: 'call-control', content: fixtures.canaries[0] }) : fixture.messages[1];
+  if (mode === 'modified') selected.content = fixtures.canaries[0];
+  const request = { agentId: 'worker', remainingContextTokens: 100, windowMessages: [fixture.messages[0], selected] };
+  const shell = new DynamicStructuredTool({ name: 'shell_control', description: 'Allowed snapshot shell.', schema: z.object({}), func: async () => carrier === 'send' ? new Command({ graph: Command.PARENT, goto: [new Send('worker', { summarizationRequest: request })] }) : new Command({ update: { custom: { summarizationRequest: request } } }) });
+  const callback = BaseCallbackHandler.fromMethods({ handleToolEnd: (output): void => { native.push(JSON.stringify(output)); } }); callback.awaitHandlers = true;
+  const node = new ToolNode({ tools: [shell], trace: true, toolResultProtection: fixture.gate });
+  const outcome = await node.invoke({ messages: [new AIMessage({ content: '', tool_calls: [{ id: 'shell-call', name: 'shell_control', args: {}, type: 'tool_call' }] })] }, { callbacks: [callback] }).catch((error: Error) => error);
+  assertNoCanary(native.join('')); assertNoCanary(outcome);
+  if (mode === 'control') expect(outcome).not.toBeInstanceOf(Error); else { expect(native).toEqual([]); expect(outcome).toBeInstanceOf(ToolResultProtectionError); }
+});
+
+it.each(['unapproved', 'modified', 'native-mutation', 'alias', 'control', 'default-off', 'opaque'] as const)('admits native tuple content before tool-end observers (%s)', async (mode) => {
+  const fixture = await certifiedHistory(); const native: string[] = []; let retained: ToolMessage | undefined;
+  const selected = mode === 'unapproved' || mode === 'default-off' ? new ToolMessage({ name: 'lookup', tool_call_id: 'call-control', content: fixtures.canaries[0] }) : fixture.messages[1];
+  if (mode === 'modified') selected.content = fixtures.canaries[0];
+  const artifact = { opaque: new Date(0) };
+  const shell = new DynamicStructuredTool({ name: 'shell_control', description: 'Allowed tuple shell.', schema: z.object({}), responseFormat: 'content_and_artifact', func: async () => mode === 'opaque' ? ['Allowed unselected prose', artifact] : [selected, null] });
+  const callback = BaseCallbackHandler.fromMethods({ handleToolEnd: (output): void => { native.push(JSON.stringify(output)); retained = output as ToolMessage; if (mode === 'native-mutation') retained.content = fixtures.canaries[0]; } }); callback.awaitHandlers = true;
+  const node = new ToolNode({ tools: [shell], trace: true, ...(mode === 'default-off' ? {} : { toolResultProtection: fixture.gate }) });
+  const outcome = await node.invoke({ messages: [new AIMessage({ content: '', tool_calls: [{ id: 'shell-call', name: 'shell_control', args: {}, type: 'tool_call' }] })] }, { callbacks: [callback] }).catch((error: Error) => error);
+  if (mode === 'default-off') { expect(native.join('')).toContain(fixtures.canaries[0]); return; }
+  assertNoCanary(native.join('')); if (mode === 'alias') retained!.content = fixtures.canaries[0]; assertNoCanary(outcome);
+  if (mode === 'unapproved' || mode === 'modified' || mode === 'native-mutation') expect(outcome).toBeInstanceOf(ToolResultProtectionError);
+  else { expect(outcome).not.toBeInstanceOf(Error); if (mode === 'opaque') expect((outcome as { messages: ToolMessage[] }).messages[0].artifact).toBe(artifact); }
+});

@@ -1329,8 +1329,10 @@ function toolOutcomeGuard(policy: ToolResultProtection, value: unknown, active =
     for (const [field, snapshot] of snapshots) {
       const data = Object.getOwnPropertyDescriptor(record, field)?.value;
       if (data == null) continue;
-      const expected = snapshot(data);
-      guards.set(field, (candidate) => { const detached = snapshot(candidate); if (!isDeepStrictEqual(detached, expected)) throw new ToolResultProtectionError('unsupported'); return detached; });
+      const dataSnapshot = snapshot(data);
+      const guard = toolOutcomeGuard(policy, dataSnapshot, active, depth + 1);
+      const expected = guard(dataSnapshot);
+      guards.set(field, (candidate) => { const detached = guard(snapshot(candidate)); if (!isDeepStrictEqual(detached, expected)) throw new ToolResultProtectionError('unsupported'); return detached; });
     }
     const keys = Object.keys(record);
     for (const field of keys) if (!guards.has(field)) guards.set(field, toolOutcomeGuard(policy, Object.getOwnPropertyDescriptor(record, field)!.value, active, depth + 1));
@@ -1881,8 +1883,7 @@ function withToolResultCarrierBoundary(tool: GenericTool, policy: ToolResultProt
   const shell = Object.create(Object.getPrototypeOf(tool), Object.getOwnPropertyDescriptors(tool)) as StructuredTool;
   const guards = new WeakMap<object, ToolOutcomeGuard>();
   const call: (input: unknown, manager?: CallbackManagerForToolRun, config?: RunnableConfig) => Promise<unknown> = Reflect.get(tool, '_call');
-  Object.defineProperty(shell, '_call', { value: async (input: unknown, manager?: CallbackManagerForToolRun, config?: RunnableConfig): Promise<unknown> => {
-    const raw = await call.call(tool, input, manager, config);
+  const admit = (raw: unknown): unknown => {
     if (raw == null || typeof raw !== 'object') return raw;
     if (types.isProxy(raw)) throw new ToolResultProtectionError('unsupported');
     if (!(raw instanceof Command) && !trustedMessageImplementations.has(Object.getPrototypeOf(raw)) && Object.getOwnPropertyDescriptor(raw, 'lc_direct_tool_output')?.value !== true) return raw;
@@ -1890,6 +1891,13 @@ function withToolResultCarrierBoundary(tool: GenericTool, policy: ToolResultProt
     const detached = guard(raw) as object;
     guards.set(detached, guard);
     return detached;
+  };
+  Object.defineProperty(shell, '_call', { value: async (input: unknown, manager?: CallbackManagerForToolRun, config?: RunnableConfig): Promise<unknown> => {
+    const raw = await call.call(tool, input, manager, config);
+    if (shell.responseFormat !== 'content_and_artifact') return admit(raw);
+    const tuple = snapshotDataArray(raw as readonly unknown[], 2);
+    if (tuple.length !== 2) throw new ToolResultProtectionError('unsupported');
+    return [admit(tuple[0]), tuple[1]];
   } });
   const invoke = shell.invoke;
   Object.defineProperty(shell, 'invoke', { value: async (...args: Parameters<StructuredTool['invoke']>): ReturnType<StructuredTool['invoke']> => {
