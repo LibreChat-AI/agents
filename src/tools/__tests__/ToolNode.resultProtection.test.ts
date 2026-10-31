@@ -4360,7 +4360,7 @@ it.each(['lc_kwargs', 'late-lc_kwargs', 'control'] as const)('rebuilds selected 
 });
 
 it.each((['object', 'tuples', 'send', 'overwrite', 'resume'] as const).flatMap((carrier) => (['mutate', 'before-callback', 'unapproved', 'late', 'control'] as const).map((mode) => [carrier, mode] as const)))('guards released messages in custom state carriers (%s/%s)', async (carrier, mode) => {
-  const fixture = await certifiedHistory(); let retained: ToolMessage | undefined;
+  const fixture = await certifiedHistory(); let retained: ToolMessage | undefined; const nativeOutputs: string[] = [];
   const shell = new DynamicStructuredTool({ name: 'shell_control', description: 'Allowed routing shell.', schema: z.object({}), func: async () => {
     const selected = mode === 'unapproved' ? new ToolMessage({ name: 'lookup', tool_call_id: 'call-control', content: fixtures.canaries[0] }) : fixture.messages[1];
     if (mode === 'before-callback') selected.content = fixtures.canaries[0];
@@ -4370,7 +4370,7 @@ it.each((['object', 'tuples', 'send', 'overwrite', 'resume'] as const).flatMap((
     const update = carrier === 'tuples' ? [['custom', custom]] as [string, unknown][] : { custom: carrier === 'overwrite' ? new Overwrite(custom) : custom };
     return new Command({ update, goto: 'recipient' });
   } });
-  const callback = BaseCallbackHandler.fromMethods({ handleChainEnd: (output): void => {
+  const callback = BaseCallbackHandler.fromMethods({ handleToolEnd: (output): void => { nativeOutputs.push(JSON.stringify(output)); }, handleChainEnd: (output): void => {
     const command = (Array.isArray(output) ? output : output.output)[0] as Command;
     let custom: object;
     if (carrier === 'resume') custom = (command.resume as { custom: object }).custom;
@@ -4383,6 +4383,7 @@ it.each((['object', 'tuples', 'send', 'overwrite', 'resume'] as const).flatMap((
   const node = new ToolNode({ trace: true, tools: [shell], toolResultProtection: fixture.gate });
   const outcome = await node.invoke({ messages: [new AIMessage({ content: '', tool_calls: [{ id: 'shell-call', name: 'shell_control', args: {}, type: 'tool_call' }] })] }, { callbacks: [callback] }).catch((error: Error) => error);
   if (mode === 'late') retained!.content = fixtures.canaries[0];
+  assertNoCanary(nativeOutputs.join(''));
   assertNoCanary(outcome);
   if (mode === 'mutate' || mode === 'before-callback' || mode === 'unapproved') expect(outcome).toMatchObject({ code: 'unsupported' }); else expect(outcome).not.toBeInstanceOf(Error);
 });
@@ -4446,4 +4447,28 @@ it.each((['object', 'tuples'] as const).flatMap((carrier) => [true, false].map((
   const writes: Array<[string, unknown]> = [['subagentResult', { agentId: 'default', message: final }], ['messages', [final]]];
   if (!resultFirst) writes.reverse();
   await expect(run.resume([{ type: 'approve' }], config, undefined, { update: carrier === 'object' ? Object.fromEntries(writes) : writes })).resolves.toBeUndefined();
+});
+
+it.each(['mutate', 'alias', 'control', 'default-off'] as const)('readmits native routing carriers after tool-end observers (%s)', async (mode) => {
+  const fixture = await certifiedHistory(); let retained: ToolMessage | undefined; const observed: string[] = []; let executions = 0;
+  const shell = new DynamicStructuredTool({ name: 'shell_control', description: 'Allowed native routing shell.', schema: z.object({}), func: async () => {
+    executions++;
+    const selected = mode === 'default-off' ? new ToolMessage({ name: 'lookup', tool_call_id: 'call-control', content: fixtures.canaries[0] }) : fixture.messages[1];
+    return new Command({ update: { custom: { selected } } });
+  } });
+  const callback = BaseCallbackHandler.fromMethods({ handleToolEnd: (output): void => {
+    const command = output as Command;
+    const custom = Array.isArray(command.update) ? command.update.find(([key]) => key === 'custom')![1] : command.update!.custom;
+    retained = (custom as { selected: ToolMessage }).selected;
+    observed.push(JSON.stringify(output));
+    if (mode === 'mutate') retained.content = fixtures.canaries[0];
+  } }); callback.awaitHandlers = true;
+  const node = new ToolNode({ tools: [shell], trace: true, ...(mode === 'default-off' ? {} : { toolResultProtection: fixture.gate }) });
+  const outcome = await node.invoke({ messages: [new AIMessage({ content: '', tool_calls: [{ id: 'shell-call', name: 'shell_control', args: {}, type: 'tool_call' }] })] }, { callbacks: [callback] }).catch((error: Error) => error);
+  expect(executions).toBe(1);
+  if (mode === 'default-off') { expect(observed.join('')).toContain(fixtures.canaries[0]); expect(outcome).not.toBeInstanceOf(Error); return; }
+  assertNoCanary(observed.join(''));
+  if (mode === 'alias') retained!.content = fixtures.canaries[0];
+  assertNoCanary(outcome);
+  if (mode === 'mutate') expect(outcome).toBeInstanceOf(ToolResultProtectionError); else expect(outcome).not.toBeInstanceOf(Error);
 });

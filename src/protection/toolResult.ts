@@ -1866,6 +1866,43 @@ function toolBodyCallbacks(
   }) as CallbackManagerForToolRun;
 }
 
+function isNativeToolResultShell(tool: GenericTool): tool is StructuredTool {
+  return tool instanceof StructuredTool && tool.invoke === StructuredTool.prototype.invoke && [
+    StructuredTool.prototype.call,
+    DynamicStructuredTool.prototype.call,
+    DynamicTool.prototype.call,
+    Tool.prototype.call,
+  ].includes(tool.call);
+}
+
+/** Unselected prose stays opaque; embedded releases in native control carriers do not. */
+function withToolResultCarrierBoundary(tool: GenericTool, policy: ToolResultProtection): GenericTool {
+  if (!isNativeToolResultShell(tool)) return tool;
+  const shell = Object.create(Object.getPrototypeOf(tool), Object.getOwnPropertyDescriptors(tool)) as StructuredTool;
+  const guards = new WeakMap<object, ToolOutcomeGuard>();
+  const call: (input: unknown, manager?: CallbackManagerForToolRun, config?: RunnableConfig) => Promise<unknown> = Reflect.get(tool, '_call');
+  Object.defineProperty(shell, '_call', { value: async (input: unknown, manager?: CallbackManagerForToolRun, config?: RunnableConfig): Promise<unknown> => {
+    const raw = await call.call(tool, input, manager, config);
+    if (raw == null || typeof raw !== 'object') return raw;
+    if (types.isProxy(raw)) throw new ToolResultProtectionError('unsupported');
+    if (!(raw instanceof Command) && !trustedMessageImplementations.has(Object.getPrototypeOf(raw)) && Object.getOwnPropertyDescriptor(raw, 'lc_direct_tool_output')?.value !== true) return raw;
+    const guard = toolOutcomeGuard(policy, raw);
+    const detached = guard(raw) as object;
+    guards.set(detached, guard);
+    return detached;
+  } });
+  const invoke = shell.invoke;
+  Object.defineProperty(shell, 'invoke', { value: async (...args: Parameters<StructuredTool['invoke']>): ReturnType<StructuredTool['invoke']> => {
+    const output: unknown = await invoke.apply(shell, args);
+    if (output == null || typeof output !== 'object') return output;
+    const guard = guards.get(output);
+    if (guard == null) return output;
+    guards.delete(output);
+    return guard(output);
+  } });
+  return shell;
+}
+
 /** Intercepts StructuredTool before native tool-end callbacks, never mutating a shared tool. */
 export function withToolResultBoundary(
   tool: GenericTool,
@@ -1874,12 +1911,13 @@ export function withToolResultBoundary(
   config: RunnableConfig,
   requestName = tool.name
 ): GenericTool {
-  if (policy != null) validateToolResultProtection(policy);
+  if (policy == null) return tool;
+  validateToolResultProtection(policy);
   if (
     !requiresToolResultProtection(policy, tool.name) &&
     !requiresToolResultProtection(policy, requestName)
   )
-    return tool;
+    return withToolResultCarrierBoundary(tool, policy);
   if (requestName !== tool.name)
     throw new ToolResultProtectionError('unsupported');
   const toolName = tool.name;
@@ -1893,19 +1931,8 @@ export function withToolResultBoundary(
     ].includes(tool.name)
   )
     throw new ToolResultProtectionError('unsupported');
-  if (!(tool instanceof StructuredTool))
-    throw new ToolResultProtectionError('unsupported');
+  if (!isNativeToolResultShell(tool)) throw new ToolResultProtectionError('unsupported');
   const responseFormat = tool.responseFormat;
-  if (
-    tool.invoke !== StructuredTool.prototype.invoke ||
-    ![
-      StructuredTool.prototype.call,
-      DynamicStructuredTool.prototype.call,
-      DynamicTool.prototype.call,
-      Tool.prototype.call,
-    ].includes(tool.call)
-  )
-    throw new ToolResultProtectionError('unsupported');
   const protectedTool = Object.create(
     Object.getPrototypeOf(tool),
     Object.getOwnPropertyDescriptors(tool)
