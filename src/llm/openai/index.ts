@@ -286,6 +286,26 @@ function applyManagedRequestParams<T extends object>(
   };
 }
 
+/** Deployment aliases must not determine the logical model's token parameter. */
+function preserveReasoningTokenLimit(
+  params: ReturnType<OriginalChatOpenAICompletions['invocationParams']>,
+  model: string,
+  maxTokens: number | undefined
+): ReturnType<OriginalChatOpenAICompletions['invocationParams']> {
+  if (!isReasoningModel(model) || isReasoningModel(params.model)) {
+    return params;
+  }
+  const normalized = {
+    ...params,
+    max_completion_tokens:
+      maxTokens === -1
+        ? undefined
+        : (maxTokens ?? params.max_completion_tokens),
+  };
+  delete normalized.max_tokens;
+  return normalized;
+}
+
 function isCacheableChatPart(part: unknown): part is CacheableChatPart {
   if (typeof part !== 'object' || part == null || !('type' in part)) {
     return false;
@@ -1888,10 +1908,17 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
     return stripIntentFromStrictTools(
       stripUnsupportedAstraParams(
         this.astraRulesApply,
-        applyManagedRequestParams(super.invocationParams(options, extra), {
-          promptCacheExplicit: this.promptCacheExplicit,
-          safetyIdentifier: this.safetyIdentifier,
-        }),
+        applyManagedRequestParams(
+          preserveReasoningTokenLimit(
+            super.invocationParams(options, extra),
+            this.model,
+            this.maxTokens
+          ),
+          {
+            promptCacheExplicit: this.promptCacheExplicit,
+            safetyIdentifier: this.safetyIdentifier,
+          }
+        ),
         'completions'
       )
     );
@@ -2475,10 +2502,17 @@ class LibreChatAzureOpenAICompletions extends OriginalAzureChatOpenAICompletions
     return stripIntentFromStrictTools(
       stripUnsupportedAstraParams(
         this.astraRulesApply,
-        applyManagedRequestParams(super.invocationParams(options, extra), {
-          promptCacheExplicit: this.promptCacheExplicit,
-          safetyIdentifier: this.safetyIdentifier,
-        }),
+        applyManagedRequestParams(
+          preserveReasoningTokenLimit(
+            super.invocationParams(options, extra),
+            this.model,
+            this.maxTokens
+          ),
+          {
+            promptCacheExplicit: this.promptCacheExplicit,
+            safetyIdentifier: this.safetyIdentifier,
+          }
+        ),
         'completions'
       )
     );
