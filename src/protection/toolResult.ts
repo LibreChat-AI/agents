@@ -1251,16 +1251,18 @@ function assertToolProposalSource(sources: ToolCallSources, id: string, name: st
 }
 
 type ToolOutcomeGuard = (input: unknown) => unknown;
+type ToolOutcomeContext = { sources?: ToolCallSources; proposals?: Map<string, string>; control?: boolean };
 const toolOutcomeAdmissions = new WeakMap<object, { policy: ToolResultProtection; guard: ToolOutcomeGuard }>();
 
-function toolOutcomeGuard(policy: ToolResultProtection, value: unknown, active = new WeakSet<object>(), depth = 0): ToolOutcomeGuard {
+function toolOutcomeGuard(policy: ToolResultProtection, value: unknown, active = new WeakSet<object>(), depth = 0, context: ToolOutcomeContext = {}): ToolOutcomeGuard {
   if (depth > 64) throw new ToolResultProtectionError('unsupported');
   if (value == null || typeof value !== 'object') return (current) => { if (!Object.is(current, value)) throw new ToolResultProtectionError('unsupported'); return current; };
   if (types.isProxy(value) || active.has(value)) throw new ToolResultProtectionError('unsupported');
   active.add(value);
   try {
     if (Array.isArray(value)) {
-      const guards = snapshotToolCheckpointArray(value).map((entry) => toolOutcomeGuard(policy, entry, active, depth + 1));
+      const scope = { ...context, proposals: new Map(context.proposals) };
+      const guards = snapshotToolCheckpointArray(value).map((entry) => toolOutcomeGuard(policy, entry, active, depth + 1, scope));
       return (current) => {
         const entries = snapshotToolCheckpointArray(current as readonly unknown[]);
         if (entries.length !== guards.length) throw new ToolResultProtectionError('unsupported');
@@ -1274,7 +1276,20 @@ function toolOutcomeGuard(policy: ToolResultProtection, value: unknown, active =
       const envelope = admission?.policy === policy ? admission.envelope : undefined;
       if (envelope != null && !matchesToolMessageEnvelope(snapshotToolMessageEnvelope(message as ToolMessage), envelope)) throw new ToolResultProtectionError('unsupported');
       const name = ownMessageValue(message, 'name');
-      if (type === 'tool' && typeof name === 'string' && requiresToolResultProtection(policy, name) && envelope == null) throw new ToolResultProtectionError('unsupported');
+      if (type === 'human') context.proposals?.clear();
+      if (type === 'ai') {
+        const ids = new Set<string>();
+        for (const call of (ownMessageValue(message, 'tool_calls') ?? []) as Array<{ id?: string; name: string }>) {
+          if (typeof call.name !== 'string' || (call.id != null && (typeof call.id !== 'string' || call.id === '' || ids.has(call.id)))) throw new ToolResultProtectionError('unsupported');
+          if (call.id != null) { ids.add(call.id); context.proposals?.set(call.id, call.name); }
+        }
+      }
+      if (type === 'tool') {
+        const identity = historyIdentity(message);
+        const source = context.proposals?.get(identity.tool_call_id) ?? (envelope == null && context.sources != null ? toolSourceName(context.sources, identity.tool_call_id, identity.id, undefined) : admission?.name);
+        const selected = (typeof name === 'string' && requiresToolResultProtection(policy, name)) || (source != null && requiresToolResultProtection(policy, source));
+        if ((envelope == null && (selected || (context.control === true && name == null))) || (selected && source != null && name != null && name !== source)) throw new ToolResultProtectionError('unsupported');
+      }
       const identity = ['type', 'id', 'name', 'tool_call_id'].map((field) => ownMessageValue(message, field));
       return (current) => {
         const copy = snapshotToolInputMessages([current as BaseMessage])[0];
@@ -1289,7 +1304,7 @@ function toolOutcomeGuard(policy: ToolResultProtection, value: unknown, active =
     }
     if (Object.hasOwn(value, '__overwrite__')) {
       const overwritten = ownMessageValue(value, '__overwrite__');
-      const guard = toolOutcomeGuard(policy, overwritten, active, depth + 1);
+      const guard = toolOutcomeGuard(policy, overwritten, active, depth + 1, context);
       return (current) => {
         if (current == null || typeof current !== 'object' || !Object.hasOwn(current, '__overwrite__')) throw new ToolResultProtectionError('unsupported');
         return new Overwrite(guard(ownMessageValue(current, '__overwrite__')));
@@ -1297,9 +1312,9 @@ function toolOutcomeGuard(policy: ToolResultProtection, value: unknown, active =
     }
     if (value instanceof Command) {
       const command = snapshotToolCommand(value);
-      const update = toolOutcomeGuard(policy, snapshotToolResumeUpdates(command.update), active, depth + 1);
-      const resume = toolOutcomeGuard(policy, command.resume, active, depth + 1);
-      const goto = toolOutcomeGuard(policy, command.goto, active, depth + 1);
+      const update = toolOutcomeGuard(policy, snapshotToolResumeUpdates(command.update), active, depth + 1, { ...context, control: true });
+      const resume = toolOutcomeGuard(policy, command.resume, active, depth + 1, { ...context, control: true });
+      const goto = toolOutcomeGuard(policy, command.goto, active, depth + 1, { ...context, control: true });
       return (current) => {
         if (current == null || typeof current !== 'object') throw new ToolResultProtectionError('unsupported');
         const candidate = snapshotToolCommand(current as Command);
@@ -1310,7 +1325,7 @@ function toolOutcomeGuard(policy: ToolResultProtection, value: unknown, active =
       };
     }
     if (value instanceof Send) {
-      const packet = snapshotToolSend(value); const args = toolOutcomeGuard(policy, packet.args, active, depth + 1);
+      const packet = snapshotToolSend(value); const args = toolOutcomeGuard(policy, packet.args, active, depth + 1, { ...context, control: true });
       return (current) => {
         const next = snapshotToolSend(current);
         if (next.node !== packet.node || !isDeepStrictEqual(next.timeout, packet.timeout)) throw new ToolResultProtectionError('unsupported');
@@ -1330,12 +1345,12 @@ function toolOutcomeGuard(policy: ToolResultProtection, value: unknown, active =
       const data = Object.getOwnPropertyDescriptor(record, field)?.value;
       if (data == null) continue;
       const dataSnapshot = snapshot(data);
-      const guard = toolOutcomeGuard(policy, dataSnapshot, active, depth + 1);
+      const guard = toolOutcomeGuard(policy, dataSnapshot, active, depth + 1, { ...context, control: true });
       const expected = guard(dataSnapshot);
       guards.set(field, (candidate) => { const detached = guard(snapshot(candidate)); if (!isDeepStrictEqual(detached, expected)) throw new ToolResultProtectionError('unsupported'); return detached; });
     }
     const keys = Object.keys(record);
-    for (const field of keys) if (!guards.has(field)) guards.set(field, toolOutcomeGuard(policy, Object.getOwnPropertyDescriptor(record, field)!.value, active, depth + 1));
+    for (const field of keys) if (!guards.has(field)) guards.set(field, toolOutcomeGuard(policy, Object.getOwnPropertyDescriptor(record, field)!.value, active, depth + 1, context));
     return (current) => {
       const next = snapshotToolCheckpointRecord(current as object, keys);
       if (!isDeepStrictEqual(Object.keys(next), keys)) throw new ToolResultProtectionError('unsupported');
@@ -1883,21 +1898,29 @@ function withToolResultCarrierBoundary(tool: GenericTool, policy: ToolResultProt
   const shell = Object.create(Object.getPrototypeOf(tool), Object.getOwnPropertyDescriptors(tool)) as StructuredTool;
   const guards = new WeakMap<object, ToolOutcomeGuard>();
   const call: (input: unknown, manager?: CallbackManagerForToolRun, config?: RunnableConfig) => Promise<unknown> = Reflect.get(tool, '_call');
-  const admit = (raw: unknown): unknown => {
+  const admit = (raw: unknown, config?: RunnableConfig): unknown => {
     if (raw == null || typeof raw !== 'object') return raw;
     if (types.isProxy(raw)) throw new ToolResultProtectionError('unsupported');
     if (!(raw instanceof Command) && !trustedMessageImplementations.has(Object.getPrototypeOf(raw)) && Object.getOwnPropertyDescriptor(raw, 'lc_direct_tool_output')?.value !== true) return raw;
-    const guard = toolOutcomeGuard(policy, raw);
+    const runtime = config as (RunnableConfig & { state?: { messages?: BaseMessage[]; agentMessages?: BaseMessage[] } | BaseMessage[] }) | undefined;
+    const state = runtime?.state;
+    let groups: BaseMessage[][] = [];
+    if (Array.isArray(state)) groups = [snapshotToolInputMessages(state)];
+    else if (state != null) {
+      const carrier = snapshotToolCheckpointRecord(state, ['messages', 'agentMessages']);
+      groups = [carrier.messages, carrier.agentMessages].filter((messages): messages is BaseMessage[] => messages != null).map(snapshotToolInputMessages);
+    }
+    const guard = toolOutcomeGuard(policy, raw, undefined, 0, { sources: snapshotToolCallSources(groups) });
     const detached = guard(raw) as object;
     guards.set(detached, guard);
     return detached;
   };
   Object.defineProperty(shell, '_call', { value: async (input: unknown, manager?: CallbackManagerForToolRun, config?: RunnableConfig): Promise<unknown> => {
     const raw = await call.call(tool, input, manager, config);
-    if (shell.responseFormat !== 'content_and_artifact') return admit(raw);
+    if (shell.responseFormat !== 'content_and_artifact') return admit(raw, config);
     const tuple = snapshotDataArray(raw as readonly unknown[], 2);
     if (tuple.length !== 2) throw new ToolResultProtectionError('unsupported');
-    return [admit(tuple[0]), tuple[1]];
+    return [admit(tuple[0], config), tuple[1]];
   } });
   const invoke = shell.invoke;
   Object.defineProperty(shell, 'invoke', { value: async (...args: Parameters<StructuredTool['invoke']>): ReturnType<StructuredTool['invoke']> => {
