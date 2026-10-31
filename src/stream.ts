@@ -2288,6 +2288,7 @@ export function createContentAggregator(): t.ContentAggregatorResult {
   const contentParts: Array<t.MessageContentComplex | undefined> = [];
   const stepMap = new Map<string, t.RunStep>();
   const toolCallContentIndexMap = new Map<string, number>();
+  const providerItemsByToolCallId = new Map<string, t.ProviderOutputItems>();
   const sourceContentIndexMap = new Map<number, number>();
   const toolStepContentMap = new Map<string, ToolStepContentState>();
   let indexedContentLength = 0;
@@ -2609,12 +2610,20 @@ export function createContentAggregator(): t.ContentAggregatorResult {
         toolCallContentIndexMap.delete(existingToolCallId);
       }
 
-      const newToolCall: ToolCall & t.PartMetadata & { outcome?: string } = {
-        id,
-        name,
-        args,
-        type: ToolCallTypes.TOOL_CALL,
-      };
+      const newToolCall: ToolCall &
+        t.PartMetadata &
+        Pick<
+          t.ToolCallPart,
+          | 'outcome'
+          | 'roundId'
+          | 'providerItems'
+          | 'outputFormat'
+        > = {
+          id,
+          name,
+          args,
+          type: ToolCallTypes.TOOL_CALL,
+        };
 
       const auth =
         contentPart.tool_call.auth ?? existingContent?.tool_call?.auth;
@@ -2625,6 +2634,18 @@ export function createContentAggregator(): t.ContentAggregatorResult {
         newToolCall.auth = auth;
         newToolCall.expires_at = expiresAt;
       }
+      const roundId =
+        (contentPart.tool_call as t.ToolCallPart).roundId ??
+        existingContent?.tool_call?.roundId;
+      if (roundId != null) {
+        newToolCall.roundId = roundId;
+      }
+      const providerItems =
+        existingContent?.tool_call?.providerItems ??
+        providerItemsByToolCallId.get(id);
+      if (providerItems != null) {
+        newToolCall.providerItems = providerItems;
+      }
 
       if (finalUpdate) {
         newToolCall.progress = 1;
@@ -2632,6 +2653,10 @@ export function createContentAggregator(): t.ContentAggregatorResult {
         const outcome = (contentPart.tool_call as t.ToolCallPart).outcome;
         if (outcome != null) {
           newToolCall.outcome = outcome;
+        }
+        const { outputFormat } = contentPart.tool_call as t.ToolCallPart;
+        if (outputFormat != null) {
+          newToolCall.outputFormat = outputFormat;
         }
       }
 
@@ -2660,10 +2685,24 @@ export function createContentAggregator(): t.ContentAggregatorResult {
       | t.MessageDeltaEvent
       | t.ReasoningDeltaEvent
       | t.RunStepDeltaEvent
+      | t.ProviderOutputItemsEvent
       | t.SummarizeDeltaData
       | t.SummarizeCompleteEvent
       | { result: t.ToolEndEvent };
   }): void => {
+    if (event === GraphEvents.ON_PROVIDER_OUTPUT_ITEMS) {
+      for (const { id, providerItems } of (data as t.ProviderOutputItemsEvent)
+        .tool_calls) {
+        providerItemsByToolCallId.set(id, providerItems);
+        const index = toolCallContentIndexMap.get(id);
+        const part = index != null ? contentParts[index] : undefined;
+        if (part?.type === ContentTypes.TOOL_CALL && part.tool_call != null) {
+          part.tool_call = { ...part.tool_call, providerItems };
+        }
+      }
+      return;
+    }
+
     if (event === GraphEvents.ON_SUMMARIZE_DELTA) {
       const deltaData = data as t.SummarizeDeltaData;
       const runStep = stepMap.get(deltaData.id);
@@ -2750,6 +2789,7 @@ export function createContentAggregator(): t.ContentAggregatorResult {
                 args: toolCall.args,
                 name: toolCall.name,
                 id: toolCallId,
+                ...(runStep.roundId != null && { roundId: runStep.roundId }),
               },
             };
 

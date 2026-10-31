@@ -3462,6 +3462,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       }
 
       let contentString: string;
+      let outputFormat: t.ToolOutputFormat | undefined;
       if (isComputerCallOutputMessage(toolMessage)) {
         contentString = truncateToolResultContent(
           '[Computer screenshot omitted from completion event]',
@@ -3474,6 +3475,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           toolMessage.content,
           this.maxToolResultChars
         ).content;
+        outputFormat = 'blocks';
       }
 
       /**
@@ -3500,6 +3502,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         output: contentString,
         progress: 1,
         ...(outcome != null && { outcome }),
+        ...(outputFormat != null && { outputFormat }),
       };
 
       await safeDispatchCustomEvent(
