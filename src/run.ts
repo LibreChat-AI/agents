@@ -2398,7 +2398,7 @@ export class Run<_T extends t.BaseGraphState> {
       if (key === '__pregel_tasks' || key === '__pregel_push') { admitted.push([key, await graph.validateToolResultTaskWrites(value, signal, this.protectedSendSources)]); continue; }
       if (key === 'runStepState') { admitted.push([key, snapshotToolRunStepWrite(value)]); continue; }
       if (key === 'handoffState') { admitted.push([key, snapshotToolHandoffWrite(value)]); continue; }
-      if (key === 'subagentResult' && value != null) { admitted.push([key, graph.validateToolResultSubagentResult(value as t.SubagentGraphResult, [...messages, ...alternate])]); continue; }
+      if (key === 'subagentResult' && value != null) { admitted.push([key, snapshotToolSubagentResult(value as t.SubagentGraphResult)]); continue; }
       if (key === 'summarizationRequest' && value != null) { admitted.push([key, await graph.validateToolResultWindow(value as t.SummarizationNodeInput, snapshot.values?.runStepState, signal, this.protectedSendSources)]); continue; }
       if (key !== 'messages' && key !== 'agentMessages') { admitted.push([key, value]); continue; }
       const change = snapshotToolResumeMessages(value);
@@ -2410,6 +2410,7 @@ export class Run<_T extends t.BaseGraphState> {
     }
     messages = await graph.validateToolResultHistory(messages, snapshot.values?.runStepState, signal);
     if (alternate.length > 0) await graph.validateToolResultHistory([...messages, ...alternate], snapshot.values?.runStepState, signal);
+    for (const write of admitted) if (write[0] === 'subagentResult' && write[1] != null) write[1] = graph.validateToolResultSubagentResult(write[1] as t.SubagentGraphResult, [...messages, ...alternate]);
     return { update: update == null ? update : admitted, messages };
   }
 

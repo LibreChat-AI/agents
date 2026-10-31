@@ -69,6 +69,7 @@ import fixtures from '@/protection/__tests__/fixtures/a1.json';
 import { stableStringify } from '@/tools/eagerEventExecution';
 import { StreamLimitExceededError } from '@/llm/streamLimits';
 import { MultiAgentGraph } from '@/graphs/MultiAgentGraph';
+import { formatFromLangChain } from '@/messages/format';
 import { isToolApprovalInterrupt } from '@/types/hitl';
 import { ChatModelStreamHandler } from '@/stream';
 import { StandardGraph } from '@/graphs/Graph';
@@ -4341,4 +4342,108 @@ it.each((['object', 'tuples', 'overwrite', 'send'] as const).flatMap((shape) => 
   assertNoCanary(String(result)); assertNoCanary(JSON.stringify(result));
   if (mode === 'mutate') expect(result).toMatchObject({ code: 'unsupported' });
   else { expect(result).not.toBeInstanceOf(Error); expect(JSON.stringify(result)).toContain('[EMAIL_1]'); retained!.content = fixtures.canaries[0]; assertNoCanary(result); }
+});
+
+it.each(['lc_kwargs', 'late-lc_kwargs', 'control'] as const)('rebuilds selected chain outcomes from admitted message fields (%s)', async (mode) => {
+  let retained: ToolMessage | undefined;
+  const callback = BaseCallbackHandler.fromMethods({ handleChainEnd: (output): void => {
+    retained = (output.messages as ToolMessage[])[0];
+    if (mode === 'lc_kwargs') retained.lc_kwargs.content = fixtures.canaries[0];
+  } }); callback.awaitHandlers = true;
+  const node = new ToolNode({ trace: true, tools: [direct(() => fixtures.canaries[0])], toolResultProtection: policy() });
+  const result = await node.invoke(state(), { callbacks: [callback] }) as { messages: ToolMessage[] };
+  if (mode === 'late-lc_kwargs') retained!.lc_kwargs.content = fixtures.canaries[0];
+  expect(result.messages[0].content).toBe('[EMAIL_1]');
+  expect(formatFromLangChain(result.messages[0]).content).toBe('[EMAIL_1]');
+  expect(result.messages[0].lc_kwargs.content).toBe('[EMAIL_1]');
+  assertNoCanary(result.messages[0].toJSON());
+});
+
+it.each((['object', 'tuples', 'send', 'overwrite', 'resume'] as const).flatMap((carrier) => (['mutate', 'before-callback', 'unapproved', 'late', 'control'] as const).map((mode) => [carrier, mode] as const)))('guards released messages in custom state carriers (%s/%s)', async (carrier, mode) => {
+  const fixture = await certifiedHistory(); let retained: ToolMessage | undefined;
+  const shell = new DynamicStructuredTool({ name: 'shell_control', description: 'Allowed routing shell.', schema: z.object({}), func: async () => {
+    const selected = mode === 'unapproved' ? new ToolMessage({ name: 'lookup', tool_call_id: 'call-control', content: fixtures.canaries[0] }) : fixture.messages[1];
+    if (mode === 'before-callback') selected.content = fixtures.canaries[0];
+    const custom = { type: 'custom-state', args: { count: 42 }, nested: [{ result: selected }] };
+    if (carrier === 'resume') return new Command({ resume: { custom } });
+    if (carrier === 'send') return new Command({ graph: Command.PARENT, goto: [new Send('recipient', { custom })] });
+    const update = carrier === 'tuples' ? [['custom', custom]] as [string, unknown][] : { custom: carrier === 'overwrite' ? new Overwrite(custom) : custom };
+    return new Command({ update, goto: 'recipient' });
+  } });
+  const callback = BaseCallbackHandler.fromMethods({ handleChainEnd: (output): void => {
+    const command = (Array.isArray(output) ? output : output.output)[0] as Command;
+    let custom: object;
+    if (carrier === 'resume') custom = (command.resume as { custom: object }).custom;
+    else if (carrier === 'send') custom = (command.goto as Send[])[0].args.custom;
+    else if (Array.isArray(command.update)) custom = command.update.find(([key]) => key === 'custom')![1] as object;
+    else custom = command.update!.custom as object;
+    retained = ((custom instanceof Overwrite ? custom.value : custom) as { nested: Array<{ result: ToolMessage }> }).nested[0].result;
+    if (mode === 'mutate') retained.content = fixtures.canaries[0];
+  } }); callback.awaitHandlers = true;
+  const node = new ToolNode({ trace: true, tools: [shell], toolResultProtection: fixture.gate });
+  const outcome = await node.invoke({ messages: [new AIMessage({ content: '', tool_calls: [{ id: 'shell-call', name: 'shell_control', args: {}, type: 'tool_call' }] })] }, { callbacks: [callback] }).catch((error: Error) => error);
+  if (mode === 'late') retained!.content = fixtures.canaries[0];
+  assertNoCanary(outcome);
+  if (mode === 'mutate' || mode === 'before-callback' || mode === 'unapproved') expect(outcome).toMatchObject({ code: 'unsupported' }); else expect(outcome).not.toBeInstanceOf(Error);
+});
+
+it.each(['array', 'method', 'property', 'adapter', 'budget'] as const)('snapshots required tool policy at configuration time (%s)', async (mode) => {
+  const names = ['lookup']; let inspections = 0;
+  const gate = { ...policy(), toolNames: names, inspect: ({ content }: Parameters<ToolResultProtection['inspect']>[0]): ToolResultProtectionResult => { inspections++; return approve(content.replaceAll(fixtures.canaries[0], '[EMAIL_1]')); } };
+  const run = await Run.create({ runId: `snapshot-policy-${mode}`, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, tools: [direct(() => fixtures.canaries[0])] }, toolResultProtection: gate });
+  if (mode === 'array') names.splice(0, 1, 'other');
+  if (mode === 'method') Object.defineProperty(names, 'includes', { value: () => false });
+  if (mode === 'property') gate.toolNames = ['other'];
+  if (mode === 'adapter') gate.inspect = ({ content }): ToolResultProtectionResult => approve(content);
+  if (mode === 'budget') gate.timeoutMs = 0;
+  const model = new FakeChatModel({ responses: ['', 'Allowed answer'], toolCalls: [{ id: 'snapshot-policy-call', name: 'lookup', args: { count: 42 }, type: 'tool_call' }] });
+  run.Graph!.overrideModel = model;
+  const observed: string[] = []; const callback = observer(observed);
+  await run.processStream({ messages: [new HumanMessage('Allowed input')] }, { version: 'v2', callbacks: [callback] });
+  expect(inspections).toBeGreaterThan(0); assertNoCanary(observed.join(''));
+});
+
+it.each(['prepared', 'stream', 'private-restart', 'control'] as const)('detaches startup abort reasons before creating inspection attempts (%s)', async (kind) => {
+  const fixture = await certifiedHistory(); const controller = new AbortController();
+  let reason: Error = new Error(fixtures.canaries[0]);
+  if (kind === 'prepared') reason = new PreparedSubagentError(fixtures.canaries[0]);
+  if (kind === 'stream') reason = new StreamLimitExceededError({ kind: 'delta_events', limit: 1, observed: 2 });
+  if (kind === 'private-restart') reason = createProviderTextRestartCancellation();
+  if (kind === 'stream') { reason.message = fixtures.canaries[0]; Object.defineProperty(reason, 'cause', { value: fixtures.canaries[0] }); }
+  controller.abort(reason);
+  const historical = new ToolMessage({ name: 'lookup', tool_call_id: 'call-control', content: '[EMAIL_1]', status: 'success' });
+  const outcome = await validateToolMessageHistory(fixture.gate, [fixture.messages[0], historical], fixture.releases, controller.signal).catch((error: Error) => error);
+  assertNoCanary(String(outcome)); assertNoCanary(JSON.stringify(outcome)); expect(outcome).not.toHaveProperty('cause');
+  if (kind === 'private-restart') expect(outcome).toBe(reason);
+  else { expect(outcome).toBeInstanceOf(Error); expect(outcome).not.toBe(reason); }
+});
+
+it.each((['agentId', 'remainingContextTokens', 'reason', 'allowSummarization'] as const).flatMap((field) => (['proxy', 'coercion', 'wrong-type', 'control'] as const).map((mode) => [field, mode] as const)))('validates summarization routing scalar shapes (%s/%s)', async (field, mode) => {
+  let reads = 0;
+  const request = { agentId: 'worker', remainingContextTokens: 100, reason: 'overflow' as const, allowSummarization: false };
+  const coercion = { [Symbol.toPrimitive]: (): never => { reads++; throw new Error(fixtures.canaries[0]); } };
+  let invalid: object | number | string = 42;
+  if (field === 'remainingContextTokens') invalid = NaN;
+  if (field === 'reason') invalid = 'wrong';
+  if (mode === 'coercion') invalid = coercion;
+  if (mode === 'proxy') invalid = new Proxy({}, { get: (): never => { reads++; throw new Error(fixtures.canaries[0]); } });
+  if (mode !== 'control') Object.defineProperty(request, field, { value: invalid, enumerable: true });
+  const graph = new StandardGraph({ runId: 'summary-scalars', agents: [{ agentId: 'worker', provider: Providers.OPENAI }], toolResultProtection: policy() });
+  const outcome = await graph.validateToolResultCheckpoint({ values: { messages: [], summarizationRequest: request }, tasks: [] }).catch((error: Error) => error);
+  expect(reads).toBe(0); assertNoCanary(String(outcome));
+  if (mode === 'control') expect(outcome).not.toBeInstanceOf(Error); else expect(outcome).toBeInstanceOf(ToolResultProtectionError);
+});
+
+it.each((['object', 'tuples'] as const).flatMap((carrier) => [true, false].map((resultFirst) => [carrier, resultFirst] as const)))('validates resume result carriers against final histories independent of order (%s/resultFirst=%s)', async (carrier, resultFirst) => {
+  const runId = `resume-result-order-${carrier}-${resultFirst}`; const hooks = new HookRegistry();
+  hooks.register('PreToolUse', { hooks: [async () => ({ decision: 'ask', reason: 'Allowed approval' })] });
+  const run = await Run.create({ runId, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, tools: [direct(() => 'Allowed output')], compileOptions: { checkpointer: new MemorySaver() } }, toolResultProtection: policy(), hooks, humanInTheLoop: { enabled: true } });
+  run.Graph!.overrideModel = new FakeChatModel({ responses: ['', 'Allowed final answer'], toolCalls: [{ id: 'ordered-call', name: 'lookup', args: { count: 42 }, type: 'tool_call' }] });
+  const config = { version: 'v2' as const, configurable: { thread_id: runId } };
+  await run.processStream({ messages: [new HumanMessage('Allowed input')] }, config);
+  expect(run.getInterrupt()).toBeDefined();
+  const final = new AIMessage({ id: 'ordered-result', content: 'Allowed designated result' });
+  const writes: Array<[string, unknown]> = [['subagentResult', { agentId: 'default', message: final }], ['messages', [final]]];
+  if (!resultFirst) writes.reverse();
+  await expect(run.resume([{ type: 'approve' }], config, undefined, { update: carrier === 'object' ? Object.fromEntries(writes) : writes })).resolves.toBeUndefined();
 });

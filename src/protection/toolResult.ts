@@ -101,6 +101,7 @@ export type ToolMessageRelease = {
   readonly envelope: Omit<ToolMessageEnvelope, 'content'>;
 };
 
+const policies = new WeakMap<ToolResultProtection, ToolResultProtection>();
 const adapters = new WeakMap<ToolResultProtection, ProviderTextProtection>();
 const approved = new WeakMap<
   object,
@@ -213,35 +214,43 @@ export async function withToolResultSafetySignal<T>(signal: AbortSignal | undefi
 }
 
 function checkToolResultAttempt(attempt: ProviderTextAttempt): void {
-  try { attempt.check(); } catch (error) { throw detachToolSafetyError(error) ?? error; }
+  try { attempt.check(); } catch (error) { throw detachToolSafetyError(error) ?? normalizeToolResultError(error); }
 }
 
 function toolResultAttempt(policy: ToolResultProtection, signal?: AbortSignal): ProviderTextAttempt {
-  try { return new ProviderTextAttempt(budget(policy), signal); }
-  catch (error) { throw detachToolSafetyError(error) ?? error; }
+  try { return new ProviderTextAttempt(budget(snapshotToolResultProtection(policy)), signal); }
+  catch (error) { throw detachToolSafetyError(error) ?? normalizeToolResultError(error); }
 }
 
-export function validateToolResultProtection(
-  policy: ToolResultProtection
-): void {
-  const version: number = policy.version;
+/** Capture once so shared host configuration cannot downgrade an active release boundary. */
+export function snapshotToolResultProtection(policy: ToolResultProtection): ToolResultProtection {
+  const existing = policies.get(policy);
+  if (existing != null) return existing;
+  plainObject(policy, ['version', 'toolNames', 'timeoutMs', 'maxAttemptBytes', 'maxBufferedBytes', 'classify', 'inspect']);
+  const version = ownMessageValue(policy, 'version');
   if (version !== 1) throw new ToolResultProtectionError('incompatible');
-  if (
-    typeof policy.inspect !== 'function' ||
-    typeof policy.classify !== 'function'
-  )
-    throw new ToolResultProtectionError('unavailable');
-  if (
-    !Array.isArray(policy.toolNames) ||
-    policy.toolNames.length === 0 ||
-    policy.toolNames.length > 128 ||
-    policy.toolNames.some(
-      (name) =>
-        typeof name !== 'string' || name.trim() !== name || name.length === 0
-    )
-  )
-    throw new ToolResultProtectionError('incompatible');
-  budget(policy);
+  const inspect = ownMessageValue(policy, 'inspect');
+  const classify = ownMessageValue(policy, 'classify');
+  if (typeof inspect !== 'function' || typeof classify !== 'function') throw new ToolResultProtectionError('unavailable');
+  const toolNames = snapshotDataArray(ownMessageValue(policy, 'toolNames') as readonly string[], 128);
+  if (toolNames.length === 0 || toolNames.some((name) => typeof name !== 'string' || name.trim() !== name || name.length === 0)) throw new ToolResultProtectionError('incompatible');
+  const snapshot: ToolResultProtection = Object.freeze({
+    version: 1,
+    toolNames: Object.freeze(toolNames),
+    timeoutMs: ownMessageValue(policy, 'timeoutMs') as number,
+    maxAttemptBytes: ownMessageValue(policy, 'maxAttemptBytes') as number,
+    maxBufferedBytes: ownMessageValue(policy, 'maxBufferedBytes') as number,
+    classify: classify as ToolResultProtection['classify'],
+    inspect: inspect as ToolResultProtection['inspect'],
+  });
+  try { budget(snapshot); } catch (error) { throw normalizeToolResultError(error); }
+  policies.set(policy, snapshot);
+  policies.set(snapshot, snapshot);
+  return snapshot;
+}
+
+export function validateToolResultProtection(policy: ToolResultProtection): void {
+  snapshotToolResultProtection(policy);
 }
 
 function budget(policy: ToolResultProtection): ProviderTextProtection {
@@ -269,7 +278,7 @@ export function requiresToolResultProtection(
   policy: ToolResultProtection | undefined,
   name: string
 ): policy is ToolResultProtection {
-  return policy != null && policy.toolNames.includes(name);
+  return policy != null && snapshotToolResultProtection(policy).toolNames.includes(name);
 }
 
 function plainObject(
@@ -383,17 +392,18 @@ async function release(
   status: 'success' | 'error',
   attempt: ProviderTextAttempt
 ): Promise<string> {
-  attempt.check();
+  checkToolResultAttempt(attempt);
+  const trusted = snapshotToolResultProtection(policy);
   if (typeof text !== 'string')
     throw new ToolResultProtectionError('unsupported');
   attempt.append(text);
   try {
-    if (policy.classify(text) !== 'prose')
+    if (trusted.classify(text) !== 'prose')
       throw new ToolResultProtectionError('unsupported');
-    attempt.check();
+    checkToolResultAttempt(attempt);
     const result = await attempt.wait(
       Promise.resolve(
-        policy.inspect({
+        trusted.inspect({
           version: 1,
           content: text,
           toolName: name,
@@ -408,13 +418,13 @@ async function release(
         })
       )
     );
-    attempt.check();
+    checkToolResultAttempt(attempt);
     const canonical = decision(result);
-    attempt.check();
+    checkToolResultAttempt(attempt);
     attempt.retain(canonical.length * 2);
     return canonical;
   } catch (error) {
-    attempt.check();
+    checkToolResultAttempt(attempt);
     if (error instanceof ProviderTextProtectionError)
       throw normalizeToolResultError(error);
     throw new ToolResultProtectionError('unavailable');
@@ -431,12 +441,19 @@ export async function protectToolText(
 ): Promise<unknown> {
   if (!requiresToolResultProtection(policy, name)) return text;
   validateToolResultProtection(policy);
-  const attempt = new ProviderTextAttempt(budget(policy), signal);
+  const attempt = toolResultAttempt(snapshotToolResultProtection(policy), signal);
   try {
     return await release(policy, name, id, text, status, attempt);
   } finally {
     attempt.finish();
   }
+}
+
+/** Mint ordinary failure provenance only from already inspected text. */
+export function releaseToolError(policy: ToolResultProtection, name: string, id: string, text: string): Error {
+  const error = new Error(text);
+  approved.set(error, { policy, name, id, text, status: 'error' });
+  return error;
 }
 
 export function detachReleasedToolError(policy: ToolResultProtection | undefined, name: string, id: string, error: Error): Error | undefined {
@@ -483,13 +500,13 @@ export function isReleasedToolError(
 }
 
 /** Internal provenance only after an awaited release; never exposed from the root SDK entry. */
-export function markReleasedToolMessage(
+export function markReleasedToolMessage<M extends ToolMessage | ToolMessageChunk>(
   policy: ToolResultProtection | undefined,
   name: string,
   id: string,
-  message: ToolMessage,
+  message: M,
   referenceContent?: string
-): ToolMessage {
+): M {
   if (
     requiresToolResultProtection(policy, name) &&
     typeof message.content === 'string'
@@ -746,7 +763,9 @@ export function snapshotToolSubagentResult(input: SubagentGraphResult): Subagent
 }
 
 export function snapshotToolSummarizationRequest(value: SummarizationNodeInput): SummarizationNodeInput {
-  const request = snapshotToolCheckpointRecord(value, ['windowMessages', 'agentId', 'remainingContextTokens', 'reason']);
+  const request = snapshotToolCheckpointRecord(value, ['windowMessages', 'agentId', 'remainingContextTokens', 'reason', 'allowSummarization']);
+  const reason: unknown = request.reason;
+  if (typeof request.agentId !== 'string' || request.agentId === '' || typeof request.remainingContextTokens !== 'number' || !Number.isFinite(request.remainingContextTokens) || (reason !== undefined && reason !== 'trigger' && reason !== 'overflow' && reason !== 'manual') || (request.allowSummarization !== undefined && typeof request.allowSummarization !== 'boolean')) throw new ToolResultProtectionError('unsupported');
   if (request.windowMessages != null) request.windowMessages = snapshotToolInputMessages(request.windowMessages);
   return request;
 }
@@ -759,6 +778,7 @@ function checkpointReadId(scope: RunnableConfig['configurable']): string | undef
 }
 
 export const toolCheckpointSafety: ToolCheckpointSafety = {
+  failure: normalizeToolResultError,
   identify: (config, history) => {
     const snapshot = snapshotToolCheckpointConfig(config);
     const scope = snapshot.configurable;
@@ -1233,13 +1253,14 @@ function assertToolProposalSource(sources: ToolCallSources, id: string, name: st
 type ToolOutcomeGuard = (input: unknown) => unknown;
 const toolOutcomeAdmissions = new WeakMap<object, { policy: ToolResultProtection; guard: ToolOutcomeGuard }>();
 
-function toolOutcomeGuard(policy: ToolResultProtection, value: unknown, active = new WeakSet<object>()): ToolOutcomeGuard {
-  if (value == null || typeof value !== 'object') return (current) => { if (current !== value) throw new ToolResultProtectionError('unsupported'); return current; };
+function toolOutcomeGuard(policy: ToolResultProtection, value: unknown, active = new WeakSet<object>(), depth = 0): ToolOutcomeGuard {
+  if (depth > 64) throw new ToolResultProtectionError('unsupported');
+  if (value == null || typeof value !== 'object') return (current) => { if (!Object.is(current, value)) throw new ToolResultProtectionError('unsupported'); return current; };
   if (types.isProxy(value) || active.has(value)) throw new ToolResultProtectionError('unsupported');
   active.add(value);
   try {
     if (Array.isArray(value)) {
-      const guards = snapshotToolCheckpointArray(value).map((entry) => toolOutcomeGuard(policy, entry, active));
+      const guards = snapshotToolCheckpointArray(value).map((entry) => toolOutcomeGuard(policy, entry, active, depth + 1));
       return (current) => {
         const entries = snapshotToolCheckpointArray(current as readonly unknown[]);
         if (entries.length !== guards.length) throw new ToolResultProtectionError('unsupported');
@@ -1247,24 +1268,28 @@ function toolOutcomeGuard(policy: ToolResultProtection, value: unknown, active =
       };
     }
     const type = ownMessageValue(value, 'type');
-    if (typeof type === 'string') {
+    if (trustedMessageImplementations.has(Object.getPrototypeOf(value)) || (typeof type === 'string' && ['ai', 'human', 'system', 'tool', 'function', 'generic', 'remove'].includes(type))) {
       const message = snapshotToolInputMessages([value as BaseMessage])[0];
       const admission = approved.get(message);
-      const envelope = admission?.policy === policy && admission.envelope != null ? snapshotToolMessageEnvelope(message as ToolMessage) : undefined;
+      const envelope = admission?.policy === policy ? admission.envelope : undefined;
+      if (envelope != null && !matchesToolMessageEnvelope(snapshotToolMessageEnvelope(message as ToolMessage), envelope)) throw new ToolResultProtectionError('unsupported');
+      const name = ownMessageValue(message, 'name');
+      if (type === 'tool' && typeof name === 'string' && requiresToolResultProtection(policy, name) && envelope == null) throw new ToolResultProtectionError('unsupported');
       const identity = ['type', 'id', 'name', 'tool_call_id'].map((field) => ownMessageValue(message, field));
       return (current) => {
         const copy = snapshotToolInputMessages([current as BaseMessage])[0];
         if (!identity.every((field, index) => field === ownMessageValue(copy, ['type', 'id', 'name', 'tool_call_id'][index]))) throw new ToolResultProtectionError('unsupported');
         if (envelope != null && admission != null) {
           if (!matchesToolMessageEnvelope(snapshotToolMessageEnvelope(copy as ToolMessage), envelope)) throw new ToolResultProtectionError('unsupported');
-          return markReleasedToolMessage(policy, admission.name, admission.id, copy as ToolMessage, admission.referenceContent);
+          const Message = Object.getPrototypeOf(message) === ToolMessageChunk.prototype ? ToolMessageChunk : ToolMessage;
+          return markReleasedToolMessage(policy, admission.name, admission.id, new Message(envelope), admission.referenceContent);
         }
         return copy;
       };
     }
     if (Object.hasOwn(value, '__overwrite__')) {
       const overwritten = ownMessageValue(value, '__overwrite__');
-      const guard = toolOutcomeGuard(policy, overwritten, active);
+      const guard = toolOutcomeGuard(policy, overwritten, active, depth + 1);
       return (current) => {
         if (current == null || typeof current !== 'object' || !Object.hasOwn(current, '__overwrite__')) throw new ToolResultProtectionError('unsupported');
         return new Overwrite(guard(ownMessageValue(current, '__overwrite__')));
@@ -1272,28 +1297,29 @@ function toolOutcomeGuard(policy: ToolResultProtection, value: unknown, active =
     }
     if (value instanceof Command) {
       const command = snapshotToolCommand(value);
-      const update = toolOutcomeGuard(policy, snapshotToolResumeUpdates(command.update), active);
-      const goto = toolOutcomeGuard(policy, command.goto, active);
+      const update = toolOutcomeGuard(policy, snapshotToolResumeUpdates(command.update), active, depth + 1);
+      const resume = toolOutcomeGuard(policy, command.resume, active, depth + 1);
+      const goto = toolOutcomeGuard(policy, command.goto, active, depth + 1);
       return (current) => {
         if (current == null || typeof current !== 'object') throw new ToolResultProtectionError('unsupported');
         const candidate = snapshotToolCommand(current as Command);
-        if (candidate.graph !== command.graph || candidate.resume !== command.resume || candidate.lc_direct_tool_output !== command.lc_direct_tool_output) throw new ToolResultProtectionError('unsupported');
-        const copy = new Command({ graph: candidate.graph, resume: candidate.resume, goto: goto(candidate.goto) as Command['goto'], update: command.update == null ? undefined : update(snapshotToolResumeUpdates(candidate.update)) as Command['update'] });
+        if (candidate.graph !== command.graph || candidate.lc_direct_tool_output !== command.lc_direct_tool_output) throw new ToolResultProtectionError('unsupported');
+        const copy = new Command({ graph: candidate.graph, resume: resume(candidate.resume), goto: goto(candidate.goto) as Command['goto'], update: command.update == null ? undefined : update(snapshotToolResumeUpdates(candidate.update)) as Command['update'] });
         copy.lc_direct_tool_output = candidate.lc_direct_tool_output;
         return copy;
       };
     }
     if (value instanceof Send) {
-      const packet = snapshotToolSend(value); const args = toolOutcomeGuard(policy, packet.args, active);
+      const packet = snapshotToolSend(value); const args = toolOutcomeGuard(policy, packet.args, active, depth + 1);
       return (current) => {
         const next = snapshotToolSend(current);
         if (next.node !== packet.node || !isDeepStrictEqual(next.timeout, packet.timeout)) throw new ToolResultProtectionError('unsupported');
         return Object.assign(Object.create(Send.prototype) as Send, next, { args: args(next.args) });
       };
     }
+    plainObject(value, Object.getOwnPropertyNames(value));
     const record = snapshotToolCheckpointRecord(value, ['messages', 'agentMessages', 'runStepState', 'handoffState', 'subagentResult', 'summarizationRequest']);
     const guards = new Map<string, ToolOutcomeGuard>();
-    for (const field of ['messages', 'agentMessages']) if (Object.hasOwn(record, field)) guards.set(field, toolOutcomeGuard(policy, Object.getOwnPropertyDescriptor(record, field)!.value, active));
     const snapshots: Array<[string, (input: unknown) => unknown]> = [
       ['runStepState', snapshotToolRunStepWrite],
       ['handoffState', snapshotToolHandoffWrite],
@@ -1307,6 +1333,7 @@ function toolOutcomeGuard(policy: ToolResultProtection, value: unknown, active =
       guards.set(field, (candidate) => { const detached = snapshot(candidate); if (!isDeepStrictEqual(detached, expected)) throw new ToolResultProtectionError('unsupported'); return detached; });
     }
     const keys = Object.keys(record);
+    for (const field of keys) if (!guards.has(field)) guards.set(field, toolOutcomeGuard(policy, Object.getOwnPropertyDescriptor(record, field)!.value, active, depth + 1));
     return (current) => {
       const next = snapshotToolCheckpointRecord(current as object, keys);
       if (!isDeepStrictEqual(Object.keys(next), keys)) throw new ToolResultProtectionError('unsupported');
@@ -1957,15 +1984,7 @@ export function withToolResultBoundary(
           attempt
         );
         if (status === 'error') {
-          const error = new Error(content);
-          approved.set(error, {
-            policy,
-            name: toolName,
-            id,
-            text: content,
-            status,
-          });
-          throw error;
+          throw releaseToolError(policy, toolName, id, content);
         }
         const message = new ToolMessage({
           name: toolName,

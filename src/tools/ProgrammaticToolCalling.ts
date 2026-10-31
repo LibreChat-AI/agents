@@ -1321,6 +1321,10 @@ export function createProgrammaticToolCallingTool(
         throw new CodeApiRequestError();
       } catch (error) {
         if (error instanceof ProviderTextProtectionError) throw toolCall.toolResultProtection == null ? error : normalizeToolResultError(error);
+        if (toolCall.toolResultProtection != null) {
+          const safety = detachToolSafetyError(error, true);
+          if (safety != null) throw safety;
+        }
         const messageWithReminder = appendFailedExecutionFileReminder(
           (error as Error).message,
           code

@@ -54,7 +54,7 @@ import type { PreparedSubagents } from '@/tools/preparedSubagents';
 import type { ToolMessageRelease } from '@/protection/toolResult';
 import type { RunBreakerScope } from '@/llm/streamLimits';
 import type * as t from '@/types';
-import { captureToolResultOutcome, readmitToolResultOutcome, detachToolControlInterrupt, withToolResultSafetySignal, detachToolSafetyError, validateToolReplayRelease, snapshotToolErrorText, protectToolErrorText, detachReleasedToolError, getToolMessageRelease, replaceReleasedToolMessage, normalizeToolResultError, needsToolReferenceInspection, protectToolReferenceState, bindToolExecuteProtection, validateToolExecuteResults, hasReleasedToolReference, isReleasedToolError, markReleasedToolMessage, protectToolText, protectToolMessage, protectToolExecuteResult, withToolResultBoundary, requiresToolResultProtection, validateToolResultProtection, ToolResultProtectionError } from '@/protection/toolResult';
+import { releaseToolError, captureToolResultOutcome, readmitToolResultOutcome, detachToolControlInterrupt, withToolResultSafetySignal, detachToolSafetyError, validateToolReplayRelease, snapshotToolErrorText, protectToolErrorText, detachReleasedToolError, getToolMessageRelease, replaceReleasedToolMessage, normalizeToolResultError, needsToolReferenceInspection, protectToolReferenceState, bindToolExecuteProtection, validateToolExecuteResults, hasReleasedToolReference, isReleasedToolError, markReleasedToolMessage, protectToolText, protectToolMessage, protectToolExecuteResult, withToolResultBoundary, requiresToolResultProtection, validateToolResultProtection, ToolResultProtectionError } from '@/protection/toolResult';
 import {
   TOOL_BATCH_REPLAY_KEY,
   TOOL_REPLAY_CONFIGS_KEY,
@@ -2226,8 +2226,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       if (!this.handleToolErrors) {
         if (requiresToolResultProtection(this.toolResultProtection, call.name) && !isReleasedToolError(this.toolResultProtection, call.name, call.id ?? '', e) && !(e instanceof ProviderTextProtectionError) &&
             !(e instanceof StreamLimitExceededError) && !(e instanceof PreparedSubagentError) && !isGraphInterrupt(e)) {
-          // eslint-disable-next-line preserve-caught-error -- Raw causes must not escape protection.
-          throw new Error(await protectToolErrorText(this.toolResultProtection, call.name, call.id ?? '', e, config.signal));
+          const text = await protectToolErrorText(this.toolResultProtection, call.name, call.id ?? '', e, config.signal);
+          throw releaseToolError(this.toolResultProtection, call.name, call.id ?? '', text);
         }
         throw e;
       }
