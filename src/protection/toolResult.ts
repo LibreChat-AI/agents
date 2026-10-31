@@ -145,6 +145,52 @@ export function normalizeToolResultError(
   );
 }
 
+const detachedToolSafetyErrors = new WeakSet<Error>();
+
+/** Public safety-error classes do not certify producer-controlled diagnostics. */
+export function detachToolSafetyError(error: unknown, releasedOnly = false): PreparedSubagentError | StreamLimitExceededError | undefined {
+  if (error == null || typeof error !== 'object' || types.isProxy(error) || (releasedOnly && !detachedToolSafetyErrors.has(error as Error))) return undefined;
+  if (error instanceof PreparedSubagentError) {
+    const detached = new PreparedSubagentError('Tool execution aborted after prepared work started.'); detachedToolSafetyErrors.add(detached); return detached;
+  }
+  if (!(error instanceof StreamLimitExceededError)) return undefined;
+  const kind = ownMessageValue(error, 'kind');
+  const limit = ownMessageValue(error, 'limit');
+  const observed = ownMessageValue(error, 'observed');
+  if ((kind !== 'tool_call_args' && kind !== 'delta_events') || typeof limit !== 'number' || !Number.isSafeInteger(limit) || limit < 0 || typeof observed !== 'number' || !Number.isSafeInteger(observed) || observed < 0) throw new ToolResultProtectionError('unsupported');
+  const detached = new StreamLimitExceededError({ kind, limit, observed }); detachedToolSafetyErrors.add(detached); return detached;
+}
+
+/** Native runnable abort races must observe the same raw-free failures as tool bodies. */
+export async function withToolResultSafetySignal<T>(signal: AbortSignal | undefined, invoke: (signal: AbortSignal | undefined) => Promise<T>): Promise<T> {
+  if (signal == null) {
+    try { return await invoke(signal); } catch (error) { throw detachToolSafetyError(error, true) ?? error; }
+  }
+  const controller = new AbortController();
+  const abort = (): void => {
+    let reason: Error;
+    try {
+      const error: unknown = signal.reason;
+      reason = detachToolSafetyError(error) ?? (error instanceof ProviderTextProtectionError ? normalizeToolResultError(error) : new ToolResultProtectionError('cancelled'));
+    } catch { reason = new ToolResultProtectionError('unsupported'); }
+    controller.abort(reason);
+  };
+  signal.addEventListener('abort', abort, { once: true });
+  if (signal.aborted) abort();
+  try { return await invoke(controller.signal); }
+  catch (error) { throw detachToolSafetyError(error, true) ?? error; }
+  finally { signal.removeEventListener('abort', abort); }
+}
+
+function checkToolResultAttempt(attempt: ProviderTextAttempt): void {
+  try { attempt.check(); } catch (error) { throw detachToolSafetyError(error) ?? error; }
+}
+
+function toolResultAttempt(policy: ToolResultProtection, signal?: AbortSignal): ProviderTextAttempt {
+  try { return new ProviderTextAttempt(budget(policy), signal); }
+  catch (error) { throw detachToolSafetyError(error) ?? error; }
+}
+
 export function validateToolResultProtection(
   policy: ToolResultProtection
 ): void {
@@ -1695,8 +1741,8 @@ export function withToolResultBoundary(
       manager: CallbackManagerForToolRun | undefined,
       effective?: RunnableConfig
     ): Promise<ToolMessage> => {
-      const attempt = new ProviderTextAttempt(
-        budget(policy),
+      const attempt = toolResultAttempt(
+        policy,
         effective?.signal ?? config.signal
       );
       try {
@@ -1710,15 +1756,12 @@ export function withToolResultBoundary(
             )
           );
         } catch (error) {
-          attempt.check();
+          checkToolResultAttempt(attempt);
           if (error != null && typeof error === 'object' && types.isProxy(error)) throw new ToolResultProtectionError('unsupported');
           if (error instanceof ProviderTextProtectionError)
             throw normalizeToolResultError(error);
-          if (
-            error instanceof PreparedSubagentError ||
-            error instanceof StreamLimitExceededError
-          )
-            throw error;
+          const safety = detachToolSafetyError(error);
+          if (safety != null) throw safety;
           if (error instanceof GraphInterrupt) {
             const interrupts = ownMessageValue(error, 'interrupts');
             if (snapshotToolCheckpointArray(interrupts as readonly object[]).length === 0) throw new GraphInterrupt([]);
@@ -1731,7 +1774,7 @@ export function withToolResultBoundary(
           raw = snapshotToolErrorText(error);
           status = 'error';
         }
-        attempt.check();
+        checkToolResultAttempt(attempt);
         if (
           admittedTool.name !== toolName ||
           admittedTool.responseFormat !== responseFormat
@@ -1777,12 +1820,12 @@ export function withToolResultBoundary(
         });
         return markReleasedToolMessage(policy, toolName, id, message);
       } catch (error) {
-        attempt.check();
+        checkToolResultAttempt(attempt);
         if (error instanceof ProviderTextProtectionError)
           throw normalizeToolResultError(error);
+        const safety = detachToolSafetyError(error);
+        if (safety != null) throw safety;
         if (
-          error instanceof PreparedSubagentError ||
-          error instanceof StreamLimitExceededError ||
           error instanceof GraphInterrupt ||
           (error instanceof Error &&
             isReleasedToolError(policy, toolName, id, error))

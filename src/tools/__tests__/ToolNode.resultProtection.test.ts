@@ -49,6 +49,7 @@ import {
   createCloudflareProgrammaticToolCallingTool,
   createCloudflareBashProgrammaticToolCallingTool,
 } from '@/tools/cloudflare/CloudflareProgrammaticToolCalling';
+import { createProviderTextRestartCancellation, ProviderTextProtectionError } from '@/protection/providerText';
 import { createLocalProgrammaticToolCallingTool } from '@/tools/local/LocalProgrammaticToolCalling';
 import {
   createProgrammaticToolCallingTool,
@@ -61,7 +62,6 @@ import {
 } from '@/tools/toolBatchReplay';
 import { messagesStateReducer, createRemoveAllMessage } from '@/messages/reducer';
 import { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
-import { ProviderTextProtectionError } from '@/protection/providerText';
 import { Constants, GraphEvents, Providers, StepTypes } from '@/common';
 import { PreparedSubagentError } from '@/tools/preparedSubagents';
 import fixtures from '@/protection/__tests__/fixtures/a1.json';
@@ -996,7 +996,7 @@ it.each(['direct', 'host'] as const)(
 );
 
 it.each([true, false])(
-  'preserves SDK-owned safety interruption identity with tool handling=%s',
+  'keeps producer safety interruptions terminal with tool handling=%s',
   async (handleToolErrors) => {
     const safety = new PreparedSubagentError(
       'Allowed prepared-execution safety control'
@@ -1010,7 +1010,9 @@ it.each([true, false])(
       toolResultProtection: policy(),
       handleToolErrors,
     });
-    await expect(node.invoke(state())).rejects.toBe(safety);
+    const result = await node.invoke(state()).catch((error: Error) => error);
+    expect(result).toBeInstanceOf(PreparedSubagentError); expect(result).not.toBe(safety);
+    assertNoCanary(String(result));
   }
 );
 
@@ -4050,4 +4052,67 @@ it('preserves frozen handoff budgets and transitions, and admits payload-free Ov
   const copy = snapshotToolHandoffState(source); expect(copy).toEqual(source); expect(copy).not.toBe(source); expect(copy.transitions).not.toBe(source.transitions);
   const overwrite = snapshotToolHandoffWrite(new Overwrite(source)) as Overwrite<HandoffState>; expect(overwrite.value).toEqual(source); expect(overwrite.value).not.toBe(source);
   expect((snapshotToolHandoffWrite(new Overwrite(undefined)) as Overwrite<undefined>).value).toBeUndefined();
+});
+
+it.each((['stream', 'prepared'] as const).flatMap((type) => (['message', 'cause', 'fields', 'accessor', 'callback-mutation'] as const).flatMap((carrier) => [true, false].map((handling) => [type, carrier, handling] as const))))('detaches producer safety exceptions before native callbacks (%s/%s/handling=%s)', async (type, carrier, handleToolErrors) => {
+  let reads = 0; let inspections = 0; let nativeErrors = 0; let errorHooks = 0; const observed: string[] = [];
+  const safety = type === 'stream' ? new StreamLimitExceededError({ kind: 'tool_call_args', limit: 10, observed: 11, toolName: 'lookup' }) : new PreparedSubagentError('Allowed original diagnostic');
+  if (carrier === 'message' || carrier === 'callback-mutation') { safety.message = fixtures.canaries[0]; safety.stack = fixtures.canaries[0]; }
+  if (carrier === 'cause') Object.defineProperty(safety, 'cause', { value: new Error(fixtures.canaries[0]), enumerable: true });
+  if (carrier === 'fields') { Object.defineProperty(safety, 'raw', { value: fixtures.canaries[0], enumerable: true }); if (type === 'stream') Object.defineProperty(safety, 'toolName', { value: fixtures.canaries[0] }); else safety.name = fixtures.canaries[0]; }
+  if (carrier === 'accessor') for (const key of ['message', 'stack', 'cause']) Object.defineProperty(safety, key, { configurable: true, get: () => { reads++; throw new Error(fixtures.canaries[0]); } });
+  const callback = BaseCallbackHandler.fromMethods({ handleToolError: (error): void => {
+    nativeErrors++; observed.push(String(error), JSON.stringify(error), error.stack ?? '');
+    if (carrier === 'callback-mutation') { error.message = fixtures.canaries[0]; Object.defineProperty(error, 'cause', { value: fixtures.canaries[0] }); }
+  }, handleToolEnd: (output): void => { observed.push(JSON.stringify(output)); } }); callback.awaitHandlers = true;
+  const node = new ToolNode({ trace: true, tools: [direct(() => { throw safety; })], toolResultProtection: policy({ inspect: ({ content }) => { inspections++; return approve(content); } }), handleToolErrors, errorHandler: async () => { errorHooks++; return true; }, toolOutputReferences: { enabled: true } });
+  const result = await node.invoke(state(), { callbacks: [callback], configurable: { run_id: 'safe-native-error' } }).catch((error: Error) => error);
+  expect(result).toBeInstanceOf(type === 'stream' ? StreamLimitExceededError : PreparedSubagentError); expect(result).not.toBe(safety);
+  expect(reads).toBe(0); expect(inspections).toBe(0); expect(errorHooks).toBe(0); expect(nativeErrors).toBe(1); assertNoCanary(observed.join('')); assertNoCanary(String(result)); assertNoCanary(JSON.stringify(result));
+  expect(result).not.toHaveProperty('cause'); expect(result).not.toHaveProperty('raw'); expect(node._unsafeGetToolOutputRegistry()!.size).toBe(0);
+  if (type === 'stream') expect(result).toMatchObject({ kind: 'tool_call_args', limit: 10, observed: 11 });
+});
+
+it.each(['stream', 'prepared'] as const)('preserves safety abort semantics without mutable signal diagnostics (%s)', async (type) => {
+  const reason = type === 'stream' ? new StreamLimitExceededError({ kind: 'delta_events', limit: 10, observed: 11 }) : new PreparedSubagentError(fixtures.canaries[0], { cause: new Error(fixtures.canaries[0]) });
+  reason.message = fixtures.canaries[0]; const abort = new AbortController(); let executions = 0; const observed: string[] = [];
+  const source = new DynamicStructuredTool({ name: 'lookup', description: 'Allowed abort control.', schema: z.object({ count: z.number() }), func: async () => { executions++; abort.abort(reason); throw reason; } });
+  const callback = BaseCallbackHandler.fromMethods({ handleToolError: (error): void => { observed.push(String(error), JSON.stringify(error)); } }); callback.awaitHandlers = true;
+  const node = new ToolNode({ trace: true, tools: [source], toolResultProtection: policy() });
+  const result = await node.invoke(state(), { signal: abort.signal, callbacks: [callback] }).catch((error: Error) => error);
+  expect(executions).toBe(1); expect(result).toBeInstanceOf(type === 'stream' ? StreamLimitExceededError : PreparedSubagentError); assertNoCanary(observed.join('')); assertNoCanary(String(result)); expect(result).not.toHaveProperty('cause');
+});
+
+it.each((['stream', 'prepared'] as const).flatMap((type) => [false, true].map((unselected) => [type, unselected] as const)))('retains original producer safety diagnostics when protection is absent or unselected (%s/%s)', async (type, unselected) => {
+  const safety = type === 'stream' ? new StreamLimitExceededError({ kind: 'tool_call_args', limit: 10, observed: 11 }) : new PreparedSubagentError(fixtures.canaries[0]); safety.message = fixtures.canaries[0];
+  const node = new ToolNode({ trace: true, tools: [direct(() => { throw safety; })], ...(unselected ? { toolResultProtection: policy({ toolNames: ['other'] }) } : {}) });
+  await expect(node.invoke(state())).rejects.toBe(safety);
+});
+
+it.each(['kind', 'limit', 'observed', 'inherited', 'getter'] as const)('fails closed on malformed producer safety metadata before native callbacks (%s)', async (field) => {
+  let reads = 0; const observed: string[] = [];
+  const safety = new StreamLimitExceededError({ kind: 'tool_call_args', limit: 10, observed: 11 });
+  if (field === 'kind') Object.defineProperty(safety, 'kind', { value: fixtures.canaries[0] });
+  if (field === 'limit') Object.defineProperty(safety, 'limit', { value: NaN });
+  if (field === 'observed') Object.defineProperty(safety, 'observed', { value: fixtures.canaries[0] });
+  if (field === 'inherited') { Reflect.deleteProperty(safety, 'kind'); Object.setPrototypeOf(safety, Object.create(StreamLimitExceededError.prototype, { kind: { get: () => { reads++; throw new Error(fixtures.canaries[0]); } } })); }
+  if (field === 'getter') Object.defineProperty(safety, 'observed', { get: () => { reads++; throw new Error(fixtures.canaries[0]); } });
+  const callback = BaseCallbackHandler.fromMethods({ handleToolError: (error): void => { observed.push(String(error), JSON.stringify(error)); } }); callback.awaitHandlers = true;
+  const node = new ToolNode({ trace: true, tools: [direct(() => { throw safety; })], toolResultProtection: policy() });
+  const result = await node.invoke(state(), { callbacks: [callback] }).catch((error: Error) => error);
+  expect(result).toMatchObject({ code: 'unsupported' }); expect(reads).toBe(0); assertNoCanary(String(result)); assertNoCanary(observed.join(''));
+});
+
+it.each([true, false])('detaches safety failures retained by native chain-error observers (signal=%s)', async (withSignal) => {
+  const callback = BaseCallbackHandler.fromMethods({ handleChainError: (error): void => { error.message = fixtures.canaries[0]; Object.defineProperty(error, 'cause', { value: fixtures.canaries[0], configurable: true }); } }); callback.awaitHandlers = true;
+  const source = direct(() => { throw new StreamLimitExceededError({ kind: 'delta_events', limit: 10, observed: 11 }); });
+  const node = new ToolNode({ trace: true, tools: [source], toolResultProtection: policy() });
+  const result = await node.invoke(state(), { callbacks: [callback], ...(withSignal ? { signal: new AbortController().signal } : {}) }).catch((error: Error) => error);
+  expect(result).toBeInstanceOf(StreamLimitExceededError); expect(result).not.toHaveProperty('cause'); assertNoCanary(String(result));
+});
+
+it('preserves the private SDK restart marker through the protected native abort path', async () => {
+  const marker = createProviderTextRestartCancellation(); const abort = new AbortController();
+  const node = new ToolNode({ trace: true, tools: [direct(() => { abort.abort(marker); throw marker; })], toolResultProtection: policy() });
+  await expect(node.invoke(state(), { signal: abort.signal })).rejects.toBe(marker);
 });
