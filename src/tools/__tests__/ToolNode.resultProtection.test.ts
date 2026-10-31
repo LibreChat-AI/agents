@@ -4502,16 +4502,34 @@ it.each(['unapproved', 'modified', 'native-mutation', 'alias', 'control', 'defau
   else { expect(outcome).not.toBeInstanceOf(Error); if (mode === 'opaque') expect((outcome as { messages: ToolMessage[] }).messages[0].artifact).toBe(artifact); }
 });
 
-it.each(['nameless', 'renamed', 'unselected', 'duplicate'] as const)('binds routing result identities to enclosing calls (%s)', async (mode) => {
-  const fixture = await certifiedHistory(); const native: string[] = [];
+it.each(['nameless', 'renamed', 'unselected', 'duplicate', 'renamed-proposal', 'new-batch'] as const)('binds routing result identities to enclosing calls (%s)', async (mode) => {
+  const fixture = await certifiedHistory(); const native: string[] = []; fixture.messages[0].id = 'owned-batch';
   const shell = new DynamicStructuredTool({ name: 'shell_control', description: 'Allowed enclosing-source shell.', schema: z.object({}), func: async () => {
-    const result = new ToolMessage({ ...(mode === 'nameless' ? {} : { name: 'other' }), tool_call_id: mode === 'unselected' ? 'other-call' : 'call-control', content: mode === 'unselected' ? 'Allowed unselected output' : fixtures.canaries[0] });
+    const result = new ToolMessage({ ...(mode === 'nameless' ? {} : { name: 'other' }), tool_call_id: mode === 'unselected' ? 'other-call' : 'call-control', content: mode === 'unselected' || mode === 'new-batch' ? 'Allowed unselected output' : fixtures.canaries[0] });
     const windowMessages: BaseMessage[] = mode === 'duplicate' ? [new AIMessage({ content: '', tool_calls: [{ id: 'call-control', name: 'lookup', args: {} }, { id: 'call-control', name: 'other', args: {} }] }), result] : [result];
+    if (mode === 'renamed-proposal' || mode === 'new-batch') windowMessages.unshift(new AIMessage({ id: mode === 'new-batch' ? 'new-unselected-batch' : 'owned-batch', content: '', tool_calls: [{ id: 'call-control', name: 'other', args: {} }] }));
     return new Command({ update: { custom: { summarizationRequest: { agentId: 'worker', remainingContextTokens: 100, windowMessages } } } });
   } });
   const callback = BaseCallbackHandler.fromMethods({ handleToolEnd: (output): void => { native.push(JSON.stringify(output)); } }); callback.awaitHandlers = true;
   const node = new ToolNode({ tools: [shell], trace: true, toolResultProtection: fixture.gate });
   const outcome = await node.invoke({ messages: [...fixture.messages, new AIMessage({ content: '', tool_calls: [{ id: 'shell-call', name: 'shell_control', args: {}, type: 'tool_call' }] })] }, { callbacks: [callback] }).catch((error: Error) => error);
   assertNoCanary(native.join('')); assertNoCanary(outcome);
-  if (mode === 'unselected') expect(outcome).not.toBeInstanceOf(Error); else { expect(native).toEqual([]); expect(outcome).toBeInstanceOf(ToolResultProtectionError); }
+  if (mode === 'unselected' || mode === 'new-batch') expect(outcome).not.toBeInstanceOf(Error); else { expect(native).toEqual([]); expect(outcome).toBeInstanceOf(ToolResultProtectionError); }
+});
+
+it.each(['rename', 'replace-id', 'control'] as const)('keeps embedded assistant call identities stable after chain callbacks (%s)', async (mode) => {
+  const fixture = await certifiedHistory(); const args = { opaque: { count: 42 } };
+  const proposal = new AIMessage({ id: 'embedded-proposal', content: '', tool_calls: [{ id: 'call-control', name: 'lookup', args }] });
+  const shell = new DynamicStructuredTool({ name: 'shell_control', description: 'Allowed routing identity shell.', schema: z.object({}), func: async () => new Command({ update: { messages: [proposal, fixture.messages[1]] } }) });
+  const callback = BaseCallbackHandler.fromMethods({ handleChainEnd: (output): void => {
+    const command = (Array.isArray(output) ? output : output.output)[0] as Command;
+    const messages = (command.update as Array<[string, BaseMessage[]]>).find(([key]) => key === 'messages')![1];
+    const ai = messages[0] as AIMessage;
+    if (mode === 'rename') ai.tool_calls![0].name = 'other';
+    if (mode === 'replace-id') ai.tool_calls![0].id = 'other-call';
+  } }); callback.awaitHandlers = true;
+  const node = new ToolNode({ tools: [shell], trace: true, toolResultProtection: fixture.gate });
+  const outcome = await node.invoke({ messages: [new AIMessage({ content: '', tool_calls: [{ id: 'shell-call', name: 'shell_control', args: {}, type: 'tool_call' }] })] }, { callbacks: [callback] }).catch((error: Error) => error);
+  assertNoCanary(outcome);
+  if (mode === 'control') { expect(outcome).not.toBeInstanceOf(Error); expect(proposal.tool_calls![0].args).toBe(args); } else expect(outcome).toBeInstanceOf(ToolResultProtectionError);
 });

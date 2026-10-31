@@ -1251,7 +1251,7 @@ function assertToolProposalSource(sources: ToolCallSources, id: string, name: st
 }
 
 type ToolOutcomeGuard = (input: unknown) => unknown;
-type ToolOutcomeContext = { sources?: ToolCallSources; proposals?: Map<string, string>; control?: boolean };
+type ToolOutcomeContext = { sources?: ToolCallSources; proposals?: Map<string, Pick<ToolCallSource, 'name' | 'batchId'>>; control?: boolean };
 const toolOutcomeAdmissions = new WeakMap<object, { policy: ToolResultProtection; guard: ToolOutcomeGuard }>();
 
 function toolOutcomeGuard(policy: ToolResultProtection, value: unknown, active = new WeakSet<object>(), depth = 0, context: ToolOutcomeContext = {}): ToolOutcomeGuard {
@@ -1276,24 +1276,34 @@ function toolOutcomeGuard(policy: ToolResultProtection, value: unknown, active =
       const envelope = admission?.policy === policy ? admission.envelope : undefined;
       if (envelope != null && !matchesToolMessageEnvelope(snapshotToolMessageEnvelope(message as ToolMessage), envelope)) throw new ToolResultProtectionError('unsupported');
       const name = ownMessageValue(message, 'name');
+      const calls = type === 'ai' ? (ownMessageValue(message, 'tool_calls') ?? []) as Array<{ id?: string; name: string }> : undefined;
+      const routing = calls?.map(({ id, name }) => ({ id, name }));
       if (type === 'human') context.proposals?.clear();
       if (type === 'ai') {
+        const batchId = ownMessageValue(message, 'id');
+        if (batchId != null && typeof batchId !== 'string') throw new ToolResultProtectionError('unsupported');
         const ids = new Set<string>();
-        for (const call of (ownMessageValue(message, 'tool_calls') ?? []) as Array<{ id?: string; name: string }>) {
+        for (const call of calls!) {
           if (typeof call.name !== 'string' || (call.id != null && (typeof call.id !== 'string' || call.id === '' || ids.has(call.id)))) throw new ToolResultProtectionError('unsupported');
-          if (call.id != null) { ids.add(call.id); context.proposals?.set(call.id, call.name); }
+          if (call.id != null) {
+            if (context.sources != null) assertToolProposalSource(context.sources, call.id, call.name, batchId ?? undefined);
+            ids.add(call.id); context.proposals?.set(call.id, { name: call.name, batchId: batchId ?? undefined });
+          }
         }
       }
       if (type === 'tool') {
         const identity = historyIdentity(message);
-        const source = context.proposals?.get(identity.tool_call_id) ?? (envelope == null && context.sources != null ? toolSourceName(context.sources, identity.tool_call_id, identity.id, undefined) : admission?.name);
+        const proposal = context.proposals?.get(identity.tool_call_id);
+        const owned = envelope == null && context.sources != null ? toolSourceName(context.sources, identity.tool_call_id, identity.id, proposal?.batchId, proposal != null) : admission?.name;
+        const source = owned ?? proposal?.name;
         const selected = (typeof name === 'string' && requiresToolResultProtection(policy, name)) || (source != null && requiresToolResultProtection(policy, source));
-        if ((envelope == null && (selected || (context.control === true && name == null))) || (selected && source != null && name != null && name !== source)) throw new ToolResultProtectionError('unsupported');
+        if ((envelope == null && (selected || (context.control === true && name == null))) || (selected && ((source != null && name != null && name !== source) || (owned != null && proposal != null && owned !== proposal.name)))) throw new ToolResultProtectionError('unsupported');
       }
       const identity = ['type', 'id', 'name', 'tool_call_id'].map((field) => ownMessageValue(message, field));
       return (current) => {
         const copy = snapshotToolInputMessages([current as BaseMessage])[0];
         if (!identity.every((field, index) => field === ownMessageValue(copy, ['type', 'id', 'name', 'tool_call_id'][index]))) throw new ToolResultProtectionError('unsupported');
+        if (routing != null && !isDeepStrictEqual(((ownMessageValue(copy, 'tool_calls') ?? []) as Array<{ id?: string; name: string }>).map(({ id, name }) => ({ id, name })), routing)) throw new ToolResultProtectionError('unsupported');
         if (envelope != null && admission != null) {
           if (!matchesToolMessageEnvelope(snapshotToolMessageEnvelope(copy as ToolMessage), envelope)) throw new ToolResultProtectionError('unsupported');
           const Message = Object.getPrototypeOf(message) === ToolMessageChunk.prototype ? ToolMessageChunk : ToolMessage;
