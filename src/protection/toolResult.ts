@@ -1262,6 +1262,14 @@ function toolOutcomeGuard(policy: ToolResultProtection, value: unknown, active =
         return copy;
       };
     }
+    if (Object.hasOwn(value, '__overwrite__')) {
+      const overwritten = ownMessageValue(value, '__overwrite__');
+      const guard = toolOutcomeGuard(policy, overwritten, active);
+      return (current) => {
+        if (current == null || typeof current !== 'object' || !Object.hasOwn(current, '__overwrite__')) throw new ToolResultProtectionError('unsupported');
+        return new Overwrite(guard(ownMessageValue(current, '__overwrite__')));
+      };
+    }
     if (value instanceof Command) {
       const command = snapshotToolCommand(value);
       const update = toolOutcomeGuard(policy, snapshotToolResumeUpdates(command.update), active);

@@ -4319,3 +4319,26 @@ it.each(['tool-method', 'tool-type', 'container-getter', 'mismatch', 'wrong-agen
   expect(nativeInvocations).toBe(0); expect(reads).toBe(0); assertNoCanary(String(result)); assertNoCanary(JSON.stringify(result));
   if (kind === 'control' || kind === 'empty') expect(result).toMatchObject({ content: kind === 'empty' ? 'Task completed' : 'Allowed designated answer' }); else expect(result).toBeInstanceOf(ToolResultProtectionError);
 });
+
+it.each((['object', 'tuples', 'overwrite', 'send'] as const).flatMap((shape) => (['mutate', 'control'] as const).map((mode) => [shape, mode] as const)))('preserves post-chain admission for Command outcome message carriers (%s/%s)', async (shape, mode) => {
+  const fixture = await certifiedHistory(); const selected = fixture.messages[1] as ToolMessage; let retained: ToolMessage | undefined;
+  const shell = new DynamicStructuredTool({ name: 'shell_control', description: 'Allowed routing shell.', schema: z.object({}), func: async () => {
+    const messages = [selected, new ToolMessage({ name: 'shell_control', tool_call_id: 'shell-call', content: 'Allowed shell result' })];
+    if (shape === 'send') return new Command({ graph: Command.PARENT, goto: [new Send('recipient', { messages })] });
+    const update = shape === 'tuples' ? [['messages', messages]] as [string, unknown][] : { messages: shape === 'overwrite' ? new Overwrite(messages) : messages };
+    return new Command({ update, goto: 'recipient' });
+  } });
+  const callback = BaseCallbackHandler.fromMethods({ handleChainEnd: (output): void => {
+    const commands = (Array.isArray(output) ? output : output.output) as Command[];
+    const command = commands[0];
+    let messages: ToolMessage[];
+    if (shape === 'send') messages = ((command.goto as Send[])[0].args as { messages: ToolMessage[] }).messages;
+    else { const value: unknown = Array.isArray(command.update) ? command.update.find(([key]) => key === 'messages')?.[1] : command.update?.messages; messages = (value instanceof Overwrite ? value.value : value) as ToolMessage[]; }
+    retained = messages.find((message) => message.tool_call_id === 'call-control'); if (mode === 'mutate') retained!.content = fixtures.canaries[0];
+  } }); callback.awaitHandlers = true;
+  const node = new ToolNode({ trace: true, tools: [shell], toolResultProtection: fixture.gate });
+  const result = await node.invoke({ messages: [new AIMessage({ id: 'shell-batch', content: '', tool_calls: [{ id: 'shell-call', name: 'shell_control', args: {}, type: 'tool_call' }] })] }, { callbacks: [callback] }).catch((error: Error) => error);
+  assertNoCanary(String(result)); assertNoCanary(JSON.stringify(result));
+  if (mode === 'mutate') expect(result).toMatchObject({ code: 'unsupported' });
+  else { expect(result).not.toBeInstanceOf(Error); expect(JSON.stringify(result)).toContain('[EMAIL_1]'); retained!.content = fixtures.canaries[0]; assertNoCanary(result); }
+});
