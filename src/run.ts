@@ -1,5 +1,9 @@
+import type { ToolCallSources } from '@/protection/toolResult';
+import { snapshotToolSubagentResult, snapshotToolHandoffWrite, snapshotToolHandoffState, snapshotToolSummarizationRequest, snapshotToolRunStepWrite, snapshotToolCallSources, snapshotToolCommand, protectToolApprovalResume, snapshotToolInputMessages, snapshotToolRunStepState, snapshotToolCheckpointRecord, admitToolResultCheckpoints, getToolResultCheckpointLookup, bindToolResultCheckpoint, snapshotToolMessageRemoval, snapshotToolResumeUpdates, snapshotToolResumeMessages, snapshotToolHistoryMessages, normalizeToolResultError, hasRequiredToolExecuteProtection, ToolResultProtectionError } from '@/protection/toolResult';
+import { messagesStateReducer } from '@/messages/reducer';
 // src/run.ts
 import { nanoid } from 'nanoid';
+import { isProxy } from 'node:util/types';
 import { PromptTemplate } from '@langchain/core/prompts';
 import { RunnableLambda } from '@langchain/core/runnables';
 import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
@@ -82,6 +86,7 @@ import {
 } from '@/langfuseConfig';
 import {
   cloneToolApprovalInterruptPayload,
+  createToolApprovalReviewEvidence,
   TOOL_APPROVAL_REVIEW_CONFIG_KEY,
 } from '@/hitl/approvalReview';
 import {
@@ -308,6 +313,7 @@ type InterruptStateSnapshot = {
   values?: {
     handoffState?: t.HandoffState;
     messages?: BaseMessage[];
+    agentMessages?: BaseMessage[];
     runStepState?: t.RunStepResumeState;
   };
   tasks?: Array<{
@@ -450,7 +456,7 @@ function overwriteResumeRunStepState(
 
 function copyResumeCommand(
   command: Command,
-  overrides: Pick<ConstructorParameters<typeof Command>[0], 'resume' | 'update'>
+  overrides: Pick<ConstructorParameters<typeof Command>[0], 'resume' | 'update' | 'goto'>
 ): Command {
   const resumed = new Command({
     ...(command.graph == null ? {} : { graph: command.graph }),
@@ -458,6 +464,7 @@ function copyResumeCommand(
     ...(command.update === undefined ? {} : { update: command.update }),
     ...(command.goto === undefined ? {} : { goto: command.goto }),
     ...overrides,
+
   });
   resumed.lc_direct_tool_output = command.lc_direct_tool_output;
   return resumed;
@@ -497,6 +504,10 @@ export class Run<_T extends t.BaseGraphState> {
   private subagentUsageSink?: t.SubagentUsageSink;
   private preemption?: t.StreamPreemption;
   private maxStopContinuations: number;
+  private toolResultProtection?: t.StandardGraphInput['toolResultProtection'];
+  private protectedSendSources: ToolCallSources = new Map();
+  private readonly protectedApprovals = new Map<string, t.ToolApprovalInterruptPayload | undefined>();
+  private readonly preparedToolResumes = new WeakSet<Command>();
   private providerTextProtection?: t.StandardGraphInput['providerTextProtection'];
   private streamLimits?: t.StreamLimits;
   private subagentTasks?: t.SubagentTaskConfig;
@@ -600,9 +611,13 @@ export class Run<_T extends t.BaseGraphState> {
     );
     this.streamLimits = config.streamLimits;
     this.providerTextProtection = config.providerTextProtection;
+    this.toolResultProtection = config.toolResultProtection;
 
     if (!config.graphConfig) {
       throw new Error('Graph config not provided');
+    }
+    if ('toolResultProtection' in config.graphConfig && config.graphConfig.toolResultProtection != null) {
+      throw new ToolResultProtectionError('incompatible');
     }
     if ('providerTextProtection' in config.graphConfig &&
         config.graphConfig.providerTextProtection != null) {
@@ -705,6 +720,7 @@ export class Run<_T extends t.BaseGraphState> {
         preemption: this.preemption,
         streamLimits: this.streamLimits,
         providerTextProtection: this.providerTextProtection,
+        toolResultProtection: this.toolResultProtection,
         toolExecution: this.toolExecution,
         clientDelegatedToolNames: this.clientDelegatedToolNames,
       },
@@ -753,6 +769,7 @@ export class Run<_T extends t.BaseGraphState> {
         preemption: this.preemption,
         streamLimits: this.streamLimits,
         providerTextProtection: this.providerTextProtection,
+        toolResultProtection: this.toolResultProtection,
         toolExecution: this.toolExecution,
       },
     });
@@ -1118,7 +1135,13 @@ export class Run<_T extends t.BaseGraphState> {
        * close; duplicate callback echoes are absorbed by the terminal-status
        * guard in `closeRunStep`.
        */
+      const requiredToolRequest = eventName === GraphEvents.ON_TOOL_EXECUTE && hasRequiredToolExecuteProtection(data as t.ToolExecuteBatchRequest)
+        ? data as t.ToolExecuteBatchRequest : undefined;
       try {
+        if (requiredToolRequest != null && (!handler || !this.Graph)) {
+          requiredToolRequest.reject(new ToolResultProtectionError('unavailable'));
+          return;
+        }
         if (handler && this.Graph) {
           return await handler.handle(
             eventName,
@@ -1136,6 +1159,9 @@ export class Run<_T extends t.BaseGraphState> {
             this.Graph
           );
         }
+      } catch (error) {
+        if (requiredToolRequest == null) throw error;
+        requiredToolRequest.reject(normalizeToolResultError(error));
       } finally {
         if (
           eventName === GraphEvents.ON_RUN_STEP_COMPLETED &&
@@ -1303,16 +1329,12 @@ export class Run<_T extends t.BaseGraphState> {
      * new prompt to evaluate) and read run-state from the Graph wrapper
      * instead of `inputs.messages`.
      */
+    if (this.toolResultProtection != null && isProxy(inputs)) throw new ToolResultProtectionError('unsupported');
     const isResume = inputs instanceof Command;
     if (!isResume) {
       graph.startFreshLangfuseExecution();
     }
-    const stateInputs = isResume ? undefined : (inputs as t.IState);
-    if (stateInputs != null) {
-      this.activityPhaseTraceInput = findActivityPhaseTraceInput(
-        stateInputs.messages
-      );
-    }
+    let stateInputs = isResume ? undefined : (inputs as t.IState);
 
     /**
      * Every honored seal costs one extra superstep, so a preemption-enabled
@@ -1341,27 +1363,23 @@ export class Run<_T extends t.BaseGraphState> {
     }
     let overwriteLegacyResumeState = false;
     if (isResume) {
-      config = await this.resolveInterruptResumeConfig(
-        config,
-        (inputs as Command).update,
-        (inputs as Command).resume
-      );
+      const original = inputs as Command;
+      const command = this.toolResultProtection == null ? original : snapshotToolCommand(original);
+      const prepared = await this.resolveInterruptResumeConfig(config, command.update, command.resume, this.preparedToolResumes.delete(original));
+      config = prepared.config;
       const interruptId = this._interrupt?.interruptId;
-      const command = inputs as Command;
-      if (
-        command.resume !== undefined &&
-        typeof interruptId === 'string' &&
-        interruptId.length > 0 &&
-        !isLangGraphResumeMapForInterrupt(
-          command.resume,
-          interruptId,
-          this.getPendingInterruptState().ids
-        )
-      ) {
-        inputs = copyResumeCommand(command, {
-          resume: { [interruptId]: command.resume },
-        });
+      let resume = command.resume;
+      if (resume !== undefined && typeof interruptId === 'string' && interruptId.length > 0 && !isLangGraphResumeMapForInterrupt(resume, interruptId, this.getPendingInterruptState().ids)) resume = { [interruptId]: resume };
+      let goto = command.goto;
+      if (this.toolResultProtection != null) {
+        for (const pending of this.getPendingInterruptState().pending) {
+          const evidence = createToolApprovalReviewEvidence(pending.interruptId, getPublicToolInterruptPayload(pending.payload));
+          this.protectedApprovals.set(pending.interruptId, evidence?.payload);
+        }
+        goto = await graph.validateToolResultGoto(goto, callerConfig.signal, this.protectedSendSources);
+        if (resume != null) resume = await protectToolApprovalResume(this.toolResultProtection, resume, this.protectedApprovals, interruptId, callerConfig.signal);
       }
+      inputs = copyResumeCommand(command, { update: prepared.update, resume, goto });
       if (graph.getStopContinuationExecutionId() === '') {
         graph.startStopContinuationExecution(nanoid());
         overwriteLegacyResumeState = this.hasCheckpointer;
@@ -1393,6 +1411,7 @@ export class Run<_T extends t.BaseGraphState> {
      * block so the sidecars survive both ends of the interrupt
      * boundary.
      */
+    let inputCheckpoint: InterruptStateSnapshot | undefined;
     if (!isResume) {
       const checkpointThreadId =
         typeof config.configurable?.thread_id === 'string'
@@ -1418,6 +1437,22 @@ export class Run<_T extends t.BaseGraphState> {
       graph.resetValues(streamOptions?.keepContent, checkpointScope);
       graph.handoffRouting?.start();
       graph.startStopContinuationExecution(nanoid());
+      if (this.toolResultProtection != null && this.hasCheckpointer) {
+        const workflow = graphRunnable as t.CompiledStateWorkflow & WorkflowWithStateHistory;
+        const admission = graph.createToolResultCheckpointAdmission(callerConfig.signal);
+        config.configurable = admitToolResultCheckpoints(config, graph.compileOptions?.checkpointer, admission.admit).configurable;
+        inputCheckpoint = await workflow.getState?.(getToolResultCheckpointLookup(config), { subgraphs: true });
+        if (inputCheckpoint == null) throw new ToolResultProtectionError('unsupported');
+        inputCheckpoint = await graph.validateToolResultCheckpoint(inputCheckpoint, callerConfig.signal, await admission.finish());
+        config.configurable = bindToolResultCheckpoint(config, inputCheckpoint, graph.compileOptions?.checkpointer, admission.admit).configurable;
+      }
+    }
+    if (stateInputs != null) {
+      if (this.toolResultProtection != null) {
+        stateInputs = await this.validateToolResultStateInputs(stateInputs, inputCheckpoint, callerConfig.signal);
+        inputs = stateInputs;
+      }
+      this.activityPhaseTraceInput = findActivityPhaseTraceInput(stateInputs.messages);
     }
     this._interrupt = undefined;
     this._haltedReason = undefined;
@@ -1528,6 +1563,10 @@ export class Run<_T extends t.BaseGraphState> {
       );
       if (shouldHalt) {
         return undefined;
+      }
+      if (this.toolResultProtection != null) {
+        stateInputs = await this.validateToolResultStateInputs(stateInputs, inputCheckpoint, callerConfig.signal);
+        inputs = stateInputs;
       }
     }
 
@@ -2151,25 +2190,14 @@ export class Run<_T extends t.BaseGraphState> {
       'update' | 'goto'
     >
   ): Promise<MessageContentComplex[] | undefined> {
-    await this.restoreInterruptFromCheckpoint(
-      callerConfig,
-      commandOptions?.update
-    );
-    // langgraph 1.4.5 applies resume + state update + reroute in one superstep
-    // (single checkpoint). `update`/`goto` are omitted unless the caller sets them.
-    return this.processStream(
-      new Command({
-        resume: resumeValue,
-        ...(commandOptions?.update !== undefined
-          ? { update: commandOptions.update }
-          : {}),
-        ...(commandOptions?.goto !== undefined
-          ? { goto: commandOptions.goto }
-          : {}),
-      }),
-      callerConfig,
-      streamOptions
-    );
+    const prepared = await this.restoreInterruptFromCheckpoint(callerConfig, commandOptions?.update);
+    const command = new Command({
+      resume: resumeValue,
+      ...(prepared.update === undefined ? {} : { update: prepared.update }),
+      ...(commandOptions?.goto === undefined ? {} : { goto: commandOptions.goto }),
+    });
+    this.preparedToolResumes.add(command);
+    return this.processStream(command, prepared.config, streamOptions);
   }
 
   private restoreRootReplayConfig(
@@ -2228,9 +2256,12 @@ export class Run<_T extends t.BaseGraphState> {
   private async resolveInterruptResumeConfig(
     callerConfig: t.RunStreamConfig,
     resumeUpdate?: ResumeCommandUpdate,
-    resumeValue?: unknown
-  ): Promise<t.RunStreamConfig> {
-    await this.restoreInterruptFromCheckpoint(callerConfig, resumeUpdate);
+    resumeValue?: unknown,
+    checkpointPrepared = false
+  ): Promise<{ config: t.RunStreamConfig; update: ResumeCommandUpdate }> {
+    const prepared = checkpointPrepared ? { config: callerConfig, update: resumeUpdate } : await this.restoreInterruptFromCheckpoint(callerConfig, resumeUpdate);
+    const update = prepared.update;
+    callerConfig = prepared.config;
     const interrupt = this._interrupt;
     const replayPayload = stripRunStepResumeState(interrupt?.payload);
     const resumeManifest =
@@ -2266,7 +2297,7 @@ export class Run<_T extends t.BaseGraphState> {
       | undefined;
     const stateHistory = workflow?.getStateHistory;
     if (interrupt?.checkpointId != null && interrupt.checkpointId.length > 0) {
-      return this.selectInterruptCheckpoint(manifestConfig, interrupt.checkpointId, interrupt.checkpointNs);
+      return { update, config: this.selectInterruptCheckpoint(manifestConfig, interrupt.checkpointId, interrupt.checkpointNs) };
     }
     if (
       interrupt == null ||
@@ -2274,7 +2305,7 @@ export class Run<_T extends t.BaseGraphState> {
       interruptId.length === 0 ||
       typeof stateHistory !== 'function'
     ) {
-      return manifestConfig;
+      return { config: manifestConfig, update };
     }
 
     for await (const snapshot of stateHistory.call(
@@ -2302,52 +2333,141 @@ export class Run<_T extends t.BaseGraphState> {
           ...(typeof checkpointNs === 'string' ? { checkpointNs } : {}),
         };
         this.restoreRootReplayConfig(resumeConfigurable, resumeValue);
-        return this.selectInterruptCheckpoint(
-          manifestConfig,
-          checkpointId,
-          typeof checkpointNs === 'string' ? checkpointNs : undefined
-        );
+        return { update, config: this.selectInterruptCheckpoint(manifestConfig, checkpointId, typeof checkpointNs === 'string' ? checkpointNs : undefined) };
       }
     }
 
-    return manifestConfig;
+    return { config: manifestConfig, update };
+  }
+
+  private async validateToolResultStateInputs(input: t.IState, checkpoint?: InterruptStateSnapshot, signal?: AbortSignal): Promise<t.IState> {
+    const source = snapshotToolCheckpointRecord(input as t.IState & { summarizationRequest?: t.SummarizationNodeInput; subagentResult?: t.SubagentGraphResult }, ['messages', 'agentMessages', 'runStepState', 'handoffState', 'subagentResult', 'summarizationRequest', '__pregel_tasks', '__pregel_push']);
+    const runStepState = source.runStepState == null ? undefined : snapshotToolRunStepState(source.runStepState);
+    if (source.handoffState != null) source.handoffState = snapshotToolHandoffState(source.handoffState);
+    const subagentResult = source.subagentResult == null ? undefined : snapshotToolSubagentResult(source.subagentResult);
+    const state = runStepState ?? checkpoint?.values?.runStepState;
+    const request = source.summarizationRequest == null ? undefined : snapshotToolSummarizationRequest(source.summarizationRequest);
+    const messages = snapshotToolInputMessages(source.messages);
+    const alternate = 'agentMessages' in source && source.agentMessages != null ? snapshotToolInputMessages(source.agentMessages as BaseMessage[]) : undefined;
+    const owned = checkpoint == null ? undefined : this.Graph!.getToolResultCallSources(checkpoint);
+    const current = snapshotToolHistoryMessages(checkpoint?.values?.messages ?? []);
+    const admitted = await this.validateToolResultMessageWrite(current, messages, state, signal, false, true, owned);
+    let sources = snapshotToolCallSources([admitted.messages], state?.toolResultReleases ?? [], owned);
+    let canonicalAlternate: BaseMessage[] | undefined;
+    if (alternate != null) {
+      canonicalAlternate = await this.Graph!.validateToolResultHistory(alternate, state, signal, sources);
+      const canonical = await this.Graph!.validateToolResultHistory([...admitted.messages, ...canonicalAlternate], state, signal);
+      canonicalAlternate = canonical.slice(admitted.messages.length);
+      sources = snapshotToolCallSources([canonicalAlternate], state?.toolResultReleases ?? [], sources);
+    }
+    const summarizationRequest = request == null ? undefined : await this.Graph!.validateToolResultWindow(request, state, signal, sources);
+    if (subagentResult != null) source.subagentResult = this.Graph!.validateToolResultSubagentResult(subagentResult, [...admitted.messages, ...canonicalAlternate ?? []]);
+    const taskUpdates: Array<[string, unknown]> = [];
+    for (const key of ['__pregel_tasks', '__pregel_push']) {
+      const value = Object.getOwnPropertyDescriptor(source, key)?.value;
+      if (value != null) taskUpdates.push([key, await this.Graph!.validateToolResultTaskWrites(value, signal, sources)]);
+    }
+    return { ...source, ...Object.fromEntries(taskUpdates), ...(summarizationRequest == null ? {} : { summarizationRequest }), messages: admitted.update, ...(runStepState == null ? {} : { runStepState }), ...(canonicalAlternate == null ? {} : { agentMessages: canonicalAlternate }) } as t.IState;
+  }
+
+  private async validateToolResultMessageWrite(current: BaseMessage[], update: BaseMessage[], state?: t.RunStepResumeState, signal?: AbortSignal, overwrite = false, removalControls = true, sources?: ToolCallSources): Promise<{ update: BaseMessage[]; messages: BaseMessage[] }> {
+    const messages = snapshotToolHistoryMessages(update);
+    const removals = messages.map(snapshotToolMessageRemoval);
+    if ((!removalControls || overwrite) && removals.some((control) => control != null)) throw new ToolResultProtectionError('unsupported');
+    const outputs = messages.filter((_message, index) => removals[index] == null);
+    // Validate each supplied result before reduction, including writes removed later.
+    const canonical = sources == null
+      ? (await this.Graph!.validateToolResultHistory([...current, ...outputs], state, signal)).slice(current.length)
+      : await this.Graph!.validateToolResultHistory(outputs, state, signal, sources);
+    this.Graph!.commitToolResultMessages(canonical);
+    let position = 0;
+    const effective = messages.map((_message, index) => removals[index] ?? canonical[position++]);
+    const reduced = overwrite ? effective : messagesStateReducer(current, effective);
+    await this.Graph!.validateToolResultHistory(reduced, state, signal);
+    return { update: effective, messages: reduced };
+  }
+
+  private async validateToolResultResumeUpdate(snapshot: InterruptStateSnapshot, update: ResumeCommandUpdate, signal?: AbortSignal): Promise<{ update: ResumeCommandUpdate; messages: BaseMessage[] }> {
+    const graph = this.Graph!;
+    let messages = snapshotToolHistoryMessages(snapshot.values?.messages ?? []);
+    let alternate = snapshotToolHistoryMessages(snapshot.values?.agentMessages ?? []);
+    const writes = snapshotToolResumeUpdates(update);
+    if (writes.length === 0) return { update, messages };
+    const admitted: Array<[string, unknown]> = [];
+    for (const [key, value] of writes) {
+      if (key === '__pregel_tasks' || key === '__pregel_push') { admitted.push([key, await graph.validateToolResultTaskWrites(value, signal, this.protectedSendSources)]); continue; }
+      if (key === 'runStepState') { admitted.push([key, snapshotToolRunStepWrite(value)]); continue; }
+      if (key === 'handoffState') { admitted.push([key, snapshotToolHandoffWrite(value)]); continue; }
+      if (key === 'subagentResult' && value != null) { admitted.push([key, graph.validateToolResultSubagentResult(value as t.SubagentGraphResult, [...messages, ...alternate])]); continue; }
+      if (key === 'summarizationRequest' && value != null) { admitted.push([key, await graph.validateToolResultWindow(value as t.SummarizationNodeInput, snapshot.values?.runStepState, signal, this.protectedSendSources)]); continue; }
+      if (key !== 'messages' && key !== 'agentMessages') { admitted.push([key, value]); continue; }
+      const change = snapshotToolResumeMessages(value);
+      change.messages = snapshotToolInputMessages(change.messages);
+      const validated = await this.validateToolResultMessageWrite(messages, change.messages, snapshot.values?.runStepState, signal, change.overwrite, key === 'messages', this.protectedSendSources);
+      if (key === 'agentMessages') alternate = validated.update;
+      else messages = validated.messages;
+      admitted.push([key, change.overwrite ? new Overwrite(validated.update) : validated.update]);
+    }
+    messages = await graph.validateToolResultHistory(messages, snapshot.values?.runStepState, signal);
+    if (alternate.length > 0) await graph.validateToolResultHistory([...messages, ...alternate], snapshot.values?.runStepState, signal);
+    return { update: update == null ? update : admitted, messages };
   }
 
   private async restoreInterruptFromCheckpoint(
     callerConfig: t.RunStreamConfig,
     resumeUpdate?: ResumeCommandUpdate
-  ): Promise<void> {
-    if (this._interrupt != null || !this.hasCheckpointer) {
-      return;
+  ): Promise<{ update: ResumeCommandUpdate; config: t.RunStreamConfig }> {
+    if (!this.hasCheckpointer) {
+      if (this.toolResultProtection != null && resumeUpdate != null) throw new ToolResultProtectionError('unsupported');
+      return { update: resumeUpdate, config: callerConfig };
     }
+    if (this._interrupt != null && this.toolResultProtection == null) return { update: resumeUpdate, config: callerConfig };
     const workflow = this.graphRunnable as
       | (t.CompiledStateWorkflow & WorkflowWithStateHistory)
       | undefined;
     if (typeof workflow?.getState !== 'function') {
-      return;
+      if (this.toolResultProtection != null) throw new ToolResultProtectionError('unsupported');
+      return { update: resumeUpdate, config: callerConfig };
     }
 
-    const snapshot = await workflow.getState(callerConfig as RunnableConfig, {
+    const pending = this.toolResultProtection == null ? undefined : this._interrupt;
+    if (pending?.checkpointId != null) callerConfig = { ...callerConfig, configurable: { ...callerConfig.configurable, checkpoint_id: pending.checkpointId, checkpoint_ns: pending.checkpointNs ?? '' } };
+    const admission = this.toolResultProtection == null ? undefined : this.Graph!.createToolResultCheckpointAdmission(callerConfig.signal);
+    if (admission != null) callerConfig = admitToolResultCheckpoints(callerConfig, this.Graph?.compileOptions?.checkpointer, admission.admit);
+    const lookup = this.toolResultProtection == null ? callerConfig : getToolResultCheckpointLookup(callerConfig);
+    let snapshot = await workflow.getState(lookup as RunnableConfig, {
       subgraphs: true,
     });
-    this.Graph?.handoffRouting?.resume(snapshot.values?.handoffState);
-    const persistedInterrupt = getFirstPersistedInterrupt(snapshot);
-    if (persistedInterrupt == null) {
-      return;
+    let validated: { update: ResumeCommandUpdate; messages: BaseMessage[] } | undefined;
+    if (this.toolResultProtection != null) {
+      snapshot = await this.Graph!.validateToolResultCheckpoint(snapshot, callerConfig.signal, await admission!.finish());
+      this.protectedApprovals.clear();
+      this.protectedSendSources = this.Graph!.getToolResultCallSources(snapshot);
+      const collect = (state: InterruptStateSnapshot): void => {
+        for (const task of state.tasks ?? []) {
+          for (const entry of task.interrupts ?? []) {
+            const evidence = createToolApprovalReviewEvidence(entry.id, getPublicToolInterruptPayload(entry.value));
+            if (entry.id != null) this.protectedApprovals.set(entry.id, evidence?.payload);
+          }
+          if (task.state != null && Object.hasOwn(task.state, 'tasks')) collect(task.state as InterruptStateSnapshot);
+        }
+      };
+      collect(snapshot);
+      callerConfig = bindToolResultCheckpoint(callerConfig, snapshot, this.Graph?.compileOptions?.checkpointer, admission!.admit);
+      validated = await this.validateToolResultResumeUpdate(snapshot, resumeUpdate, callerConfig.signal);
     }
+    if (this._interrupt != null) return { update: validated?.update ?? resumeUpdate, config: callerConfig };
+    const persistedInterrupt = getFirstPersistedInterrupt(snapshot);
+    if (persistedInterrupt == null) return { update: validated?.update ?? resumeUpdate, config: callerConfig };
+    this.Graph?.handoffRouting?.resume(snapshot.values?.handoffState);
     this.Graph?.restoreRunStepResumeState(
-      getRunStepResumeState(persistedInterrupt.value) ??
-        snapshot.values?.runStepState
+      getRunStepResumeState(persistedInterrupt.value) ?? snapshot.values?.runStepState
     );
-    const persistedMessages = getPersistedMessages(snapshot);
+    const persistedMessages = validated?.messages ?? getPersistedMessages(snapshot);
     if (persistedMessages != null) {
-      const resumeMessages = getResumeUpdateMessages(resumeUpdate);
+      const resumeMessages = validated == null ? getResumeUpdateMessages(resumeUpdate) : undefined;
       this.Graph?.restoreCheckpointMessages(persistedMessages, resumeMessages);
-      this.activityPhaseTraceInput = findActivityPhaseTraceInput(
-        resumeMessages == null
-          ? persistedMessages
-          : [...persistedMessages, ...resumeMessages]
-      );
+      this.activityPhaseTraceInput = findActivityPhaseTraceInput(resumeMessages == null ? persistedMessages : [...persistedMessages, ...resumeMessages]);
     }
 
     const checkpointConfigurable = snapshot.config?.configurable;
@@ -2362,6 +2482,7 @@ export class Run<_T extends t.BaseGraphState> {
       ...(typeof checkpointId === 'string' ? { checkpointId } : {}),
       ...(typeof checkpointNs === 'string' ? { checkpointNs } : {}),
     };
+    return { update: validated?.update ?? resumeUpdate, config: callerConfig };
   }
 
   private createSystemCallback<K extends keyof t.ClientCallbacks>(
