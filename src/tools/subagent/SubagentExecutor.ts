@@ -103,6 +103,7 @@ import type {
 import type { RunBreakerScope } from '@/llm/streamLimits';
 import type { GraphFactory } from '@/graphs/graphFactory';
 import type { StandardGraph } from '@/graphs/Graph';
+import { protectToolApprovalResume, admitToolResultCheckpoints, getToolResultCheckpointLookup, bindToolResultCheckpoint, normalizeToolResultError, hasRequiredToolExecuteProtection, ToolResultProtectionError } from '@/protection/toolResult';
 import {
   getSubagentApprovalExecutionScope,
   SubagentDefinitionBindingError,
@@ -136,6 +137,7 @@ import {
   pickSubagentHostArgInput,
   getSubagentHostArgsDigest,
 } from './hostArgs';
+import { createToolApprovalReviewEvidence, cloneToolApprovalInterruptPayload } from '@/hitl/approvalReview';
 import {
   executeHooks,
   HookRegistry,
@@ -160,7 +162,6 @@ import {
   createChildGraphPlan,
   isGraphSubagentConfig,
 } from './childGraphConfig';
-import { cloneToolApprovalInterruptPayload } from '@/hitl/approvalReview';
 import { ProviderTextProtectionError } from '@/protection/providerText';
 import { stripRunStepResumeState } from '@/tools/runStepResume';
 import { seedAgentInitialSessions } from '@/utils/toolSessions';
@@ -385,7 +386,7 @@ type StatefulCompiledWorkflow = Omit<CompiledStateWorkflow, 'invoke'> & {
     input: BaseGraphState | Command | null,
     config?: RunnableConfig
   ): Promise<MultiAgentGraphState>;
-  getState(config: RunnableConfig): Promise<StateSnapshot>;
+  getState(config: RunnableConfig, options?: { subgraphs?: boolean }): Promise<StateSnapshot>;
   updateState?(
     config: RunnableConfig,
     values: Record<string, unknown>,
@@ -1147,6 +1148,7 @@ export type SubagentExecutorOptions = {
    * graph's own resolved limits; without this the child would silently
    * revert to the defaults.
    */
+  toolResultProtection?: StandardGraphInput['toolResultProtection'];
   providerTextProtection?: StandardGraphInput['providerTextProtection'];
   streamLimits?: StandardGraphInput['streamLimits'];
   humanInTheLoop?: HumanInTheLoopConfig;
@@ -1225,6 +1227,7 @@ export class SubagentExecutor {
   private readonly executionContext: SubagentExecutionContext;
   private readonly langfuse?: StandardGraphInput['langfuse'];
   private readonly tokenCounter?: TokenCounter;
+  private readonly toolResultProtection?: StandardGraphInput['toolResultProtection'];
   private readonly providerTextProtection?: StandardGraphInput['providerTextProtection'];
   private readonly streamLimits?: StandardGraphInput['streamLimits'];
   private readonly humanInTheLoop?: HumanInTheLoopConfig;
@@ -1267,6 +1270,7 @@ export class SubagentExecutor {
     this.tokenCounter = options.tokenCounter;
     this.streamLimits = options.streamLimits;
     this.providerTextProtection = options.providerTextProtection;
+    this.toolResultProtection = options.toolResultProtection;
     this.humanInTheLoop = options.humanInTheLoop;
     this.checkpointer = isCheckpointSaver(options.checkpointer)
       ? options.checkpointer
@@ -1552,6 +1556,7 @@ export class SubagentExecutor {
       onResolutionFailure: this.onResolutionFailure,
       streamLimits: this.streamLimits,
       providerTextProtection: this.providerTextProtection,
+      toolResultProtection: this.toolResultProtection,
       humanInTheLoop:
         this.humanInTheLoop?.enabled === true ||
         this.humanInTheLoop?.backgroundPausePolicy === 'deny'
@@ -2932,6 +2937,7 @@ export class SubagentExecutor {
     executableConfig: ExecutableSubagentConfigEntry
   ): Promise<SubagentExecuteResult> {
     const { description, subagentType, threadId, parentToolCallId } = params;
+    if (params.taskRuntime != null && this.toolResultProtection != null) throw new ToolResultProtectionError('unsupported');
     /** Captured ONCE per execution, preferring the controller the parent
      * tool batch captured at ITS entry (before PreToolUse hooks): a failed
      * run's graph reset replaces the live controller, and resolving it here
@@ -3146,6 +3152,7 @@ export class SubagentExecutor {
       tokenCounter: this.tokenCounter,
       streamLimits: this.streamLimits,
       providerTextProtection: this.providerTextProtection,
+      toolResultProtection: this.toolResultProtection,
       subagentScope: true,
       subagentExecutionContext: childExecutionContext,
       subagentContext: this.subagentContext,
@@ -3335,10 +3342,18 @@ export class SubagentExecutor {
         configurable: childConfigurable,
       };
       activeChildRun.invokeConfig = childInvokeConfig;
+      let admittedChildCheckpoint: StateSnapshot | undefined;
+      if (this.toolResultProtection != null && this.humanInTheLoop?.enabled === true) {
+        const admission = childGraph.createToolResultCheckpointAdmission(childSignal);
+        Object.assign(childConfigurable, admitToolResultCheckpoints(childInvokeConfig, this.checkpointer, admission.admit).configurable);
+        const snapshot = await workflow.getState(getToolResultCheckpointLookup(childInvokeConfig), { subgraphs: true });
+        admittedChildCheckpoint = await childGraph.validateToolResultCheckpoint(snapshot, childSignal, await admission.finish());
+        Object.assign(childConfigurable, bindToolResultCheckpoint(childInvokeConfig, admittedChildCheckpoint, this.checkpointer, admission.admit).configurable);
+      }
       if (cachedChildRun == null && this.humanInTheLoop?.enabled === true) {
         /** Rehydrate child-owned interrupt state when a host rebuilds Run
          * around the same durable checkpointer after a process boundary. */
-        const persistedState = await workflow.getState(childInvokeConfig);
+        const persistedState = admittedChildCheckpoint ?? await workflow.getState(childInvokeConfig);
         const checkpointMessages = getCheckpointMessages(
           (persistedState.values as { messages?: unknown } | undefined)
             ?.messages
@@ -3411,7 +3426,13 @@ export class SubagentExecutor {
             childThreadId,
             new Set(Object.keys(childResumeMap))
           );
-          childInput = new Command({ resume: childResumeMap });
+          const approvals = new Map<string, ToolApprovalInterruptPayload | undefined>();
+          if (this.toolResultProtection != null) for (const entry of activeChildRun.pendingInterrupts) {
+            const evidence = createToolApprovalReviewEvidence(entry.id, getPublicToolInterruptPayload(entry.value));
+            if (entry.id != null) approvals.set(entry.id, evidence?.payload);
+          }
+          const resume = this.toolResultProtection == null ? childResumeMap : await protectToolApprovalResume(this.toolResultProtection, childResumeMap, approvals, activeChildRun.pendingInterrupts[0]?.id, childSignal);
+          childInput = new Command({ resume });
         } else if (recoveredInProgress) {
           childInput = null;
         } else {
@@ -3656,6 +3677,7 @@ export class SubagentExecutor {
     if (result == null) {
       throw new Error('Subagent completed without producing graph state.');
     }
+    if (this.toolResultProtection != null && childPlan.kind === 'graph' && result.subagentResult != null) result.subagentResult = childGraph.validateToolResultSubagentResult(result.subagentResult, result.messages, childPlan.resultAgentId);
     const filteredContent =
       childPlan.kind === 'graph'
         ? filterGraphSubagentResult(result, childPlan.resultAgentId)
@@ -3945,11 +3967,15 @@ export class SubagentExecutor {
           const toolHandler = parentRegistry.getHandler(
             GraphEvents.ON_TOOL_EXECUTE
           );
-          if (toolHandler) {
-            await toolHandler.handle(
-              GraphEvents.ON_TOOL_EXECUTE,
-              data as ToolExecuteBatchRequest
-            );
+          const request = data as ToolExecuteBatchRequest;
+          const required = hasRequiredToolExecuteProtection(request);
+          try {
+            if (toolHandler) await toolHandler.handle(GraphEvents.ON_TOOL_EXECUTE, request);
+            else if (required) request.reject(new ToolResultProtectionError('unavailable'));
+          } catch (error) {
+            if (!required) throw error;
+            request.reject(normalizeToolResultError(error));
+            return;
           }
           /**
            * We also surface a short notice in the subagent-update stream so

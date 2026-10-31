@@ -32,6 +32,7 @@ import {
   calculateMaxToolResultChars,
   HARD_MAX_TOOL_RESULT_CHARS,
 } from '@/utils/truncation';
+import { snapshotToolHistoryMessages } from '@/protection/toolResult';
 import { withInstructionlessHandoffCue } from '@/messages/handoffCue';
 import { HandoffRouting, handoffStateAnnotation } from './handoff';
 import { serializeToolContentBounded } from '@/utils/toolContent';
@@ -1381,7 +1382,7 @@ export class MultiAgentGraph extends StandardGraph {
           if (!this.messages.length) {
             this.startIndex = a.length + b.length;
           }
-          const result = messagesStateReducer(a, b);
+          const result = this.reduceProtectedMessages(a, b);
           this.messages = result;
           return result;
         },
@@ -1485,6 +1486,12 @@ export class MultiAgentGraph extends StandardGraph {
         state: t.MultiAgentGraphState,
         config?: LangGraphRunnableConfig
       ): Promise<t.MultiAgentGraphState | Command> => {
+        if (this.toolResultProtection != null && state.agentMessages != null) {
+          const current = snapshotToolHistoryMessages(state.messages);
+          const alternate = snapshotToolHistoryMessages(state.agentMessages);
+          const canonical = await this.validateToolResultHistory([...current, ...alternate], state.runStepState, config?.signal);
+          state = { ...state, messages: canonical.slice(0, current.length), agentMessages: canonical.slice(current.length) };
+        }
         this.handoffRouting?.restore(state.handoffState);
         let result: t.MultiAgentGraphState;
         let inputMessages = state.messages;

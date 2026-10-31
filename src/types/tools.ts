@@ -1,3 +1,5 @@
+import type { BaseMessage } from '@langchain/core/messages';
+import type { ToolResultProtection } from '@/protection/toolResult';
 // src/types/tools.ts
 import type {
   RunnableConfig,
@@ -263,6 +265,7 @@ export type ToolNodeOptions = {
    * Ignored when `toolOutputRegistry` is also provided (host-supplied
    * registry wins).
    */
+  toolResultProtection?: ToolResultProtection;
   toolOutputReferences?: ToolOutputReferencesConfig;
   /**
    * Pre-constructed registry instance shared across ToolNodes for the
@@ -311,8 +314,8 @@ export type ToolNodeOptions = {
     state?: RunStepResumeState,
     config?: RunnableConfig
   ) => void;
-  /** SDK-owned checkpoint snapshot for open run-step lifecycle state. */
-  createRunStepResumeState?: () => RunStepResumeState;
+  /** SDK-owned snapshot; commits returned message identities before capturing receipts. */
+  createRunStepResumeState?: (messages?: BaseMessage[]) => RunStepResumeState;
   /** Internal ownership bridge, awaited before ToolNode can execute a batch. */
   onToolCallsClaimed?: (
     messageId: string,
@@ -1256,6 +1259,7 @@ export type ToolExecutionConfig = {
 };
 
 export type ProgrammaticCache = {
+  toolResultProtection?: ToolResultProtection;
   toolMap: ToolMap;
   toolDefs: LCTool[];
   /** Actual outer runner name used for caller-policy diagnostics. */

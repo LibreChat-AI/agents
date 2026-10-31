@@ -1,3 +1,4 @@
+import type { ToolMessageRelease } from '@/protection/toolResult';
 // src/types/stream.ts
 import type {
   AIMessageChunk,
@@ -133,6 +134,7 @@ export interface RunStepResumeEntry {
 /** SDK-private state persisted in LangGraph checkpoints for process-safe resume. */
 export interface RunStepResumeState {
   version: 1;
+  toolResultReleases?: ToolMessageRelease[];
   revision: number;
   nextIndex: number;
   /** Warm terminal continuations already admitted for this execution. */
