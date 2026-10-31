@@ -9,6 +9,7 @@ import type {
   BaseMessage,
   MessageContentComplex,
 } from '@langchain/core/messages';
+import type { ContentBlock } from '@aws-sdk/client-bedrock-runtime';
 import type Anthropic from '@anthropic-ai/sdk';
 import type { AnthropicMessages } from '@/types/messages';
 import {
@@ -18,7 +19,11 @@ import {
   projectOpenRouterToolMessageContent,
   projectComputerCallOutputsToText,
 } from './core';
-import { addTailCacheControl, addBedrockTailCacheControl } from './cache';
+import {
+  addTailCacheControl,
+  addBedrockTailCacheControl,
+  getBedrockMessageCachePointBudget,
+} from './cache';
 import { convertToConverseMessages } from '@/llm/bedrock/utils';
 import { toLangChainContent } from './langchain';
 
@@ -529,5 +534,333 @@ describe('addBedrockTailCacheControl (single tail cachePoint)', () => {
     );
     expect(JSON.stringify(converse).match(/"cachePoint"/g)).toHaveLength(1);
     expect(computerOutput.content).toBe('data:image/png;base64,AA==');
+  });
+});
+
+function toolRound(id: string): BaseMessage[] {
+  return [
+    new AIMessage({
+      content: `Calling ${id}`,
+      tool_calls: [{ id, name: 'search', args: { q: id } }],
+    }),
+    new ToolMessage({ tool_call_id: id, content: `result ${id}` }),
+  ];
+}
+
+function toolRounds(prefix: string, count: number): BaseMessage[] {
+  return Array.from({ length: count }, (_, i) =>
+    toolRound(`${prefix}${i}`)
+  ).flat();
+}
+
+function cachePointIndexes(message: { content: unknown }): number[] {
+  if (!Array.isArray(message.content)) {
+    return [];
+  }
+  return (message.content as CacheControlBlock[]).flatMap((block, index) =>
+    'cachePoint' in block ? [index] : []
+  );
+}
+
+describe('addBedrockTailCacheControl with a second message cachePoint', () => {
+  test('anchors the tail and the latest human message before it', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage('Turn one'),
+      ...toolRounds('a', 3),
+      new AIMessage('Turn one answer'),
+      new HumanMessage('Turn two'),
+    ];
+
+    const result = addBedrockTailCacheControl(messages, undefined, 2);
+
+    expect(countCachePoints(result)).toBe(2);
+    expect(blocksOf(result[0])).toEqual([
+      { type: 'text', text: 'Turn one' },
+      { cachePoint: { type: 'default' } },
+    ]);
+    expect(blocksOf(result[result.length - 1])).toEqual([
+      { type: 'text', text: 'Turn two' },
+      { cachePoint: { type: 'default' } },
+    ]);
+  });
+
+  test('anchors the opening human message during a tool loop', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage('Run the tools'),
+      ...toolRounds('a', 2),
+    ];
+
+    const result = addBedrockTailCacheControl(messages, undefined, 2);
+
+    expect(countCachePoints(result)).toBe(2);
+    expect(cachePointIndexes(result[0])).toEqual([1]);
+    expect(cachePointIndexes(result[result.length - 1])).toEqual([1]);
+  });
+
+  test('keeps a single tail cachePoint by default', () => {
+    const result = addBedrockTailCacheControl([
+      new HumanMessage('Turn one'),
+      new AIMessage('answer'),
+      new HumanMessage('Turn two'),
+    ]);
+
+    expect(countCachePoints(result)).toBe(1);
+    expect(cachePointIndexes(result[0])).toEqual([]);
+    expect(cachePointIndexes(result[2])).toEqual([1]);
+  });
+
+  test('places only the tail when no earlier human message exists', () => {
+    const result = addBedrockTailCacheControl(
+      [new HumanMessage('Only question')],
+      undefined,
+      2
+    );
+
+    expect(countCachePoints(result)).toBe(1);
+  });
+
+  test('never anchors the second cachePoint on tool results, assistant turns or synthetic messages', () => {
+    const meta = new HumanMessage({ content: 'reinjected skill body' });
+    (
+      meta as unknown as { additional_kwargs: Record<string, unknown> }
+    ).additional_kwargs = { source: 'skill' };
+    const messages: BaseMessage[] = [
+      new HumanMessage('Real question'),
+      meta,
+      ...toolRounds('a', 2),
+    ];
+
+    const result = addBedrockTailCacheControl(messages, undefined, 2);
+
+    expect(countCachePoints(result)).toBe(2);
+    expect(cachePointIndexes(result[0])).toEqual([1]);
+    expect(cachePointIndexes(result[1])).toEqual([]);
+    expect(cachePointIndexes(result[2])).toEqual([]);
+    expect(cachePointIndexes(result[3])).toEqual([]);
+    expect(cachePointIndexes(result[4])).toEqual([]);
+    expect(cachePointIndexes(result[5])).toEqual([1]);
+  });
+
+  test('strips stale cachePoints on older messages while placing two', () => {
+    const stale = new HumanMessage({
+      content: toLangChainContent([
+        { type: 'text', text: 'oldest' },
+        { cachePoint: { type: 'default' } },
+      ] as MessageContentComplex[]),
+    });
+
+    const result = addBedrockTailCacheControl(
+      [
+        stale,
+        new AIMessage('reply'),
+        new HumanMessage('middle'),
+        new AIMessage('reply'),
+        new HumanMessage('newest'),
+      ],
+      undefined,
+      2
+    );
+
+    expect(countCachePoints(result)).toBe(2);
+    expect(cachePointIndexes(result[0])).toEqual([]);
+    expect(cachePointIndexes(result[2])).toEqual([1]);
+    expect(cachePointIndexes(result[4])).toEqual([1]);
+  });
+
+  test('applies the configured TTL to both cachePoints', () => {
+    const result = addBedrockTailCacheControl(
+      [new HumanMessage('one'), new AIMessage('a'), new HumanMessage('two')],
+      '1h',
+      2
+    );
+
+    expect(blocksOf(result[0])[1]).toEqual({
+      cachePoint: { type: 'default', ttl: '1h' },
+    });
+    expect(blocksOf(result[2])[1]).toEqual({
+      cachePoint: { type: 'default', ttl: '1h' },
+    });
+  });
+});
+
+describe('getBedrockMessageCachePointBudget', () => {
+  const systemWith = (cachePoints: number): SystemMessage =>
+    new SystemMessage({
+      content: toLangChainContent([
+        { type: 'text', text: 'stable' },
+        ...Array.from({ length: cachePoints }, () => ({
+          cachePoint: { type: 'default' },
+        })),
+        { type: 'text', text: 'dynamic' },
+      ] as MessageContentComplex[]),
+    });
+
+  test.each([
+    [0, 2],
+    [1, 2],
+    [2, 1],
+    [3, 1],
+  ])(
+    'with %i system cachePoints allows %i message cachePoints',
+    (system, expected) => {
+      expect(
+        getBedrockMessageCachePointBudget([
+          systemWith(system),
+          new HumanMessage('q'),
+        ])
+      ).toBe(expected);
+    }
+  );
+
+  test('allows two without a system message or with a string system message', () => {
+    expect(getBedrockMessageCachePointBudget([new HumanMessage('q')])).toBe(2);
+    expect(
+      getBedrockMessageCachePointBudget([
+        new SystemMessage('rules'),
+        new HumanMessage('q'),
+      ])
+    ).toBe(2);
+    expect(getBedrockMessageCachePointBudget([])).toBe(2);
+  });
+
+  test('never exceeds four cachePoints with the system and a tool checkpoint', () => {
+    for (const systemPoints of [0, 1, 2]) {
+      const messages: BaseMessage[] = [
+        systemWith(systemPoints),
+        new HumanMessage('one'),
+        ...toolRounds('a', 2),
+        new HumanMessage('two'),
+      ];
+      const cached = addBedrockTailCacheControl(
+        messages,
+        undefined,
+        getBedrockMessageCachePointBudget(messages)
+      );
+      const toolCheckpoint = 1;
+      expect(countCachePoints(cached) + toolCheckpoint).toBeLessThanOrEqual(4);
+    }
+  });
+});
+
+describe('Bedrock lookback from the message cachePoints (Converse payload)', () => {
+  /** Bedrock finds an earlier entry at most this many added blocks back (21 hits, 22 misses). */
+  const MAX_BLOCKS_ADDED = 21;
+
+  type Flat = { blocks: ContentBlock[]; points: number[] };
+
+  function flattenConverse(messages: BaseMessage[]): Flat {
+    const { converseMessages } = convertToConverseMessages(messages);
+    const blocks: ContentBlock[] = [];
+    const points: number[] = [];
+    for (const message of converseMessages) {
+      for (const block of (message.content ?? []) as ContentBlock[]) {
+        if ('cachePoint' in block) {
+          points.push(blocks.length);
+          continue;
+        }
+        blocks.push(block);
+      }
+    }
+    return { blocks, points };
+  }
+
+  /** Assistant step of a tool round; `live` adds a block that a rebuilt history drops (e.g. unreplayed reasoning). */
+  function assistantStep(id: string, live: boolean): AIMessage {
+    const text = { type: 'text', text: `Calling ${id}` };
+    const extra = { type: 'text', text: `notes for ${id}` };
+    return new AIMessage({
+      content: toLangChainContent(
+        (live ? [extra, text] : [text]) as MessageContentComplex[]
+      ),
+      tool_calls: [{ id, name: 'search', args: { q: id } }],
+    });
+  }
+
+  function turnOne(rounds: number, live: boolean): BaseMessage[] {
+    const conv: BaseMessage[] = [new HumanMessage('Turn one question')];
+    for (let i = 0; i < rounds; i++) {
+      conv.push(assistantStep(`a${i}`, live));
+      conv.push(
+        new ToolMessage({ tool_call_id: `a${i}`, content: `result a${i}` })
+      );
+    }
+    return conv;
+  }
+
+  /** Prefixes written by every call of turn one (each call caches up to its cachePoints). */
+  function cachedEntries(
+    rounds: number,
+    maxCachePoints: number
+  ): ContentBlock[][] {
+    const live = turnOne(rounds, true);
+    const entries: ContentBlock[][] = [];
+    for (let end = 1; end <= live.length; end += 2) {
+      const flat = flattenConverse(
+        addBedrockTailCacheControl(
+          live.slice(0, end),
+          undefined,
+          maxCachePoints
+        )
+      );
+      for (const point of flat.points) {
+        entries.push(flat.blocks.slice(0, point));
+      }
+    }
+    return entries;
+  }
+
+  /** Whether any cachePoint in `request` reaches an identical earlier entry within the lookback. */
+  function readsCachedPrefix(
+    request: Flat,
+    entries: ContentBlock[][]
+  ): boolean {
+    return request.points.some((point) =>
+      entries.some(
+        (entry) =>
+          entry.length <= point &&
+          point - entry.length <= MAX_BLOCKS_ADDED &&
+          JSON.stringify(entry) ===
+            JSON.stringify(request.blocks.slice(0, entry.length))
+      )
+    );
+  }
+
+  function turnTwo(rounds: number, live: boolean): BaseMessage[] {
+    return [
+      ...turnOne(rounds, live),
+      new AIMessage('Turn one answer'),
+      new HumanMessage('Turn two question'),
+    ];
+  }
+
+  test('a rebuilt history reaches the previous turn only through the second cachePoint', () => {
+    const rounds = 12;
+    const rebuilt = turnTwo(rounds, false);
+
+    const tailOnly = flattenConverse(addBedrockTailCacheControl(rebuilt));
+    const withSecond = flattenConverse(
+      addBedrockTailCacheControl(rebuilt, undefined, 2)
+    );
+
+    expect(readsCachedPrefix(tailOnly, cachedEntries(rounds, 1))).toBe(false);
+    expect(readsCachedPrefix(withSecond, cachedEntries(rounds, 2))).toBe(true);
+  });
+
+  test('with an unchanged history the tail alone already reaches the previous turn', () => {
+    const rounds = 12;
+    const unchanged = flattenConverse(
+      addBedrockTailCacheControl(turnTwo(rounds, true))
+    );
+
+    expect(readsCachedPrefix(unchanged, cachedEntries(rounds, 1))).toBe(true);
+  });
+
+  test('a short rebuilt turn stays within reach of the tail', () => {
+    const rounds = 3;
+    const tailOnly = flattenConverse(
+      addBedrockTailCacheControl(turnTwo(rounds, false))
+    );
+
+    expect(readsCachedPrefix(tailOnly, cachedEntries(rounds, 1))).toBe(true);
   });
 });
