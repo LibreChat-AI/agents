@@ -1,6 +1,5 @@
 import { nanoid } from 'nanoid';
 import { types } from 'node:util';
-import { RemoveMessage, ToolMessage } from '@langchain/core/messages';
 import { AsyncLocalStorageProviderSingleton } from '@langchain/core/singletons';
 import {
   StructuredTool,
@@ -9,12 +8,18 @@ import {
   Tool,
 } from '@langchain/core/tools';
 import { BaseCheckpointSaver, GraphInterrupt, ParentCommand, Send, Overwrite } from '@langchain/langgraph';
+import {
+  RemoveMessage, ToolMessage, ToolMessageChunk, AIMessage, AIMessageChunk,
+  HumanMessage, HumanMessageChunk, SystemMessage, SystemMessageChunk,
+  FunctionMessage, FunctionMessageChunk, ChatMessage, ChatMessageChunk,
+} from '@langchain/core/messages';
 import type { CallbackManagerForToolRun } from '@langchain/core/callbacks/manager';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { CheckpointTuple } from '@langchain/langgraph';
 import type { BaseMessage } from '@langchain/core/messages';
 import type {
   GenericTool,
+  HandoffState,
   RunStepResumeState,
   SummarizationNodeInput,
   ToolExecuteResult,
@@ -564,17 +569,58 @@ export function snapshotToolRunStepWrite(value: unknown): RunStepResumeState | O
   return overwrite ? new Overwrite(state) : state;
 }
 
+const trustedMessageImplementations = new Map([
+  AIMessage, AIMessageChunk, HumanMessage, HumanMessageChunk, SystemMessage,
+  SystemMessageChunk, ToolMessage, ToolMessageChunk, FunctionMessage,
+  FunctionMessageChunk, ChatMessage, ChatMessageChunk, RemoveMessage,
+].map((message) => {
+  const behavior = new Set<PropertyKey>();
+  let prototype: object | null = message.prototype;
+  while (prototype != null) {
+    for (const key of Reflect.ownKeys(prototype)) {
+      const descriptor = Object.getOwnPropertyDescriptor(prototype, key)!;
+      if (!('value' in descriptor) || typeof descriptor.value === 'function') behavior.add(key);
+    }
+    prototype = Object.getPrototypeOf(prototype);
+  }
+  return [message.prototype, behavior] as const;
+}));
+
+export function snapshotToolHandoffState(input: HandoffState): HandoffState {
+  const state = snapshotToolCheckpointData(input);
+  const version: number = state.version;
+  if (version !== 1) throw new ToolResultProtectionError('incompatible');
+  const nonempty = (value: unknown): boolean => typeof value === 'string' && value !== '';
+  if (!nonempty(state.executionId) || !nonempty(state.entryAgentId) || typeof state.parallel !== 'boolean' || (state.historyComplete != null && typeof state.historyComplete !== 'boolean') || (state.maxHandoffs != null && (!Number.isSafeInteger(state.maxHandoffs) || state.maxHandoffs < 0)) || !Array.isArray(state.transitions)) throw new ToolResultProtectionError('unsupported');
+  const ids = new Set<string>();
+  const validScope = (scope: string): boolean => scope === 'turn' || scope === 'conversation';
+  for (const transition of state.transitions) {
+    const candidate: unknown = transition;
+    if (candidate == null || typeof candidate !== 'object' || !nonempty(transition.id) || ids.has(transition.id) || !nonempty(transition.sourceAgentId) || !nonempty(transition.targetAgentId) || !nonempty(transition.toolCallId) || !validScope(transition.scope) || !Number.isSafeInteger(transition.depth) || transition.depth < 0) throw new ToolResultProtectionError('unsupported');
+    ids.add(transition.id);
+  }
+  return state;
+}
+
+export function snapshotToolHandoffWrite(value: unknown): HandoffState | Overwrite<HandoffState | undefined> | undefined {
+  if (value == null) return undefined;
+  const carrier = snapshotToolCheckpointRecord(value as HandoffState & { __overwrite__?: HandoffState }, ['__overwrite__']);
+  if (Object.hasOwn(carrier, '__overwrite__')) return new Overwrite(carrier.__overwrite__ == null ? undefined : snapshotToolHandoffState(carrier.__overwrite__));
+  return snapshotToolHandoffState(carrier);
+}
+
 /** Detach routing identities, not arguments or opaque unselected payloads. */
 export function snapshotToolInputMessages(messages: readonly BaseMessage[]): BaseMessage[] {
   return snapshotToolHistoryMessages(messages).map((message) => {
     ownMessageValue(message, 'type');
-    let prototype = Object.getPrototypeOf(message);
-    while (prototype != null) {
-      if (types.isProxy(prototype)) throw new ToolResultProtectionError('unsupported');
-      prototype = Object.getPrototypeOf(prototype);
-    }
+    const prototype = Object.getPrototypeOf(message);
+    const behavior = trustedMessageImplementations.get(prototype);
+    if (behavior == null) throw new ToolResultProtectionError('unsupported');
     const descriptors = Object.getOwnPropertyDescriptors(message);
-    for (const key of Reflect.ownKeys(descriptors)) if (!('value' in descriptors[key as keyof typeof descriptors])) throw new ToolResultProtectionError('unsupported');
+    for (const key of Reflect.ownKeys(descriptors)) {
+      const descriptor = descriptors[key as keyof typeof descriptors];
+      if (!('value' in descriptor) || typeof descriptor.value === 'function' || behavior.has(key)) throw new ToolResultProtectionError('unsupported');
+    }
     for (const key of ['additional_kwargs', 'response_metadata', 'lc_kwargs']) {
       if (Object.hasOwn(descriptors, key) && descriptors[key].value != null) descriptors[key] = { ...descriptors[key], value: snapshotToolCheckpointRecord(descriptors[key].value as object, []) };
     }
@@ -584,7 +630,7 @@ export function snapshotToolInputMessages(messages: readonly BaseMessage[]): Bas
       descriptors.tool_calls = { ...descriptors.tool_calls, value: detached };
       if (Object.hasOwn(descriptors, 'lc_kwargs') && descriptors.lc_kwargs.value != null && Object.hasOwn(descriptors.lc_kwargs.value as object, 'tool_calls')) Object.defineProperty(descriptors.lc_kwargs.value, 'tool_calls', { value: detached, enumerable: true, writable: true, configurable: true });
     }
-    const copy = Object.create(Object.getPrototypeOf(message), descriptors) as BaseMessage;
+    const copy = Object.create(prototype, descriptors) as BaseMessage;
     const admission = approved.get(message);
     if (admission != null) approved.set(copy, admission);
     return copy;
@@ -642,7 +688,7 @@ export const toolCheckpointSafety: ToolCheckpointSafety = {
     return snapshot;
   },
   delta: (channels): void => {
-    if (channels.some((channel) => ['messages', 'agentMessages', 'runStepState', 'summarizationRequest', '__pregel_tasks', '__pregel_push'].includes(channel))) throw new ToolResultProtectionError('unsupported');
+    if (channels.some((channel) => ['messages', 'agentMessages', 'runStepState', 'handoffState', 'summarizationRequest', '__pregel_tasks', '__pregel_push'].includes(channel))) throw new ToolResultProtectionError('unsupported');
   },
 };
 
@@ -650,11 +696,12 @@ export function snapshotToolSend(input: unknown): Send {
   if (input == null || typeof input !== 'object') throw new ToolResultProtectionError('unsupported');
   const packet = snapshotToolCheckpointRecord(input as Send, ['node', 'args', 'timeout']);
   if (typeof packet.node !== 'string' || packet.node === '' || packet.args == null || typeof packet.args !== 'object') throw new ToolResultProtectionError('unsupported');
-  const args = snapshotToolCheckpointRecord(packet.args as { messages?: BaseMessage[]; agentMessages?: BaseMessage[]; runStepState?: RunStepResumeState; summarizationRequest?: SummarizationNodeInput }, ['messages', 'agentMessages', 'runStepState', 'summarizationRequest', '__pregel_tasks']);
+  const args = snapshotToolCheckpointRecord(packet.args as { messages?: BaseMessage[]; agentMessages?: BaseMessage[]; runStepState?: RunStepResumeState; handoffState?: HandoffState; summarizationRequest?: SummarizationNodeInput }, ['messages', 'agentMessages', 'runStepState', 'handoffState', 'summarizationRequest', '__pregel_tasks']);
   if (Object.hasOwn(args, '__pregel_tasks')) throw new ToolResultProtectionError('unsupported');
   if (args.messages != null) args.messages = snapshotToolInputMessages(args.messages);
   if (args.agentMessages != null) args.agentMessages = snapshotToolInputMessages(args.agentMessages);
   if (args.runStepState != null) args.runStepState = snapshotToolRunStepState(args.runStepState);
+  if (args.handoffState != null) args.handoffState = snapshotToolHandoffState(args.handoffState);
   if (args.summarizationRequest != null) args.summarizationRequest = snapshotToolSummarizationRequest(args.summarizationRequest);
   return Object.assign(Object.create(Send.prototype) as Send, packet, { args, timeout: snapshotToolCheckpointData(packet.timeout) });
 }

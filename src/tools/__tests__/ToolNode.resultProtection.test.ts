@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
+import * as nativeMessages from '@langchain/core/messages';
 import { RunnableLambda } from '@langchain/core/runnables';
 import { ChatGenerationChunk } from '@langchain/core/outputs';
 import { DynamicStructuredTool } from '@langchain/core/tools';
@@ -35,6 +36,7 @@ import type {
   IState,
   AgentInputs,
   GraphSubagentConfig,
+  HandoffState,
 } from '@/types';
 import type {
   ToolResultProtection,
@@ -42,7 +44,7 @@ import type {
 } from '@/protection/toolResult';
 import type { ToolOutputReferenceState } from '@/tools/toolOutputReferences';
 import type { SettledToolBatchResult } from '@/tools/toolBatchReplay';
-import { snapshotToolCallSources, admitToolResultCheckpoints, snapshotToolRunStepState, snapshotToolMessageRemoval, validateToolMessageHistory, getToolMessageRelease, ToolResultProtectionError   } from '@/protection/toolResult';
+import { snapshotToolHandoffState, snapshotToolHandoffWrite, snapshotToolInputMessages, snapshotToolCallSources, admitToolResultCheckpoints, snapshotToolRunStepState, snapshotToolMessageRemoval, validateToolMessageHistory, getToolMessageRelease, ToolResultProtectionError   } from '@/protection/toolResult';
 import {
   createCloudflareProgrammaticToolCallingTool,
   createCloudflareBashProgrammaticToolCallingTool,
@@ -3940,4 +3942,112 @@ it('rejects a completed receipt paired with another occurrence’s tool proposal
   const scopes = graph.getToolResultCallSources({ values: { messages: [source] } });
   const state = graph.createRunStepResumeState(); state.toolResultReleases = fixture.releases;
   await expect(graph.validateToolResultSend(new Send('worker', { messages: [source, fixture.messages[1]], runStepState: state }), undefined, undefined, scopes)).rejects.toMatchObject({ code: 'unsupported' });
+});
+
+it.each((['fresh', 'checkpoint', 'resume', 'send', 'window'] as const).flatMap((carrier) => (['subclass', 'prototype', 'own-method', 'own-constructor', 'control'] as const).map((kind) => [carrier, kind] as const)))('admits only trusted message implementations before downstream calls (%s/%s)', async (carrier, kind) => {
+  let reads = 0; let tamper = false; const observed: string[] = []; const runId = `message-implementation-${carrier}-${kind}`;
+  const diagnostic = (): never => { reads++; throw new Error(fixtures.canaries[0]); };
+  class HostMessage extends HumanMessage { override getType(): 'human' { return diagnostic(); } }
+  const message = (): BaseMessage => {
+    const value = kind === 'subclass' ? new HostMessage('Allowed caller input') : new HumanMessage('Allowed caller input');
+    if (kind === 'prototype') Object.setPrototypeOf(value, Object.create(HumanMessage.prototype, { getType: { value: diagnostic }, toJSON: { value: diagnostic } }));
+    if (kind === 'own-method') Object.defineProperty(value, 'getType', { value: diagnostic });
+    if (kind === 'own-constructor') Object.defineProperty(value, 'constructor', { value: Object.defineProperty({}, 'lc_name', { get: diagnostic }) });
+    return value;
+  };
+  class Saver extends MemorySaver { override async getTuple(config: RunnableConfig): ReturnType<MemorySaver['getTuple']> {
+    const tuple = await super.getTuple(config); if (tuple != null && tamper) tuple.checkpoint.channel_values.messages = [...tuple.checkpoint.channel_values.messages as BaseMessage[], message()]; return tuple;
+  } }
+  const hooks = new HookRegistry(); hooks.register('PreToolUse', { hooks: [async () => ({ decision: 'ask', reason: 'Allowed approval' })] });
+  const run = await Run.create({ runId, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, tools: [direct(() => 'Allowed result')], compileOptions: { checkpointer: new Saver() } }, toolResultProtection: policy(), hooks, humanInTheLoop: { enabled: true } });
+  const config = { version: 'v2' as const, configurable: { thread_id: runId } };
+  if (carrier === 'checkpoint' || carrier === 'resume' || carrier === 'send') { run.Graph!.overrideModel = new FakeChatModel({ responses: ['', 'Allowed final answer'], toolCalls: [{ id: 'implementation-approval', name: 'lookup', args: { count: 42 }, type: 'tool_call' }] }); await run.processStream({ messages: [new HumanMessage('Allowed seed input')] }, config); }
+  else run.Graph!.overrideModel = new FakeChatModel({ responses: ['Allowed final answer'] });
+  const callback = BaseCallbackHandler.fromMethods({ handleChainStart: (_chain, value): void => { observed.push(JSON.stringify(value)); } }); callback.awaitHandlers = true;
+  const invoke = (): Promise<unknown> => {
+    const options = { ...config, callbacks: [callback] };
+    if (carrier === 'checkpoint') { tamper = true; return run.resume([{ type: 'approve' }], options); }
+    if (carrier === 'resume') return run.resume([{ type: 'approve' }], options, undefined, { update: { messages: [message()] } });
+    if (carrier === 'send') { const packet = new Send('default', { messages: [] as BaseMessage[] }); packet.args.messages = [message()]; return run.resume([{ type: 'approve' }], options, undefined, { goto: [packet] }); }
+    if (carrier === 'window') return run.processStream({ messages: [new HumanMessage('Allowed input')], summarizationRequest: { agentId: 'default', remainingContextTokens: 100, windowMessages: [message()] } } as IState, options);
+    return run.processStream({ messages: [message()] }, options);
+  };
+  const outcome = await invoke().catch((error: Error) => error);
+  expect(reads).toBe(0); assertNoCanary(String(outcome)); assertNoCanary(observed.join(''));
+  if (kind === 'control') expect(outcome).toBeUndefined(); else { expect(outcome).toMatchObject({ code: 'unsupported' }); expect(observed).toEqual([]); }
+});
+
+it.each((['checkpoint', 'pending', 'pending-overwrite', 'fresh', 'resume', 'resume-overwrite', 'send'] as const).flatMap((carrier) => (['proxy', 'version-getter', 'inherited-entry', 'transition-getter', 'invalid', 'control'] as const).map((kind) => [carrier, kind] as const)))('admits handoff control state before native routing (%s/%s)', async (carrier, kind) => {
+  let tamper = false; let reads = 0; let retained: HandoffState | undefined; const observed: string[] = []; const runId = `handoff-control-${carrier}-${kind}`;
+  const diagnostic = (): never => { reads++; throw new Error(fixtures.canaries[0]); };
+  const hostile = (source: HandoffState): HandoffState => {
+    const value = structuredClone(source); retained = value;
+    if (kind === 'proxy') return new Proxy(value, { get: diagnostic, getPrototypeOf: diagnostic });
+    if (kind === 'version-getter') Object.defineProperty(value, 'version', { get: diagnostic });
+    if (kind === 'inherited-entry') { Reflect.deleteProperty(value, 'entryAgentId'); Object.setPrototypeOf(value, { get entryAgentId() { return diagnostic(); } }); }
+    if (kind === 'transition-getter') value.transitions = [Object.defineProperty({ id: 'allowed-transition', sourceAgentId: 'worker', targetAgentId: 'worker', toolCallId: 'allowed-handoff', scope: 'turn' as const, depth: 0 }, 'targetAgentId', { get: diagnostic })];
+    if (kind === 'invalid') Object.defineProperty(value, 'version', { value: 2 });
+    return value;
+  };
+  class Saver extends MemorySaver { override async getTuple(config: RunnableConfig): ReturnType<MemorySaver['getTuple']> {
+    const tuple = await super.getTuple(config); if (tuple != null && tamper && (config.configurable?.checkpoint_ns ?? '') === '') {
+      const state = hostile(tuple.checkpoint.channel_values.handoffState as HandoffState);
+      if (carrier === 'checkpoint') tuple.checkpoint.channel_values.handoffState = state;
+      else tuple.pendingWrites = [...tuple.pendingWrites ?? [], ['00000000-0000-0000-0000-000000000000', 'handoffState', carrier === 'pending-overwrite' ? new Overwrite(state) : state]];
+    } return tuple;
+  } }
+  const saver = new Saver();
+  const create = async (resumed: boolean): Promise<Run<IState>> => { const hooks = new HookRegistry(); hooks.register('PreToolUse', { hooks: [async () => ({ decision: 'ask', reason: 'Allowed approval' })] }); const run = await Run.create({ runId, graphConfig: { type: 'multi-agent', entryAgentId: 'worker', agents: [{ agentId: 'worker', provider: Providers.OPENAI, tools: [direct(() => 'Allowed result')] }], edges: [], compileOptions: { checkpointer: saver } }, toolResultProtection: policy(), hooks, humanInTheLoop: { enabled: true } }); run.Graph!.overrideModel = new FakeChatModel({ responses: resumed ? ['Allowed final answer'] : ['', 'Allowed final answer'], toolCalls: resumed ? [] : [{ id: 'handoff-approval', name: 'lookup', args: { count: 42 }, type: 'tool_call' }] }); return run; };
+  const config = { version: 'v2' as const, configurable: { thread_id: runId } }; const first = await create(false); await first.processStream({ messages: [new HumanMessage('Allowed initial input')] }, config); expect(first.getInterrupt()).toBeDefined();
+  const source = (await saver.getTuple(config))!.checkpoint.channel_values.handoffState as HandoffState;
+  const next = await create(true); const callback = BaseCallbackHandler.fromMethods({ handleChainStart: (_chain, value): void => { observed.push(JSON.stringify(value)); } }); callback.awaitHandlers = true;
+  const invoke = (): Promise<unknown> => {
+    const options = { ...config, callbacks: [callback] };
+    if (carrier === 'checkpoint' || carrier === 'pending' || carrier === 'pending-overwrite') { tamper = true; return next.resume([{ type: 'approve' }], options); }
+    if (carrier === 'resume' || carrier === 'resume-overwrite') return next.resume([{ type: 'approve' }], options, undefined, { update: { handoffState: carrier === 'resume-overwrite' ? new Overwrite(hostile(source)) : hostile(source) } });
+    if (carrier === 'send') { const packet = new Send('worker', { messages: [new HumanMessage('Allowed Send input')], handoffState: undefined as HandoffState | undefined }); packet.args.handoffState = hostile(source); return next.resume([{ type: 'approve' }], options, undefined, { goto: [packet] }); }
+    return next.processStream({ messages: [new HumanMessage('Allowed next input')], handoffState: hostile(source) }, options);
+  };
+  const outcome = await invoke().catch((error: Error) => error);
+  expect(reads).toBe(0); assertNoCanary(String(outcome)); assertNoCanary(observed.join(''));
+  if (kind === 'control') { expect(outcome).toBeUndefined(); expect(retained).toBeDefined(); }
+  else { expect(outcome).toBeInstanceOf(ToolResultProtectionError); expect(observed).toEqual([]); }
+});
+
+it('preserves every recognized native message and chunk implementation without rewriting payloads', async () => {
+  const { SystemMessage, SystemMessageChunk, HumanMessageChunk, ToolMessageChunk, FunctionMessage, FunctionMessageChunk, ChatMessage, ChatMessageChunk } = nativeMessages;
+  const artifact = { format: 'allowed-opaque-data' }; const args = { count: 42 };
+  const messages: BaseMessage[] = [new HumanMessage('Allowed user'), new HumanMessageChunk('Allowed chunk'), new AIMessage({ content: '', tool_calls: [{ id: 'native-call', name: 'other', args }] }), new AIMessageChunk('Allowed assistant chunk'), new SystemMessage('Allowed instructions'), new SystemMessageChunk('Allowed instructions chunk'), new ToolMessage({ id: 'native-result', name: 'other', tool_call_id: 'native-call', content: 'Allowed result', artifact }), new ToolMessageChunk({ tool_call_id: 'native-call', content: 'Allowed result chunk' }), new FunctionMessage({ name: 'other', content: 'Allowed function' }), new FunctionMessageChunk({ name: 'other', content: 'Allowed function chunk' }), new ChatMessage({ role: 'allowed-role', content: 'Allowed generic' }), new ChatMessageChunk({ role: 'allowed-role', content: 'Allowed generic chunk' }), new RemoveMessage({ id: 'native-removal' })];
+  const snapshots = snapshotToolInputMessages(messages);
+  for (let index = 0; index < messages.length; index++) { expect(snapshots[index]).not.toBe(messages[index]); expect(Object.getPrototypeOf(snapshots[index])).toBe(Object.getPrototypeOf(messages[index])); expect(snapshots[index].getType()).toBe(messages[index].getType()); expect(snapshots[index].toDict()).toEqual(messages[index].toDict()); expect(snapshots[index].toJSON()).toEqual(messages[index].toJSON()); }
+  expect((snapshots[6] as ToolMessage).artifact).toBe(artifact); expect((snapshots[2] as AIMessage).tool_calls![0].args).toBe((messages[2] as AIMessage).tool_calls![0].args);
+  const fixture = await certifiedHistory(); const canonical = await validateToolMessageHistory(fixture.gate, snapshotToolInputMessages(fixture.messages), fixture.releases); expect(canonical[1].content).toBe('[EMAIL_1]'); assertNoCanary(canonical);
+});
+
+it.each(['getType', '_getType', 'toJSON', 'toDict', 'text', 'contentBlocks', 'concat', 'constructor'] as const)('rejects checkpoint-owned %s behavior overrides without execution', (method) => {
+  let calls = 0; const message = new AIMessageChunk('Allowed data');
+  Object.defineProperty(message, method, { value: method === 'constructor' ? { lc_name: () => { calls++; throw new Error(fixtures.canaries[0]); } } : () => { calls++; throw new Error(fixtures.canaries[0]); } });
+  expect(() => snapshotToolInputMessages([message])).toThrow(ToolResultProtectionError); expect(calls).toBe(0);
+});
+
+it.each(['values', 'pending', 'overwrite'] as const)('detaches handoff %s control data before awaited inspection', async (carrier) => {
+  const fixture = await certifiedHistory(); let reads = 0;
+  const handoffState: HandoffState = { version: 1, executionId: 'allowed-execution', entryAgentId: 'worker', maxHandoffs: 2, transitions: [{ id: 'allowed-transition', sourceAgentId: 'worker', targetAgentId: 'recipient', toolCallId: 'allowed-handoff', scope: 'conversation', depth: 0 }], parallel: false, historyComplete: true };
+  const gate = policy({ inspect: async ({ content }) => { Object.defineProperty(handoffState.transitions[0], 'targetAgentId', { configurable: true, get: () => { reads++; throw new Error(fixtures.canaries[0]); } }); await Promise.resolve(); return approve(content); } });
+  const graph = new StandardGraph({ runId: 'retained-handoff', agents: [{ agentId: 'worker', provider: Providers.OPENAI }], toolResultProtection: gate });
+  const state = graph.createRunStepResumeState(); state.toolResultReleases = fixture.releases;
+  const checkpoint = emptyCheckpoint(); checkpoint.channel_values = { messages: fixture.messages, runStepState: state, ...(carrier === 'values' ? { handoffState } : {}) };
+  const tuple: CheckpointTuple = { config: { configurable: { thread_id: 'retained-handoff', checkpoint_ns: '', checkpoint_id: checkpoint.id } }, checkpoint, pendingWrites: carrier === 'values' ? [] : [['task-control', 'handoffState', carrier === 'overwrite' ? new Overwrite(handoffState) : handoffState]] };
+  const admitted = await graph.validateToolResultCheckpointTuple(tuple);
+  const value = carrier === 'values' ? admitted.checkpoint.channel_values.handoffState : admitted.pendingWrites![0][2];
+  const detached = value instanceof Overwrite ? value.value as HandoffState : value as HandoffState;
+  expect(detached).not.toBe(handoffState); expect(detached.transitions[0]).not.toBe(handoffState.transitions[0]); expect(detached.transitions[0].targetAgentId).toBe('recipient'); expect(reads).toBe(0); assertNoCanary(detached);
+});
+
+it('preserves frozen handoff budgets and transitions, and admits payload-free Overwrite clears', () => {
+  const source: HandoffState = { version: 1, executionId: 'allowed-turn', entryAgentId: 'worker', maxHandoffs: 1, parallel: true, transitions: [{ id: 'allowed-hop', sourceAgentId: 'worker', targetAgentId: 'recipient', toolCallId: 'handoff-call', scope: 'conversation', depth: 0 }] };
+  Object.freeze(source.transitions[0]); Object.freeze(source.transitions); Object.freeze(source);
+  const copy = snapshotToolHandoffState(source); expect(copy).toEqual(source); expect(copy).not.toBe(source); expect(copy.transitions).not.toBe(source.transitions);
+  const overwrite = snapshotToolHandoffWrite(new Overwrite(source)) as Overwrite<HandoffState>; expect(overwrite.value).toEqual(source); expect(overwrite.value).not.toBe(source);
+  expect((snapshotToolHandoffWrite(new Overwrite(undefined)) as Overwrite<undefined>).value).toBeUndefined();
 });

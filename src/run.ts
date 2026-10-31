@@ -1,5 +1,5 @@
 import type { ToolCallSources } from '@/protection/toolResult';
-import { snapshotToolSummarizationRequest, snapshotToolRunStepWrite, snapshotToolCallSources, snapshotToolCommand, protectToolApprovalResume, snapshotToolInputMessages, snapshotToolRunStepState, snapshotToolCheckpointRecord, admitToolResultCheckpoints, getToolResultCheckpointLookup, bindToolResultCheckpoint, snapshotToolMessageRemoval, snapshotToolResumeUpdates, snapshotToolResumeMessages, snapshotToolHistoryMessages, normalizeToolResultError, hasRequiredToolExecuteProtection, ToolResultProtectionError } from '@/protection/toolResult';
+import { snapshotToolHandoffWrite, snapshotToolHandoffState, snapshotToolSummarizationRequest, snapshotToolRunStepWrite, snapshotToolCallSources, snapshotToolCommand, protectToolApprovalResume, snapshotToolInputMessages, snapshotToolRunStepState, snapshotToolCheckpointRecord, admitToolResultCheckpoints, getToolResultCheckpointLookup, bindToolResultCheckpoint, snapshotToolMessageRemoval, snapshotToolResumeUpdates, snapshotToolResumeMessages, snapshotToolHistoryMessages, normalizeToolResultError, hasRequiredToolExecuteProtection, ToolResultProtectionError } from '@/protection/toolResult';
 import { messagesStateReducer } from '@/messages/reducer';
 // src/run.ts
 import { nanoid } from 'nanoid';
@@ -2341,8 +2341,9 @@ export class Run<_T extends t.BaseGraphState> {
   }
 
   private async validateToolResultStateInputs(input: t.IState, checkpoint?: InterruptStateSnapshot, signal?: AbortSignal): Promise<t.IState> {
-    const source = snapshotToolCheckpointRecord(input as t.IState & { summarizationRequest?: t.SummarizationNodeInput }, ['messages', 'agentMessages', 'runStepState', 'summarizationRequest', '__pregel_tasks', '__pregel_push']);
+    const source = snapshotToolCheckpointRecord(input as t.IState & { summarizationRequest?: t.SummarizationNodeInput }, ['messages', 'agentMessages', 'runStepState', 'handoffState', 'summarizationRequest', '__pregel_tasks', '__pregel_push']);
     const runStepState = source.runStepState == null ? undefined : snapshotToolRunStepState(source.runStepState);
+    if (source.handoffState != null) source.handoffState = snapshotToolHandoffState(source.handoffState);
     const state = runStepState ?? checkpoint?.values?.runStepState;
     const request = source.summarizationRequest == null ? undefined : snapshotToolSummarizationRequest(source.summarizationRequest);
     const messages = snapshotToolInputMessages(source.messages);
@@ -2394,6 +2395,7 @@ export class Run<_T extends t.BaseGraphState> {
     for (const [key, value] of writes) {
       if (key === '__pregel_tasks' || key === '__pregel_push') { admitted.push([key, await graph.validateToolResultTaskWrites(value, signal, this.protectedSendSources)]); continue; }
       if (key === 'runStepState') { admitted.push([key, snapshotToolRunStepWrite(value)]); continue; }
+      if (key === 'handoffState') { admitted.push([key, snapshotToolHandoffWrite(value)]); continue; }
       if (key === 'summarizationRequest' && value != null) { admitted.push([key, await graph.validateToolResultWindow(value as t.SummarizationNodeInput, snapshot.values?.runStepState, signal, this.protectedSendSources)]); continue; }
       if (key !== 'messages' && key !== 'agentMessages') { admitted.push([key, value]); continue; }
       const change = snapshotToolResumeMessages(value);
