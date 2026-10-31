@@ -2152,32 +2152,40 @@ it('copies retained producer metadata before canonical native publication', asyn
   expect(result.messages[0]).toMatchObject({ id: 'call-control', status: 'success', content: '[EMAIL_1]' }); assertNoCanary(result);
 });
 
-it.each((['text', 'json'] as const).flatMap((mode) => (['ordinary', 'string', 'typed', 'prepared', 'stream'] as const).map((reasonKind) => [mode, reasonKind] as const)))('normalizes and latches local bridge cancellation before the %s/%s response', async (mode, reasonKind) => {
-  const responses: string[] = []; let executions = 0; let inspections = 0; const received = deferred<void>();
+it.each((['text', 'json'] as const).flatMap((mode) => (['ordinary', 'string', 'typed', 'prepared', 'stream', 'prepared-accessor', 'stream-accessor', 'malformed-stream'] as const).map((reasonKind) => [mode, reasonKind] as const)))('normalizes and latches local bridge cancellation before the %s/%s response', async (mode, reasonKind) => {
+  const responses: string[] = []; let executions = 0; let inspections = 0; let reads = 0; const received = deferred<void>();
   const audit = createServer((request, response) => {
     let body = '';
     request.on('data', (chunk: Buffer): void => { body += chunk.toString(); });
-    request.on('end', (): void => { responses.push(body); response.end('Allowed audit control'); received.resolve(); });
+    request.on('end', (): void => { responses.push(body); response.end('Allowed audit control'); if (responses.length === 2) received.resolve(); });
   });
   await new Promise<void>((resolve) => audit.listen(0, '127.0.0.1', resolve));
   let reason: Error | string = new Error(fixtures.canaries[0]);
   if (reasonKind === 'string') reason = fixtures.canaries[0];
   if (reasonKind === 'typed') { reason = new ToolResultProtectionError('blocked'); reason.message = fixtures.canaries[0]; }
-  if (reasonKind === 'prepared') reason = new PreparedSubagentError('Allowed prepared control');
-  if (reasonKind === 'stream') reason = new StreamLimitExceededError({ kind: 'tool_call_args', limit: 10, observed: 11, toolName: 'lookup' });
+  if (reasonKind === 'prepared' || reasonKind === 'prepared-accessor') reason = new PreparedSubagentError('Allowed prepared control');
+  if (reasonKind === 'stream' || reasonKind === 'stream-accessor' || reasonKind === 'malformed-stream') reason = new StreamLimitExceededError({ kind: 'tool_call_args', limit: 10, observed: 11, toolName: 'lookup' });
+  if (reason instanceof PreparedSubagentError || reason instanceof StreamLimitExceededError) {
+    reason.message = fixtures.canaries[0]; reason.stack = fixtures.canaries[0]; Object.defineProperty(reason, 'cause', { configurable: true, value: new Error(fixtures.canaries[0]) });
+    if (reasonKind.endsWith('accessor')) for (const field of ['message', 'stack', 'cause']) Object.defineProperty(reason, field, { configurable: true, get: () => { reads++; throw new Error(fixtures.canaries[0]); } });
+    if (reasonKind === 'malformed-stream') Object.defineProperty(reason, 'kind', { value: fixtures.canaries[0] });
+  }
   const controller = new AbortController(); controller.abort(reason);
   const runner = createLocalProgrammaticToolCallingTool({ cwd: process.cwd() });
   const invoke: (params: { lang: string; code: string; tool_manifest: string[] }, manager: undefined, config: RunnableConfig & { toolCall?: ToolCall & Partial<ProgrammaticCache> }) => Promise<unknown> = Reflect.get(runner, '_call');
   try {
     const auditUrl = `http://127.0.0.1:${(audit.address() as AddressInfo).port}`;
-    const code = `response=$(curl -sS -X POST -H "Content-Type: application/json" -H "$__LIBRECHAT_TOOL_HEADER: $__LIBRECHAT_TOOL_TOKEN" --data-binary '{"name":"lookup","input":{"count":42}}' "$__LIBRECHAT_TOOL_BRIDGE?mode=${mode}")
+    const code = `for attempt in 1 2; do
+response=$(curl -sS -X POST -H "Content-Type: application/json" -H "$__LIBRECHAT_TOOL_HEADER: $__LIBRECHAT_TOOL_TOKEN" --data-binary '{"name":"lookup","input":{"count":42}}' "$__LIBRECHAT_TOOL_BRIDGE?mode=${mode}")
 printf '%s' "$response" | curl -sS -X POST --data-binary @- '${auditUrl}'
+done
 echo "Allowed outer control"`;
     // Exercise the real runner body so LangChain's outer abort race cannot mask bridge responses.
     const outcome = invoke.call(runner, { lang: 'bash', code, tool_manifest: ['lookup'] }, undefined, { signal: controller.signal, toolCall: { id: 'cancelled-local', name: runner.name, type: 'tool_call', args: {}, toolMap: new Map([['lookup', direct(() => { executions++; return fixtures.canaries[0]; })]]), toolDefs: [{ name: 'lookup', allowed_callers: ['code_execution'], parameters: { type: 'object', properties: { count: { type: 'number' } } } }], toolResultProtection: policy({ inspect: () => { inspections++; return approve('[EMAIL_1]'); } }) } }).catch((value: Error) => value);
-    await received.promise; expect(responses).toHaveLength(1); assertNoCanary(responses.join('')); const error = await outcome;
-    if (reasonKind === 'prepared' || reasonKind === 'stream') expect(error).toBe(reason);
-    else { const code = reasonKind === 'typed' ? 'blocked' : 'cancelled'; expect(error).toMatchObject({ code }); expect(responses[0]).toContain(code); } assertNoCanary(String(error)); expect(executions).toBe(0); expect(inspections).toBe(0);
+    await received.promise; expect(responses).toHaveLength(2); assertNoCanary(responses.join('')); const error = await outcome;
+    if (reasonKind.startsWith('prepared') || reasonKind === 'stream' || reasonKind === 'stream-accessor') { expect(error).toBeInstanceOf(reasonKind.startsWith('prepared') ? PreparedSubagentError : StreamLimitExceededError); expect(error).not.toBe(reason); expect(error).not.toHaveProperty('cause'); if (error instanceof StreamLimitExceededError) expect(error).toMatchObject({ kind: 'tool_call_args', limit: 10, observed: 11 }); }
+    else if (reasonKind === 'malformed-stream') expect(error).toMatchObject({ code: 'unsupported' });
+    else { const code = reasonKind === 'typed' ? 'blocked' : 'cancelled'; expect(error).toMatchObject({ code }); expect(responses[0]).toContain(code); } assertNoCanary(String(error)); assertNoCanary(JSON.stringify(error)); expect(reads).toBe(0); expect(executions).toBe(0); expect(inspections).toBe(0);
   } finally { audit.closeAllConnections(); await new Promise<void>((resolve) => audit.close(() => resolve())); }
 });
 
@@ -4191,4 +4199,40 @@ it('detaches delayed native tool-error aliases without modifying the shared prod
   expect(result).toBeInstanceOf(GraphInterrupt); expect(result).not.toBe(retained); expect(retained).toBeDefined();
   await new Promise<void>((resolve) => setImmediate(() => { retained!.interrupts.push({ id: 'late-native-alias', value: fixtures.canaries[0] }); retained!.message = fixtures.canaries[0]; resolve(); }));
   expect((result as GraphInterrupt).interrupts).toEqual([]); assertNoCanary(String(result)); assertNoCanary(JSON.stringify(result)); expect(producer.invoke).toBe(invoke); expect(producer.call).toBe(call);
+});
+
+it.each((['blocked', 'unavailable', 'timeout', 'overflow', 'cancelled', 'unsupported', 'incompatible'] as const).flatMap((code) => [false, true].flatMap((signal) => (['diagnostic', 'accessor', 'code-getter'] as const).map((mutation) => [code, signal, mutation] as const))))('normalizes policy failures after native chain-error callbacks (%s/signal=%s/%s)', async (code, withSignal, mutation) => {
+  let reads = 0; let callbacks = 0; let retained: Error | undefined; const observed: string[] = [];
+  const callback = BaseCallbackHandler.fromMethods({ handleChainError: (error): void => {
+    callbacks++; retained = error; observed.push(String(error));
+    if (mutation === 'diagnostic') { error.message = fixtures.canaries[0]; error.stack = fixtures.canaries[0]; Object.defineProperty(error, 'cause', { value: fixtures.canaries[0] }); }
+    if (mutation === 'accessor') for (const field of ['message', 'stack', 'cause']) Object.defineProperty(error, field, { configurable: true, get: () => { reads++; throw new Error(fixtures.canaries[0]); } });
+    if (mutation === 'code-getter') Object.defineProperty(error, 'code', { get: () => { reads++; throw new Error(fixtures.canaries[0]); } });
+  } }); callback.awaitHandlers = true;
+  const node = new ToolNode({ trace: true, tools: [direct(() => { throw new ToolResultProtectionError(code); })], toolResultProtection: policy(), toolOutputReferences: { enabled: true } });
+  const result = await node.invoke(state(), { callbacks: [callback], ...(withSignal ? { signal: new AbortController().signal } : {}) }).catch((error: Error) => error);
+  expect(callbacks).toBe(1); expect(result).toBeInstanceOf(ToolResultProtectionError); expect(result).not.toBe(retained); expect(result).toMatchObject({ code: mutation === 'code-getter' ? 'incompatible' : code });
+  expect(reads).toBe(0); expect(result).not.toHaveProperty('cause'); assertNoCanary(String(result)); assertNoCanary(JSON.stringify(result)); assertNoCanary(observed.join('')); expect(node._unsafeGetToolOutputRegistry()!.size).toBe(0);
+});
+
+it.each((['text', 'json'] as const).flatMap((mode) => (['prepared', 'stream', 'restart'] as const).map((kind) => [mode, kind] as const)))('latches detached standalone bridge failures even when the program ignores HTTP errors (%s/%s)', async (mode, kind) => {
+  const responses: string[] = []; const received = deferred<void>(); let executions = 0;
+  const marker = createProviderTextRestartCancellation();
+  const safety = kind === 'prepared' ? new PreparedSubagentError(fixtures.canaries[0], { cause: new Error(fixtures.canaries[0]) }) : new StreamLimitExceededError({ kind: 'delta_events', limit: 10, observed: 11 }); if (kind !== 'restart') safety.message = fixtures.canaries[0];
+  const audit = createServer((request, response) => { let body = ''; request.on('data', (chunk: Buffer): void => { body += chunk.toString(); }); request.on('end', (): void => { responses.push(body); response.end('Allowed audit control'); if (responses.length === 2) received.resolve(); }); });
+  await new Promise<void>((resolve) => audit.listen(0, '127.0.0.1', resolve));
+  const runner = createLocalProgrammaticToolCallingTool({ cwd: process.cwd() });
+  const invoke: (params: { lang: string; code: string; tool_manifest: string[] }, manager: undefined, config: RunnableConfig & { toolCall?: ToolCall & Partial<ProgrammaticCache> }) => Promise<unknown> = Reflect.get(runner, '_call');
+  try {
+    const code = `for attempt in 1 2; do
+response=$(curl -sS -X POST -H "Content-Type: application/json" -H "$__LIBRECHAT_TOOL_HEADER: $__LIBRECHAT_TOOL_TOKEN" --data-binary '{"name":"lookup","input":{"count":42}}' "$__LIBRECHAT_TOOL_BRIDGE?mode=${mode}")
+printf '%s' "$response" | curl -sS -X POST --data-binary @- 'http://127.0.0.1:${(audit.address() as AddressInfo).port}'
+done
+echo 'Allowed program ignored failures'`;
+    const outcome = invoke.call(runner, { lang: 'bash', code, tool_manifest: ['lookup'] }, undefined, { toolCall: { id: 'bridge-latched-control', name: runner.name, type: 'tool_call', args: {}, toolMap: new Map([['lookup', direct(() => { executions++; throw kind === 'restart' ? marker : safety; })]]), toolDefs: [{ name: 'lookup', allowed_callers: ['code_execution'], parameters: { type: 'object', properties: { count: { type: 'number' } } } }], toolResultProtection: policy() } }).catch((error: Error) => error);
+    await received.promise; const error = await outcome;
+    expect(responses).toHaveLength(2); expect(executions).toBe(1); assertNoCanary(responses.join('')); assertNoCanary(String(error));
+    if (kind === 'restart') expect(error).toBe(marker);
+    else { expect(error).toBeInstanceOf(kind === 'prepared' ? PreparedSubagentError : StreamLimitExceededError); expect(error).not.toBe(safety); expect(error).not.toHaveProperty('cause'); }
+  } finally { audit.closeAllConnections(); await new Promise<void>((resolve) => audit.close(() => resolve())); }
 });

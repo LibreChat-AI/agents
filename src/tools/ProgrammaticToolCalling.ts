@@ -1,6 +1,6 @@
 import { ToolMessage } from '@langchain/core/messages';
 import type { ToolResultProtection } from '@/protection/toolResult';
-import { ToolResultProtectionError, normalizeToolResultError, protectToolMessage, protectToolErrorText, protectToolText, withToolResultBoundary, requiresToolResultProtection } from '@/protection/toolResult';
+import { detachToolSafetyError, ToolResultProtectionError, normalizeToolResultError, protectToolMessage, protectToolErrorText, protectToolText, withToolResultBoundary, requiresToolResultProtection } from '@/protection/toolResult';
 import { ProviderTextProtectionError } from '@/protection/providerText';
 // src/tools/ProgrammaticToolCalling.ts
 import { config } from 'dotenv';
@@ -917,6 +917,10 @@ export async function executeTools(
       };
     } catch (error) {
       if (error instanceof ProviderTextProtectionError) throw protection?.policy == null ? error : normalizeToolResultError(error);
+      if (requiresToolResultProtection(protection?.policy, call.name)) {
+        const safety = detachToolSafetyError(error, true);
+        if (safety != null) throw safety;
+      }
       return {
         call_id: call.id,
         result: null,

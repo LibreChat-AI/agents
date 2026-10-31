@@ -177,10 +177,19 @@ export function detachToolSafetyError(error: unknown, releasedOnly = false): Pre
   const detached = new StreamLimitExceededError({ kind, limit, observed }); detachedToolSafetyErrors.add(detached); return detached;
 }
 
+function readmitToolResultFailure(error: unknown): unknown {
+  const control = detachToolControlInterrupt(error);
+  if (control != null) return control;
+  const safety = detachToolSafetyError(error, true);
+  if (safety != null) return safety;
+  if (error instanceof ProviderTextProtectionError) return normalizeToolResultError(error);
+  return error;
+}
+
 /** Native runnable abort races must observe the same raw-free failures as tool bodies. */
 export async function withToolResultSafetySignal<T>(signal: AbortSignal | undefined, invoke: (signal: AbortSignal | undefined) => Promise<T>): Promise<T> {
   if (signal == null) {
-    try { return await invoke(signal); } catch (error) { throw detachToolControlInterrupt(error) ?? detachToolSafetyError(error, true) ?? error; }
+    try { return await invoke(signal); } catch (error) { throw readmitToolResultFailure(error); }
   }
   const controller = new AbortController();
   const abort = (): void => {
@@ -194,7 +203,7 @@ export async function withToolResultSafetySignal<T>(signal: AbortSignal | undefi
   signal.addEventListener('abort', abort, { once: true });
   if (signal.aborted) abort();
   try { return await invoke(controller.signal); }
-  catch (error) { throw detachToolControlInterrupt(error) ?? detachToolSafetyError(error, true) ?? error; }
+  catch (error) { throw readmitToolResultFailure(error); }
   finally { signal.removeEventListener('abort', abort); }
 }
 
