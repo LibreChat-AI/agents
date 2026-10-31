@@ -62,8 +62,15 @@ jobs:
           path: node_modules
           key: node-modules-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
 
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: .bun-version
+
+      - name: Test typecheck runner
+        run: npm run test:typecheck
+
       - name: TypeScript type-check
-        run: npx tsc --noEmit
+        run: npm run typecheck
 
   circular-deps:
     needs: install

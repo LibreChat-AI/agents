@@ -1,6 +1,6 @@
 {
   "name": "@librechat/agents",
-  "version": "4.1.1",
+  "version": "4.2.0",
   "reova": {
     "enabled": true,
     "endpoint": "https://telemetry.reo.dev/data"
@@ -215,6 +215,8 @@
     "prepublishOnly": "npm run build",
     "build": "tsdown && tsc -p tsconfig.build.json",
     "build:dev": "tsdown",
+    "typecheck": "node scripts/typecheck.ts",
+    "test:typecheck": "node --test scripts/typecheck.test.ts",
     "check:circular-deps": "node config/circular-deps.mjs",
     "test:circular-deps": "node --test config/circular-deps.test.mjs",
     "test:light-entries": "node --test config/light-entries.test.mjs",
