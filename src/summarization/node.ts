@@ -1422,15 +1422,16 @@ export function createSummarizeNode({
      * is also skipped outright when the caller never enabled it.
      */
     if (
-      request.reason === 'overflow' &&
-      (request.allowSummarization !== true ||
-        agentContext.summarizationEnabled !== true)
+      request.reason === 'request-body' ||
+      (request.reason === 'overflow' &&
+        (request.allowSummarization !== true ||
+          agentContext.summarizationEnabled !== true))
     ) {
       emitAgentLog(
         config,
         'debug',
         'summarize',
-        'Overflow recovery re-prune — compressing tool output without a summarization call',
+        'Size recovery re-prune: compressing tool output without a summarization call',
         {
           maxContextTokens: agentContext.maxContextTokens,
           summarizationEnabled: agentContext.summarizationEnabled === true,

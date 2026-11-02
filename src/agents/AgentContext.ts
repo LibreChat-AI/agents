@@ -56,6 +56,11 @@ import {
   Constants,
   Providers,
 } from '@/common';
+import {
+  DEFAULT_MAX_OVERFLOW_RECOVERIES,
+  MIN_MESSAGE_HEADROOM_TOKENS,
+  getBlindRecoveryBudget,
+} from '@/llm/contextOverflowRecovery';
 import { isTokenCounterCacheCompatible } from '@/llm/tokenCounterCacheCompatibility';
 import { snapshotCompactionSemanticIndex } from '@/summarization/semanticIndex';
 import { createExactTokenCountCache } from '@/llm/contextPressureMeter';
@@ -466,6 +471,11 @@ export class AgentContext {
    * make the run compact indefinitely.
    */
   private _overflowRecoveryAttempts: number = 0;
+  private _requestBodyRejection?: {
+    observedBytes: number;
+    messageCount: number;
+    tail?: BaseMessage;
+  };
   /**
    * Budget in force before the first overflow correction of the current run.
    * Recorded so `reset()` can undo the correction for the next run without
@@ -1709,6 +1719,40 @@ export class AgentContext {
     return this._overflowRecoveryAttempts;
   }
 
+  /**
+   * Uses a smaller context budget as a compaction actuator, never as a byte
+   * conversion or provider calibration. Every retry must pass serialization
+   * again. Shares the run's forced-compaction allowance with token recovery.
+   */
+  tryRequestBodyRecovery(observedBytes: number, messages: BaseMessage[]): boolean {
+    const budget = this.maxContextTokens;
+    const previous = this._requestBodyRejection;
+    const tail = messages[messages.length - 1];
+    if (
+      this.tokenCounter == null ||
+      budget == null || !Number.isFinite(budget) || budget <= 0 ||
+      this._overflowRecoveryAttempts >= DEFAULT_MAX_OVERFLOW_RECOVERIES ||
+      (previous != null && previous.messageCount === messages.length &&
+        previous.tail === tail && observedBytes >= previous.observedBytes)
+    ) {
+      return false;
+    }
+    const nextBudget = getBlindRecoveryBudget(budget);
+    if (nextBudget == null || nextBudget >= budget) {
+      return false;
+    }
+    const reserveRatio = this.summarizationConfig?.reserveRatio ?? DEFAULT_RESERVE_RATIO;
+    const reserveTokens = reserveRatio > 0 && reserveRatio < 1
+      ? Math.round(nextBudget * reserveRatio) : 0;
+    if (nextBudget - reserveTokens - this.instructionTokens < MIN_MESSAGE_HEADROOM_TOKENS) {
+      return false;
+    }
+    this.applyContextBudgetCorrection(nextBudget);
+    this.markSummarizationTriggered(messages.length);
+    this._requestBodyRejection = { observedBytes, messageCount: messages.length, tail };
+    return true;
+  }
+
   shouldSummarizeOverflow(): boolean {
     return (
       this.summarizationEnabled === true &&
@@ -1759,8 +1803,8 @@ export class AgentContext {
   }
 
   /**
-   * Retargets the context budget after a provider rejected the prompt as too
-   * large, and clears the memoized pruner so the next call is planned against
+   * Retargets the context budget after a local or provider size rejection,
+   * and clears the memoized pruner so the next call is planned against
    * the corrected budget rather than the one that was evidently wrong.
    *
    * Also clears the "already summarized at this message count" guard: that
@@ -1990,6 +2034,7 @@ export class AgentContext {
     this.correctedContextBudgetMode = undefined;
     this._lastOverflowPromptTokens = undefined;
     this._overflowRecoveryAttempts = 0;
+    this._requestBodyRejection = undefined;
   }
 
   clearSummary(): void {

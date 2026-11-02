@@ -4,6 +4,87 @@ import { messagesStateReducer } from '@/messages/reducer';
 import { AgentContext } from '@/agents/AgentContext';
 import { Providers } from '@/common';
 
+describe('AgentContext local byte recovery', () => {
+  function context(): AgentContext {
+    return AgentContext.fromConfig(
+      {
+        agentId: 'body-budget',
+        provider: Providers.OPENAI,
+        instructions: 'Test',
+        maxContextTokens: 16_000,
+      },
+      () => 10
+    );
+  }
+
+  it('bounds local retries, preserves calibration and resets the allowance', () => {
+    const agent = context();
+    const messages = [new HumanMessage('canonical')];
+    const calibration = agent.calibrationRatio;
+    expect(agent.tryRequestBodyRecovery(140_000, messages)).toBe(true);
+    expect(agent.maxContextTokens).toBe(11_200);
+    expect(agent.shouldSkipSummarization(messages.length)).toBe(true);
+    expect(agent.shouldSkipSummarization(messages.length + 1)).toBe(false);
+    expect(agent.tryRequestBodyRecovery(135_000, messages)).toBe(true);
+    expect(agent.maxContextTokens).toBeLessThan(11_200);
+    expect(agent.tryRequestBodyRecovery(132_000, messages)).toBe(false);
+    expect(agent.overflowRecoveryAttempts).toBe(2);
+    expect(agent.calibrationRatio).toBe(calibration);
+    agent.reset();
+    expect(agent.maxContextTokens).toBe(16_000);
+    expect(agent.overflowRecoveryAttempts).toBe(0);
+    expect(agent.tryRequestBodyRecovery(140_000, messages)).toBe(true);
+  });
+
+  it('stops when reserialization makes no progress on unchanged history', () => {
+    const agent = context();
+    const messages = [new HumanMessage('canonical')];
+    expect(agent.tryRequestBodyRecovery(140_000, messages)).toBe(true);
+    expect(agent.tryRequestBodyRecovery(140_000, [...messages])).toBe(false);
+    expect(agent.tryRequestBodyRecovery(150_000, [...messages])).toBe(false);
+    expect(agent.overflowRecoveryAttempts).toBe(1);
+    expect(agent.tryRequestBodyRecovery(150_000, [...messages, new HumanMessage('new turn')])).toBe(true);
+  });
+
+  it('shares the finite allowance with provider recovery', () => {
+    const agent = context();
+    agent.applyContextBudgetCorrection(12_000);
+    agent.applyContextBudgetCorrection(10_000);
+    expect(agent.tryRequestBodyRecovery(140_000, [new HumanMessage('canonical')])).toBe(false);
+    expect(agent.maxContextTokens).toBe(10_000);
+  });
+
+  it('leaves message headroom after instructions and the normal reserve', async () => {
+    const agent = AgentContext.fromConfig(
+      {
+        agentId: 'large-instructions',
+        provider: Providers.OPENAI,
+        instructions: 'large system prompt',
+        maxContextTokens: 60_000,
+      },
+      () => 40_000
+    );
+    await agent.tokenCalculationPromise;
+    expect(agent.instructionTokens).toBeGreaterThanOrEqual(40_000);
+    expect(agent.tryRequestBodyRecovery(140_000, [new HumanMessage('task')])).toBe(false);
+    expect(agent.maxContextTokens).toBe(60_000);
+    expect(agent.overflowRecoveryAttempts).toBe(0);
+  });
+
+  it('declines without a usable counter or budget', () => {
+    const agent = context();
+    agent.tokenCounter = undefined;
+    expect(agent.tryRequestBodyRecovery(140_000, [])).toBe(false);
+    const noBudget = context();
+    noBudget.maxContextTokens = undefined;
+    expect(noBudget.tryRequestBodyRecovery(140_000, [])).toBe(false);
+    expect(noBudget.overflowRecoveryAttempts).toBe(0);
+    const noHeadroom = context();
+    noHeadroom.maxContextTokens = 2_000;
+    expect(noHeadroom.tryRequestBodyRecovery(140_000, [])).toBe(false);
+    expect(noHeadroom.overflowRecoveryAttempts).toBe(0);
+  });
+});
 /**
  * The overflow-recovery bookkeeping on AgentContext: the budget correction,
  * its restoration between runs, and the stall detector that stops a recovery

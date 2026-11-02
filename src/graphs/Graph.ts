@@ -135,6 +135,7 @@ import {
   ProviderTextProtectionError,
   validateProviderTextProtection,
 } from '@/protection/providerText';
+import { RequestBodyBudgetError, RequestBodyLimitError } from '@/llm/requestBodyBudget';
 import {
   annotateMessagesForLLM,
   ToolOutputReferenceRegistry,
@@ -3246,6 +3247,42 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     };
   }
 
+  private beginRequestBodyRecovery({
+    error, agentContext, messages, agentId, config, originalToolContent,
+  }: {
+    error: RequestBodyBudgetError;
+    agentContext: AgentContext;
+    messages: BaseMessage[];
+    agentId: string;
+    config?: RunnableConfig;
+    originalToolContent?: Map<number, string>;
+  }): Partial<t.AgentSubgraphState> {
+    const previousBudget = agentContext.maxContextTokens;
+    if (!(error instanceof RequestBodyLimitError) ||
+        !agentContext.tryRequestBodyRecovery(error.observedBytes, messages)) {
+      throw error;
+    }
+    agentContext.preserveOriginalToolContent(originalToolContent);
+    emitAgentLog(config, 'warn', 'graph',
+      'Local serialized request limit exceeded: re-pruning before forwarding', {
+        detectedBy: error.source,
+        observedBytes: error.observedBytes,
+        limitBytes: error.limitBytes,
+        previousBudget,
+        recoveredBudget: agentContext.maxContextTokens,
+        attempt: agentContext.overflowRecoveryAttempts,
+        compaction: 'compress',
+      }, { runId: this.runId, agentId }, { force: true });
+    return {
+      summarizationRequest: {
+        remainingContextTokens: 0,
+        agentId: agentId || agentContext.agentId,
+        reason: 'request-body',
+        allowSummarization: false,
+      },
+    };
+  }
+
   private getPreparedToolsForBinding(
     agentContext: AgentContext,
     provider: t.ProviderName = agentContext.provider,
@@ -4529,6 +4566,13 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
          * retry would resend a byte-identical prompt. Skipping the detour
          * keeps the original error and one round trip instead of three.
          */
+        if (primaryError instanceof RequestBodyBudgetError) {
+          return this.beginRequestBodyRecovery({
+            error: primaryError, agentContext, messages, agentId, config,
+            originalToolContent: prunedOriginalToolContent,
+          });
+        }
+
         const estimatedPromptTokens = getEstimatedPromptTokens(contextUsage);
 
         const recencyTokenCounter =
@@ -4861,6 +4905,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             if (trippedReason != null) {
               throw trippedReason;
             }
+          }
+          if (fallbackError instanceof RequestBodyBudgetError) {
+            throw fallbackError;
           }
           const overflowCandidates =
             getFallbackOverflowCandidates(fallbackError);

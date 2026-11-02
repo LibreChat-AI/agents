@@ -48,6 +48,7 @@ export type AzureClientOptions = Partial<OpenAIChatInput> &
   } & BaseChatModelParams & {
     configuration?: OAIClientOptions;
   } & ManagedRequestOptions &
+  RequestBodyBudgetOptions &
   StreamSmoothingOptions;
 /**
  * Controls whether Claude's reasoning content is returned in adaptive
@@ -105,6 +106,16 @@ export type ManagedRequestOptions = {
    */
   firstPartyEndpoint?: boolean;
 };
+/** Optional local bound for built-in OpenAI/Azure serialized request bodies. */
+export type RequestBodyBudgetOptions = {
+  /**
+   * Maximum UTF-8 bytes after SDK serialization and request-option overrides.
+   * Unset by default. Rejects non-string bodies, custom request delegates and
+   * SDK provider hooks that could mutate the body after serialization.
+   * A local rejection never forwards the body or triggers transport retries.
+   */
+  maxRequestBodyBytes?: number;
+};
 /**
  * Adaptive stream-smoothing configuration shared by every provider client.
  */
@@ -119,6 +130,7 @@ export type StreamSmoothingOptions = {
 
 export type OpenAIClientOptions = ChatOpenAIFields &
   ManagedRequestOptions &
+  RequestBodyBudgetOptions &
   StreamSmoothingOptions;
 export type AnthropicClientOptions = Omit<AnthropicInput, 'thinking'> &
   StreamSmoothingOptions & {

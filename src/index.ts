@@ -74,6 +74,7 @@ export {
 export type { Interrupt } from '@langchain/langgraph';
 
 /* LLM */
+export { RequestBodyBudgetError, RequestBodyLimitError } from './llm/requestBodyBudget';
 export { markTokenCounterCacheCompatible } from './llm/tokenCounterCacheCompatibility';
 /** Provider chat-model classes moved off the root barrel: importing any of them here
  *  forced every host to pay that provider SDK's module init at boot. They remain
