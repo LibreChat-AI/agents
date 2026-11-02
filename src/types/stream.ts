@@ -9,6 +9,7 @@ import type {
 import type { ToolCall, ToolCallChunk } from '@langchain/core/messages/tool';
 import type { LLMResult, Generation } from '@langchain/core/outputs';
 import type { Command } from '@langchain/langgraph';
+import type { OpenAI as OpenAIClient } from 'openai';
 import type Anthropic from '@anthropic-ai/sdk';
 import type { AnthropicContentBlock } from '@/llm/anthropic/types';
 import type { AssistantTextPhase } from '@/types/assistantPhase';
@@ -111,6 +112,8 @@ export type RunStep = {
   groupId?: number; // #new
   index: number; // #new
   stepIndex?: number; // #new
+  /** Tool-calls steps only: shared by the calls of one model response. */
+  roundId?: string;
   stepDetails: StepDetails;
   summary?: SummaryContentBlock;
   usage?: null | object;
@@ -253,7 +256,12 @@ export type ProcessedToolCall = {
    * which is language-neutral and always consistent.
    */
   outcome?: string;
+  /** Set when `output` is the JSON of the content blocks the tool returned. */
+  outputFormat?: ToolOutputFormat;
 };
+
+/** `blocks`: the tool returned content blocks, stored as their JSON in `output`. */
+export type ToolOutputFormat = 'blocks';
 
 export type ProcessedContent = {
   type: ContentType;
@@ -499,6 +507,39 @@ export type ToolCallPart = {
   auth?: string;
   /** Expiration time */
   expires_at?: number;
+  /**
+   * Model response that issued the call (`RunStep.roundId`). Calls sharing it
+   * replay as one assistant message; a change starts the next tool round.
+   */
+  roundId?: string;
+  /** See `ProcessedToolCall.outputFormat`; restored as the same content blocks. */
+  outputFormat?: ToolOutputFormat;
+  /**
+   * OpenAI Responses output items of the model response, from the item after
+   * the previous call through this call's `function_call` (the last call also
+   * carries any trailing items). Replayed verbatim on restore so the tool
+   * round serializes as the live request did.
+   */
+  providerItems?: ProviderOutputItems;
+};
+
+/**
+ * Provider output items persisted on a tool call part. Restore replays only
+ * `reasoning`, `function_call`, and `message` items within a size cap, and
+ * only to the origin that produced them; hosts must still treat stored items
+ * as data they wrote, not as input from users.
+ */
+export type ProviderOutputItems = {
+  /** Opaque digest of the model and endpoint; replay only goes back to it. */
+  origin: string;
+  /** Response creation time, epoch seconds. */
+  created_at?: number;
+  items: OpenAIClient.Responses.ResponseOutputItem[];
+};
+
+/** Registry-only event: output items of a tool round, keyed by tool call. */
+export type ProviderOutputItemsEvent = {
+  tool_calls: Array<{ id: string; providerItems: ProviderOutputItems }>;
 };
 
 export type ToolCallContent = {
@@ -573,6 +614,7 @@ export type ContentAggregator = ({
     | MessageDeltaEvent
     | ReasoningDeltaEvent
     | RunStepDeltaEvent
+    | ProviderOutputItemsEvent
     | SummarizeDeltaData
     | SummarizeCompleteEvent
     | { result: ToolEndEvent };
