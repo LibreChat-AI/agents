@@ -496,6 +496,7 @@ export function resolveLocalImplementationNames(
 
 export function resolveLocalExecutionTools(args: {
   toolMap: t.ToolMap;
+  maxToolResultChars?: number;
   toolExecution?: t.ToolExecutionConfig;
   toolRegistry?: t.LCToolRegistry;
   /**
@@ -610,6 +611,7 @@ export function resolveLocalExecutionTools(args: {
     ) {
       const bundle = createLocalCodingToolBundle(localConfig, {
         checkpointer: args.fileCheckpointer,
+        maxReadResultChars: args.maxToolResultChars,
       });
       fileCheckpointer = bundle.checkpointer;
       for (const localTool of bundle.tools) {
@@ -622,7 +624,7 @@ export function resolveLocalExecutionTools(args: {
         );
       }
     } else {
-      for (const localTool of createLocalCodingTools(localConfig)) {
+      for (const localTool of createLocalCodingTools(localConfig, { maxReadResultChars: args.maxToolResultChars })) {
         toolMap.set(localTool.name, localTool);
         localImplementationNames.add(localTool.name);
         addDirectToolName(

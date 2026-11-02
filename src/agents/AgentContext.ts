@@ -125,6 +125,7 @@ export class AgentContext {
       toolEnd,
       toolRegistry,
       toolDefinitions,
+      programmaticToolInstructions,
       instructions,
       additional_instructions,
       streamBuffer,
@@ -160,6 +161,7 @@ export class AgentContext {
       toolRegistry,
       toolExecution,
       toolDefinitions,
+      programmaticToolInstructions,
       instructions,
       additionalInstructions: additional_instructions,
       reasoningKey,
@@ -377,6 +379,7 @@ export class AgentContext {
   toolRegistry?: t.LCToolRegistry;
   /** Run-scoped backend used to identify auto-bound programmatic runners. */
   private toolExecution?: t.ToolExecutionConfig;
+  private readonly programmaticToolInstructions?: t.ToolExecutionConfig['programmaticToolInstructions'];
   /**
    * Serializable tool definitions for event-driven execution.
    * When provided, ToolNode operates in event-driven mode.
@@ -524,6 +527,7 @@ export class AgentContext {
     toolRegistry,
     toolExecution,
     toolDefinitions,
+    programmaticToolInstructions,
     instructions,
     additionalInstructions,
     reasoningKey,
@@ -553,6 +557,7 @@ export class AgentContext {
     toolRegistry?: t.LCToolRegistry;
     toolExecution?: t.ToolExecutionConfig;
     toolDefinitions?: t.LCTool[];
+    programmaticToolInstructions?: t.ToolExecutionConfig['programmaticToolInstructions'];
     instructions?: string;
     additionalInstructions?: string;
     reasoningKey?: 'reasoning_content' | 'reasoning';
@@ -588,6 +593,7 @@ export class AgentContext {
       toolExecution,
     });
     this.toolExecution = toolExecution;
+    this.programmaticToolInstructions = programmaticToolInstructions;
     this.toolDefinitions = filterToolsByLocalAllowlist(
       toolDefinitions as t.GraphTools | undefined,
       toolExecution
@@ -627,6 +633,21 @@ export class AgentContext {
   private buildProgrammaticOnlyToolsInstructions(): string {
     const programmaticTools = this.getProgrammaticToolInstructionTargets();
     if (programmaticTools.length === 0) return '';
+    const instructionStyle =
+      this.programmaticToolInstructions ??
+      this.toolExecution?.programmaticToolInstructions;
+    if (instructionStyle === 'discovery') {
+      return (
+        '\n\n## Programmatic Tool Calling\n\n' +
+        'Discover callable tools with tool_search before invoking them through the programmatic runner.'
+      );
+    }
+    if (instructionStyle === 'hybrid') {
+      return (
+        '\n\n## Programmatic Tool Calling\n\n' +
+        'The profile\'s selected local coding tools support direct calls and code execution without discovery.'
+      );
+    }
     const directProgrammaticTools = programmaticTools.filter(
       (tool) => tool.executesDirectly
     );

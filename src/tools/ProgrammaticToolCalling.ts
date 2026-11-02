@@ -3,7 +3,10 @@ import { config } from 'dotenv';
 import { randomUUID } from 'node:crypto';
 import fetch, { RequestInit } from 'node-fetch';
 import { tool, DynamicStructuredTool } from '@langchain/core/tools';
+import { pickRunnableConfigKeys } from '@langchain/core/runnables';
+import { AsyncLocalStorageProviderSingleton } from '@langchain/core/singletons';
 import type { ToolCall } from '@langchain/core/messages/tool';
+import type { RunnableConfig } from '@langchain/core/runnables';
 import type { ProgrammaticToolCallingJsonSchema } from './ptcTimeout';
 import type * as t from '@/types';
 import {
@@ -50,6 +53,7 @@ import { appendExecutionArtifactFileSummary } from './CodeSessionFileSummary';
 import { resolveFetchProxyAgent } from '@/utils/proxy';
 import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { Constants } from '@/common';
+import { supportsAwaitedCancellation } from './awaitedCancellation';
 
 config();
 
@@ -875,8 +879,16 @@ function normalizeToolInput(
 export async function executeTools(
   toolCalls: t.PTCToolCall[],
   toolMap: t.ToolMap,
-  programmaticToolName = Constants.PROGRAMMATIC_TOOL_CALLING
+  programmaticToolName: string = Constants.PROGRAMMATIC_TOOL_CALLING,
+  signal?: AbortSignal,
+  config?: RunnableConfig
 ): Promise<t.PTCToolResult[]> {
+  const inherited = config ?? AsyncLocalStorageProviderSingleton.getRunnableConfig() as RunnableConfig | undefined;
+  const childConfig: RunnableConfig = { ...pickRunnableConfigKeys(inherited) };
+  delete childConfig.signal;
+  delete childConfig.timeout;
+  delete childConfig.runId;
+  delete childConfig.runName;
   const executions = toolCalls.map(async (call): Promise<t.PTCToolResult> => {
     const tool = toolMap.get(call.name);
 
@@ -890,9 +902,18 @@ export async function executeTools(
     }
 
     try {
-      const result = await tool.invoke(normalizeToolInput(call.input, tool), {
-        metadata: { [programmaticToolName]: true },
+      signal?.throwIfAborted();
+      const metadata = { ...(signal == null ? {} : inherited?.metadata), [programmaticToolName]: true };
+      const invoke = (): ReturnType<t.GenericTool['invoke']> => tool.invoke(normalizeToolInput(call.input, tool), {
+        ...(signal == null ? {} : childConfig),
+        metadata,
+        ...(signal != null && supportsAwaitedCancellation(tool) ? { signal } : {}),
       });
+      // LangChain's tool() helper races abort against the callback. Unowned
+      // tools must finish without a signal, including one inherited from ALS.
+      const result = signal == null
+        ? await invoke()
+        : await AsyncLocalStorageProviderSingleton.runWithConfig(childConfig, invoke);
 
       const isMCPTool = tool.mcp === true;
       const unwrappedResult = unwrapToolResponse(result, isMCPTool);

@@ -108,6 +108,17 @@ export function isToolDefinitionActive(
   );
 }
 
+/** Execution must enforce the same policy as model-facing tool projection. */
+export function getDirectToolCallError(
+  definition: t.LCTool | undefined,
+  discoveredNames: readonly string[]
+): string | undefined {
+  if (definition == null) return undefined;
+  if (!allowsToolCaller(definition, 'direct')) return `Tool "${definition.name}" cannot be called directly`;
+  if (definition.defer_loading === true && !discoveredNames.includes(definition.name)) return `Tool "${definition.name}" is not available before discovery`;
+  return undefined;
+}
+
 export function resolveCallerCapabilityProjection(
   toolDefs: Iterable<t.LCTool>,
   isActive: (toolDef: t.LCTool) => boolean = () => true

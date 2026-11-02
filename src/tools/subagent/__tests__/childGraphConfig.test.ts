@@ -7,6 +7,7 @@ import type {
 } from '@/types';
 import {
   buildGraphChildInputs,
+  buildChildInputs,
   normalizeSubagentConfigEntries,
   normalizeSubagentConfigs,
   resolveSubagentConfigEntries,
@@ -366,6 +367,7 @@ describe('graph subagent config', () => {
     };
     const sourceAgent: AgentInputs = {
       ...makeAgent('coordinator'),
+      programmaticToolInstructions: 'hybrid',
       toolDefinitions: [{ name: 'event_tool' }],
       graphTools: [graphTool],
       initialSummary: { text: 'old summary', tokenCount: 2 },
@@ -386,6 +388,7 @@ describe('graph subagent config', () => {
     expect(prepared).toHaveLength(1);
     expect(prepared[0]).toMatchObject({
       agentId: 'coordinator',
+      programmaticToolInstructions: 'hybrid',
       toolDefinitions: [{ name: 'event_tool' }],
       graphTools: [graphTool],
     });
@@ -398,6 +401,26 @@ describe('graph subagent config', () => {
       tokenCount: 2,
     });
     expect(sourceAgent.maxSubagentDepth).toBe(9);
+    expect(sourceAgent.programmaticToolInstructions).toBe('hybrid');
+  });
+
+  it('preserves the self agent instruction policy without mutating its inputs', () => {
+    const source: AgentInputs = {
+      ...makeAgent('parent'),
+      programmaticToolInstructions: 'discovery',
+      discoveredTools: ['prior_tool'],
+    };
+    const before = { ...source };
+    const parent = AgentContext.fromConfig(source);
+    const [resolved] = resolveSubagentConfigs(
+      [{ type: 'self', name: 'Self', description: 'A self worker', self: true }],
+      parent
+    );
+    const child = buildChildInputs(resolved, 'self-child', 3, true);
+
+    expect(child.programmaticToolInstructions).toBe('discovery');
+    expect(child.discoveredTools).toBeUndefined();
+    expect(source).toEqual(before);
   });
 });
 

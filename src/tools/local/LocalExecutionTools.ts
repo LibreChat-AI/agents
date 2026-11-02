@@ -1,4 +1,3 @@
-import { tool } from '@langchain/core/tools';
 import type { DynamicStructuredTool } from '@langchain/core/tools';
 import type * as t from '@/types';
 import {
@@ -19,6 +18,7 @@ import {
   CodeExecutionToolSchema,
 } from '@/tools/CodeExecutor';
 import { Constants } from '@/common';
+import { createAwaitedTool } from '../awaitedCancellation';
 
 const emptyOutputMessage =
   'stdout: Empty. Ensure you\'re writing output explicitly.\n';
@@ -45,7 +45,18 @@ Usage:
 - Prefer project-native commands and inspect files before changing them.
 `.trim();
 
-function formatLocalOutput(
+export const LocalBashExecutionToolSchema = {
+  ...BashExecutionToolSchema,
+  properties: {
+    ...BashExecutionToolSchema.properties,
+    command: {
+      type: 'string',
+      description: 'Bash command or script in the configured working directory. Files persist between executions; shell variables do not. Print the results needed for the task.',
+    },
+  },
+} as const;
+
+export function formatLocalOutput(
   result: {
     stdout: string;
     stderr: string;
@@ -54,6 +65,9 @@ function formatLocalOutput(
     overflowKilled?: boolean;
     signal?: string;
     fullOutputPath?: string;
+    outputTruncated?: boolean;
+    outputRecoveryError?: string;
+    outputOnHost?: boolean;
   },
   cwd: string
 ): string {
@@ -91,8 +105,18 @@ function formatLocalOutput(
     formatted += `killed: true (signal=${result.signal})\n`;
   }
 
+  if (result.outputTruncated === true) formatted += 'output_truncated: true\n';
+  if (result.overflowKilled === true || result.timedOut || result.signal != null) {
+    formatted += 'capture_incomplete: true (execution was terminated)\n';
+  }
   if (result.fullOutputPath != null) {
-    formatted += `full_output_path: ${result.fullOutputPath} (output exceeded the configured cap; use bash to inspect — the file holds the complete stdout/stderr)\n`;
+    const location = result.outputOnHost === true
+      ? 'host capture; retrieval requires the host filesystem, which the custom execution backend may not share'
+      : 'combined captured output; use local bash to inspect a bounded range';
+    formatted += `full_output_path: ${result.fullOutputPath} (${location})\n`;
+  }
+  if (result.outputRecoveryError != null) {
+    formatted += `output_recovery_failed: ${result.outputRecoveryError}\n`;
   }
 
   formatted += `working_directory: ${cwd}`;
@@ -102,30 +126,33 @@ function formatLocalOutput(
 export function createLocalCodeExecutionTool(
   config: t.LocalExecutionConfig = {}
 ): DynamicStructuredTool {
-  return tool(
-    async (rawInput) => {
+  return createAwaitedTool({
+    func: async (
+      rawInput,
+      _manager,
+      invocation
+    ): Promise<[string, t.CodeExecutionArtifact]> => {
       const input = rawInput as {
         lang: string;
         code: string;
         args?: string[];
       };
       const cwd = getLocalCwd(config);
-      const result = await executeLocalCode(input, config);
+      const result = await executeLocalCode(input, config, invocation?.signal);
+      invocation?.signal?.throwIfAborted();
       return [
-        formatLocalOutput(result, cwd),
+        formatLocalOutput(capLocalOutput(result, config), cwd),
         {
           session_id: getLocalSessionId(config),
           files: [],
         } satisfies t.CodeExecutionArtifact,
       ];
     },
-    {
-      name: CodeExecutionToolName,
-      description: LocalCodeExecutionToolDescription,
-      schema: CodeExecutionToolSchema,
-      responseFormat: Constants.CONTENT_AND_ARTIFACT,
-    }
-  );
+    name: CodeExecutionToolName,
+    description: LocalCodeExecutionToolDescription,
+    schema: CodeExecutionToolSchema,
+    responseFormat: Constants.CONTENT_AND_ARTIFACT,
+  });
 }
 
 /**
@@ -133,15 +160,16 @@ export function createLocalCodeExecutionTool(
  * the status lines (`exit_code`, `timed_out`, `killed`) are always kept.
  * stderr gets at most half of the budget.
  */
-function capStreams<T extends { stdout: string; stderr: string }>(
+export function capLocalOutput<T extends { stdout: string; stderr: string; outputTruncated?: boolean }>(
   result: T,
   config: t.LocalExecutionConfig
 ): T {
   const maxChars = config.toolResultMaxChars;
-  if (maxChars == null || maxChars <= 0) return result;
+  if (maxChars == null || maxChars <= 0 || result.stdout.length + result.stderr.length <= maxChars) return result;
   const stderrBudget = Math.min(result.stderr.length, Math.floor(maxChars / 2));
   return {
     ...result,
+    outputTruncated: result.outputTruncated === true || result.stdout.length + result.stderr.length > maxChars,
     stdout: capHeadTail(result.stdout, maxChars - stderrBudget),
     stderr: capHeadTail(result.stderr, Math.max(stderrBudget, 1)),
   };
@@ -152,8 +180,12 @@ export function createLocalBashExecutionTool(options?: {
   enableToolOutputReferences?: boolean;
 }): DynamicStructuredTool {
   const config = options?.config ?? {};
-  return tool(
-    async (rawInput) => {
+  return createAwaitedTool({
+    func: async (
+      rawInput,
+      _manager,
+      invocation
+    ): Promise<[string, t.CodeExecutionArtifact]> => {
       const input = rawInput as { command: string; args?: string[] };
       const cwd = getLocalCwd(config);
       // Use the standard `bash -lc <command> -- <args...>` form so
@@ -164,24 +196,28 @@ export function createLocalBashExecutionTool(options?: {
       // shell snippets like `command: 'echo "$1"'`.
       const result =
         input.args != null && input.args.length > 0
-          ? await executeLocalBashWithArgs(input.command, input.args, config)
-          : await executeLocalBash(input.command, config);
+          ? await executeLocalBashWithArgs(
+            input.command,
+            input.args,
+            config,
+            invocation?.signal
+          )
+          : await executeLocalBash(input.command, config, invocation?.signal);
+      invocation?.signal?.throwIfAborted();
       return [
-        formatLocalOutput(capStreams(result, config), cwd),
+        formatLocalOutput(capLocalOutput(result, config), cwd),
         {
           session_id: getLocalSessionId(config),
           files: [],
         } satisfies t.CodeExecutionArtifact,
       ];
     },
-    {
-      name: BashExecutionToolName,
-      description:
-        options?.enableToolOutputReferences === true
-          ? `${LocalBashExecutionToolDescription}\n\n${BashToolOutputReferencesGuide}`
-          : LocalBashExecutionToolDescription,
-      schema: BashExecutionToolSchema,
-      responseFormat: Constants.CONTENT_AND_ARTIFACT,
-    }
-  );
+    name: BashExecutionToolName,
+    description:
+      options?.enableToolOutputReferences === true
+        ? `${LocalBashExecutionToolDescription}\n\n${BashToolOutputReferencesGuide}`
+        : LocalBashExecutionToolDescription,
+    schema: LocalBashExecutionToolSchema,
+    responseFormat: Constants.CONTENT_AND_ARTIFACT,
+  });
 }
