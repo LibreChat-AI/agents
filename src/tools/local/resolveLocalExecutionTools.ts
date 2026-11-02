@@ -1,14 +1,14 @@
 import type * as t from '@/types';
 import {
-  createLocalBashProgrammaticToolCallingTool,
-  createLocalProgrammaticToolCallingTool,
-} from './LocalProgrammaticToolCalling';
-import {
   CLOUDFLARE_CODING_TOOL_NAMES,
   createCloudflareCodingToolBundle,
   createCloudflareCodingTools,
   createCloudflareExecutionTool,
 } from '@/tools/cloudflare';
+import {
+  createLocalBashProgrammaticToolCallingTool,
+  createLocalProgrammaticToolCallingTool,
+} from './LocalProgrammaticToolCalling';
 import {
   createLocalCodingToolBundle,
   createLocalCodingToolDefinitions,
@@ -184,7 +184,7 @@ function filterCloudflareCodingToolAllowlist(
  * Name of a bindable tool in any supported shape: `{ name }`, OpenAI's
  * `{ function: { name } }` or Bedrock's `{ toolSpec: { name } }`.
  */
-function bindableToolName(tool: unknown): string | undefined {
+export function bindableToolName(tool: unknown): string | undefined {
   if (tool == null || typeof tool !== 'object') return undefined;
   const {
     name,
@@ -201,7 +201,7 @@ function bindableToolName(tool: unknown): string | undefined {
 }
 
 /** The `functionDeclarations` of a Google tool object, if it is one. */
-function functionDeclarationsOf(tool: unknown): unknown[] | undefined {
+export function functionDeclarationsOf(tool: unknown): unknown[] | undefined {
   if (tool == null || typeof tool !== 'object') return undefined;
   const declarations = (tool as { functionDeclarations?: unknown })
     .functionDeclarations;

@@ -38,6 +38,16 @@ import {
   getPublicToolInterruptPayload,
 } from '@/tools/toolBatchReplay';
 import {
+  createLangfuseTraceMetadata,
+  createLangfuseHandler,
+  maskRedactedLabelGeneration,
+  disposeLangfuseHandler,
+  getLangfuseTraceName,
+  isLangfuseCallbackHandler,
+  withLangfuseAttributes,
+  withLangfuseToolRedaction,
+} from '@/langfuse';
+import {
   Callback,
   GraphEvents,
   TitleMethod,
@@ -48,15 +58,6 @@ import {
   DEFAULT_MAX_STOP_CONTINUATIONS,
   DEFAULT_RECURSION_LIMIT,
 } from '@/common';
-import {
-  createLangfuseTraceMetadata,
-  createLangfuseHandler,
-  maskRedactedLabelGeneration,
-  disposeLangfuseHandler,
-  getLangfuseTraceName,
-  isLangfuseCallbackHandler,
-  withLangfuseAttributes,
-} from '@/langfuse';
 import {
   ACTIVITY_PHASE_LABEL_PROMPT,
   ACTIVITY_LABEL_PROMPT,
@@ -98,6 +99,7 @@ import {
   resolveLangfuseRuntimeScope,
   withLangfuseRuntimeScope,
 } from '@/langfuseRuntimeScope';
+import { TOOL_OUTPUT_READER, withToolOutputReaderRedaction } from '@/tools/ToolOutputReader';
 import {
   getRunStepResumeState,
   stripRunStepResumeState,
@@ -583,7 +585,10 @@ export class Run<_T extends t.BaseGraphState> {
     this.handlerRegistry = handlerRegistry;
     this.hookRegistry = config.hooks;
     this.humanInTheLoop = config.humanInTheLoop;
-    this.langfuse = config.langfuse;
+    this.langfuse = withToolOutputReaderRedaction(
+      config.langfuse,
+      config.toolOutputReferences?.enabled === true && config.toolOutputReferences.readTool === true
+    );
     this.toolOutputReferences = config.toolOutputReferences;
     this.eagerEventToolExecution = config.eagerEventToolExecution;
     this.clientDelegatedToolNames = config.clientDelegatedToolNames;
@@ -1439,6 +1444,9 @@ export class Run<_T extends t.BaseGraphState> {
       config.callbacks,
       streamCallbacks ? [streamCallbacks, customHandler] : [customHandler]
     );
+    if (this.toolOutputReferences?.enabled === true && this.toolOutputReferences.readTool === true) {
+      config.callbacks = withLangfuseToolRedaction(config.callbacks, TOOL_OUTPUT_READER);
+    }
 
     const primaryContext = graph.agentContexts.get(graph.defaultAgentId);
     const userId =

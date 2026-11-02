@@ -17,12 +17,19 @@ import {
   isGraphInterrupt,
   isInterrupted,
 } from '@langchain/langgraph';
+import type { ChatGenerationChunk } from '@langchain/core/outputs';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type * as t from '@/types';
 import { handleConverseStreamMetadata } from '@/llm/bedrock/utils/message_outputs';
+import { createLangfuseHandler, withLangfuseToolRedaction } from '@/langfuse';
+import { buildActivityLabelPrompt } from '@/prompts/activityLabel';
+import { resolveToolOutputTracingConfig } from '@/langfuseConfig';
+import { TOOL_OUTPUT_READER } from '@/tools/ToolOutputReader';
+import { initializeLangfuseTracing } from '@/instrumentation';
 import { traceIdFromSeed } from '@/langfuseRuntimeContext';
 import { Constants, Providers } from '@/common';
 import { ToolNode } from '@/tools/ToolNode';
+import { FakeChatModel } from '@/llm/fake';
 import { askUserQuestion } from '@/hitl';
 import { Run } from '@/run';
 
@@ -32,6 +39,7 @@ const mockProcessorStarts: Array<{
 }> = [];
 const mockSpanAttributeSets: Array<Record<string, unknown>> = [];
 const mockEndedSpanAttributes: Array<Record<string, unknown>> = [];
+const mockExportedSpanAttributes: typeof mockEndedSpanAttributes = [];
 let mockSpansStarted = 0;
 let mockSpansEnded = 0;
 let mockProviderInput:
@@ -101,7 +109,9 @@ const mockShutdown = jest.fn();
 jest.mock('@langfuse/otel', () => ({
   LangfuseSpanProcessor: jest.fn().mockImplementation((params) => ({
     forceFlush: jest.fn(),
-    onEnd: jest.fn(),
+    onEnd: jest.fn((span: { attributes: typeof mockEndedSpanAttributes[number] }) => {
+      mockExportedSpanAttributes.push({ ...span.attributes });
+    }),
     onStart: jest.fn((span) => {
       mockProcessorStarts.push({
         params,
@@ -133,6 +143,7 @@ describe('Langfuse callback composition', () => {
     mockProcessorStarts.length = 0;
     mockSpanAttributeSets.length = 0;
     mockEndedSpanAttributes.length = 0;
+    mockExportedSpanAttributes.length = 0;
     mockSpansStarted = 0;
     mockSpansEnded = 0;
     delete process.env.LANGFUSE_PUBLIC_KEY;
@@ -140,6 +151,101 @@ describe('Langfuse callback composition', () => {
     delete process.env.LANGFUSE_BASE_URL;
     delete process.env.LANGFUSE_BASEURL;
     delete process.env.LANGFUSE_FORCE_FLUSH_ON_DISPOSE;
+  });
+
+  it.each([false, true].flatMap((stamped) => [false, true].map((manager) => ({ stamped, manager }))))(
+    'redacts retained output with a preexisting handler, stamped=$stamped manager=$manager', async ({ stamped, manager }) => {
+      const secret = 'RETAINED_PRIVATE_TRACE_TEXT';
+      const langfuse: t.LangfuseConfig = {
+        publicKey: 'pk-reader-fixture', secretKey: 'sk-reader-fixture',
+        toolOutputTracing: { enabled: true, redactedToolNames: ['producer'] },
+      };
+      initializeLangfuseTracing(langfuse);
+      const producer = tool(async () => secret, {
+        name: 'producer', description: 'Synthetic producer', schema: z.object({}),
+      });
+      const run = await Run.create({
+        runId: 'retained-reader-trace', langfuse,
+        toolOutputReferences: { enabled: true, readTool: true },
+        graphConfig: { type: 'standard', agents: [{
+          agentId: 'reader', provider: Providers.OPENAI,
+          clientOptions: { model: 'fake' }, tools: [producer],
+          langfuse: { toolOutputTracing: { redactedToolNames: ['agent_only_private'] } },
+        }] },
+        skipCleanup: true,
+      });
+      class ReaderModel extends FakeChatModel {
+        private readerTurn = 0;
+        override async *_streamResponseChunks(): AsyncGenerator<ChatGenerationChunk> {
+          const turn = this.readerTurn++;
+          if (turn > 1) {
+            yield this._createResponseChunk('Finished.');
+            return;
+          }
+          yield this._createResponseChunk('', [{
+            id: `reader-trace-${turn}`, index: 0,
+            name: turn === 0 ? 'producer' : TOOL_OUTPUT_READER,
+            args: JSON.stringify(turn === 0 ? {} : { reference: 'tool0turn0' }),
+          }]);
+        }
+      }
+    run.Graph!.overrideModel = new ReaderModel({ responses: ['unused'] });
+    const handler = createLangfuseHandler({
+      langfuse,
+      runId: stamped ? run.Graph!.langfuseScopeRunId : undefined,
+      toolOutputTracing: resolveToolOutputTracingConfig(langfuse),
+    });
+    expect(handler).toBeDefined();
+    const existingCallbacks = handler != null ? [handler] : [];
+    const callbacks = manager ? new CallbackManager() : existingCallbacks;
+    if (callbacks instanceof CallbackManager && handler) callbacks.addHandler(handler, true);
+    await run.processStream({ messages: [new HumanMessage('Read the retained result.')] }, {
+      callbacks, version: 'v2',
+      configurable: { thread_id: 'retained-reader-trace' },
+    });
+    const toolSpans = mockExportedSpanAttributes.filter((attributes) =>
+      attributes[LangfuseOtelSpanAttributes.OBSERVATION_TYPE] === 'tool'
+    );
+    expect(new Set(toolSpans.map((attributes) => attributes[LangfuseOtelSpanAttributes.OBSERVATION_INPUT])))
+      .toEqual(new Set(['{}', '{"reference":"tool0turn0"}']));
+    for (const attributes of toolSpans) {
+      expect(attributes[LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]).toBe('[tool output redacted]');
+    }
+    expect(mockExportedSpanAttributes.some((attributes) =>
+      attributes[LangfuseOtelSpanAttributes.OBSERVATION_TYPE] === 'generation' &&
+      JSON.stringify(attributes[LangfuseOtelSpanAttributes.OBSERVATION_INPUT]).includes(TOOL_OUTPUT_READER) &&
+      JSON.stringify(attributes[LangfuseOtelSpanAttributes.OBSERVATION_INPUT]).includes('[tool output redacted]')
+    )).toBe(true);
+    expect(JSON.stringify(mockExportedSpanAttributes)).not.toContain(secret);
+    expect(buildActivityLabelPrompt({
+      entries: [{ toolName: TOOL_OUTPUT_READER, toolInput: { reference: 'tool0turn0' }, toolOutput: secret, status: 'success' }],
+      charLimit: 600, redaction: resolveToolOutputTracingConfig(run.Graph!.langfuse),
+    })).not.toContain(secret);
+    expect(Array.isArray(callbacks) ? callbacks : callbacks.handlers).toEqual([handler]);
+    expect(langfuse.toolOutputTracing?.redactedToolNames).toEqual(['producer']);
+    run.Graph!.clearHeavyState();
+    });
+
+  it('adapts a shared handler without changing either callback manager list', () => {
+    const handler = createLangfuseHandler({
+      langfuse: { publicKey: 'pk-reader-copy', secretKey: 'sk-reader-copy' },
+      runId: 'reader-copy',
+    })!;
+    handler.awaitHandlers = true;
+    handler.ignoreRetriever = true;
+    const callbacks = new CallbackManager();
+    callbacks.addHandler(handler, true);
+    const adapted = withLangfuseToolRedaction(callbacks, TOOL_OUTPUT_READER);
+    expect(adapted).toBeInstanceOf(CallbackManager);
+    if (adapted == null || Array.isArray(adapted)) throw new Error('Expected a callback manager');
+    const copy = adapted.handlers[0];
+    expect(copy).not.toBe(handler);
+    expect(copy.awaitHandlers).toBe(true);
+    expect(copy.ignoreRetriever).toBe(true);
+    expect(adapted.inheritableHandlers).toEqual([copy]);
+    expect(callbacks.handlers).toEqual([handler]);
+    expect(callbacks.inheritableHandlers).toEqual([handler]);
+    expect(withLangfuseToolRedaction([copy], TOOL_OUTPUT_READER)).toEqual([copy]);
   });
 
   it('runs explicit per-agent tracing when callbacks is a CallbackManager', async () => {

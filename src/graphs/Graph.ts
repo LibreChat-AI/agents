@@ -104,6 +104,13 @@ import {
   RUN_BREAKER_SCOPE_CONFIG_KEY,
 } from '@/llm/streamLimits';
 import {
+  TOOL_OUTPUT_READER,
+  createToolOutputReader,
+  isToolOutputReader,
+  toolOutputReaderDefinition,
+  withToolOutputReaderRedaction,
+} from '@/tools/ToolOutputReader';
+import {
   DEFAULT_SUBAGENT_DESCRIPTION,
   SubagentExecutor,
   isGraphSubagentConfig,
@@ -136,6 +143,7 @@ import {
   validateProviderTextProtection,
 } from '@/protection/providerText';
 import { RequestBodyBudgetError, RequestBodyLimitError } from '@/llm/requestBodyBudget';
+import { bindableToolName, functionDeclarationsOf } from '@/tools/local/resolveLocalExecutionTools';
 import {
   annotateMessagesForLLM,
   ToolOutputReferenceRegistry,
@@ -2886,7 +2894,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     ) {
       return false;
     }
-    const graphTools = agentContext.graphTools as t.GenericTool[] | undefined;
+    const graphTools = (agentContext.graphTools as t.GenericTool[] | undefined)
+      ?.filter((tool) => !isToolOutputReader(tool));
     return (
       graphTools?.length === 1 &&
       graphTools[0].name === Constants.SUBAGENT &&
@@ -3024,6 +3033,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         interruptingToolNames: effectiveInterruptingToolNames,
         maxContextTokens: agentContext?.maxContextTokens,
         maxToolResultChars: agentContext?.maxToolResultChars,
+        toolOutputReferences: this.toolOutputReferences,
         toolOutputRegistry: this.getOrCreateToolOutputRegistry(),
         fileCheckpointer: this.getOrCreateFileCheckpointer(),
         getBreakerSignal: (): AbortSignal => this.breakerAbort.signal,
@@ -3107,6 +3117,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       humanInTheLoop: this.humanInTheLoop,
       maxContextTokens: agentContext?.maxContextTokens,
       maxToolResultChars: agentContext?.maxToolResultChars,
+      toolOutputReferences: this.toolOutputReferences,
       toolOutputRegistry: this.getOrCreateToolOutputRegistry(),
       fileCheckpointer: this.getOrCreateFileCheckpointer(),
       getBreakerSignal: (): AbortSignal => this.breakerAbort.signal,
@@ -5371,12 +5382,56 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     return buildRunStepStateAnnotation();
   }
 
+  private initializeToolOutputReader(agentContext: AgentContext): void {
+    if (this.toolOutputReferences?.enabled !== true || this.toolOutputReferences.readTool !== true) return;
+    this.langfuse = withToolOutputReaderRedaction(this.langfuse, true);
+    const outputTracing = resolveToolOutputTracingConfig(this.langfuse, agentContext.langfuse);
+    agentContext.langfuse = {
+      ...agentContext.langfuse,
+      toolOutputTracing: { ...outputTracing, redactedToolNames: [...outputTracing.redactedToolNames] },
+    };
+    const graphTools = agentContext.graphTools ?? [];
+    const hasReservedName = (tool: t.GraphTools[number]): boolean =>
+      bindableToolName(tool) === TOOL_OUTPUT_READER ||
+      functionDeclarationsOf(tool)?.some((declaration) => bindableToolName(declaration) === TOOL_OUTPUT_READER) === true;
+    const existing = graphTools.find(hasReservedName);
+    if (
+      (existing != null && !isToolOutputReader(existing)) ||
+      agentContext.tools?.some(hasReservedName) === true ||
+      agentContext.toolDefinitions?.some((tool) => tool.name === TOOL_OUTPUT_READER) === true ||
+      agentContext.toolMap?.has(TOOL_OUTPUT_READER) === true ||
+      (agentContext.toolRegistry?.has(TOOL_OUTPUT_READER) === true && !isToolOutputReader(existing))
+    ) {
+      throw new Error(`Reserved tool name: ${TOOL_OUTPUT_READER}`);
+    }
+    if (existing != null) return;
+    agentContext.graphTools = [...graphTools, createToolOutputReader(
+      undefined,
+      agentContext.maxToolResultChars ?? calculateMaxToolResultChars(agentContext.maxContextTokens)
+    )];
+    agentContext.toolRegistry = new Map(agentContext.toolRegistry);
+    agentContext.toolRegistry.set(TOOL_OUTPUT_READER, {
+      ...toolOutputReaderDefinition,
+      allowed_callers: ['direct'],
+    });
+    if (agentContext.tokenCounter != null) {
+      const { tokenCounter, baseIndexTokenCountMap } = agentContext;
+      agentContext.tokenCalculationPromise = (agentContext.tokenCalculationPromise ?? Promise.resolve())
+        .then(() => agentContext.calculateInstructionTokens(tokenCounter))
+        .then(() => { agentContext.updateTokenMapWithInstructions(baseIndexTokenCountMap); })
+        .catch((error) => {
+          console.error('Error recalculating instruction tokens after retained-output reader injection:', error);
+        });
+    }
+  }
+
   createAgentNode(agentId: string): t.CompiledAgentWorfklow {
     const getConfig = (): RunnableConfig | undefined => this.config;
     const agentContext = this.agentContexts.get(agentId);
     if (!agentContext) {
       throw new Error(`Agent context not found for agentId: ${agentId}`);
     }
+    this.initializeToolOutputReader(agentContext);
 
     /**
      * Depth countdown across graph boundaries: the parent's `maxSubagentDepth`

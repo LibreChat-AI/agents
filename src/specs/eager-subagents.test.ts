@@ -1,3 +1,5 @@
+import { z } from 'zod';
+import { tool } from '@langchain/core/tools';
 import { MemorySaver } from '@langchain/langgraph';
 import { HumanMessage, ToolMessage } from '@langchain/core/messages';
 import type { ChatGenerationChunk } from '@langchain/core/outputs';
@@ -211,6 +213,20 @@ describe('Eager subagents through the real graph and provider stream', () => {
       graph.clearHeavyState();
     }
   });
+  it('preserves eager prestart with only the optional internal output reader', () => {
+    const { graph } = fixture();
+    graph.toolOutputReferences = { enabled: true, readTool: true };
+    graph.createWorkflow();
+    const agent = graph.agentContexts.get('parent')!;
+    expect(graph.canPrestartSubagents(agent)).toBe(true);
+    const customTool = tool(async () => 'ordinary', {
+      name: 'ordinary_graph_tool', description: 'Ordinary graph tool', schema: z.object({}),
+    });
+    agent.graphTools = [...(agent.graphTools ?? []), customTool];
+    expect(graph.canPrestartSubagents(agent)).toBe(false);
+    graph.clearHeavyState();
+  });
+
   it('keeps durable checkpoint execution on the normal path', () => {
     const { graph } = fixture();
     graph.createWorkflow();
