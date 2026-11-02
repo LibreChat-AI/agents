@@ -25,7 +25,7 @@ for (const format of ['esm', 'cjs']) {
       import assert from 'node:assert/strict';
       import { isBuiltin, registerHooks } from 'node:module';
       import manifest from './package.json' with { type: 'json' };
-      import { z } from 'zod-v4';
+      import { z } from 'zod';
       const entry = new URL('./dist/${format}/utils/schema.${extension}', import.meta.url);
       registerHooks({
         resolve(specifier, context, nextResolve) {

@@ -497,6 +497,11 @@ export class AgentContext {
    * disturbing a `maxContextTokens` that no correction ever touched.
    */
   private _preOverflowMaxContextTokens?: number;
+  private correctedContextBudgetMode?: t.ContextBudgetMode;
+
+  get summarizationBudgetMode(): t.ContextBudgetMode {
+    return this.correctedContextBudgetMode ?? this.summarizationConfig?.contextBudgetMode ?? 'input';
+  }
   /**
    * Prompt size, normalized into the local counter's uncalibrated units, at
    * the last overflow correction. Keeping both measurements in the same units
@@ -1881,6 +1886,7 @@ export class AgentContext {
     }
     if (budgetTokens != null) {
       this.maxContextTokens = budgetTokens;
+      this.correctedContextBudgetMode = 'input';
     }
     this.pruneMessages = undefined;
     this.clearProviderProjection(true);
@@ -2090,6 +2096,7 @@ export class AgentContext {
     }
     this.maxContextTokens = this._preOverflowMaxContextTokens;
     this._preOverflowMaxContextTokens = undefined;
+    this.correctedContextBudgetMode = undefined;
     this._lastOverflowPromptTokens = undefined;
     this._overflowRecoveryAttempts = 0;
   }

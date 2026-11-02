@@ -1,4 +1,4 @@
-import { z } from 'zod/v4';
+import { z } from 'zod';
 import { tool } from '@langchain/core/tools';
 import type { TokenCounter } from '@/types';
 import { AgentContext } from '../AgentContext';

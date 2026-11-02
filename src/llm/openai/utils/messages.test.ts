@@ -5,6 +5,46 @@ import {
 } from './index';
 import { calculateMaxToolCallInputChars, HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
 
+describe('Responses reasoning summaries', () => {
+  it.each([
+    { name: 'empty', parts: [] as [number, string][], expected: [] },
+    { name: 'single', parts: [[0, 'Thinking']], expected: ['Thinking'] },
+    {
+      name: 'streamed',
+      parts: [
+        [0, ''],
+        [0, 'First '],
+        [0, 'part'],
+        [1, 'Second part'],
+      ],
+      expected: ['First part', 'Second part'],
+    },
+  ])('strips indexes from $name summaries', ({ parts, expected }) => {
+    const message = new AIMessage({
+      content: '',
+      additional_kwargs: {
+        reasoning: {
+          id: 'rs_summary',
+          type: 'reasoning',
+          summary: parts.map(([index, text]) => ({
+            index,
+            text,
+            type: 'summary_text',
+          })),
+        },
+      },
+    });
+
+    const items = _convertMessagesToOpenAIResponsesParams([message]);
+
+    expect(items[0]).toEqual({
+      id: 'rs_summary',
+      type: 'reasoning',
+      summary: expected.map((text) => ({ type: 'summary_text', text })),
+    });
+  });
+});
+
 describe('_convertMessagesToOpenAIParams', () => {
   it('includes reasoning_content for assistant messages in tool-call context when requested', () => {
     const messages = [

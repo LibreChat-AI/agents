@@ -4,6 +4,7 @@ import type {
   FadingTier,
   FadingTiers,
   RunStepResumeState,
+  RunInterruptResult,
   ToolSessionContext,
 } from '@/types';
 import type { ToolOutputReferenceState } from '@/tools/toolOutputReferences';
@@ -90,6 +91,10 @@ export interface SubagentResumeExecution {
   checkpoints: SubagentCheckpointReference[];
   graphState: SubagentGraphResumeState;
   approvalReplays: ToolApprovalReplaySnapshot[];
+  pendingInterruptIds?: string[];
+  pendingInterrupts?: Array<
+    Pick<RunInterruptResult<unknown>, 'interruptId' | 'payload'>
+  >;
   descendant?: SubagentResumeManifest;
 }
 
@@ -345,6 +350,15 @@ function isGraphResumeState(value: unknown): value is SubagentGraphResumeState {
   );
 }
 
+function isPendingInterrupt(
+  value: unknown
+): value is NonNullable<SubagentResumeExecution['pendingInterrupts']>[number] {
+  if (value == null || typeof value !== 'object') return false;
+  const pending = value as Partial<RunInterruptResult<unknown>>;
+  return isString(pending.interruptId) &&
+    Object.prototype.hasOwnProperty.call(pending, 'payload');
+}
+
 function isSubagentResumeExecution(
   value: unknown,
   seen: Set<object>,
@@ -375,7 +389,22 @@ function isSubagentResumeExecution(
     checkpoints.length === 0 ||
     !checkpoints.every(isCheckpointReference) ||
     !isGraphResumeState(graphState) ||
-    !Array.isArray(approvalReplays)
+    !Array.isArray(approvalReplays) ||
+    (execution.pendingInterruptIds != null &&
+      (!Array.isArray(execution.pendingInterruptIds) ||
+        !execution.pendingInterruptIds.every(isString) ||
+        new Set(execution.pendingInterruptIds).size !==
+          execution.pendingInterruptIds.length)) ||
+    (execution.pendingInterrupts != null &&
+      (!Array.isArray(execution.pendingInterrupts) ||
+        !execution.pendingInterrupts.every(isPendingInterrupt) ||
+        new Set(execution.pendingInterrupts.map((pending) => pending.interruptId)).size !==
+          execution.pendingInterrupts.length ||
+        (execution.pendingInterruptIds != null &&
+          (execution.pendingInterruptIds.length !== execution.pendingInterrupts.length ||
+            execution.pendingInterrupts.some(
+              (pending) => execution.pendingInterruptIds?.includes(pending.interruptId) !== true
+            )))))
   ) {
     return false;
   }

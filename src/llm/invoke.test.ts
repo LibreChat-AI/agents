@@ -870,6 +870,30 @@ describe('tryFallbackProviders applies the same lazy annotation transform', () =
     expect(yields).toBeLessThanOrEqual(2);
   });
 
+  it.each(['input', 'window', undefined] as const)(
+    'forwards budget mode %s through deprecated fallback preparation', async contextBudgetMode => {
+      const {invokeMessages, model} = buildCapturingModel();
+      const messages = [new HumanMessage('Fallback input')];
+      const clientOptions = {model: 'fallback', maxTokens: 1024};
+      const prepare = jest.fn<NonNullable<Parameters<typeof tryFallbackProviders>[0]['prepareProviderMessages']>>(
+        async input => input.messages
+      );
+      await jest.isolateModulesAsync(async () => {
+        jest.doMock('@/llm/init', () => ({initializeModel: () => model}));
+        const {tryFallbackProviders: freshTry} = await import('@/llm/invoke');
+        await freshTry({fallbacks: [{provider: Providers.OPENAI, clientOptions, maxContextTokens: 10_000, contextBudgetMode}],
+          messages, primaryError: new Error('Primary unavailable'), prepareProviderMessages: prepare,
+        });
+      });
+      expect(prepare).toHaveBeenCalledTimes(1);
+      expect(prepare).toHaveBeenCalledWith(expect.objectContaining({model, messages, provider: Providers.OPENAI,
+        clientOptions, maxContextTokens: 10_000, contextBudgetMode,
+      }));
+      expect(invokeMessages).toHaveLength(1);
+      jest.dontMock('@/llm/init');
+    }
+  );
+
   it('rejects before invoking a fallback when the breaker tripped during preparation', async () => {
     const abort = new AbortController();
     const { invokeMessages, model } = buildCapturingModel();
