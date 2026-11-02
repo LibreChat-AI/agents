@@ -1,13 +1,13 @@
 import { tool } from '@langchain/core/tools';
 import { CallbackHandler } from '@langfuse/langchain';
 import { LangfuseOtelContextKeys } from '@langfuse/core';
+import { isGraphInterrupt, isParentCommand } from '@langchain/langgraph';
+import { context as otelContext, trace as otelTrace } from '@opentelemetry/api';
 import {
   AIMessage,
   HumanMessage,
   AIMessageChunk,
 } from '@langchain/core/messages';
-import { isGraphInterrupt, isParentCommand } from '@langchain/langgraph';
-import { context as otelContext, trace as otelTrace } from '@opentelemetry/api';
 import {
   getLangfuseTracerProvider,
   propagateAttributes,
@@ -23,15 +23,18 @@ import type {
   LLMResult,
 } from '@langchain/core/outputs';
 import type { PropagateAttributesParams } from '@langfuse/tracing';
+import type { Callbacks } from '@langchain/core/callbacks/manager';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { Context, SpanContext } from '@opentelemetry/api';
 import type { ResolvedLangfuseToolOutputTracingConfig } from '@/langfuseRuntimeContext';
+import type { CallbackEntry } from '@/utils/callbacks';
 import type * as t from '@/types';
 import {
   resolveLangfuseConfigForSpan,
   resolveLangfuseScopeAgentId,
   resolveLangfuseScopeRunId,
   resolveTraceIdSeedForSpan,
+  resolveToolOutputTracingConfigForSpan,
   withLangfuseRuntimeScope,
 } from '@/langfuseRuntimeScope';
 import {
@@ -311,6 +314,8 @@ function detachForeignAmbientSpan(
 }
 
 class ScopedLangfuseCallbackHandler extends CallbackHandler {
+  private readonly creationParams?: AgentLangfuseHandlerParams;
+  private readonly requiredRedactedTools: readonly string[];
   private readonly langfuse?: t.LangfuseConfig;
   private readonly traceIdSeed?: string;
   private readonly traceAnchor?: object;
@@ -332,7 +337,7 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
     | { type: 'error'; error: Error; parentRunId?: string }
     | undefined;
 
-  constructor(params?: AgentLangfuseHandlerParams) {
+  constructor(params?: AgentLangfuseHandlerParams, requiredRedactedTools: readonly string[] = []) {
     const {
       langfuse,
       traceIdSeed,
@@ -356,6 +361,8 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
         }
         : {}),
     });
+    this.creationParams = params;
+    this.requiredRedactedTools = requiredRedactedTools;
     this.langfuse = langfuse;
     this.traceIdSeed = traceIdSeed;
     this.traceAnchor = traceAnchor;
@@ -376,6 +383,34 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
         inheritTraceIdentity === true ? undefined : handlerParams.traceMetadata,
       traceName: inheritTraceIdentity === true ? undefined : traceName,
     };
+  }
+
+  withRequiredToolRedaction(toolName: string): ScopedLangfuseCallbackHandler {
+    if (this.requiredRedactedTools.includes(toolName)) return this;
+    const policy = this.toolOutputTracing ?? resolveToolOutputTracingConfig(this.langfuse);
+    const redactedToolNames = new Set(policy.redactedToolNames);
+    redactedToolNames.add(toolName);
+    const handler = new ScopedLangfuseCallbackHandler({
+      ...this.creationParams,
+      toolOutputTracing: { ...policy, redactedToolNames },
+    }, [...this.requiredRedactedTools, toolName]);
+    handler.awaitHandlers = this.awaitHandlers;
+    handler.ignoreLLM = this.ignoreLLM;
+    handler.ignoreChain = this.ignoreChain;
+    handler.ignoreAgent = this.ignoreAgent;
+    handler.ignoreRetriever = this.ignoreRetriever;
+    handler.ignoreCustomEvent = this.ignoreCustomEvent;
+    handler.raiseError = this.raiseError;
+    handler.generationMask = this.generationMask;
+    return handler;
+  }
+
+  private getRequiredToolRedaction(activeContext: Context, langfuse?: t.LangfuseConfig):
+    ResolvedLangfuseToolOutputTracingConfig | undefined {
+    if (this.requiredRedactedTools.length === 0) return undefined;
+    const policy = resolveToolOutputTracingConfigForSpan(activeContext) ??
+      this.toolOutputTracing ?? resolveToolOutputTracingConfig(langfuse);
+    return { ...policy, redactedToolNames: new Set([...policy.redactedToolNames, ...this.requiredRedactedTools]) };
   }
 
   private getDeterministicTraceSeed(): string | undefined {
@@ -506,6 +541,7 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
           traceAnchor: this.traceAnchor,
           runId: scopeRunId ?? this.runId,
           agentId: scopeAgentId ?? this.agentId,
+          toolOutputTracing: this.getRequiredToolRedaction(activeContext, langfuse),
         },
         action
       );
@@ -1032,6 +1068,26 @@ export function maskRedactedLabelGeneration(
     input: tracedPrompt === '' ? redaction.redactionText : tracedPrompt,
     output: redaction.redactionText,
   });
+}
+
+/** Adds run-local output protection without mutating caller-owned callback handlers. */
+export function withLangfuseToolRedaction(callbacks: Callbacks | undefined, toolName: string): Callbacks | undefined {
+  if (callbacks == null) return callbacks;
+  const adapted = new Map<ScopedLangfuseCallbackHandler, ScopedLangfuseCallbackHandler>();
+  const adapt = <T extends CallbackEntry>(handler: T): T | ScopedLangfuseCallbackHandler => {
+    if (!(handler instanceof ScopedLangfuseCallbackHandler)) return handler;
+    let replacement = adapted.get(handler);
+    if (replacement == null) {
+      replacement = handler.withRequiredToolRedaction(toolName);
+      adapted.set(handler, replacement);
+    }
+    return replacement;
+  };
+  if (Array.isArray(callbacks)) return callbacks.map(adapt);
+  const copy = callbacks.copy();
+  copy.handlers = copy.handlers.map(adapt);
+  copy.inheritableHandlers = copy.inheritableHandlers.map(adapt);
+  return copy;
 }
 
 export function createLangfuseHandler({

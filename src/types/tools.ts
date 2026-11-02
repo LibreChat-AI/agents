@@ -260,8 +260,8 @@ export type ToolNodeOptions = {
    * `true`, ToolNode registers successful outputs and substitutes
    * `{{tool<idx>turn<turn>}}` placeholders found in string args.
    *
-   * Ignored when `toolOutputRegistry` is also provided (host-supplied
-   * registry wins).
+   * Storage limits are ignored when `toolOutputRegistry` is provided.
+   * The optional reader setting still applies to that registry.
    */
   toolOutputReferences?: ToolOutputReferencesConfig;
   /**
@@ -764,6 +764,8 @@ export type LCToolRegistry = Map<string, LCTool>;
 export type ToolOutputReferencesConfig = {
   /** Enable the registry and placeholder substitution. Defaults to `false`. */
   enabled?: boolean;
+  /** Opt into a direct bounded reader. Requires enabled and a result cap of at least 256. */
+  readTool?: boolean;
   /**
    * Maximum characters stored (and substituted) per registered output.
    * Applied to the *raw* output before storage. Defaults to

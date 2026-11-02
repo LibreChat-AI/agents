@@ -2,6 +2,7 @@ import { MemorySaver } from '@langchain/langgraph';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type { GraphFactory, GraphFactoryRequest } from '@/graphs/graphFactory';
+import type { AgentContext } from '@/agents/AgentContext';
 import type * as t from '@/types';
 import {
   Constants,
@@ -9,6 +10,7 @@ import {
   STANDARD_GRAPH_RUN_NAME,
   MULTI_AGENT_GRAPH_RUN_NAME,
 } from '@/common';
+import { TOOL_OUTPUT_READER } from '@/tools/ToolOutputReader';
 import { MultiAgentGraph } from '@/graphs/MultiAgentGraph';
 import { createFakeStreamingLLM } from '@/llm/fake';
 import { createGraph } from '@/graphs/createGraph';
@@ -176,14 +178,16 @@ describe('graph factory', () => {
     );
   });
 
-  it('propagates an injected factory through child and grandchild graphs', async () => {
+  it.each([undefined, false, true])('propagates an injected factory and readTool=%s through child and grandchild graphs', async (readTool) => {
     const requests: GraphFactoryRequest[] = [];
+    const childContexts: AgentContext[] = [];
     const graphFactory: GraphFactory = (request) => {
       requests.push(request);
-      if (request.kind === 'multi-agent') {
-        return new MultiAgentGraph(request.input, { graphFactory });
-      }
-      return new StandardGraph(request.input, { graphFactory });
+      const child = request.kind === 'multi-agent'
+        ? new MultiAgentGraph(request.input, { graphFactory })
+        : new StandardGraph(request.input, { graphFactory });
+      childContexts.push(...child.agentContexts.values());
+      return child;
     };
     const nestedToolCall: ToolCall = {
       id: 'call_nested_specialist',
@@ -222,6 +226,7 @@ describe('graph factory', () => {
       { runId: 'recursive-graph-factory', agents: [root] },
       { graphFactory }
     );
+    graph.toolOutputReferences = { enabled: true, readTool };
     graph.setSubagentModelOverride(
       createFakeStreamingLLM({
         responses: ['delegating', 'specialist complete', 'router complete'],
@@ -244,5 +249,12 @@ describe('graph factory', () => {
       { kind: 'standard', agentIds: ['router'] },
       { kind: 'standard', agentIds: ['specialist'] },
     ]);
+    expect(childContexts).toHaveLength(2);
+    for (const context of childContexts) {
+      expect(context.graphTools?.filter((entry) => 'name' in entry && entry.name === TOOL_OUTPUT_READER) ?? [])
+        .toHaveLength(readTool === true ? 1 : 0);
+      expect(context.toolRegistry?.get(TOOL_OUTPUT_READER)?.allowed_callers)
+        .toEqual(readTool === true ? ['direct'] : undefined);
+    }
   });
 });

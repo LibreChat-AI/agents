@@ -109,6 +109,13 @@ import {
   stableStringify,
 } from '@/tools/eagerEventExecution';
 import {
+  TOOL_OUTPUT_READER,
+  createToolOutputReader,
+  isToolOutputReader,
+  toolOutputReaderDefinition,
+  withToolOutputReaderRedaction,
+} from '@/tools/ToolOutputReader';
+import {
   INTENT_ARG,
   readOutcomeFields,
   resolveToolOutcome,
@@ -1347,6 +1354,26 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         maxTotalSize: toolOutputReferences.maxTotalSize,
       });
     }
+    if (toolOutputReferences?.enabled === true && toolOutputReferences.readTool === true) {
+      const existing = this.toolMap.get(TOOL_OUTPUT_READER);
+      if (
+        (existing != null && !isToolOutputReader(existing)) ||
+        this.toolDefinitions?.has(TOOL_OUTPUT_READER) === true ||
+        (this.toolRegistry?.has(TOOL_OUTPUT_READER) === true && !isToolOutputReader(existing))
+      ) {
+        throw new Error(`Reserved tool name: ${TOOL_OUTPUT_READER}`);
+      }
+      const reader = createToolOutputReader(undefined, this.maxToolResultChars);
+      this.toolMap = new Map(this.toolMap);
+      this.toolMap.set(TOOL_OUTPUT_READER, existing ?? reader);
+      this.toolRegistry = new Map(this.toolRegistry);
+      this.toolRegistry.set(TOOL_OUTPUT_READER, {
+        ...toolOutputReaderDefinition,
+        allowed_callers: ['direct'],
+      });
+      this.directToolNames = new Set([...(this.directToolNames ?? []), TOOL_OUTPUT_READER]);
+      this.runLangfuse = withToolOutputReaderRedaction(this.runLangfuse, true);
+    }
   }
 
   override async invoke(
@@ -1866,6 +1893,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       runInput,
     } = batchContext;
     const tool = this.toolMap.get(call.name);
+    const outputReader = isToolOutputReader(tool);
     const registry = this.toolOutputRegistry;
     /**
      * Prefer the caller-provided snapshot when present — `run()`
@@ -1898,7 +1926,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
      * on a shared turn field.
      */
     const refKey =
-      registry != null && batchIndex != null && turn != null
+      !outputReader && registry != null && batchIndex != null && turn != null
         ? buildReferenceKey(batchIndex, turn)
         : undefined;
     /**
@@ -1954,7 +1982,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         this.directPathTurns.set(call.id, usageCount);
       }
       let args = call.args;
-      if (resolveFn != null) {
+      if (resolveFn != null && !outputReader) {
         const { resolved, unresolved } = resolveFn(runId, args);
         args = resolved;
         unresolvedRefs = unresolved;
@@ -2077,10 +2105,13 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       }
 
       this.throwIfBreakerTripped(config);
+      const invocationTool = outputReader
+        ? createToolOutputReader(preBatchSnapshot ?? registry?.snapshot(runId), this.maxToolResultChars)
+        : tool;
       const output = await (this.preparedSubagents?.take(
         this.executingAgentId ?? '',
         { ...call, args }
-      ) ?? this.invokeWithRuntime(tool, invokeParams, call, config, runInput));
+      ) ?? this.invokeWithRuntime(invocationTool, invokeParams, call, config, runInput));
       if (isCommand(output)) {
         return output;
       }
@@ -2548,6 +2579,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     const resolveDirectArgs = (
       args: Record<string, unknown>
     ): Record<string, unknown> => {
+      if (isToolOutputReader(this.toolMap.get(call.name))) return args;
       if (batchContext.preBatchSnapshot != null) {
         return batchContext.preBatchSnapshot.resolve(args, hookResolveOptions)
           .resolved as Record<string, unknown>;
