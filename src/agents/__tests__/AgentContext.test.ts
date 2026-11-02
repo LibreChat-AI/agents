@@ -1834,7 +1834,7 @@ describe('AgentContext', () => {
       expect(unfiltered.toolSchemaTokens).toBe(99999);
     });
 
-    it('keeps the cached total when a retained tool is a native schema the recount cannot measure', async () => {
+    it('retains the native-schema cache floor and reserves an added local schema', async () => {
       const nativeSearch = {
         type: 'function',
         function: { name: 'web_search', parameters: {} },
@@ -1851,7 +1851,7 @@ describe('AgentContext', () => {
         },
       });
       await ctx.tokenCalculationPromise;
-      expect(ctx.toolSchemaTokens).toBe(99999);
+      expect(ctx.toolSchemaTokens).toBeGreaterThan(99999);
     });
 
     it('excludes deferred-undiscovered toolDefinitions from toolSchemaTokens', async () => {
