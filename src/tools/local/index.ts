@@ -1,6 +1,7 @@
 export * from './CompileCheckTool';
 export * from './FileCheckpointer';
 export * from './LocalCodingTools';
+export * from './LocalBackgroundTools';
 export * from './LocalExecutionEngine';
 export * from './LocalExecutionTools';
 export * from './LocalProgrammaticToolCalling';
