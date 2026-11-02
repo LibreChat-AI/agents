@@ -9,7 +9,7 @@ import {
   ToolMessage,
 } from '@langchain/core/messages';
 import { tool } from '@langchain/core/tools';
-import { z } from 'zod/v3';
+import { z } from 'zod';
 import { ChatVertexAI } from './index';
 
 const gemini3Models = [

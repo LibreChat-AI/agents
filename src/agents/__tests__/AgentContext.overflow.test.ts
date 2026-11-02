@@ -1,8 +1,8 @@
 import { AIMessage, HumanMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
+import { messagesStateReducer } from '@/messages/reducer';
 import { AgentContext } from '@/agents/AgentContext';
 import { Providers } from '@/common';
-import { messagesStateReducer } from '@/messages/reducer';
 
 /**
  * The overflow-recovery bookkeeping on AgentContext: the budget correction,
@@ -26,6 +26,28 @@ describe('AgentContext overflow recovery state', () => {
     expect(context.overflowRecoveryAttempts).toBe(1);
     /** Forces the pruner to be rebuilt against the corrected budget. */
     expect(context.pruneMessages).toBeUndefined();
+  });
+
+  it('tracks input-ceiling units after correction and restores configured units on reset', () => {
+    const context = createContext(32_000);
+    context.summarizationConfig = {contextBudgetMode: 'window'};
+    expect(context.summarizationBudgetMode).toBe('window');
+    context.applyContextBudgetCorrection(26_600);
+    expect(context.maxContextTokens).toBe(26_600);
+    expect(context.summarizationBudgetMode).toBe('input');
+    expect(context.summarizationConfig.contextBudgetMode).toBe('window');
+    context.reset();
+    expect(context.maxContextTokens).toBe(32_000);
+    expect(context.summarizationBudgetMode).toBe('window');
+  });
+
+  it('does not change budget units when an overflow supplies no numeric correction', () => {
+    const context = createContext(32_000);
+    context.summarizationConfig = {contextBudgetMode: 'window'};
+    context.applyContextBudgetCorrection(undefined);
+    expect(context.summarizationBudgetMode).toBe('window');
+    context.reset();
+    expect(context.summarizationBudgetMode).toBe('window');
   });
 
   it('keeps one provider projection per run and rebuilds it after overflow', () => {

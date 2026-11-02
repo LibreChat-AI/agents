@@ -1,6 +1,9 @@
 /** Host context preparation and trusted subagent execution identity are supported. */
 export const SUBAGENT_CONTEXT_VERSION = 1;
 
+/** Foreground graph-subagent approval and durable resume support. */
+export const GRAPH_SUBAGENT_HITL_VERSION = 1;
+
 /**
  * Anthropic direct API tool schema overhead multiplier.
  * Empirically calibrated against real MCP tool sets (29 tools).
