@@ -3255,4 +3255,55 @@ describe('AgentContext', () => {
       expect(ctx.systemMessageTokens).toBeGreaterThan(systemBefore);
     });
   });
+
+  describe('toolDispatch', () => {
+    const boundNames = (ctx: AgentContext): string[] =>
+      (ctx.getToolsForBinding() ?? []).map((tool) =>
+        'name' in tool ? String(tool.name) : ''
+      );
+    const toolDefinitions: t.LCTool[] = [
+      { name: 'bound_tool' },
+      { name: 'late_tool', defer_loading: true },
+    ];
+
+    it('binds call_tool after the other tools and leaves deferred tools unbound', () => {
+      const ctx = createBasicContext({
+        agentConfig: { toolDefinitions, toolDispatch: true },
+      });
+      expect(boundNames(ctx)).toEqual(['bound_tool', 'call_tool']);
+    });
+
+    it('keeps a discovered deferred tool unbound with the dispatcher, bound without it', () => {
+      const bound = (toolDispatch: boolean): string[] => {
+        const ctx = createBasicContext({
+          agentConfig: { toolDefinitions, toolDispatch: toolDispatch || undefined },
+        });
+        ctx.markToolsAsDiscovered(['late_tool']);
+        return boundNames(ctx);
+      };
+      expect(bound(true)).toEqual(['bound_tool', 'call_tool']);
+      expect(bound(false)).toEqual(['bound_tool', 'late_tool']);
+    });
+
+    it('binds no dispatcher unless the host opts in', () => {
+      const ctx = createBasicContext({ agentConfig: { toolDefinitions } });
+      expect(boundNames(ctx)).toEqual(['bound_tool']);
+    });
+
+    it('counts the dispatcher schema with the other tool schemas', async () => {
+      const tokenCounter = (message: { content: unknown }): number =>
+        String(message.content).includes('call_tool') ? 100 : 1;
+      const toolTokens = async (toolDispatch?: boolean): Promise<number> => {
+        const ctx = createBasicContext({
+          agentConfig: { toolDefinitions, toolDispatch },
+        });
+        await ctx.calculateInstructionTokens(
+          tokenCounter as unknown as t.TokenCounter
+        );
+        return ctx.toolSchemaTokens;
+      };
+
+      expect((await toolTokens(true)) - (await toolTokens())).toBeGreaterThanOrEqual(100);
+    });
+  });
 });

@@ -3008,6 +3008,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         toolRegistry: agentContext?.toolRegistry,
         getDiscoveredToolNames: (): readonly string[] =>
           agentContext?.getDiscoveredTools() ?? [],
+        toolDispatch: agentContext?.toolDispatch,
         hookRegistry: this.hookRegistry,
         humanInTheLoop: this.humanInTheLoop,
         eagerEventToolExecution: this.eagerEventToolExecution,
@@ -3097,6 +3098,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       toolRegistry: agentContext?.toolRegistry,
       getDiscoveredToolNames: (): readonly string[] =>
         agentContext?.getDiscoveredTools() ?? [],
+      toolDispatch: agentContext?.toolDispatch,
       sessions: this.sessions,
       codeSessionKey: agentContext?.codeSessionKey,
       toolExecution: this.toolExecution,

@@ -829,14 +829,19 @@ function parseSearchResults(stdout: string): t.ToolSearchResponse {
  * carried inside the JSON so the output stays parseable
  * @returns JSON string with search results
  */
+/** Found tools stay out of the tool list; the model calls them through the dispatcher. */
+type SearchDispatch = { name: string; toolRegistry: t.LCToolRegistry };
+
 function formatSearchResults(
   searchResponse: t.ToolSearchResponse,
   nameFormat: t.McpNameFormat = 'full',
-  notes: string[] = []
+  notes: string[] = [],
+  dispatch?: SearchDispatch
 ): string {
   const { tool_references, total_tools_searched, pattern_used } =
     searchResponse;
-  const useFullName = nameFormat === 'full';
+  /** The dispatcher resolves exact registry names only. */
+  const useFullName = nameFormat === 'full' || dispatch != null;
 
   const output = {
     found: tool_references.length,
@@ -845,10 +850,19 @@ function formatSearchResults(
       score: Number(ref.match_score.toFixed(2)),
       matched_in: ref.matched_field,
       snippet: ref.snippet,
+      ...(dispatch != null && {
+        parameters: dispatch.toolRegistry.get(ref.tool_name)?.parameters ?? {
+          type: 'object',
+        },
+      }),
     })),
     total_searched: total_tools_searched,
     query: pattern_used,
     ...(notes.length > 0 ? { notes } : {}),
+    ...(dispatch != null &&
+      tool_references.length > 0 && {
+      call_with: `These tools are not in your tool list. Call one with ${dispatch.name}: "name" is the tool name, "arguments" its arguments as a JSON object string following "parameters".`,
+    }),
   };
 
   return JSON.stringify(output, null, 2);
@@ -948,7 +962,8 @@ function formatServerListing(
   tools: t.ToolMetadata[],
   serverNames: string | string[],
   nameFormat: t.McpNameFormat = 'full',
-  notes: string[] = []
+  notes: string[] = [],
+  dispatcher?: string
 ): string {
   const servers = Array.isArray(serverNames) ? serverNames : [serverNames];
   const useFullName = nameFormat === 'full';
@@ -996,7 +1011,10 @@ function formatServerListing(
     total_tools: tools.length,
     tools_by_server: toolsByServer,
     ...(notes.length > 0 ? { notes } : {}),
-    hint: `To use a tool, search for it by name (e.g., query: "${exampleToolName}") to load it.`,
+    hint:
+      dispatcher == null
+        ? `To use a tool, search for it by name (e.g., query: "${exampleToolName}") to load it.`
+        : `To use a tool, search for it by name (e.g., query: "${exampleToolName}") to get its parameters, then call it with ${dispatcher}.`,
   };
 
   return JSON.stringify(output, null, 2);
@@ -1050,7 +1068,11 @@ function createToolSearch(
     deferredToolsListing.length > 0
       ? `
 
-Deferred tools (search to load; \u2026 = has params, search first):
+Deferred tools (${
+  initParams.toolDispatch == null
+    ? 'search to load'
+    : `search, then call with ${initParams.toolDispatch}`
+}; \u2026 = has params, search first):
 ${deferredToolsListing}`
       : '';
 
@@ -1273,7 +1295,8 @@ ${mcpNote}${toolsListSection}
           deferredTools,
           activeServers,
           mcpNameFormat,
-          filterNotes
+          filterNotes,
+          initParams.toolDispatch
         );
 
         return [
@@ -1290,6 +1313,11 @@ ${mcpNote}${toolsListSection}
         ];
       }
 
+      const dispatch =
+        initParams.toolDispatch == null
+          ? undefined
+          : { name: initParams.toolDispatch, toolRegistry };
+
       if (mode === 'local') {
         const searchResponse = performLocalSearch(
           deferredTools,
@@ -1301,7 +1329,8 @@ ${mcpNote}${toolsListSection}
         const formattedOutput = formatSearchResults(
           searchResponse,
           mcpNameFormat,
-          filterNotes
+          filterNotes,
+          dispatch
         );
 
         return [
@@ -1380,7 +1409,7 @@ ${mcpNote}${toolsListSection}
         }
 
         const searchResponse = parseSearchResults(result.stdout);
-        const formattedOutput = `${warningMessage}${formatSearchResults(searchResponse, mcpNameFormat, filterNotes)}`;
+        const formattedOutput = `${warningMessage}${formatSearchResults(searchResponse, mcpNameFormat, filterNotes, dispatch)}`;
 
         return [
           formattedOutput,

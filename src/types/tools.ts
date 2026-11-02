@@ -147,6 +147,8 @@ export type ToolNodeOptions = {
   toolRegistry?: LCToolRegistry;
   /** Returns the owning agent's currently discovered deferred tool names. */
   getDiscoveredToolNames?: () => readonly string[];
+  /** The agent binds the dispatcher tool; its calls are unwrapped to their target before anything else reads them. */
+  toolDispatch?: boolean | ToolDispatchOptions;
   /** Reference to Graph's sessions map for automatic session injection */
   sessions?: ToolSessionMap;
   /** Partition within `sessions` used by this agent's code tools. */
@@ -584,6 +586,12 @@ export type LCTool = {
   serverName?: string;
   /** Tool type classification */
   toolType?: 'builtin' | 'mcp' | 'action';
+  /**
+   * The tool stays bound but every call fails with a tool error before hooks,
+   * approval, or execution, so a host can switch it off without changing the
+   * provider's `tools` parameter (and its prompt cache).
+   */
+  disabled?: { reason?: string };
 };
 
 /** Single tool call within a batch request for event-driven execution */
@@ -1305,6 +1313,12 @@ export type ToolSearchParams = {
   mcpServer?: string | string[];
   /** Format for MCP tool names: 'full' (tool_mcp_server) or 'base' (tool only). Default: 'full' */
   mcpNameFormat?: McpNameFormat;
+  /**
+   * Dispatcher tool name when the agent uses `toolDispatch`: results carry
+   * full names and parameter schemas and tell the model to call found tools
+   * through the dispatcher.
+   */
+  toolDispatch?: string;
 };
 
 /** Simplified tool metadata for search purposes */
@@ -1517,3 +1531,9 @@ export type ToolSessionContext = CodeSessionContext;
  * Keys are tool constants (e.g., Constants.EXECUTE_CODE, Constants.PROGRAMMATIC_TOOL_CALLING).
  */
 export type ToolSessionMap = Map<string, ToolSessionContext>;
+
+/** Host policy for the `call_tool` dispatcher. */
+export type ToolDispatchOptions = {
+  /** Deferred tools the dispatcher may reach; a rejected target is answered with an error before hooks and execution. All when unset. */
+  canDispatch?: (toolName: string) => boolean;
+};
