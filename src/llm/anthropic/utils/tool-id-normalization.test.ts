@@ -284,4 +284,33 @@ describe('_convertMessagesToAnthropicPayload — cross-provider ID normalization
     expect(block.type).toBe('server_tool_use');
     expect(block.id).toBe(serverId);
   });
+
+  it('keeps a tool result the same string once the tail marker has moved on', () => {
+    const toolCallId = 'toolu_01ABcdEFgh';
+    const resultOf = (content: ToolMessage['content']): unknown => {
+      const payload = _convertMessagesToAnthropicPayload([
+        new AIMessage({
+          content: '',
+          tool_calls: [
+            { id: toolCallId, name: 'search', args: {}, type: 'tool_call' },
+          ],
+        }),
+        new ToolMessage({ tool_call_id: toolCallId, content }),
+      ]);
+      const blocks = payload.messages[payload.messages.length - 1]
+        .content as unknown as Array<Record<string, unknown>>;
+      return blocks.find((block) => block.type === 'tool_result')!.content;
+    };
+
+    expect(resultOf('result body')).toBe('result body');
+    expect(
+      resultOf([
+        {
+          type: 'text',
+          text: 'result body',
+          cache_control: { type: 'ephemeral', ttl: '1h' },
+        },
+      ])
+    ).toBe('result body');
+  });
 });
