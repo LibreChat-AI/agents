@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { tool } from '@langchain/core/tools';
-import { AIMessage } from '@langchain/core/messages';
+import { AIMessage, ToolMessage } from '@langchain/core/messages';
 import { describe, it, expect, jest, afterEach } from '@jest/globals';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type * as t from '@/types';
@@ -11,6 +11,34 @@ import { Constants, GraphEvents } from '@/common';
 describe('ToolNode programmatic caller policy', () => {
   afterEach(() => {
     jest.restoreAllMocks();
+  });
+
+  it.each([false, true])('enforces direct policy before executing or dispatching a mixed batch (event=%s)', async (eventDrivenMode) => {
+    const called: string[] = [];
+    const definitions: t.LCTool[] = [
+      { name: 'code_only', allowed_callers: ['code_execution'], defer_loading: true },
+      { name: 'undiscovered', allowed_callers: ['direct'], defer_loading: true },
+      { name: 'disabled', allowed_callers: [] },
+      { name: 'allowed', allowed_callers: ['direct'], defer_loading: true },
+    ];
+    const tools = definitions.map((definition) => tool(async () => { called.push(definition.name); return 'ok'; }, { name: definition.name, schema: z.object({}) }));
+    jest.spyOn(events, 'safeDispatchCustomEvent').mockImplementation(async (event, data): Promise<void> => {
+      if (event !== GraphEvents.ON_TOOL_EXECUTE) return;
+      const batch = data as t.ToolExecuteBatchRequest;
+      called.push(...batch.toolCalls.map((call) => call.name));
+      batch.resolve(batch.toolCalls.map((call) => ({ toolCallId: call.id, status: 'success', content: 'ok' })));
+    });
+    const node = new ToolNode({ tools, eventDrivenMode, toolRegistry: new Map(definitions.map((definition) => [definition.name, definition])),
+      toolCallStepIds: new Map(definitions.map(({ name }) => [name, `step-${name}`])),
+      toolDefinitions: eventDrivenMode ? new Map(definitions.map(({ name }) => [name, { name }])) : undefined,
+      getDiscoveredToolNames: () => ['code_only', 'allowed'],
+    });
+    const result = await node.invoke({ messages: [new AIMessage({ content: '', tool_calls: definitions.map(({ name }) => ({ id: name, name, args: {} })) })] }) as ToolMessage[] | { messages: ToolMessage[] };
+    const messages = Array.isArray(result) ? result : result.messages;
+    expect(called).toEqual(['allowed']);
+    expect(messages).toHaveLength(4);
+    expect(messages.slice(0, 3).map((message) => 'status' in message ? message.status : undefined)).toEqual(['error', 'error', 'error']);
+    expect(messages.map((message) => 'tool_call_id' in message ? message.tool_call_id : undefined)).toEqual(definitions.map(({ name }) => name));
   });
 
   it('separates programmatic tools from direct-only preflight definitions', async () => {

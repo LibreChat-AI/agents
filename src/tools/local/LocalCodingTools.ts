@@ -2,6 +2,7 @@ import { basename, dirname } from 'path';
 import { createTwoFilesPatch } from 'diff';
 import { tool } from '@langchain/core/tools';
 import type { DynamicStructuredTool } from '@langchain/core/tools';
+import type { ReadFilePageInput } from './readFilePaging';
 import type * as t from '@/types';
 import {
   commandAvailabilityEnvCacheKey,
@@ -33,6 +34,7 @@ import { decodeFile, encodeFile } from './textEncoding';
 import { withIntent } from '@/tools/intentArg';
 import { runPostEditSyntaxCheck } from './syntaxCheck';
 import { capHeadTail, capLines } from './toolResultCaps';
+import { readFilePage } from './readFilePaging';
 import { Constants, LOCAL_CODING_BUNDLE_NAMES } from '@/common';
 
 const MAX_READ_CHARS = 256000;
@@ -67,6 +69,14 @@ export const LocalReadFileToolSchema: t.JsonSchemaType = withIntent({
     limit: {
       type: 'integer',
       description: 'Optional maximum number of lines to return.',
+    },
+    cursor: {
+      type: 'string',
+      description: 'Exact continuation cursor from a bounded read. Reuse the same path; omit offset. Fails if the file bytes changed.',
+    },
+    line_numbers: {
+      type: 'boolean',
+      description: 'Include line numbers (default true). Set false for programmatic processing or when numbering is unnecessary.',
     },
   },
   required: ['path'],
@@ -176,7 +186,8 @@ export const LocalListDirectoryToolSchema: t.JsonSchemaType = withIntent({
 function lineWindow(
   content: string,
   offset?: number,
-  limit?: number
+  limit?: number,
+  lineNumbers = true
 ): { text: string; truncated: boolean } {
   const start = Math.max((offset ?? 1) - 1, 0);
   // Avoid splitting the whole file when the caller asked for a small
@@ -191,7 +202,7 @@ function lineWindow(
     const numbered = selected
       .map(
         (line, index) =>
-          `${String(start + index + 1).padStart(6, ' ')}\t${line}`
+          lineNumbers ? `${String(start + index + 1).padStart(6, ' ')}\t${line}` : line
       )
       .join('\n');
     return {
@@ -227,56 +238,13 @@ function lineWindow(
   }
   const numbered = out
     .map(
-      (text, index) => `${String(start + index + 1).padStart(6, ' ')}\t${text}`
+      (text, index) => lineNumbers ? `${String(start + index + 1).padStart(6, ' ')}\t${text}` : text
     )
     .join('\n');
   return {
     text: truncateLocalOutput(numbered, MAX_READ_CHARS),
     truncated: !exhausted || numbered.length > MAX_READ_CHARS,
   };
-}
-
-/** Reads whole lines from `offset` until `maxChars` or `limit` lines, then says how to continue. */
-function cappedLineWindow(
-  content: string,
-  offset: number | undefined,
-  limit: number | undefined,
-  maxChars: number
-): string {
-  const start = Math.max(offset ?? 1, 1);
-  // Walk newline indices instead of splitting the file, so a page costs
-  // O(offset + page) rather than O(file).
-  let cursor = 0;
-  for (let line = 1; line < start; line++) {
-    const next = content.indexOf('\n', cursor);
-    if (next === -1) return '';
-    cursor = next + 1;
-  }
-  const maxLines = limit != null && limit > 0 ? limit : Infinity;
-  const kept: string[] = [];
-  let used = 0;
-  while (cursor <= content.length && kept.length < maxLines) {
-    const newline = content.indexOf('\n', cursor);
-    const lineEnd = newline === -1 ? content.length : newline;
-    const text = content.slice(cursor, Math.min(lineEnd, cursor + maxChars));
-    const full = `${String(start + kept.length).padStart(6, ' ')}\t${text}`;
-    const numbered =
-      lineEnd - cursor > maxChars || full.length > maxChars
-        ? `${full.slice(0, maxChars)} [line truncated]`
-        : full;
-    if (used + numbered.length + 1 > maxChars && kept.length > 0) break;
-    kept.push(numbered);
-    used += numbered.length + 1;
-    if (newline === -1) {
-      cursor = content.length + 1;
-      break;
-    }
-    cursor = newline + 1;
-  }
-  const end = start + kept.length - 1;
-  return cursor <= content.length
-    ? `${kept.join('\n')}\n[showing lines ${start}-${end}; continue with offset=${end + 1}]`
-    : kept.join('\n');
 }
 
 const MAX_DIFF_CHARS = 4000;
@@ -440,16 +408,13 @@ async function looksBinary(
 const DEFAULT_MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024;
 
 export function createLocalReadFileTool(
-  config: t.LocalExecutionConfig = {}
+  config: t.LocalExecutionConfig = {},
+  options: { maxResultChars?: number } = {}
 ): DynamicStructuredTool {
   const fs = getWorkspaceFS(config);
   return tool(
     async (rawInput) => {
-      const input = rawInput as {
-        path: string;
-        offset?: number;
-        limit?: number;
-      };
+      const input = rawInput as ReadFilePageInput & { path: string };
       const path = await resolveWorkspacePathSafe(
         input.path,
         config,
@@ -464,11 +429,17 @@ export function createLocalReadFileTool(
         1
       );
       if (fileStat.size > maxBytes) {
+        if (input.cursor != null) {
+          throw new Error(`File exceeds the ${maxBytes}-byte read cap.`);
+        }
         const stub = `File is ${fileStat.size} bytes, exceeds the ${maxBytes}-byte read cap. Read a slice via bash (e.g. head/sed) or raise local.maxReadBytes.`;
         return [stub, { path, bytes: fileStat.size, truncated: true }];
       }
 
       if (await looksBinary(path, fs)) {
+        if (input.cursor != null) {
+          throw new Error('A read_file cursor requires a UTF-8 text file.');
+        }
         const attachmentMode = config.attachReadAttachments ?? 'off';
         if (attachmentMode !== 'off') {
           const attachment = await classifyAttachment({
@@ -543,19 +514,23 @@ export function createLocalReadFileTool(
         }
       }
 
-      const content = await fs.readFile(path, 'utf8');
-      if (config.toolResultMaxChars != null && config.toolResultMaxChars > 0) {
-        return [
-          cappedLineWindow(
-            content,
-            input.offset,
-            input.limit,
-            config.toolResultMaxChars
-          ),
-          { path, bytes: fileStat.size },
-        ];
+      if ((config.toolResultMaxChars != null && config.toolResultMaxChars > 0) || input.cursor != null) {
+        const bytes = await fs.readFile(path);
+        if (bytes.length > maxBytes) {
+          throw new Error(`File grew beyond the ${maxBytes}-byte read cap.`);
+        }
+        const page = readFilePage(
+          bytes,
+          input,
+          config.toolResultMaxChars != null && config.toolResultMaxChars > 0
+            ? config.toolResultMaxChars
+            : MAX_READ_CHARS,
+          options.maxResultChars
+        );
+        return [page.text, { path, bytes: bytes.length, recovery: page.recovery }];
       }
-      const result = lineWindow(content, input.offset, input.limit);
+      const content = await fs.readFile(path, 'utf8');
+      const result = lineWindow(content, input.offset, input.limit, input.line_numbers);
       return [
         result.truncated ? `${result.text}\n[truncated]` : result.text,
         { path, bytes: fileStat.size },
@@ -564,7 +539,7 @@ export function createLocalReadFileTool(
     {
       name: Constants.READ_FILE,
       description:
-        'Read a local text file from the configured working directory with line numbers. ' +
+        'Read a local text file from the configured working directory with optional line numbers. ' +
         'When `attachReadAttachments` is enabled (e.g. images-only), reading an image returns an ' +
         '`image_url` content block so vision-capable models can see the file directly.',
       schema: LocalReadFileToolSchema,
@@ -597,7 +572,7 @@ export function createLocalWriteFileTool(
       let encoding = { text: '', hasBom: false, newline: '\n' as const } as
         | ReturnType<typeof decodeFile>
         | { text: string; hasBom: false; newline: '\n' };
-      let existed = false;
+      let existed: boolean;
       try {
         const raw = await fs.readFile(path, 'utf8');
         const decoded = decodeFile(raw);
@@ -1452,9 +1427,14 @@ export type LocalCodingToolBundle = {
   checkpointer?: t.LocalFileCheckpointer;
 };
 
+interface LocalCodingToolOptions {
+  checkpointer?: t.LocalFileCheckpointer;
+  maxReadResultChars?: number;
+}
+
 export function createLocalCodingTools(
   config: t.LocalExecutionConfig = {},
-  options: { checkpointer?: t.LocalFileCheckpointer } = {}
+  options: LocalCodingToolOptions = {}
 ): DynamicStructuredTool[] {
   const checkpointer =
     options.checkpointer ??
@@ -1464,7 +1444,7 @@ export function createLocalCodingTools(
   const create = (name: string): DynamicStructuredTool => {
     switch (name) {
     case Constants.READ_FILE:
-      return createLocalReadFileTool(config);
+      return createLocalReadFileTool(config, { maxResultChars: options.maxReadResultChars });
     case Constants.WRITE_FILE:
       return createLocalWriteFileTool(config, checkpointer);
     case Constants.EDIT_FILE:
@@ -1502,7 +1482,7 @@ export function createLocalCodingTools(
  */
 export function createLocalCodingToolBundle(
   config: t.LocalExecutionConfig = {},
-  options: { checkpointer?: t.LocalFileCheckpointer } = {}
+  options: LocalCodingToolOptions = {}
 ): LocalCodingToolBundle {
   const checkpointer =
     options.checkpointer ??
@@ -1510,7 +1490,7 @@ export function createLocalCodingToolBundle(
       ? createLocalFileCheckpointer({ fs: config.exec?.fs })
       : undefined);
   return {
-    tools: createLocalCodingTools(config, { checkpointer }),
+    tools: createLocalCodingTools(config, { ...options, checkpointer }),
     checkpointer,
   };
 }
@@ -1519,7 +1499,7 @@ export function createLocalCodingToolDefinitions(): t.LCTool[] {
   return [
     toolDefinition(
       Constants.READ_FILE,
-      'Read a local text file from the configured working directory with line numbers.',
+      'Read a local text file from the configured working directory with optional line numbers.',
       LocalReadFileToolSchema as t.JsonSchemaType
     ),
     toolDefinition(

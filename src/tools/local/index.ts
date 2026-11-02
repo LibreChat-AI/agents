@@ -4,6 +4,7 @@ export * from './LocalCodingTools';
 export * from './LocalExecutionEngine';
 export * from './LocalExecutionTools';
 export * from './LocalProgrammaticToolCalling';
+export * from './LocalProgrammaticProfile';
 export * from './resolveLocalExecutionTools';
 export * from './attachments';
 export * from './bashAst';

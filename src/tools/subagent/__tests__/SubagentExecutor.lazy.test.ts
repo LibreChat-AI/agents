@@ -174,9 +174,11 @@ const createExecutor = (
 
 describe('SubagentExecutor lazy selected-subagent resolution', () => {
   it('resolves only the selected descriptor', async () => {
-    const researcherResolver = jest.fn(async () =>
-      makeAgent('lazy-researcher')
-    );
+    const researcherInputs: AgentInputs = {
+      ...makeAgent('lazy-researcher'),
+      programmaticToolInstructions: 'discovery',
+    };
+    const researcherResolver = jest.fn(async () => researcherInputs);
     const coderResolver = jest.fn(async () => makeAgent('lazy-coder'));
     const researcher = makeLazyConfig('researcher', researcherResolver);
     const coder = makeLazyConfig('coder', coderResolver);
@@ -197,6 +199,8 @@ describe('SubagentExecutor lazy selected-subagent resolution', () => {
     expect(researcherResolver).toHaveBeenCalledTimes(1);
     expect(coderResolver).not.toHaveBeenCalled();
     expect(observedInput?.agents[0].agentId).toBe('lazy-researcher');
+    expect(observedInput?.agents[0].programmaticToolInstructions).toBe('discovery');
+    expect(researcherInputs.programmaticToolInstructions).toBe('discovery');
   });
 
   it('redacts a selected resolver failure without affecting a healthy sibling', async () => {
@@ -2045,7 +2049,10 @@ describe('SubagentExecutor lazy selected-subagent resolution', () => {
 
   it('prefers eager agent inputs without calling an attached resolver', async () => {
     const resolveAgentInputs = jest.fn(async () => makeAgent('unexpected'));
-    const eagerInputs = makeAgent('eager-child');
+    const eagerInputs: AgentInputs = {
+      ...makeAgent('eager-child'),
+      programmaticToolInstructions: 'inline',
+    };
     const eagerConfig: ResolvedSubagentConfig = {
       type: 'eager',
       name: 'Eager Worker',
@@ -2070,6 +2077,8 @@ describe('SubagentExecutor lazy selected-subagent resolution', () => {
 
     expect(resolveAgentInputs).not.toHaveBeenCalled();
     expect(observedInput?.agents[0].agentId).toBe(eagerInputs.agentId);
+    expect(observedInput?.agents[0].programmaticToolInstructions).toBe('inline');
+    expect(eagerInputs.programmaticToolInstructions).toBe('inline');
   });
 
   it('accepts a legacy type-less resume for a versioned eager config', async () => {

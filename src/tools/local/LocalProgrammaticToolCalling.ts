@@ -1,40 +1,76 @@
 import { createServer } from 'http';
-import { tool } from '@langchain/core/tools';
+import type {
+  DynamicStructuredTool,
+  ToolRunnableConfig,
+} from '@langchain/core/tools';
+import type { RunnableConfig } from '@langchain/core/runnables';
 import { randomBytes, randomUUID, timingSafeEqual } from 'crypto';
-import type { DynamicStructuredTool } from '@langchain/core/tools';
+import type { ProgrammaticInvocationParams } from '@/tools/ProgrammaticCallerPolicy';
 import type { IncomingMessage, ServerResponse } from 'http';
 import type { AddressInfo } from 'net';
 import type * as t from '@/types';
 import {
   executeTools,
-  formatCompletedResponse,
   normalizeToPythonIdentifier,
   ProgrammaticToolCallingName,
   ProgrammaticToolCallingSchema,
-  ProgrammaticToolCallingDescription,
 } from '@/tools/ProgrammaticToolCalling';
 import {
   BashProgrammaticToolCallingSchema,
-  BashProgrammaticToolCallingDescription,
   normalizeToBashIdentifier,
 } from '@/tools/BashProgrammaticToolCalling';
 import {
   resolveProgrammaticToolDefinitions,
   selectProgrammaticTools,
-  type ProgrammaticInvocationParams,
 } from '@/tools/ProgrammaticCallerPolicy';
 import {
   executeLocalBash,
   executeLocalCode,
   getLocalSessionId,
+  getLocalCwd,
   shellQuote,
 } from './LocalExecutionEngine';
 import { executeHooks } from '@/hooks';
 import { Constants } from '@/common';
+import { createAwaitedTool } from '../awaitedCancellation';
+import { capLocalOutput, formatLocalOutput } from './LocalExecutionTools';
 
 const DEFAULT_TIMEOUT = 60000;
 const LOCAL_MIN_TIMEOUT = 1000;
 const LOCAL_MAX_TIMEOUT = 300000;
+
+const LOCAL_WORKSPACE_GUIDANCE =
+  'Execution starts in the configured working directory. Save task outputs with relative paths there. ' +
+  'Project files persist between calls, including files written before a later failure. ' +
+  'Each call starts a fresh process; variables and imports do not persist. ' +
+  'Execution scratch is temporary. Saved project files are accessed through workspace tools; no artifact attachments are registered. ' +
+  'Completed tool effects remain after a later failure, so check saved work before retrying. ' +
+  'Print concise results for the model.';
+
+const LOCAL_BASH_GUIDANCE =
+  'Tools are predefined Bash functions accepting one JSON string argument. ' +
+  'Capture output with raw=$(tool_name \'{"key":"value"}\'); printf \'%s\\n\' "$raw" > result.json. ' +
+  'Tool output can be JSON or text; parse JSON only when its shape requires it. ' +
+  'Independent calls can run with & followed by wait. Hyphens in tool names become underscores; reserved words get a _tool suffix.';
+
+const LOCAL_PYTHON_GUIDANCE =
+  'For Python, set lang to py or python. Code is wrapped in an async function; use await without asyncio.run(). ' +
+  'Tools are predefined async functions. Call them with keyword arguments, for example await tool_name(key="value"). ' +
+  'Results are Python values (dict, list or str); decode a JSON string only when needed. ' +
+  'Use asyncio.gather for independent calls. Hyphens in tool names become underscores; keywords get a _tool suffix.';
+
+const LOCAL_PROGRAMMATIC_DESCRIPTION = [
+  'Compose registered tools in local orchestration code. Bash is the default runtime.',
+  LOCAL_WORKSPACE_GUIDANCE,
+  LOCAL_BASH_GUIDANCE,
+  LOCAL_PYTHON_GUIDANCE,
+].join('\n\n');
+
+const LOCAL_BASH_PROGRAMMATIC_DESCRIPTION = [
+  'Compose registered tools in local Bash orchestration code.',
+  LOCAL_WORKSPACE_GUIDANCE,
+  LOCAL_BASH_GUIDANCE,
+].join('\n\n');
 
 type LocalTimeoutSchema = {
   type: 'integer';
@@ -104,6 +140,10 @@ function createLocalProgrammaticToolCallingSchema(
     ...ProgrammaticToolCallingSchema,
     properties: {
       ...ProgrammaticToolCallingSchema.properties,
+      code: {
+        ...ProgrammaticToolCallingSchema.properties.code,
+        description: LOCAL_PROGRAMMATIC_DESCRIPTION,
+      },
       timeout: createLocalTimeoutSchema(localConfig.timeoutMs),
       lang: {
         type: 'string',
@@ -123,6 +163,10 @@ function createLocalBashProgrammaticToolCallingSchema(
     ...BashProgrammaticToolCallingSchema,
     properties: {
       ...BashProgrammaticToolCallingSchema.properties,
+      code: {
+        ...BashProgrammaticToolCallingSchema.properties.code,
+        description: LOCAL_BASH_PROGRAMMATIC_DESCRIPTION,
+      },
       timeout: createLocalTimeoutSchema(localConfig.timeoutMs),
     },
   } as const;
@@ -191,7 +235,7 @@ function writeJson(res: ServerResponse, status: number, value: unknown): void {
  * Returns the (possibly rewritten) input and a `denyReason` if any
  * matcher returned `decision: 'deny'` or `'ask'`. `'ask'` collapses
  * to deny because the bridge can't raise a LangGraph interrupt from
- * inside an HTTP handler — fail-closed matches the rest of the SDK
+ * inside an HTTP handler; fail-closed matches the rest of the SDK
  * when HITL is unavailable.
  *
  * @internal Exported for tests so the deny / allow / updatedInput /
@@ -202,7 +246,8 @@ export async function applyPreToolUseHooksForBridge(
   hookContext: t.ProgrammaticHookContext,
   toolName: string,
   toolUseId: string,
-  toolInput: Record<string, unknown>
+  toolInput: Record<string, unknown>,
+  signal?: AbortSignal
 ): Promise<{ input: Record<string, unknown>; denyReason?: string }> {
   if (hookContext.registry == null) {
     return { input: toolInput };
@@ -224,6 +269,7 @@ export async function applyPreToolUseHooksForBridge(
     },
     sessionId: hookContext.runId,
     matchQuery: toolName,
+    signal,
   }).catch(() => undefined);
   if (
     hookContext.failClosedOnHookError === true &&
@@ -245,29 +291,139 @@ export async function applyPreToolUseHooksForBridge(
     return {
       input: nextInput,
       denyReason:
-        result.decision === 'ask' &&
-        hookContext.failClosedOnHookError === true
+        result.decision === 'ask' && hookContext.failClosedOnHookError === true
           ? `Approval required for "${toolName}"; unavailable in a background subagent. Ask the parent to run it in the foreground.${result.reason == null ? '' : ` Reason: ${result.reason}`}`
           : (result.reason ??
             (result.decision === 'ask'
-              ? `Tool "${toolName}" requires human approval; bridge cannot raise an interrupt — denying.`
+              ? `Tool "${toolName}" requires human approval; bridge cannot raise an interrupt, denying.`
               : `Tool "${toolName}" denied by PreToolUse hook.`)),
     };
   }
   return { input: nextInput };
 }
 
+async function executeBridgeCall(
+  call: { id: string; name: string; input: NonNullable<ToolRequest['input']> },
+  toolMap: t.ToolMap,
+  signal: AbortSignal,
+  programmaticToolName: string,
+  hookContext?: t.ProgrammaticHookContext,
+  config?: RunnableConfig
+): Promise<t.PTCToolResult> {
+  signal.throwIfAborted();
+  const hookInput = {
+    runId: hookContext?.runId ?? '',
+    threadId: hookContext?.threadId,
+    agentId: hookContext?.agentId,
+    executionContext: hookContext?.executionContext,
+    executingAgentId: hookContext?.executingAgentId,
+    toolName: call.name,
+    toolInput: call.input,
+    toolUseId: call.id,
+    stepId: '',
+    turn: 0,
+  };
+  const hookOptions =
+    hookContext?.registry == null
+      ? undefined
+      : {
+        registry: hookContext.registry,
+        sessionId: hookContext.runId,
+        matchQuery: call.name,
+      };
+  let result: t.PTCToolResult;
+  try {
+    if (hookContext != null) {
+      const gate = await applyPreToolUseHooksForBridge(
+        hookContext,
+        call.name,
+        call.id,
+        call.input,
+        signal
+      );
+      hookInput.toolInput = gate.input;
+      if (gate.denyReason != null) {
+        if (hookOptions != null) {
+          await executeHooks({
+            ...hookOptions,
+            input: {
+              ...hookInput,
+              hook_event_name: 'PermissionDenied',
+              reason: gate.denyReason,
+            },
+          }).catch(() => undefined);
+        }
+        return {
+          call_id: call.id,
+          result: null,
+          is_error: true,
+          error_message: gate.denyReason,
+        };
+      }
+    }
+    [result] = await executeTools(
+      [{ ...call, input: hookInput.toolInput }],
+      toolMap,
+      programmaticToolName,
+      signal,
+      config
+    );
+  } catch (error) {
+    result = {
+      call_id: call.id,
+      result: null,
+      is_error: true,
+      error_message:
+        error instanceof Error ? error.message : 'Tool execution cancelled',
+    };
+  }
+  if (hookOptions == null) return result;
+  // Completion hooks must still record the outcome when the request was aborted.
+  if (result.is_error) {
+    await executeHooks({
+      ...hookOptions,
+      input: {
+        ...hookInput,
+        hook_event_name: 'PostToolUseFailure',
+        error: result.error_message ?? `Tool ${call.name} failed`,
+      },
+    }).catch(() => undefined);
+    return result;
+  }
+  const post = await executeHooks({
+    ...hookOptions,
+    input: {
+      ...hookInput,
+      hook_event_name: 'PostToolUse',
+      toolOutput: result.result,
+    },
+  }).catch(() => undefined);
+  return post?.updatedOutput === undefined
+    ? result
+    : { ...result, result: post.updatedOutput };
+}
+
 async function createToolBridge(
   toolMap: t.ToolMap,
-  hookContext?: t.ProgrammaticHookContext
+  hookContext: t.ProgrammaticHookContext | undefined,
+  programmaticToolName: string,
+  config?: RunnableConfig
 ): Promise<ToolBridge> {
+  const signal = config?.signal;
   const token = randomBytes(32).toString('hex');
+  const controllers = new Set<AbortController>();
+  const pending = new Set<Promise<void>>();
+  let closing = false;
+  const abortRequests = (): void => {
+    for (const controller of controllers) controller.abort(signal?.reason);
+  };
+  signal?.addEventListener('abort', abortRequests, { once: true });
   const server = createServer((req, res) => {
-    // `?mode=text` returns the already-serialized result as the body
-    // (or the error message at non-2xx). Python/Node callers stay on
-    // JSON; bash callers using curl can avoid pulling in a JSON
-    // parser dependency (Codex P2 #19 — `python3` was a hard
-    // requirement for the bash bridge, breaking minimal containers).
+    if (closing || signal?.aborted === true) {
+      res.writeHead(503);
+      res.end('Tool bridge is closing');
+      return;
+    }
     const url = new URL(req.url ?? '/', 'http://127.0.0.1');
     const isTextMode = url.searchParams.get('mode') === 'text';
     if (req.method !== 'POST' || url.pathname !== '/tool') {
@@ -295,7 +451,18 @@ async function createToolBridge(
       return;
     }
 
-    readRequestBody(req)
+    const controller = new AbortController();
+    controllers.add(controller);
+    const disconnect = (): void => {
+      if (!res.writableFinished)
+        controller.abort(new Error('Tool bridge client disconnected'));
+    };
+    const cancelRequest = (): void => {
+      req.destroy();
+    };
+    controller.signal.addEventListener('abort', cancelRequest, { once: true });
+    res.once('close', disconnect);
+    const operation = readRequestBody(req)
       .then(async (body) => {
         if (typeof body.name !== 'string' || body.name === '') {
           const message = 'Tool request is missing a tool name.';
@@ -313,43 +480,19 @@ async function createToolBridge(
           return;
         }
 
-        const callId = body.id ?? `local_call_${randomUUID()}`;
-        let effectiveInput: Record<string, unknown> = body.input ?? {};
-        if (hookContext != null) {
-          const gate = await applyPreToolUseHooksForBridge(
-            hookContext,
-            body.name,
-            callId,
-            effectiveInput
-          );
-          if (gate.denyReason != null) {
-            const denyMsg = gate.denyReason;
-            if (isTextMode) {
-              res.writeHead(500, { 'Content-Type': 'text/plain' });
-              res.end(denyMsg);
-            } else {
-              writeJson(res, 500, {
-                call_id: callId,
-                result: null,
-                is_error: true,
-                error_message: denyMsg,
-              });
-            }
-            return;
-          }
-          effectiveInput = gate.input;
-        }
-
-        const [result] = await executeTools(
-          [
-            {
-              id: callId,
-              name: body.name,
-              input: effectiveInput,
-            },
-          ],
-          toolMap
+        const result = await executeBridgeCall(
+          {
+            id: body.id ?? `local_call_${randomUUID()}`,
+            name: body.name,
+            input: body.input ?? {},
+          },
+          toolMap,
+          controller.signal,
+          programmaticToolName,
+          hookContext,
+          config
         );
+        if (res.destroyed) return;
 
         if (isTextMode) {
           if (result.is_error === true) {
@@ -371,6 +514,7 @@ async function createToolBridge(
         });
       })
       .catch((error: Error) => {
+        if (res.destroyed) return;
         if (isTextMode) {
           res.writeHead(500, { 'Content-Type': 'text/plain' });
           res.end(error.message);
@@ -382,22 +526,40 @@ async function createToolBridge(
             error_message: error.message,
           });
         }
+      })
+      .finally(() => {
+        res.removeListener('close', disconnect);
+        controller.signal.removeEventListener('abort', cancelRequest);
+        controllers.delete(controller);
+        pending.delete(operation);
       });
+    pending.add(operation);
   });
 
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(0, '127.0.0.1', resolve);
-  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+  } catch (error) {
+    signal?.removeEventListener('abort', abortRequests);
+    throw error;
+  }
 
   const address = server.address() as AddressInfo;
   return {
     url: `http://127.0.0.1:${address.port}/tool`,
     token,
-    close: () =>
-      new Promise((resolve, reject) => {
+    close: async (): Promise<void> => {
+      closing = true;
+      signal?.removeEventListener('abort', abortRequests);
+      abortRequests();
+      const closed = new Promise<void>((resolve, reject) => {
         server.close((error) => (error ? reject(error) : resolve()));
-      }),
+      });
+      server.closeAllConnections();
+      await Promise.all([closed, ...pending]);
+    },
   };
 }
 
@@ -581,11 +743,13 @@ function createEffectiveToolMap(
 
 async function runLocalProgrammaticTool(args: {
   params: LocalProgrammaticParams;
-  config?: { toolCall?: unknown };
+  config?: ToolRunnableConfig;
   localConfig: t.LocalExecutionConfig;
   runtime: LocalProgrammaticRuntime;
 }): Promise<[string, t.ProgrammaticExecutionArtifact]> {
   const context = getProgrammaticContext(args.config);
+  const signal = args.config?.signal;
+  signal?.throwIfAborted();
   const { toolMap, disallowedToolDefs, programmaticToolName, hookContext } =
     context;
   const toolDefs = resolveProgrammaticToolDefinitions(context);
@@ -626,7 +790,12 @@ async function runLocalProgrammaticTool(args: {
     toolMap ?? new Map(),
     selectedTools
   );
-  const bridge = await createToolBridge(effectiveMap, hookContext);
+  const bridge = await createToolBridge(
+    effectiveMap,
+    hookContext,
+    runnerName,
+    args.config
+  );
 
   try {
     const timeoutMs =
@@ -640,7 +809,8 @@ async function runLocalProgrammaticTool(args: {
             bridge.url,
             bridge.token
           ),
-          { ...args.localConfig, timeoutMs }
+          { ...args.localConfig, timeoutMs },
+          signal
         )
         : await executeLocalCode(
           {
@@ -652,71 +822,82 @@ async function runLocalProgrammaticTool(args: {
               bridge.token
             ),
           },
-          { ...args.localConfig, timeoutMs }
+          { ...args.localConfig, timeoutMs },
+          signal
         );
 
+    signal?.throwIfAborted();
+    const output = formatLocalOutput(capLocalOutput(result, args.localConfig), getLocalCwd(args.localConfig));
     if (result.exitCode !== 0 || result.timedOut) {
-      throw new Error(
-        result.stderr !== ''
-          ? result.stderr
-          : `Local ${args.runtime} programmatic execution exited with code ${
-            result.exitCode ?? 'unknown'
-          }`
-      );
+      throw new Error(output);
     }
 
-    return formatCompletedResponse({
-      status: 'completed',
+    return [output, {
       session_id: getLocalSessionId(args.localConfig),
-      stdout: result.stdout,
-      stderr: result.stderr,
       files: [],
-    });
+    }];
   } finally {
     await bridge.close();
   }
 }
 
+function resolveProgrammaticOutputConfig(
+  config: t.LocalExecutionConfig
+): t.LocalExecutionConfig {
+  const maxChars = config.programmaticResultMaxChars;
+  if (maxChars === undefined) return config;
+  if (!Number.isSafeInteger(maxChars) || maxChars < 0) {
+    throw new RangeError('programmaticResultMaxChars must be a nonnegative safe integer.');
+  }
+  return { ...config, toolResultMaxChars: maxChars };
+}
+
 export function createLocalProgrammaticToolCallingTool(
   localConfig: t.LocalExecutionConfig = {}
 ): DynamicStructuredTool {
-  return tool(
-    async (rawParams, config) => {
+  const executionConfig = resolveProgrammaticOutputConfig(localConfig);
+  return createAwaitedTool({
+    func: async (
+      rawParams,
+      _manager,
+      config
+    ): Promise<[string, t.ProgrammaticExecutionArtifact]> => {
       const params = rawParams as LocalProgrammaticParams;
       return runLocalProgrammaticTool({
         params,
         config,
-        localConfig,
+        localConfig: executionConfig,
         runtime: resolveRuntime(params),
       });
     },
-    {
-      name: ProgrammaticToolCallingName,
-      description: `${ProgrammaticToolCallingDescription}\n\nLocal engine: runs bash by default, or Python when \`lang\` is \`py\` or \`python\`, on the host machine and calls tools through an in-process localhost bridge.`,
-      schema: createLocalProgrammaticToolCallingSchema(localConfig),
-      responseFormat: Constants.CONTENT_AND_ARTIFACT,
-    }
-  );
+    name: ProgrammaticToolCallingName,
+    description: LOCAL_PROGRAMMATIC_DESCRIPTION,
+    schema: createLocalProgrammaticToolCallingSchema(localConfig),
+    responseFormat: Constants.CONTENT_AND_ARTIFACT,
+  });
 }
 
 export function createLocalBashProgrammaticToolCallingTool(
   localConfig: t.LocalExecutionConfig = {}
 ): DynamicStructuredTool {
-  return tool(
-    async (rawParams, config) => {
+  const executionConfig = resolveProgrammaticOutputConfig(localConfig);
+  return createAwaitedTool({
+    func: async (
+      rawParams,
+      _manager,
+      config
+    ): Promise<[string, t.ProgrammaticExecutionArtifact]> => {
       const params = rawParams as LocalProgrammaticParams;
       return runLocalProgrammaticTool({
         params,
         config,
-        localConfig,
+        localConfig: executionConfig,
         runtime: 'bash',
       });
     },
-    {
-      name: Constants.BASH_PROGRAMMATIC_TOOL_CALLING,
-      description: `${BashProgrammaticToolCallingDescription}\n\nLocal engine: runs this bash orchestration code on the host machine and calls tools through an in-process localhost bridge.`,
-      schema: createLocalBashProgrammaticToolCallingSchema(localConfig),
-      responseFormat: Constants.CONTENT_AND_ARTIFACT,
-    }
-  );
+    name: Constants.BASH_PROGRAMMATIC_TOOL_CALLING,
+    description: LOCAL_BASH_PROGRAMMATIC_DESCRIPTION,
+    schema: createLocalBashProgrammaticToolCallingSchema(localConfig),
+    responseFormat: Constants.CONTENT_AND_ARTIFACT,
+  });
 }

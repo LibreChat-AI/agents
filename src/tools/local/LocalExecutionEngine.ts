@@ -1,8 +1,9 @@
 import { tmpdir } from 'os';
 import { spawn } from 'child_process';
+import { StringDecoder } from 'string_decoder';
 import { createWriteStream } from 'fs';
 import { createHash, randomUUID } from 'crypto';
-import { isAbsolute, relative, resolve } from 'path';
+import { isAbsolute, relative, resolve, sep } from 'path';
 import { mkdir, realpath, rm, writeFile } from 'fs/promises';
 import type { ChildProcess } from 'child_process';
 import type { WorkspaceFS } from './workspaceFS';
@@ -153,7 +154,7 @@ const nestedShellDestructivePatterns: ReadonlyArray<RegExp> = [
 const mutatingCommandPattern =
   /\b(?:rm|mv|cp|touch|mkdir|rmdir|ln|truncate|tee|sed\s+-i|perl\s+-pi|python(?:3)?\s+-c|node\s+-e|npm\s+(?:install|ci|update|publish)|pnpm\s+(?:install|update|publish)|yarn\s+(?:install|add|publish)|git\s+(?:add|commit|checkout|switch|reset|clean|rebase|merge|push|pull|stash|tag|branch)|chmod|chown)\b|(?:^|[^<])>\s*[^&]|\bcat\s+[^|;&]*>\s*/;
 
-type SpawnResult = {
+export type SpawnResult = {
   stdout: string;
   stderr: string;
   exitCode: number | null;
@@ -178,8 +179,12 @@ type SpawnResult = {
    * POSIX convention so non-null-exit-code consumers see a failure.
    */
   signal?: string;
-  /** Path to the full untruncated stdout/stderr when output exceeded `maxOutputChars`. */
+  /** Path to captured stdout/stderr; a terminated process may have incomplete output. */
   fullOutputPath?: string;
+  outputTruncated?: boolean;
+  outputRecoveryError?: string;
+  /** A custom spawn backend may not share the host's output filesystem. */
+  outputOnHost?: boolean;
 };
 
 /**
@@ -744,6 +749,8 @@ export function buildSandboxRuntimeConfig(
  * @internal
  */
 export interface SpawnLocalProcessOptions {
+  /** Cancels the owned process tree and waits for its close event. */
+  signal?: AbortSignal;
   /**
    * When true, suppress the "sandbox is off" warning AND its latch
    * for this spawn. Use for SDK-internal probes (`bash -n` syntax
@@ -763,6 +770,7 @@ export async function spawnLocalProcess(
   config: t.LocalExecutionConfig = {},
   options?: SpawnLocalProcessOptions
 ): Promise<SpawnResult> {
+  options?.signal?.throwIfAborted();
   const cwd = getLocalCwd(config);
   const timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const maxOutputChars = config.maxOutputChars ?? DEFAULT_MAX_OUTPUT_CHARS;
@@ -798,6 +806,7 @@ export async function spawnLocalProcess(
   }
 
   const launcher = getSpawn(config);
+  options?.signal?.throwIfAborted();
   return new Promise<SpawnResult>((resolveResult, reject) => {
     const spawnOptions: import('child_process').SpawnOptions = {
       cwd,
@@ -809,6 +818,7 @@ export async function spawnLocalProcess(
       value: timeoutMs,
     });
     const child = launcher(spawnCommand, spawnArgs, spawnOptions);
+    const onAbort = (): void => killProcessTree(child);
 
     let stdout = '';
     let stderr = '';
@@ -816,25 +826,40 @@ export async function spawnLocalProcess(
     let overflowKilled = false;
     let spillStream: import('fs').WriteStream | undefined;
     let spillPath: string | undefined;
+    let outputRecoveryError: string | undefined;
+    let capturePrefix = '';
+    const decoders = { stdout: new StringDecoder('utf8'), stderr: new StringDecoder('utf8') };
     let settled = false;
     let timedOut = false;
     let timeout: NodeJS.Timeout | undefined;
 
     const ensureSpill = (): void => {
-      if (spillStream != null) return;
-      // Lazy-open the temp file the first time a stream's in-memory
-      // buffer overflows. Seed it with everything we've buffered so
-      // the file holds the FULL output (not just the post-cap tail).
-      // Uses the static `createWriteStream` import — `require('fs')`
-      // would throw `ReferenceError: require is not defined` in ESM
-      // consumers (this package ships both `dist/cjs` and `dist/esm`).
+      if (spillStream != null || outputRecoveryError != null) return;
       spillPath = resolve(tmpdir(), `lc-local-output-${randomUUID()}.txt`);
-      spillStream = createWriteStream(spillPath);
-      spillStream.write('===== stdout =====\n');
-      spillStream.write(stdout);
-      spillStream.write('\n===== stderr =====\n');
-      spillStream.write(stderr);
-      spillStream.write('\n===== overflow stream begins here =====\n');
+      try {
+        spillStream = createWriteStream(spillPath, { flags: 'wx', mode: 0o600 });
+        spillStream.on('error', (error) => {
+          outputRecoveryError = error.message;
+        });
+        spillStream.write(capturePrefix);
+      } catch (error) {
+        outputRecoveryError = error instanceof Error ? error.message : String(error);
+      }
+      capturePrefix = '';
+    };
+
+    const captureText = (text: string, kind: 'stdout' | 'stderr'): void => {
+      const current = kind === 'stdout' ? stdout : stderr;
+      const totalCap = config.toolResultMaxChars;
+      if (current.length + text.length > maxOutputChars ||
+        (totalCap != null && totalCap > 0 && stdout.length + stderr.length + text.length > totalCap)) ensureSpill();
+      if (spillStream != null && outputRecoveryError == null) spillStream.write(text);
+      else if (outputRecoveryError == null) capturePrefix += text;
+      if (current.length < inMemoryCapBytes) {
+        const retained = text.slice(0, inMemoryCapBytes - current.length);
+        if (kind === 'stdout') stdout += retained;
+        else stderr += retained;
+      }
     };
 
     const handleChunk = (buf: Buffer, kind: 'stdout' | 'stderr'): void => {
@@ -851,19 +876,7 @@ export async function spawnLocalProcess(
         killProcessTree(child);
         return;
       }
-      const current = kind === 'stdout' ? stdout : stderr;
-      if (current.length < inMemoryCapBytes) {
-        const text = buf.toString('utf8');
-        if (kind === 'stdout') stdout += text;
-        else stderr += text;
-        if (current.length + text.length >= inMemoryCapBytes) {
-          ensureSpill();
-        }
-      } else {
-        ensureSpill();
-        spillStream!.write(`[${kind}] `);
-        spillStream!.write(buf);
-      }
+      if (!overflowKilled) captureText(decoders[kind].write(buf), kind);
     };
 
     const finish = (result: SpawnResult): void => {
@@ -871,10 +884,14 @@ export async function spawnLocalProcess(
         return;
       }
       settled = true;
+      options?.signal?.removeEventListener('abort', onAbort);
       if (timeout != null) {
         clearTimeout(timeout);
       }
+      let finalized = false;
       const finalize = (): void => {
+        if (finalized) return;
+        finalized = true;
         const truncated = {
           stdout: truncateLocalOutput(result.stdout, maxOutputChars),
           stderr: truncateLocalOutput(result.stderr, maxOutputChars),
@@ -882,17 +899,20 @@ export async function spawnLocalProcess(
         resolveResult({
           ...result,
           ...truncated,
-          ...(spillPath != null ? { fullOutputPath: spillPath } : {}),
+          outputTruncated: result.stdout.length > maxOutputChars || result.stderr.length > maxOutputChars,
+          ...(spillPath != null && outputRecoveryError == null ? { fullOutputPath: spillPath } : {}),
+          ...(config.exec?.spawn == null && config.spawn == null ? {} : { outputOnHost: true }),
+          ...(outputRecoveryError == null ? {} : { outputRecoveryError }),
         });
       };
-      if (spillStream == null) {
+      if (spillStream == null || spillStream.closed) {
         finalize();
         return;
       }
-      // Wait for the temp file to flush before reporting the path.
-      // Otherwise the model sees `full_output_path: …` for a file
-      // that's still being written.
-      spillStream.end(() => finalize());
+      spillStream.once('close', finalize);
+      spillStream.end((error?: Error | null) => {
+        if (error != null) outputRecoveryError = error.message;
+      });
     };
 
     const fail = (error: Error): void => {
@@ -900,6 +920,7 @@ export async function spawnLocalProcess(
         return;
       }
       settled = true;
+      options?.signal?.removeEventListener('abort', onAbort);
       if (timeout != null) {
         clearTimeout(timeout);
       }
@@ -927,6 +948,8 @@ export async function spawnLocalProcess(
     child.on('error', fail);
 
     child.on('close', (exitCode, signal) => {
+      captureText(decoders.stdout.end(), 'stdout');
+      captureText(decoders.stderr.end(), 'stderr');
       // Synthesize a non-zero exit code whenever the process exited
       // by signal — Node reports `exitCode: null` in that case and
       // the formatter only prints non-null exit codes, so signal
@@ -952,6 +975,8 @@ export async function spawnLocalProcess(
         ...(signal != null ? { signal } : {}),
       });
     });
+    if (options?.signal?.aborted === true) onAbort();
+    else options?.signal?.addEventListener('abort', onAbort, { once: true });
   });
 }
 
@@ -1023,14 +1048,16 @@ export async function probeLocalCommandAvailability(
 
 export async function executeLocalBash(
   command: string,
-  config: t.LocalExecutionConfig = {}
+  config: t.LocalExecutionConfig = {},
+  signal?: AbortSignal
 ): Promise<SpawnResult> {
+  signal?.throwIfAborted();
   const validation = await validateBashCommand(command, config);
   if (!validation.valid) {
     throw new Error(validation.errors.join('\n'));
   }
   const shell = config.shell ?? DEFAULT_SHELL;
-  return spawnLocalProcess(shell, ['-lc', command], config);
+  return spawnLocalProcess(shell, ['-lc', command], config, { signal });
 }
 
 /**
@@ -1069,8 +1096,10 @@ const DESTRUCTIVE_OP_IN_COMMAND_RE =
 export async function executeLocalBashWithArgs(
   command: string,
   args: readonly string[],
-  config: t.LocalExecutionConfig = {}
+  config: t.LocalExecutionConfig = {},
+  signal?: AbortSignal
 ): Promise<SpawnResult> {
+  signal?.throwIfAborted();
   const validation = await validateBashCommand(command, config);
   if (!validation.valid) {
     throw new Error(validation.errors.join('\n'));
@@ -1095,7 +1124,7 @@ export async function executeLocalBashWithArgs(
     }
   }
   const shell = config.shell ?? DEFAULT_SHELL;
-  return spawnLocalProcess(shell, ['-lc', command, '--', ...args], config);
+  return spawnLocalProcess(shell, ['-lc', command, '--', ...args], config, { signal });
 }
 
 export async function executeLocalCode(
@@ -1104,17 +1133,19 @@ export async function executeLocalCode(
     code: string;
     args?: string[];
   },
-  config: t.LocalExecutionConfig = {}
+  config: t.LocalExecutionConfig = {},
+  signal?: AbortSignal
 ): Promise<SpawnResult> {
+  signal?.throwIfAborted();
   if (input.lang === 'bash') {
     // Append `args` as positional parameters via the standard
     // `bash -c <code> -- <args...>` form so `$1`, `$2`, … inside
     // `code` resolve correctly. Honours the same args contract the
     // other runtimes (py, js, …) already support.
     if (input.args != null && input.args.length > 0) {
-      return executeLocalBashWithArgs(input.code, input.args, config);
+      return executeLocalBashWithArgs(input.code, input.args, config, signal);
     }
-    return executeLocalBash(input.code, config);
+    return executeLocalBash(input.code, config, signal);
   }
 
   const tempDir = resolve(tmpdir(), `lc-local-${randomUUID()}`);
@@ -1135,7 +1166,7 @@ export async function executeLocalCode(
         'utf8'
       );
     }
-    return await spawnLocalProcess(runtime.command, runtime.args, config);
+    return await spawnLocalProcess(runtime.command, runtime.args, config, { signal });
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
@@ -1373,7 +1404,7 @@ function isInsideAnyRoot(absolutePath: string, roots: string[]): boolean {
   for (const root of roots) {
     if (absolutePath === root) return true;
     const rel = relative(root, absolutePath);
-    if (!rel.startsWith('..') && !isAbsolute(rel)) return true;
+    if (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel)) return true;
   }
   return false;
 }

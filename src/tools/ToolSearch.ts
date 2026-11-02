@@ -832,7 +832,8 @@ function parseSearchResults(stdout: string): t.ToolSearchResponse {
 function formatSearchResults(
   searchResponse: t.ToolSearchResponse,
   nameFormat: t.McpNameFormat = 'full',
-  notes: string[] = []
+  notes: string[] = [],
+  schemaRegistry?: t.LCToolRegistry
 ): string {
   const { tool_references, total_tools_searched, pattern_used } =
     searchResponse;
@@ -840,18 +841,29 @@ function formatSearchResults(
 
   const output = {
     found: tool_references.length,
-    tools: tool_references.map((ref) => ({
-      name: useFullName ? ref.tool_name : getBaseToolName(ref.tool_name),
-      score: Number(ref.match_score.toFixed(2)),
-      matched_in: ref.matched_field,
-      snippet: ref.snippet,
-    })),
+    tools: tool_references.map((ref) => {
+      const definition = schemaRegistry?.get(ref.tool_name);
+      if (definition != null) {
+        return {
+          name: ref.tool_name,
+          description: definition.description,
+          parameters: definition.parameters,
+          allowed_callers: definition.allowed_callers,
+        };
+      }
+      return {
+        name: useFullName ? ref.tool_name : getBaseToolName(ref.tool_name),
+        score: Number(ref.match_score.toFixed(2)),
+        matched_in: ref.matched_field,
+        snippet: ref.snippet,
+      };
+    }),
     total_searched: total_tools_searched,
     query: pattern_used,
     ...(notes.length > 0 ? { notes } : {}),
   };
 
-  return JSON.stringify(output, null, 2);
+  return schemaRegistry == null ? JSON.stringify(output, null, 2) : JSON.stringify(output);
 }
 
 /**
@@ -891,13 +903,28 @@ function hasParams(parameters?: t.JsonSchemaType): boolean {
  */
 function getDeferredToolsListing(
   toolRegistry: t.LCToolRegistry | undefined,
-  onlyDeferred: boolean
+  onlyDeferred: boolean,
+  maxCatalogChars?: number
 ): string {
+  return getDeferredToolsCatalog(toolRegistry, onlyDeferred, maxCatalogChars).listing;
+}
+
+function getDeferredToolsCatalog(
+  toolRegistry: t.LCToolRegistry | undefined,
+  onlyDeferred: boolean,
+  maxCatalogChars?: number
+): { listing: string; hasMcpTools: boolean } {
+  if (maxCatalogChars !== undefined &&
+    (!Number.isSafeInteger(maxCatalogChars) || maxCatalogChars < 128)) {
+    throw new Error('maxCatalogChars must be an integer of at least 128');
+  }
   if (!toolRegistry) {
-    return '';
+    return { listing: '', hasMcpTools: false };
   }
 
-  const toolsByServer: Record<string, string[]> = {};
+  const toolsByServer = new Map<string, string[]>();
+  let total = 0;
+  let hasMcpTools = false;
 
   for (const lcTool of toolRegistry.values()) {
     if (onlyDeferred && lcTool.defer_loading !== true) {
@@ -905,33 +932,44 @@ function getDeferredToolsListing(
     }
 
     const toolName = lcTool.name;
-    const serverName = extractMcpServerName(toolName) ?? 'other';
+    const mcpServer = extractMcpServerName(toolName);
+    const serverName = mcpServer ?? 'other';
+    hasMcpTools ||= mcpServer !== undefined;
     const baseName = getBaseToolName(toolName);
     const displayName = hasParams(lcTool.parameters)
       ? `${baseName}(\u2026)`
       : baseName;
 
-    if (!(serverName in toolsByServer)) {
-      toolsByServer[serverName] = [];
-    }
-    toolsByServer[serverName].push(displayName);
+    const names = toolsByServer.get(serverName);
+    if (names === undefined) toolsByServer.set(serverName, [displayName]);
+    else names.push(displayName);
+    total++;
   }
 
-  const serverNames = Object.keys(toolsByServer).sort((a, b) => {
+  const serverNames = [...toolsByServer.keys()].sort((a, b) => {
     if (a === 'other') return 1;
     if (b === 'other') return -1;
     return a.localeCompare(b);
   });
 
   if (serverNames.length === 0) {
-    return '';
+    return { listing: '', hasMcpTools };
   }
 
   const lines = serverNames.map(
-    (server) => `${server}: ${toolsByServer[server].join(', ')}`
+    (server) => `${server}: ${toolsByServer.get(server)?.join(', ')}`
   );
 
-  return lines.join('\n');
+  const listing = lines.join('\n');
+  if (maxCatalogChars === undefined || listing.length <= maxCatalogChars) {
+    return { listing, hasMcpTools };
+  }
+  let preview = `${total} tools / ${serverNames.length} groups. Names omitted; search all tools. Groups shown when space permits:`;
+  for (const server of serverNames) {
+    const line = `\n${server}: ${toolsByServer.get(server)?.length} tools`;
+    if (preview.length + line.length <= maxCatalogChars) preview += line;
+  }
+  return { listing: preview, hasMcpTools };
 }
 
 /**
@@ -1041,9 +1079,10 @@ function createToolSearch(
   const baseEndpoint = initParams.baseUrl ?? getCodeBaseURL();
   const EXEC_ENDPOINT = buildCodeApiEndpoint(baseEndpoint, 'exec');
 
-  const deferredToolsListing = getDeferredToolsListing(
+  const { listing: deferredToolsListing, hasMcpTools } = getDeferredToolsCatalog(
     initParams.toolRegistry,
-    defaultOnlyDeferred
+    defaultOnlyDeferred,
+    initParams.maxCatalogChars
   );
 
   const toolsListSection =
@@ -1055,8 +1094,7 @@ ${deferredToolsListing}`
       : '';
 
   const mcpNote =
-    deferredToolsListing.includes(Constants.MCP_DELIMITER) ||
-    deferredToolsListing.split('\n').some((line) => !line.startsWith('other:'))
+    hasMcpTools || deferredToolsListing.length === 0
       ? `
 - MCP tools use format: toolName${Constants.MCP_DELIMITER}serverName
 - Use mcp_server param to filter by server`
@@ -1301,7 +1339,8 @@ ${mcpNote}${toolsListSection}
         const formattedOutput = formatSearchResults(
           searchResponse,
           mcpNameFormat,
-          filterNotes
+          filterNotes,
+          initParams.includeSchemas === true ? toolRegistry : undefined
         );
 
         return [
@@ -1349,7 +1388,7 @@ ${mcpNote}${toolsListSection}
         };
 
         const proxyAgent = resolveFetchProxyAgent(EXEC_ENDPOINT);
-        if (proxyAgent) {
+        if (proxyAgent != null) {
           fetchOptions.agent = proxyAgent;
         }
 
@@ -1380,7 +1419,8 @@ ${mcpNote}${toolsListSection}
         }
 
         const searchResponse = parseSearchResults(result.stdout);
-        const formattedOutput = `${warningMessage}${formatSearchResults(searchResponse, mcpNameFormat, filterNotes)}`;
+        const formattedOutput = `${warningMessage}${formatSearchResults(searchResponse, mcpNameFormat, filterNotes,
+          initParams.includeSchemas === true ? toolRegistry : undefined)}`;
 
         return [
           formattedOutput,

@@ -23,6 +23,13 @@ async function createTempDir(): Promise<string> {
   return dir;
 }
 
+function continuation(text: string): { body: string; cursor?: string } {
+  const match = /\n\[continue with cursor=(v1:[a-f0-9]{64}:\d+)\]$/.exec(text);
+  return match == null
+    ? { body: text }
+    : { body: text.slice(0, match.index), cursor: match[1] };
+}
+
 afterEach(async () => {
   await Promise.all(
     tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true }))
@@ -58,52 +65,7 @@ describe('toolResultMaxChars', () => {
     expect(capHeadTail('short', 400)).toBe('short');
   });
 
-  it('caps read_file at whole lines with an offset hint, and leaves defaults alone', async () => {
-    const cwd = await createTempDir();
-    await writeFile(
-      join(cwd, 'big.py'),
-      Array.from({ length: 500 }, (_, i) => `value_${i} = ${i}`).join('\n')
-    );
-    const capped = String(
-      await createLocalReadFileTool({ cwd, toolResultMaxChars: 1000 }).invoke({
-        path: 'big.py',
-      })
-    );
-    expect(capped.length).toBeLessThan(1150);
-    expect(capped).toMatch(
-      /\[showing lines 1-\d+; continue with offset=\d+\]$/
-    );
-    const next = Number(/offset=(\d+)/.exec(capped)?.[1]);
-    const rest = String(
-      await createLocalReadFileTool({ cwd, toolResultMaxChars: 1000 }).invoke({
-        path: 'big.py',
-        offset: next,
-      })
-    );
-    expect(
-      rest.startsWith(
-        `${String(next).padStart(6, ' ')}\tvalue_${next - 1} = ${next - 1}`
-      )
-    ).toBe(true);
-    expect(
-      String(await createLocalReadFileTool({ cwd }).invoke({ path: 'big.py' }))
-    ).toContain('value_499');
-  });
-
-  it('cuts a single line longer than the cap instead of returning it whole', async () => {
-    const cwd = await createTempDir();
-    await writeFile(join(cwd, 'min.json'), `[${'1,'.repeat(50000)}1]\n{}`);
-    const capped = String(
-      await createLocalReadFileTool({ cwd, toolResultMaxChars: 1000 }).invoke({
-        path: 'min.json',
-      })
-    );
-    expect(capped.length).toBeLessThan(1150);
-    expect(capped).toContain('[line truncated]');
-    expect(capped).toMatch(/continue with offset=2\]$/);
-  });
-
-  it('applies the cap to reads with an explicit limit too', async () => {
+  it('preserves content-bound continuation for capped reads with explicit limits', async () => {
     const cwd = await createTempDir();
     await writeFile(
       join(cwd, 'wide.py'),
@@ -112,11 +74,29 @@ describe('toolResultMaxChars', () => {
       )
     );
     const read = createLocalReadFileTool({ cwd, toolResultMaxChars: 1000 });
-    const capped = String(await read.invoke({ path: 'wide.py', limit: 40 }));
-    expect(capped.length).toBeLessThan(1150);
-    expect(capped).toMatch(/continue with offset=\d+\]$/);
-    const short = String(await read.invoke({ path: 'wide.py', limit: 2 }));
-    expect(short).toMatch(/showing lines 1-2; continue with offset=3\]$/);
+    const first = continuation(
+      String(await read.invoke({ path: 'wide.py', limit: 40 }))
+    );
+    expect(first.body.length).toBeLessThanOrEqual(1000);
+    expect(first.cursor).toBeDefined();
+    const firstLineCount = (first.body.match(/^ *\d+\t/gm) ?? []).length;
+    const afterFirst = String(
+      await read.invoke({ path: 'wide.py', cursor: first.cursor })
+    );
+    expect(afterFirst).toMatch(
+      new RegExp(`^ {5}${firstLineCount + 1}\\t`)
+    );
+
+    const limited = continuation(
+      String(await read.invoke({ path: 'wide.py', limit: 2 }))
+    );
+    expect(limited.body).toMatch(/^ {5}1\t/);
+    expect(limited.cursor).toBeDefined();
+    expect(
+      String(
+        await read.invoke({ path: 'wide.py', cursor: limited.cursor })
+      )
+    ).toMatch(/^ {5}3\t/);
   });
 
   it('reads the last line of a file without a trailing newline and stops at the end', async () => {

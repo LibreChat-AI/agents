@@ -76,6 +76,7 @@ import {
   isProgrammaticControlTool,
   mergeCallerCapabilityDefinitions,
   resolveCallerCapabilityProjection,
+  getDirectToolCallError as getDirectCallerError,
 } from '@/tools/CallerCapabilities';
 import {
   cloneToolMessageWithContent,
@@ -1459,6 +1460,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       toolExecution: this.toolExecution,
       toolRegistry: this.toolRegistry,
       fileCheckpointer: this.fileCheckpointer,
+      maxToolResultChars: this.maxToolResultChars,
     });
 
     this.toolMap = resolved.toolMap;
@@ -1578,6 +1580,16 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         this.toolRegistry?.values()
       ),
       (toolDef) => isToolDefinitionActive(toolDef, discoveredToolNames)
+    );
+  }
+  private getDirectToolCallError(toolName: string): string | undefined {
+    const definition = mergeCallerCapabilityDefinitions(
+      this.toolDefinitions?.values(),
+      this.toolRegistry?.values()
+    ).find((toolDef) => toolDef.name === toolName);
+    return getDirectCallerError(
+      definition,
+      this.getDiscoveredToolNames?.() ?? []
     );
   }
 
@@ -2377,6 +2389,16 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     config: RunnableConfig,
     batchContext: RunToolBatchContext<T> = {}
   ): Promise<BaseMessage | Command> {
+    const callerError = this.getDirectToolCallError(call.name);
+    if (callerError != null) {
+      return new ToolMessage({
+        status: 'error',
+        name: call.name,
+        content: callerError,
+        tool_call_id: call.id ?? '',
+      });
+    }
+
     if (
       this.preparedSubagents?.owns(this.executingAgentId ?? '', call) ===
         true &&
@@ -5517,11 +5539,43 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     input: any,
     batchContext: DispatchBatchContext = {}
   ): Promise<T> {
-    const { toolMessages, injected } = await this.dispatchToolEvents(
-      toolCalls,
-      config,
-      batchContext
+    const dispatchable: ToolCall[] = [];
+    const rejected = new Map<string, ToolMessage>();
+    for (const call of toolCalls) {
+      const callerError = this.getDirectToolCallError(call.name);
+      if (callerError == null) {
+        dispatchable.push(call);
+        continue;
+      }
+      rejected.set(
+        call.id ?? call.name,
+        new ToolMessage({
+          status: 'error',
+          name: call.name,
+          content: callerError,
+          tool_call_id: call.id ?? '',
+        })
+      );
+    }
+    const dispatched =
+      dispatchable.length === 0
+        ? { toolMessages: [], injected: [] }
+        : await this.dispatchToolEvents(dispatchable, config, batchContext);
+    const dispatchedById = new Map(
+      dispatched.toolMessages.map((message) => [message.tool_call_id, message])
     );
+    const toolMessages = toolCalls.map(
+      (call) =>
+        rejected.get(call.id ?? call.name) ??
+        dispatchedById.get(call.id ?? '') ??
+        new ToolMessage({
+          status: 'error',
+          name: call.name,
+          content: 'Tool execution did not return a result.',
+          tool_call_id: call.id ?? '',
+        })
+    );
+    const injected = dispatched.injected;
     const outputs: BaseMessage[] = [...toolMessages, ...injected];
     return (Array.isArray(input) ? outputs : { messages: outputs }) as T;
   }
