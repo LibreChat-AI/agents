@@ -2216,6 +2216,41 @@ describe('invocationParams thinking gating', () => {
   });
 });
 
+describe('invocationParams thinking block binding', () => {
+  const binding = 'thinking-binding-controls-2026-08-01';
+  const paramsFor = (fields: Record<string, unknown>) =>
+    new ChatAnthropic({
+      model: 'claude-haiku-4-5-20251001',
+      apiKey: 'testing',
+      ...fields,
+    }).invocationParams({}) as { thinking?: unknown; betas?: string[] };
+
+  test('sends drop_block with its beta when enabled thinking is replayed', () => {
+    const params = paramsFor({
+      thinking: { type: 'adaptive' },
+      dropMismatchedThinkingBlocks: true,
+    });
+
+    expect(params.thinking).toEqual({
+      type: 'adaptive',
+      block_binding: { prefix_mismatch_behavior: 'drop_block' },
+    });
+    expect(params.betas).toContain(binding);
+  });
+
+  test('sends neither without the option, without thinking, or with thinking disabled', () => {
+    for (const fields of [
+      { thinking: { type: 'adaptive' } },
+      { dropMismatchedThinkingBlocks: true },
+      { thinking: { type: 'disabled' }, dropMismatchedThinkingBlocks: true },
+    ]) {
+      const params = paramsFor(fields);
+      expect(JSON.stringify(params.thinking ?? null)).not.toContain('block_binding');
+      expect(params.betas ?? []).not.toContain(binding);
+    }
+  });
+});
+
 // Inherited from @langchain/anthropic@1.5.1 — top-level request cache_control.
 describe('invocationParams cache_control', () => {
   const newModel = () =>
