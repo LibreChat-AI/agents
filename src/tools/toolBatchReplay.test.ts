@@ -1,7 +1,14 @@
-import { ToolMessage } from '@langchain/core/messages';
 import { Command } from '@langchain/langgraph';
+import { ToolMessage } from '@langchain/core/messages';
+import type { RunnableConfig } from '@langchain/core/runnables';
+import type { SubagentResumeManifest } from '@/tools/subagent/SubagentReplay';
 import {
   TOOL_BATCH_REPLAY_KEY,
+  TOOL_REPLAY_CONFIGS_KEY,
+  TOOL_PENDING_APPROVAL_KEY,
+  getCheckpointPendingApproval,
+  getToolReplayConfig,
+  restoreToolReplayConfigs,
   attachToolBatchReplayState,
   clearStaleToolApprovalConfig,
   getToolBatchReplayOwner,
@@ -14,6 +21,9 @@ import {
   getPublicToolInterruptPayload,
   rebindToolBatchReplayPayload,
 } from './toolBatchReplay';
+import { attachSubagentResumeManifest, SUBAGENT_RESUME_MANIFEST_CONFIG_KEY } from '@/tools/subagent/SubagentReplay';
+import { getToolApprovalReviewEvidence } from '@/hitl/approvalReview';
+import { attachRunStepResumeState } from '@/tools/runStepResume';
 
 const approval = {
   type: 'tool_approval',
@@ -28,6 +38,156 @@ const approval = {
 };
 
 describe('checkpoint-owned tool batch replay', () => {
+  it.each([false, true])('routes each checkpoint owner independently across a fork, question=%s', async question => {
+    const interrupts = await Promise.all(['left', 'right'].map(async member => ({
+      id: `${member}-interrupt`,
+      value: await attachToolBatchReplayState(
+        question ? { type: 'ask_user_question', question: { question: 'Continue?' } } : approval,
+        JSON.stringify(['source', '', member, 'user', 'source-thread']),
+        new Map([[JSON.stringify(['source', member]), new Map()]]),
+      ),
+    })));
+    const config: RunnableConfig = { configurable: {
+      user_id: 'user', thread_id: 'child-thread',
+      __pregel_scratchpad: { resume: [] },
+      __librechat_tool_approval_execution_scope: 'fork',
+    } };
+    restoreToolReplayConfigs(config.configurable!, interrupts, 'source', 'fork', 'child-thread', new Set(interrupts.map(entry => entry.id)));
+    const original = config.configurable?.[TOOL_BATCH_REPLAY_KEY];
+    for (const member of ['left', 'right']) {
+      const owner = getToolBatchReplayOwner(config, member);
+      const selected = getToolReplayConfig(config, owner);
+      expect(selected).not.toBe(config);
+      expect(selected.configurable?.[TOOL_REPLAY_CONFIGS_KEY]).toBeUndefined();
+      expect(getToolBatchReplayState(selected.configurable)?.interruptId).toBe(`${member}-interrupt`);
+      expect((await restoreToolBatchReplayState(selected, owner))[0].batch).toBe(JSON.stringify(['fork', member]));
+      if (!question) expect(getToolApprovalReviewEvidence(selected)?.owner).toBe(owner);
+      const foreign = {
+        ...config,
+        configurable: { ...config.configurable, user_id: 'different-user' },
+      };
+      const neutral = getToolReplayConfig(foreign, getToolBatchReplayOwner(foreign, member));
+      expect(neutral.configurable?.[TOOL_REPLAY_CONFIGS_KEY]).toBeUndefined();
+      expect(neutral.configurable?.[TOOL_PENDING_APPROVAL_KEY]).toBeUndefined();
+      expect(neutral.configurable?.[TOOL_BATCH_REPLAY_KEY]).toBeUndefined();
+      expect(getToolApprovalReviewEvidence(neutral)).toBeUndefined();
+      expect(neutral.configurable?.[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY]).toBeUndefined();
+    }
+    expect(config.configurable?.[TOOL_BATCH_REPLAY_KEY]).toBe(original);
+    expect(getToolBatchReplayState(interrupts[0].value)?.records[0].owner).toBe(JSON.stringify(['source', '', 'left', 'user', 'source-thread']));
+  });
+
+  it.each([false, true].flatMap(question => [false, true].map(resumeRight => ({ question, resumeRight }))))('restores unaddressed settled records without approval authority: %j', async ({ question, resumeRight }) => {
+    const payload = question ? { type: 'ask_user_question', question: { question: 'Continue?' } } : approval;
+    const pending = await Promise.all(['left', 'right'].map(async member => ({
+      id: `${member}-interrupt`,
+      value: await attachToolBatchReplayState(payload,
+        JSON.stringify(['source', '', member, 'user', 'source-thread']),
+        new Map([[JSON.stringify(['source', member]), new Map([['shared-effect', {
+          proposal: { name: `${member}_effect`, args: {} },
+          output: new ToolMessage({ content: `${member} completed`, tool_call_id: 'shared-effect' }),
+          additionalContexts: [],
+        }]])]]),
+      ),
+    })));
+    const config: RunnableConfig = { configurable: { user_id: 'user', thread_id: 'child-thread', __librechat_tool_approval_execution_scope: 'fork' } };
+    restoreToolReplayConfigs(config.configurable!, pending, 'source', 'fork', 'child-thread', new Set(resumeRight ? ['right-interrupt'] : []));
+    const leftOwner = getToolBatchReplayOwner(config, 'left');
+    const left = getToolReplayConfig(config, leftOwner);
+    expect(getToolApprovalReviewEvidence(left)).toBeUndefined();
+    expect(getCheckpointPendingApproval(left)?.interruptId).toBe(question ? undefined : 'left-interrupt');
+    expect(getToolBatchReplayState(left.configurable)?.approvalOwner).toBeUndefined();
+    expect((await restoreToolBatchReplayState(left, leftOwner))[0].results[0][1].output).toMatchObject({ content: 'left completed' });
+    expect(getToolApprovalReviewEvidence(config)?.interruptId).toBe(question || !resumeRight ? undefined : 'right-interrupt');
+    const right = getToolReplayConfig(config, getToolBatchReplayOwner(config, 'right'));
+    expect(getToolApprovalReviewEvidence(right)?.interruptId).toBe(question || !resumeRight ? undefined : 'right-interrupt');
+    expect(getToolBatchReplayState(pending[0].value)?.approvalOwner).toBe(question ? undefined : JSON.stringify(['source', '', 'left', 'user', 'source-thread']));
+  });
+
+  it.each([false, true].flatMap(questionFirst => ['approval', 'question', 'both'].map(resumed => ({ questionFirst, resumed }))))('isolates ownerless question evidence without leaking decisions: %j', async ({ questionFirst, resumed }) => {
+    const approve = { id: 'approval', value: await attachToolBatchReplayState(approval, JSON.stringify(['source', '', 'left', 'user', 'source-thread']), new Map()) };
+    const question = { id: 'question', value: { type: 'ask_user_question', question: { question: 'Explain?' } } };
+    const config: RunnableConfig = { configurable: { user_id: 'user', thread_id: 'child-thread', __librechat_tool_approval_execution_scope: 'fork' } };
+    restoreToolReplayConfigs(config.configurable!, questionFirst ? [question, approve] : [approve, question], 'source', 'fork', 'child-thread', new Set(resumed === 'both' ? ['approval', 'question'] : [resumed]));
+    const selectedApproval = getToolReplayConfig(config, getToolBatchReplayOwner(config, 'left'));
+    const selectedQuestion = getToolReplayConfig(config, getToolBatchReplayOwner(config, 'right'));
+    expect(getToolApprovalReviewEvidence(selectedApproval)?.interruptId).toBe(resumed === 'question' ? undefined : 'approval');
+    expect(getToolApprovalReviewEvidence(selectedQuestion)).toBeUndefined();
+    expect(getToolBatchReplayState(selectedQuestion.configurable)).toBeUndefined();
+    const foreign = { configurable: { ...config.configurable, user_id: 'different-user' } };
+    expect(() => getToolReplayConfig(foreign, getToolBatchReplayOwner(foreign, 'left'))).toThrow('execution identity changed');
+    const foreignThread = { configurable: { ...config.configurable, thread_id: 'other-thread' } };
+    expect(() => getToolReplayConfig(foreignThread, getToolBatchReplayOwner(foreignThread, 'right'))).toThrow('execution identity changed');
+  });
+
+  it.each([false, true].flatMap(reverse => [false, true].flatMap(nested => ['left', 'right', 'both'].map(addressed => ({ reverse, nested, addressed })))))(
+    'merges inherited parent records without conflating question members: %j',
+    async ({ reverse, nested, addressed }) => {
+      const parentOwner = JSON.stringify([nested ? 'middle-scope' : 'root-scope', 'root-ns', 'parent', 'user', 'thread']);
+      const manifest: SubagentResumeManifest = { version: 1, executions: [{
+        parentToolCallId: 'spawn', childRunId: 'child-run', approvalExecutionScope: 'child-scope',
+        checkpoints: [{ threadId: 'child-thread', checkpointNs: '', checkpointId: 'checkpoint' }],
+        graphState: { toolCallSteps: [], toolSessions: [], toolNodes: [], eagerToolUsage: [], eagerToolSuppressions: [] },
+        approvalReplays: [],
+      }] };
+      if (nested) {
+        manifest.executions = [{
+          ...manifest.executions[0],
+          childRunId: 'middle-run',
+          approvalExecutionScope: 'middle-scope',
+          descendant: { version: 1, executions: [{ ...manifest.executions[0] }] },
+        }];
+      }
+      const pending = await Promise.all(['left', 'right'].map(async member => {
+        const leaf = await attachToolBatchReplayState(
+          { type: 'ask_user_question', question: { question: member } },
+          JSON.stringify(['child-scope', '', member, 'user', 'child-thread']),
+          new Map([[JSON.stringify(['child-scope', 'child-batch']), new Map()]]),
+        );
+        return { id: member, value: await attachToolBatchReplayState(
+          attachSubagentResumeManifest(leaf, manifest), parentOwner,
+          new Map([[JSON.stringify(['root-scope', 'parent-batch']), new Map()]]),
+        ) };
+      }));
+      const config: RunnableConfig = { configurable: { user_id: 'user', thread_id: 'thread', __librechat_tool_approval_execution_scope: 'root-scope' } };
+      restoreToolReplayConfigs(config.configurable!, reverse ? [...pending].reverse() : pending,
+        'root-scope', 'root-scope', 'thread', new Set(addressed === 'both' ? ['left', 'right'] : [addressed]));
+      const restoredParent = getToolReplayConfig(config, parentOwner);
+      expect(await restoreToolBatchReplayState(restoredParent, parentOwner)).toHaveLength(1);
+      expect(restoredParent.configurable?.[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY]).toEqual(manifest);
+      expect(getToolApprovalReviewEvidence(restoredParent)).toBeUndefined();
+      for (const member of ['left', 'right']) {
+        const owner = JSON.stringify(['child-scope', '', member, 'user', 'child-thread']);
+        const leaf = getToolReplayConfig(config, owner);
+        expect(await restoreToolBatchReplayState(leaf, owner)).toHaveLength(1);
+        expect(getToolApprovalReviewEvidence(leaf)).toBeUndefined();
+        expect(getToolBatchReplayState(leaf.configurable)?.approvalOwner).toBeUndefined();
+      }
+      const state = getToolBatchReplayState(pending[1].value)!;
+      const inherited = state.records.find(record => record.owner === parentOwner)!;
+      inherited.data = 'conflicting';
+      pending[1].value = attachSubagentResumeManifest({
+        type: 'ask_user_question', question: { question: 'right' },
+        [TOOL_BATCH_REPLAY_KEY]: state,
+      }, manifest);
+      expect(() => restoreToolReplayConfigs({}, pending, 'root-scope', 'root-scope', 'thread', new Set(['left', 'right']))).toThrow('Conflicting parent tool replay');
+    },
+  );
+
+  it('rejects ambiguous member evidence rather than accepting the last checkpoint', async () => {
+    const payload = await attachToolBatchReplayState(approval, JSON.stringify(['source', '', 'member']), new Map());
+    expect(() => restoreToolReplayConfigs({}, [{ id: 'first', value: payload }, { id: 'second', value: payload }], 'source', 'fork', 'child-thread', new Set(['first', 'second']))).toThrow('Ambiguous tool replay checkpoint owner');
+  });
+
+  it('does not let one restored owner select authorization for a different member', async () => {
+    const payload = await attachToolBatchReplayState(approval, JSON.stringify(['source', '', 'left']), new Map());
+    const config: RunnableConfig = { configurable: { thread_id: 'child-thread', __librechat_tool_approval_execution_scope: 'fork' } };
+    restoreToolReplayConfigs(config.configurable!, [{ id: 'only-left', value: payload }], 'source', 'fork', 'child-thread', new Set(['only-left']));
+    const selected = getToolReplayConfig(config, getToolBatchReplayOwner(config, 'right'));
+    expect(selected).toBe(config);
+    expect(getToolApprovalReviewEvidence(selected)?.owner).not.toBe(getToolBatchReplayOwner(config, 'right'));
+  });
+
   it.each([
     { interruptId: 'current', resume: [[]], isChildReplay: false, expected: 'active' },
     { interruptId: 'prior', resume: [[]], isChildReplay: false, expected: 'unverifiable' },
@@ -420,4 +580,75 @@ describe('checkpoint-owned tool batch replay', () => {
       getToolBatchReplayState({ [TOOL_BATCH_REPLAY_KEY]: undefined })
     ).toBeUndefined();
   });
+
+  it.each([false, true])('rejects an unaddressed malformed sibling manifest, wrapped=%s', (wrapped) => {
+    const malformed = {
+      type: 'ask_user_question',
+      question: { question: 'Continue?' },
+      [SUBAGENT_RESUME_MANIFEST_CONFIG_KEY]: { version: 2, executions: [] },
+    };
+    const value = wrapped ? attachRunStepResumeState(malformed, {
+      version: 1, revision: 0, nextIndex: 0, steps: [], toolCallSteps: [],
+    }) : malformed;
+    expect(() => restoreToolReplayConfigs({}, [
+      { id: 'addressed', value: approval }, { id: 'unaddressed', value },
+    ], 'source', 'target', 'thread', new Set(['addressed'])))
+      .toThrow('Invalid subagent resume manifest');
+  });
+
+  it.each(['approval', 'ownerless', 'unmatched'].flatMap((kind) => [false, true].map((reverse) => ({ kind, reverse }))))(
+    'does not inherit a sibling manifest: %j', async ({ kind, reverse }) => {
+      const manifest: SubagentResumeManifest = { version: 1, executions: [{
+        parentToolCallId: 'shared-spawn', childRunId: 'existing-child', approvalExecutionScope: 'child-scope',
+        checkpoints: [{ threadId: 'child-thread', checkpointId: 'checkpoint', checkpointNs: '' }],
+        graphState: { toolCallSteps: [], toolSessions: [], toolNodes: [], eagerToolUsage: [], eagerToolSuppressions: [] },
+        approvalReplays: [],
+      }] };
+      const owner = (member: string) => JSON.stringify(['scope', '', member, 'user', 'thread']);
+      const child = { id: 'child', value: attachSubagentResumeManifest(await attachToolBatchReplayState(approval, owner('left'), new Map()), manifest) };
+      const other = { id: 'other', value: kind === 'ownerless' ? { type: 'ask_user_question' } : await attachToolBatchReplayState(approval, owner('right'), new Map()) };
+      const config: RunnableConfig = { configurable: { user_id: 'user', thread_id: 'thread', __librechat_tool_approval_execution_scope: 'scope', __pregel_scratchpad: { resume: [] } } };
+      restoreToolReplayConfigs(config.configurable!, reverse ? [other, child] : [child, other], 'scope', 'scope', 'thread', new Set(['child']));
+      const selected = getToolReplayConfig(config, owner(kind === 'unmatched' ? 'joined' : 'right'));
+      expect(selected.configurable?.[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY]).toBeUndefined();
+      expect(selected.configurable?.[TOOL_REPLAY_CONFIGS_KEY]).toBeUndefined();
+      expect(getToolApprovalReviewEvidence(selected)).toBeUndefined();
+      expect(getToolReplayConfig(config, owner('left')).configurable?.[SUBAGENT_RESUME_MANIFEST_CONFIG_KEY]).toEqual(manifest);
+    }
+  );
+
+  it.each([
+    { runtime: {}, expected: 'reject' },
+    { runtime: { __pregel_scratchpad: { resume: [] }, __pregel_resume_map: { pending: [] } }, expected: 'stale' },
+    { runtime: { __pregel_scratchpad: { resume: [[]] }, __pregel_resume_map: { pending: [], sibling: [] } }, expected: 'reject' },
+    { runtime: { __pregel_scratchpad: { resume: [], nullResume: [] } }, expected: 'reject' },
+    { runtime: { __pregel_scratchpad: { resume: [[]] } }, expected: 'reject' },
+  ])('distinguishes active or ambiguous foreign approval from stale downstream context: $expected %j', async ({ runtime, expected }) => {
+    const config: RunnableConfig = { configurable: { thread_id: 'thread', user_id: 'original', __librechat_tool_approval_execution_scope: 'scope', ...runtime } };
+    const pending = await Promise.all(['left', 'right'].map(async (member) => ({ id: member, value: await attachToolBatchReplayState(approval,
+      JSON.stringify(['scope', '', member, 'original', 'thread']), new Map()) })));
+    restoreToolReplayConfigs(config.configurable!, pending, 'scope', 'scope', 'thread', new Set(['left', 'right']));
+    const changed = { ...config, configurable: { ...config.configurable, thread_id: 'other-thread', user_id: 'other-user' } };
+    const select = () => getToolReplayConfig(changed, getToolBatchReplayOwner(changed, 'left'));
+    if (expected === 'reject') expect(select).toThrow('execution owner changed');
+    else {
+      const neutral = select();
+      expect(neutral.configurable?.[TOOL_REPLAY_CONFIGS_KEY]).toBeUndefined();
+      expect(getToolApprovalReviewEvidence(neutral)).toBeUndefined();
+    }
+  });
+
+  it('does not invent approval authority for an opaque custom resume', async () => {
+    const config: RunnableConfig = { configurable: { user_id: 'original', thread_id: 'thread', __librechat_tool_approval_execution_scope: 'scope',
+      __pregel_scratchpad: { resume: ['custom answer'] }, __pregel_resume_map: { left: 'custom answer', right: 'custom answer' },
+    } };
+    const pending = await Promise.all(['left', 'right'].map(async (member) => ({ id: member, value: await attachToolBatchReplayState({ question: 'Custom question' },
+      JSON.stringify(['scope', '', member, 'original', 'thread']), new Map([[JSON.stringify(['scope', 'completed']), new Map()]])) })));
+    restoreToolReplayConfigs(config.configurable!, pending, 'scope', 'scope', 'thread', new Set(['left', 'right']));
+    const changed = { ...config, configurable: { ...config.configurable, user_id: 'other-user' } };
+    const neutral = getToolReplayConfig(changed, getToolBatchReplayOwner(changed, 'left'));
+    expect(getToolApprovalReviewEvidence(neutral)).toBeUndefined();
+    expect(neutral.configurable?.[TOOL_REPLAY_CONFIGS_KEY]).toBeUndefined();
+  });
+
 });

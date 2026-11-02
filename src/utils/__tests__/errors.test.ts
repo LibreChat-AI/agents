@@ -3,6 +3,7 @@ import {
   getContextOverflowInfo,
   isLikelyContextOverflowError,
   isContextOverflowError,
+  isProviderCancellation,
   extractErrorMessage,
 } from '@/utils/errors';
 import {
@@ -16,6 +17,111 @@ const UNDER_PRESSURE = {
   estimatedPromptTokens: 190_000,
   maxContextTokens: 200_000,
 };
+
+describe('isProviderCancellation — provider timeouts', () => {
+  const timeoutMessage = 'The operation was aborted due to timeout';
+  const timeoutErrors = [
+    ['native timeout', new DOMException(timeoutMessage, 'TimeoutError')],
+    [
+      'provider timeout name',
+      { name: 'TimeoutError', message: 'Operation aborted' },
+    ],
+    [
+      'SDK timeout name',
+      { name: 'APIConnectionTimeoutError', message: 'Request was aborted' },
+    ],
+    ['timeout message', new Error(timeoutMessage)],
+    ['timeout string', timeoutMessage],
+    [
+      'timed out request',
+      new Error('Request was aborted because it timed out'),
+    ],
+    ['timed-out operation', new Error('Operation canceled: request timed-out')],
+    [
+      'underscored timeout',
+      new Error('Operation cancelled: request timed_out'),
+    ],
+    ['bare abort with timeout', new Error('AbortError: request timed out')],
+    [
+      'serialized timeout',
+      new Error(
+        JSON.stringify({
+          error: { name: 'TimeoutError', message: timeoutMessage },
+        })
+      ),
+    ],
+  ] as const;
+
+  it.each(timeoutErrors)(
+    'does not treat %s as cancellation',
+    (_label, error) => {
+      expect(isProviderCancellation(error)).toBe(false);
+      for (const key of [
+        'cause',
+        'error',
+        'body',
+        'data',
+        'response',
+        '$metadata',
+      ]) {
+        expect(isProviderCancellation({ [key]: error })).toBe(false);
+        expect(
+          isProviderCancellation(
+            new Error('Provider failed', { cause: { [key]: error } })
+          )
+        ).toBe(false);
+      }
+    }
+  );
+
+  it('recognizes the reason from a real AbortSignal.timeout without leaving a pending task', async () => {
+    const signal = AbortSignal.timeout(0);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    expect(signal.aborted).toBe(true);
+    expect(signal.reason).toBeInstanceOf(DOMException);
+    expect(signal.reason.name).toBe('TimeoutError');
+    expect(isProviderCancellation(signal.reason)).toBe(false);
+  });
+
+  it.each([
+    ['AbortError', new DOMException(timeoutMessage, 'AbortError')],
+    [
+      'APIUserAbortError',
+      { name: 'APIUserAbortError', message: timeoutMessage },
+    ],
+    ['CanceledError', { name: 'CanceledError', message: timeoutMessage }],
+    ['CancelledError', { name: 'CancelledError', message: timeoutMessage }],
+    ['ABORT_ERR', { code: 'ABORT_ERR', message: timeoutMessage }],
+    ['ERR_CANCELED', { code: 'ERR_CANCELED', message: timeoutMessage }],
+    [
+      'explicit user abort',
+      new Error('The user aborted a request after a timeout'),
+    ],
+    [
+      'explicit user cancellation',
+      new Error('The user canceled a timed out request'),
+    ],
+  ])('preserves %s even when timeout text is present', (_label, error) => {
+    expect(isProviderCancellation(error)).toBe(true);
+  });
+
+  it.each(['cause', 'error', 'body', 'data', 'response', '$metadata'])(
+    'preserves true cancellation under %s of a timeout',
+    (key) => {
+      const error = Object.assign(
+        new DOMException(timeoutMessage, 'TimeoutError'),
+        {
+          [key]: new Error('Provider failed', {
+            cause: { code: 'ERR_CANCELED' },
+          }),
+        }
+      );
+
+      expect(isProviderCancellation(error)).toBe(true);
+    }
+  );
+});
 
 describe('getContextOverflowInfo — captured provider signatures', () => {
   for (const signature of OVERFLOW_SIGNATURES) {

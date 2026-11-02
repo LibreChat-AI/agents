@@ -2244,6 +2244,51 @@ describe('invocationParams cache_control', () => {
   });
 });
 
+describe('default max_tokens', () => {
+  const defaultMaxTokens = (model: string, maxTokens?: number): number =>
+    new ChatAnthropic({ model, maxTokens, apiKey: 'testing' }).invocationParams(
+      {}
+    ).max_tokens;
+
+  test.each([
+    'claude-sonnet-5-5',
+    'claude-sonnet-5',
+    'claude-haiku-5-5',
+    'claude-opus-5-5',
+    'claude-fable-5-1',
+    'claude-opus-4-8',
+    'claude-haiku-4-5',
+    'claude-sonnet-6',
+    'claude-sonnet-5-5-20261001',
+  ])('gives %s the current-generation default', (model) => {
+    expect(defaultMaxTokens(model)).toBe(16384);
+  });
+
+  test.each([
+    ['claude-3-5-haiku-20241022', 8192],
+    ['claude-3-haiku-20240307', 4096],
+    ['claude-2.1', 4096],
+    ['anthropic.claude-sonnet-5-5', 4096],
+    ['claude-sonnet-five', 4096],
+  ])('keeps the upstream default for %s', (model, expected) => {
+    expect(defaultMaxTokens(model)).toBe(expected);
+  });
+
+  test('keeps an explicit maxTokens', () => {
+    expect(defaultMaxTokens('claude-sonnet-5-5', 2048)).toBe(2048);
+    expect(defaultMaxTokens('claude-haiku-5-5', 64000)).toBe(64000);
+  });
+
+  test('sends a max_tokens set through invocationKwargs', () => {
+    const model = new ChatAnthropic({
+      model: 'claude-sonnet-5-5',
+      apiKey: 'testing',
+      invocationKwargs: { max_tokens: 2048 },
+    });
+    expect(model.invocationParams({}).max_tokens).toBe(2048);
+  });
+});
+
 describe('Opus 4.7', () => {
   test('default max_tokens for claude-opus-4-7 is 16384', () => {
     const model = new ChatAnthropic({

@@ -335,7 +335,7 @@ describe('subagent host argument declarations', () => {
     ).toThrow('only a lazy resolveAgentInputs config');
     expect(() =>
       normalizeSubagentConfigEntries([graph], parentContext)
-    ).toThrow('configId/resolveAgentInputs/hostArgs');
+    ).toThrow('resolveAgentInputs/hostArgs');
     expect(normalizeSubagentConfigEntries([lazy], parentContext)).toEqual([
       lazy,
     ]);

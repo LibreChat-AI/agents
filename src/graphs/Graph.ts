@@ -178,6 +178,10 @@ import {
   createRemoveAllMessage,
   messagesStateReducer,
 } from '@/messages/reducer';
+import {
+  isThinkingEnabled,
+  getConfiguredCompletionTokens,
+} from '@/llm/request';
 import { createToolHistoryPreparation } from '@/messages/toolHistoryProjection';
 import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
 import { shouldTraceToolNodeForLangfuse } from '@/langfuseToolOutputTracing';
@@ -202,7 +206,6 @@ import { AgentContext } from '@/agents/AgentContext';
 import { createFakeStreamingLLM } from '@/llm/fake';
 import { handoffStateAnnotation } from './handoff';
 import { handleToolCalls } from '@/tools/handlers';
-import { isThinkingEnabled } from '@/llm/request';
 import { resolveMaxSeals } from '@/llm/preempt';
 import { initializeModel } from '@/llm/init';
 import { HandlerRegistry } from '@/events';
@@ -225,6 +228,22 @@ const EMPTY_PREEMPT_BOUNDARY: PreemptBoundaryResult = {
 
 /** Minimum relative variance before calibrated toolSchemaTokens overrides current value. */
 const CALIBRATION_VARIANCE_THRESHOLD = 0.15;
+
+function parseSubagentToolNodeStateKey(stateKey: string): string[] | undefined {
+  try {
+    const identity: unknown = JSON.parse(stateKey);
+    if (
+      !Array.isArray(identity) ||
+      (identity.length !== 3 && identity.length !== 4) ||
+      !identity.every((part): part is string => typeof part === 'string')
+    ) {
+      return undefined;
+    }
+    return identity;
+  } catch {
+    return undefined;
+  }
+}
 
 function createChildHandlerRegistry(
   source: HandlerRegistry | undefined
@@ -485,26 +504,6 @@ function clearCurrentDeltaStepMarkers({
     graph.messageStepHasTextDeltas.delete(stepId);
     graph.reasoningStepHasDeltas.delete(stepId);
   }
-}
-
-/**
- * The completion allowance the caller configured, under whichever key the
- * provider's client uses. Providers count it against the same ceiling as the
- * prompt, so overflow recovery has to reserve it when the error did not
- * itemize the total.
- */
-function getConfiguredCompletionTokens(
-  clientOptions: t.ClientOptions | undefined
-): number | undefined {
-  const options = clientOptions as
-    | { maxTokens?: unknown; maxOutputTokens?: unknown }
-    | undefined;
-  for (const value of [options?.maxTokens, options?.maxOutputTokens]) {
-    if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
-      return value;
-    }
-  }
-  return undefined;
 }
 
 /**
@@ -1172,15 +1171,65 @@ export abstract class Graph<
         return [nodeState.stateKey, node] as const;
       })
     );
-    if (toolNodesByKey.size !== state.toolNodes.length) {
+    if (
+      toolNodesByKey.size !== this._compiledToolNodes.size ||
+      toolNodesByKey.size !== state.toolNodes.length
+    ) {
       throw new Error('Cannot restore changed subagent tool topology.');
     }
+    const savedStateKeys = new Set<string>();
+    const toolNodeStatesByKey = new Map<string, SubagentToolNodeResumeState>();
+    const legacyNodeStatesByKey = new Map<string, SubagentToolNodeResumeState>();
     for (const nodeState of state.toolNodes) {
-      if (!toolNodesByKey.has(nodeState.stateKey)) {
+      const identity = parseSubagentToolNodeStateKey(nodeState.stateKey);
+      if (identity == null) {
         throw new Error(
           `Cannot restore subagent tool state for "${nodeState.stateKey}".`
         );
       }
+      const stateKey = JSON.stringify(identity);
+      const exactMatch = toolNodesByKey.has(stateKey);
+      if (
+        savedStateKeys.has(stateKey) ||
+        (!exactMatch && identity.length !== 3)
+      ) {
+        throw new Error(
+          `Cannot restore subagent tool state for "${nodeState.stateKey}".`
+        );
+      }
+      savedStateKeys.add(stateKey);
+      if (exactMatch) {
+        toolNodeStatesByKey.set(stateKey, nodeState);
+        continue;
+      }
+      legacyNodeStatesByKey.set(stateKey, nodeState);
+    }
+    const toolNodeKeysByLegacyKey = new Map<string, string | null>();
+    for (const stateKey of toolNodesByKey.keys()) {
+      if (toolNodeStatesByKey.has(stateKey)) {
+        continue;
+      }
+      const identity = parseSubagentToolNodeStateKey(stateKey);
+      if (identity == null) {
+        throw new Error('Cannot restore changed subagent tool topology.');
+      }
+      const legacyKey = JSON.stringify(identity.slice(0, 3));
+      toolNodeKeysByLegacyKey.set(
+        legacyKey,
+        toolNodeKeysByLegacyKey.has(legacyKey) ? null : stateKey
+      );
+    }
+    for (const [legacyKey, nodeState] of legacyNodeStatesByKey) {
+      const stateKey = toolNodeKeysByLegacyKey.get(legacyKey);
+      if (stateKey == null || toolNodeStatesByKey.has(stateKey)) {
+        throw new Error(
+          `Cannot restore subagent tool state for "${nodeState.stateKey}".`
+        );
+      }
+      toolNodeStatesByKey.set(stateKey, nodeState);
+    }
+    if (toolNodeStatesByKey.size !== toolNodesByKey.size) {
+      throw new Error('Cannot restore changed subagent tool topology.');
     }
     const registry =
       state.toolOutputReferences == null
@@ -1204,8 +1253,8 @@ export abstract class Graph<
           : { files: context.files.map((file) => ({ ...file })) }),
       });
     }
-    for (const nodeState of state.toolNodes) {
-      const node = toolNodesByKey.get(nodeState.stateKey)!;
+    for (const [stateKey, nodeState] of toolNodeStatesByKey) {
+      const node = toolNodesByKey.get(stateKey)!;
       node.restoreSubagentResumeState(nodeState);
     }
     this.clearEagerEventToolUsageCounts();
@@ -3182,6 +3231,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     config,
     originalToolContent,
     estimatedPromptTokens,
+    windowMessages,
   }: {
     recovery: OverflowRecoveryPlan;
     agentContext: AgentContext;
@@ -3191,6 +3241,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     originalToolContent?: Map<number, string>;
     /** Size of the rejected prompt, recorded to detect a correction that changed nothing. */
     estimatedPromptTokens?: number;
+    windowMessages: BaseMessage[];
   }): Partial<t.AgentSubgraphState> {
     const previousBudget = agentContext.maxContextTokens;
     /**
@@ -3238,6 +3289,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         remainingContextTokens: 0,
         agentId: agentId || agentContext.agentId,
         reason: 'overflow',
+        windowMessages,
         allowSummarization,
       },
     };
@@ -3274,12 +3326,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     agentContext,
     agentId,
     messageCount,
+    windowMessages,
     contextUsage,
     config,
   }: {
     agentContext: AgentContext;
     agentId: string;
     messageCount: number;
+    windowMessages: BaseMessage[];
     contextUsage: t.ContextUsageEvent | null;
     config: RunnableConfig;
   }): Promise<Partial<t.AgentSubgraphState> | null> {
@@ -3311,6 +3365,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           remainingContextTokens: contextUsage?.remainingContextTokens ?? 0,
           agentId: agentId || agentContext.agentId,
           reason: 'manual',
+          windowMessages,
         },
         /** A checkpointed thread may still hold the previous compaction's
          *  summary; only the one this run produces may be reported. */
@@ -3533,6 +3588,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           agentContext,
           agentId,
           messageCount: messages.length,
+          windowMessages: context,
           contextUsage,
           config,
         });
@@ -3590,6 +3646,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             return {
               summarizationRequest: {
                 remainingContextTokens: remainingContextTokens ?? 0,
+                windowMessages: context,
                 agentId: agentId || agentContext.agentId,
               },
             };
@@ -3619,6 +3676,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           agentContext,
           agentId,
           messageCount: messages.length,
+          windowMessages: messagesToUse,
           contextUsage: null,
           config,
         });
@@ -4603,6 +4661,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             instructionTokens: agentContext.instructionTokens,
             canSummarize: agentContext.summarizationEnabled === true,
             configuredCompletionTokens: getConfiguredCompletionTokens(
+              fallbackContext?.provider ?? agentContext.provider,
               fallbackContext?.clientOptions ?? agentContext.clientOptions
             ),
             attemptsSoFar: agentContext.overflowRecoveryAttempts,
@@ -4645,6 +4704,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             agentId,
             config,
             originalToolContent: prunedOriginalToolContent,
+            windowMessages: messagesToUse,
             estimatedPromptTokens: recoveryPromptEstimate,
           });
         }
@@ -4879,6 +4939,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             agentId,
             config,
             originalToolContent: prunedOriginalToolContent,
+            windowMessages: messagesToUse,
             estimatedPromptTokens: fallbackRecoveryPromptEstimate,
           });
         }
