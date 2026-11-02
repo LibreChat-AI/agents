@@ -50,6 +50,7 @@ export * from './eventActor';
 
 /* HITL helpers */
 export * from './hitl';
+export * from './verification';
 
 /* Types */
 export type * from './types';
