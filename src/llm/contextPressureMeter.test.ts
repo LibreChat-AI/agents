@@ -14,11 +14,26 @@ function contentLength(message: BaseMessage): number {
 
 describe('createContextPressureMeter', () => {
   it.each([
-    { length: 147, projectedMessageTokens: 150, fits: false },
-    { length: 88, projectedMessageTokens: 91, fits: false },
-    { length: 87, projectedMessageTokens: 90, fits: true },
+    {
+      scenario: '@scenario:an-unchanged-oversized-retained-baseline-does-not-fit',
+      length: 147,
+      projectedMessageTokens: 150,
+      fits: false,
+    },
+    {
+      scenario: '@scenario:a-compacted-projection-one-token-above-capacity-does-not-fit',
+      length: 88,
+      projectedMessageTokens: 91,
+      fits: false,
+    },
+    {
+      scenario: '@scenario:a-compacted-projection-exactly-at-capacity-fits',
+      length: 87,
+      projectedMessageTokens: 90,
+      fits: true,
+    },
   ])(
-    'preserves baseline overage when projected content has $length tokens',
+    '$scenario preserves baseline overage when projected content has $length tokens',
     ({ length, projectedMessageTokens, fits }) => {
       const retained = new HumanMessage('x'.repeat(147));
       const meter = createContextPressureMeter({
