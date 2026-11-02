@@ -2,6 +2,7 @@ import { AIMessageChunk } from '@langchain/core/messages';
 import { ChatGenerationChunk } from '@langchain/core/outputs';
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
 import type { SmoothItem, SmoothPiece } from '@/llm/stream/smoother';
+import { hasMeaningfulReasoningPayload } from '@/messages/reasoningTypes';
 import { smoothStream } from '@/llm/stream/smoother';
 
 /**
@@ -138,7 +139,8 @@ function hasFinishReason(
   generationInfo: ChatGenerationChunk['generationInfo']
 ): boolean {
   return (
-    generationInfo?.finish_reason != null || generationInfo?.finishReason != null
+    generationInfo?.finish_reason != null ||
+    generationInfo?.finishReason != null
   );
 }
 
@@ -159,21 +161,16 @@ export function hasToolCallChunks(message: AIMessageChunk): boolean {
   return (message.tool_call_chunks?.length ?? 0) > 0;
 }
 
-export function hasReasoningKwargs(message: AIMessageChunk): boolean {
+export function hasReasoningKwargs(
+  message: Pick<AIMessageChunk, 'additional_kwargs'>
+): boolean {
   const kwargs = message.additional_kwargs;
-  if (
-    typeof kwargs.reasoning_content === 'string' &&
-    kwargs.reasoning_content !== ''
-  ) {
-    return true;
-  }
-  if (
-    Array.isArray(kwargs.reasoning_details) &&
-    kwargs.reasoning_details.length > 0
-  ) {
-    return true;
-  }
-  return kwargs.reasoning != null;
+  return (
+    hasMeaningfulReasoningPayload(kwargs.reasoning_content) ||
+    hasMeaningfulReasoningPayload(kwargs.reasoning) ||
+    (Array.isArray(kwargs.reasoning_details) &&
+      kwargs.reasoning_details.some(hasMeaningfulReasoningPayload))
+  );
 }
 
 /**
@@ -195,9 +192,8 @@ export function getReasoningKwargsText(message: AIMessageChunk): string {
     return reasoning;
   }
   if (reasoning != null && typeof reasoning === 'object') {
-    const summaryText = (
-      reasoning as { summary?: { text?: unknown }[] }
-    ).summary?.[0]?.text;
+    const summaryText = (reasoning as { summary?: { text?: unknown }[] })
+      .summary?.[0]?.text;
     if (typeof summaryText === 'string' && summaryText !== '') {
       return summaryText;
     }

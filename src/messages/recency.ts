@@ -308,6 +308,8 @@ export function splitAtRecencyBoundary(
   const turnStarts = findTurnStarts(messages, options.provider);
 
   if (turnStarts.length === 0) {
+    const toolWindowSplit = splitToolWindowAtRecencyBoundary(messages, options);
+    if (toolWindowSplit != null) return toolWindowSplit;
     return {
       head: messages,
       tail: [],
@@ -411,5 +413,81 @@ export function splitAtRecencyBoundary(
     tailTurnCount,
     tailStartIndex,
     usedIntraTurnFallback: false,
+  };
+}
+
+function inspectPairingBalancedWindow(
+  messages: BaseMessage[],
+  provider?: ProviderName
+): { starts: number[]; hasCompletedToolCalls: boolean } {
+  const lastIndexBySourceId = new Map<string, number>();
+  const sourceIds = messages.map((message, index) => {
+    const ids = getCoverageSourceIds(message);
+    for (const id of ids) lastIndexBySourceId.set(id, index);
+    return ids;
+  });
+  const calls: ProviderToolCallIndex = new Map();
+  const straddling = new Set<string>();
+  const starts = [0];
+  let newestExchangeStart = 0;
+  let hasCompletedToolCalls = false;
+  for (let i = 0; i < messages.length; i++) {
+    const beforeIsBalanced = calls.size === 0 && straddling.size === 0;
+    const pairing = inspectMessagePairing(messages[i], calls, provider);
+    hasCompletedToolCalls ||= pairing.completedToolCalls > 0;
+    if (beforeIsBalanced && Number(calls.size) > 0) newestExchangeStart = i;
+    if (pairing.userMessage && !pairing.trustedHumanToolResult) {
+      newestExchangeStart = i;
+      if (i > 0 && beforeIsBalanced && starts[starts.length - 1] !== i) {
+        starts.push(i);
+      }
+    }
+    for (const id of sourceIds[i]) {
+      if (lastIndexBySourceId.get(id) === i) straddling.delete(id);
+      else straddling.add(id);
+    }
+    if (
+      i + 1 < messages.length &&
+      pairing.completedToolCalls > 0 &&
+      calls.size === 0 &&
+      straddling.size === 0
+    ) {
+      starts.push(i + 1);
+    }
+  }
+  while (starts[starts.length - 1] > newestExchangeStart) starts.pop();
+  return {starts, hasCompletedToolCalls};
+}
+
+/** Safe suffix starts that keep the newest exchange and its source lineage. */
+export function getPairingBalancedSuffixStarts(
+  messages: BaseMessage[],
+  provider?: ProviderName
+): number[] {
+  return inspectPairingBalancedWindow(messages, provider).starts;
+}
+
+function splitToolWindowAtRecencyBoundary(
+  messages: BaseMessage[],
+  options: RecencyWindowOptions
+): RecencySplit | undefined {
+  const tokens = options.tokens ?? options.intraTurnTokens;
+  const count = options.tokenCounter;
+  if (tokens == null || !Number.isFinite(tokens) || tokens <= 0 || count == null) return undefined;
+  const {starts, hasCompletedToolCalls} = inspectPairingBalancedWindow(messages, options.provider);
+  if (!hasCompletedToolCalls) return undefined;
+  const suffixTokens = new Array<number>(messages.length + 1);
+  suffixTokens[messages.length] = 0;
+  for (let i = messages.length - 1; i >= 0; i--) suffixTokens[i] = suffixTokens[i + 1] + count(messages[i]);
+  let tailStartIndex = starts[starts.length - 1];
+  for (const start of starts) {
+    if (suffixTokens[start] <= tokens) {
+      tailStartIndex = start;
+      break;
+    }
+  }
+  return {
+    head: messages.slice(0, tailStartIndex), tail: messages.slice(tailStartIndex),
+    tailStartIndex, tailTurnCount: 0, usedIntraTurnFallback: true,
   };
 }

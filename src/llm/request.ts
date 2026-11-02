@@ -1,4 +1,5 @@
 import type * as t from '@/types';
+import { getCurrentClaudeDefaultMaxTokens } from '@/llm/anthropic/defaults';
 import { getProviderFamily } from '@/llm/providerRegistry';
 import { Providers } from '@/common';
 
@@ -80,4 +81,47 @@ export function getMaxOutputTokensKey(
     getProviderFamily(provider) === 'google'
     ? 'maxOutputTokens'
     : 'maxTokens';
+}
+
+/**
+ * The completion allowance the provider will reserve, under whichever key its
+ * client uses. Providers count it against the same ceiling as the prompt, so
+ * overflow recovery has to reserve it when the error did not itemize the
+ * total. Anthropic clients spread `invocationKwargs` over `max_tokens`, so a
+ * `max_tokens` there is the value actually sent. Without an explicit value, the
+ * built-in Anthropic client still sends its model default, so that default is
+ * reserved instead. Host providers in the Anthropic family may wrap a client
+ * with a different default, so they keep reserving nothing they did not
+ * configure.
+ */
+export function getConfiguredCompletionTokens(
+  provider: t.ProviderName,
+  clientOptions: t.ClientOptions | undefined
+): number | undefined {
+  const options = clientOptions as
+    | {
+        maxTokens?: unknown;
+        maxOutputTokens?: unknown;
+        invocationKwargs?: { max_tokens?: unknown };
+      }
+    | undefined;
+  const explicit = [
+    options?.invocationKwargs?.max_tokens,
+    options?.maxTokens,
+    options?.maxOutputTokens,
+  ];
+  for (const value of explicit) {
+    if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+      return value;
+    }
+  }
+  if (
+    explicit.some((value) => value != null) ||
+    provider !== Providers.ANTHROPIC
+  ) {
+    return undefined;
+  }
+  return getCurrentClaudeDefaultMaxTokens(
+    resolveClientOptionsModel(clientOptions)
+  );
 }
