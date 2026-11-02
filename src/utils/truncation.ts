@@ -120,6 +120,13 @@ export function truncateToolInput(
   };
 }
 
+export function toolResultTruncationIndicator(
+  contentLength: number,
+  maxChars: number
+): string {
+  return `\n\n… [truncated: ${contentLength} chars exceeded ${maxChars} limit] …\n\n`;
+}
+
 /**
  * Truncates tool result content that exceeds `maxChars` using a head+tail
  * strategy. Keeps the beginning (structure/headers) and end (return value /

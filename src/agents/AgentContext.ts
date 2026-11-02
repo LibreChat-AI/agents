@@ -41,6 +41,8 @@ import {
   filterToolsByLocalAllowlist,
   resolveLocalImplementationNames,
   resolveLocalToolRegistry,
+  resolveLocalToolsForBinding,
+  bindableToolName,
 } from '@/tools/local/resolveLocalExecutionTools';
 import {
   DEFAULT_RESERVE_RATIO,
@@ -232,8 +234,9 @@ export class AgentContext {
         toolSchemaTokens > 0 &&
         !(allowlistRemovedTools && recountMeasuresAll)
       ) {
-        /** Use pre-computed (cached) tool schema tokens — skip calculateInstructionTokens */
-        agentContext.toolSchemaTokens = toolSchemaTokens;
+        /** Keep the cached host total and add any measurable local binding growth. */
+        agentContext.toolSchemaTokens = toolSchemaTokens
+          + agentContext.getLocalToolTokenAdjustment(tokenCounter);
         agentContext.tokenCalculationPromise = Promise.resolve();
         agentContext.updateTokenMapWithInstructions(tokenMap);
       } else {
@@ -1450,28 +1453,21 @@ export class AgentContext {
      * non-`'direct'` `toolDefinitions` are excluded by
      * `getActiveToolDefinitions()` below.
      */
-    const instanceTools: t.GraphTools = [
-      ...((this.getEffectiveInstanceTools() as t.GenericTool[] | undefined) ??
-        []),
-      ...((this.graphTools as t.GenericTool[] | undefined) ?? []),
-    ];
+    const instanceTools = resolveLocalToolsForBinding({
+      tools: [
+        ...((this.getEffectiveInstanceTools() as t.GenericTool[] | undefined) ?? []),
+        ...((this.graphTools as t.GenericTool[] | undefined) ?? []),
+      ],
+      toolExecution: this.toolExecution,
+      toolRegistry: this.toolRegistry,
+      discoveredToolNames: this.discoveredToolNames,
+    }) ?? [];
 
     if (instanceTools.length > 0) {
       for (const tool of instanceTools) {
-        const genericTool = tool as Record<string, unknown>;
-        if (
-          genericTool.schema != null &&
-          typeof genericTool.schema === 'object'
-        ) {
-          const toolName = (genericTool.name as string | undefined) ?? '';
-          const jsonSchema = toJsonSchema(
-            genericTool.schema,
-            toolName,
-            (genericTool.description as string | undefined) ?? ''
-          );
-          const schemaTokens = tokenCounter(
-            new SystemMessage(JSON.stringify(jsonSchema))
-          );
+        const schemaTokens = this.countToolSchemaTokens(tool as t.GenericTool, tokenCounter);
+        if (schemaTokens != null) {
+          const toolName = bindableToolName(tool) ?? '';
           toolTokens += schemaTokens;
           if (toolName) {
             countedToolNames.add(toolName);
@@ -1506,17 +1502,7 @@ export class AgentContext {
       }
     }
 
-    const isAnthropic =
-      this.provider !== Providers.BEDROCK &&
-      (this.provider === Providers.ANTHROPIC ||
-        /anthropic|claude/i.test(
-          String(
-            (this.clientOptions as { model?: string } | undefined)?.model ?? ''
-          )
-        ));
-    const toolTokenMultiplier = isAnthropic
-      ? ANTHROPIC_TOOL_TOKEN_MULTIPLIER
-      : DEFAULT_TOOL_TOKEN_MULTIPLIER;
+    const toolTokenMultiplier = this.getToolTokenMultiplier();
     this.toolSchemaTokens = Math.ceil(toolTokens * toolTokenMultiplier);
 
     /** Largest-remainder apportionment keeps the per-tool counts summing
@@ -1537,6 +1523,48 @@ export class AgentContext {
     }
     this.toolTokenCounts = toolTokenCounts;
     this.deferredToolNames = deferredToolNames;
+  }
+
+  private countToolSchemaTokens(tool: t.GenericTool, tokenCounter: t.TokenCounter): number | undefined {
+    const schemaTool = tool as { schema?: object; name?: string; description?: string };
+    if (schemaTool.schema == null || typeof schemaTool.schema !== 'object') return;
+    return tokenCounter(new SystemMessage(JSON.stringify(toJsonSchema(
+      schemaTool.schema, schemaTool.name ?? '', schemaTool.description ?? ''
+    ))));
+  }
+
+  private getToolTokenMultiplier(): number {
+    const isAnthropic =
+      this.provider !== Providers.BEDROCK &&
+      (this.provider === Providers.ANTHROPIC ||
+        /anthropic|claude/i.test(
+          String(
+            (this.clientOptions as { model?: string } | undefined)?.model ?? ''
+          )
+        ));
+    return isAnthropic
+      ? ANTHROPIC_TOOL_TOKEN_MULTIPLIER
+      : DEFAULT_TOOL_TOKEN_MULTIPLIER;
+  }
+
+  /** Opaque cached host totals remain a floor when local binding adds or replaces schemas. */
+  private getLocalToolTokenAdjustment(tokenCounter: t.TokenCounter): number {
+    const tools = this.getToolsForBinding();
+    const resolved = resolveLocalToolsForBinding({ tools, toolExecution: this.toolExecution,
+      toolRegistry: this.toolRegistry, discoveredToolNames: this.discoveredToolNames });
+    if (resolved === tools) return 0;
+    const priorCounts = new Map<string, number | undefined>();
+    for (const tool of tools ?? []) {
+      const name = bindableToolName(tool);
+      if (name != null) priorCounts.set(name, this.countToolSchemaTokens(tool as t.GenericTool, tokenCounter));
+    }
+    let delta = 0;
+    for (const tool of resolved ?? []) {
+      const name = bindableToolName(tool);
+      const count = this.countToolSchemaTokens(tool as t.GenericTool, tokenCounter);
+      if (name != null && count != null) delta += Math.max(0, count - (priorCounts.get(name) ?? 0));
+    }
+    return Math.ceil(delta * this.getToolTokenMultiplier());
   }
 
   /**
@@ -2061,14 +2089,19 @@ export class AgentContext {
     const maxContextTokens = this.maxContextTokens ?? 0;
     /**
      * Derive `toolCount` from `getToolsForBinding()` so the diagnostic stays
-     * aligned with what is actually bound to the model — and with what
+     * aligned with what is actually bound to the model, and with what
      * `calculateInstructionTokens` counts into `toolSchemaTokens`. Using raw
      * `this.tools.length` would inflate the count whenever the registry
      * marks instance tools as deferred-undiscovered or non-`'direct'`,
      * producing the same misleading "N tools" diagnostic this fix is meant
      * to eliminate.
      */
-    const toolCount = this.getToolsForBinding()?.length ?? 0;
+    const toolCount = resolveLocalToolsForBinding({
+      tools: this.getToolsForBinding(),
+      toolExecution: this.toolExecution,
+      toolRegistry: this.toolRegistry,
+      discoveredToolNames: this.discoveredToolNames,
+    })?.length ?? 0;
     const messageCount = messages?.length ?? 0;
 
     let messageTokens = 0;

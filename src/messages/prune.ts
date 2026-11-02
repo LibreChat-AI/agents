@@ -25,6 +25,7 @@ import {
 } from '@/utils/truncation';
 import {
   cloneToolMessageWithContent,
+  compactToolMessageContent,
   compactToolContent,
   isComputerCallOutputMessage,
   serializeStructuredValueBounded,
@@ -39,6 +40,7 @@ import {
   seedFadingTier,
 } from './fading';
 import {
+  OPENAI_RESPONSES_REPLAY_POSITIONS_KEY,
   dropIncompleteToolStreamContent,
   hasNonEmptyTextContent,
 } from './core';
@@ -47,6 +49,7 @@ import { hasUnsafeStructuredSerialization } from '@/utils/tokens';
 import { ContentTypes, Providers, Constants } from '@/common';
 import { getProviderFamily } from '@/llm/providerRegistry';
 import { applyContextPruning } from './contextPruning';
+import { inspectProviderSourceMessageIds } from './provenance';
 import { toLangChainContent } from './langchain';
 import { cloneMessage } from './cache';
 
@@ -2197,7 +2200,8 @@ function projectToolCallInputsInternal(
   maxInputChars: number,
   dropIncompleteStreamContent: boolean,
   fromIndex = 0,
-  retainRawOpenAIToolCalls = true
+  retainRawOpenAIToolCalls = true,
+  exactToolInputIndices?: ReadonlySet<number>
 ): BaseMessage[] {
   const normalizedMaxInputChars = normalizeToolInputLimit(maxInputChars);
   let projectedMessages: BaseMessage[] | undefined;
@@ -2208,6 +2212,8 @@ function projectToolCallInputsInternal(
       continue;
     }
 
+    const inputLimit = exactToolInputIndices?.has(i) === true
+      ? HARD_MAX_TOOL_CALL_INPUT_CHARS : normalizedMaxInputChars;
     const aiMessage = message as AIMessage | AIMessageChunk;
     const streamContent = dropIncompleteStreamContent
       ? dropIncompleteToolStreamContent(aiMessage.content)
@@ -2217,7 +2223,7 @@ function projectToolCallInputsInternal(
     if (Array.isArray(streamContent)) {
       const originalContent = streamContent as MessageContentComplex[];
       const mappedContent = originalContent.map((block) =>
-        projectInlineToolInput(block, normalizedMaxInputChars)
+        projectInlineToolInput(block, inputLimit)
       );
       contentChanged =
         contentChanged ||
@@ -2234,7 +2240,7 @@ function projectToolCallInputsInternal(
         ? { value: ACCESSOR_INPUT_PLACEHOLDER, changed: true }
         : projectToolInputWithinLimit(
           argsProperty.value,
-          normalizedMaxInputChars
+          inputLimit
         );
       if (argsProperty.own && !projected.changed) {
         return toolCall;
@@ -2279,7 +2285,7 @@ function projectToolCallInputsInternal(
         canonicalInputs.set(id, canonicalInput);
         canonicalArguments.set(
           id,
-          serializeToolCallInput(canonicalInput, normalizedMaxInputChars)
+          serializeToolCallInput(canonicalInput, inputLimit)
         );
       }
     }
@@ -2292,7 +2298,7 @@ function projectToolCallInputsInternal(
     } else {
       const rawToolCalls = projectRawOpenAIToolCalls(
         rawAdditionalToolCalls,
-        normalizedMaxInputChars,
+        inputLimit,
         canonicalArguments
       );
       if (rawToolCalls.changed) {
@@ -2304,7 +2310,7 @@ function projectToolCallInputsInternal(
         aiMessage.additional_kwargs,
         'function_call'
       ),
-      normalizedMaxInputChars
+      inputLimit
     );
     if (legacyFunctionCall.changed) {
       additionalKwargsChanges.function_call = legacyFunctionCall.value;
@@ -2325,7 +2331,7 @@ function projectToolCallInputsInternal(
     let responseMetadataChanged = rawResponsesOutputProperty.accessor;
     const responsesOutput = projectResponsesOutput(
       rawResponsesOutput,
-      normalizedMaxInputChars,
+      inputLimit,
       canonicalArguments,
       canonicalInputs
     );
@@ -2391,7 +2397,8 @@ export function projectToolCallInputs(
 export function projectToolMessagesForProvider(
   messages: BaseMessage[],
   maxInputChars: number,
-  provider?: ProviderName
+  provider?: ProviderName,
+  exactToolInputIndices?: ReadonlySet<number>
 ): BaseMessage[] {
   const providerFamily =
     provider == null ? undefined : getProviderFamily(provider);
@@ -2404,7 +2411,8 @@ export function projectToolMessagesForProvider(
     maxInputChars,
     true,
     0,
-    retainRawOpenAIToolCalls
+    retainRawOpenAIToolCalls,
+    exactToolInputIndices
   );
 }
 
@@ -2519,7 +2527,290 @@ type ThinkingBlocks = {
   }>;
 };
 
+type CoherentToolHistory = {
+  exchanges: { startIndex: number; endIndex: number; evictable: boolean }[];
+  parentIndices: Set<number>;
+};
+
+function matchesCoherentToolMirror(
+  property: PropertyRead,
+  expected: ReadonlyMap<string, { name: string; arguments: string }>,
+  chatFormat: boolean
+): boolean {
+  if (property.accessor) return false;
+  if (property.value === undefined) return true;
+  if (!Array.isArray(property.value) || isProxy(property.value)
+    || property.value.length !== expected.size
+    || hasUnsafeStructuredSerialization(property.value)) return false;
+  const seen = new Set<string>();
+  const orderedIds = expected.keys();
+  for (const item of property.value) {
+    if (item == null || typeof item !== 'object' || isProxy(item)) return false;
+    const id = getStringProperty(item, chatFormat ? 'id' : 'call_id');
+    const call = id == null ? undefined : expected.get(id);
+    if (id == null || call == null || seen.has(id) || id !== orderedIds.next().value
+      || getStringProperty(item, 'type') !== (chatFormat ? 'function' : 'function_call')) return false;
+    const payload = chatFormat ? readPropertyWithoutAccessors(item, 'function').value : item;
+    if (payload == null || typeof payload !== 'object' || isProxy(payload)
+      || getStringProperty(payload, 'name') !== call.name
+      || getStringProperty(payload, 'arguments') !== call.arguments) return false;
+    seen.add(id);
+  }
+  return true;
+}
+
+function hasCoherentTextContent(message: BaseMessage): boolean {
+  if (typeof message.content === 'string') return true;
+  if (message.getType() === 'tool' || !Array.isArray(message.content)
+    || hasUnsafeStructuredSerialization(message.content)) return false;
+  return message.content.every((block) => typeof block === 'string'
+    || (typeof block === 'object'
+      && getStringProperty(block, 'type') === 'text'
+      && getStringProperty(block, 'text') != null));
+}
+
+function collectCoherentToolHistory(messages: BaseMessage[]): CoherentToolHistory | undefined {
+  const exchanges: CoherentToolHistory['exchanges'] = [];
+  const parentIndices = new Set<number>();
+  const callIds = new Set<string>();
+  const sourceIds = new Set<string>();
+  for (const message of messages) {
+    if (isProxy(message) || !hasCoherentTextContent(message)
+      || !['ai', 'human', 'system', 'tool'].includes(message.getType())) return;
+    const lineage = inspectProviderSourceMessageIds(message);
+    if (lineage.status === 'invalid') return;
+    if (lineage.status === 'valid') {
+      if (lineage.sourceMessageIds.length !== 1) return;
+      const id = lineage.sourceMessageIds[0];
+      if (sourceIds.has(id)) return;
+      sourceIds.add(id);
+    }
+    if (hasUnsafeStructuredSerialization(message.additional_kwargs)
+      || hasUnsafeStructuredSerialization(message.response_metadata)) return;
+  }
+  for (let index = 0; index < messages.length; index++) {
+    const message = messages[index];
+    if (message.getType() === 'tool') return;
+    if (message.getType() !== 'ai') continue;
+    const assistant = message as AIMessage;
+    const calls = assistant.tool_calls;
+    if (!Array.isArray(calls) || isProxy(calls)
+      || (assistant.invalid_tool_calls?.length ?? 0) > 0) return;
+    for (const key of ['function_call', 'reasoning_content', 'reasoning', 'thinking_blocks',
+      'provider_specific_fields', 'tool_outputs', OPENAI_RESPONSES_REPLAY_POSITIONS_KEY,
+      '__openai_custom_tool_call_ids__']) {
+      const property = readPropertyWithoutAccessors(assistant.additional_kwargs, key);
+      if (property.accessor || property.value !== undefined) return;
+    }
+    const nativeOutputs = readPropertyWithoutAccessors(assistant.response_metadata, 'tool_outputs');
+    if (nativeOutputs.accessor || nativeOutputs.value !== undefined
+      || assistant.response_metadata.preempted === true) return;
+    const expected = new Map<string, { name: string; arguments: string }>();
+    for (const call of calls) {
+      if (typeof call !== 'object' || isProxy(call)
+        || hasUnsafeStructuredSerialization(call)) return;
+      const id = getStringProperty(call, 'id');
+      const name = getStringProperty(call, 'name');
+      const args = readPropertyWithoutAccessors(call, 'args');
+      if (id == null || id.length === 0 || name == null || name.length === 0
+        || callIds.has(id) || args.accessor || args.value == null || typeof args.value !== 'object'
+        || Array.isArray(args.value) || hasUnsafeStructuredSerialization(args.value)) return;
+      const serialized = serializeStructuredValueBounded(args.value,
+        HARD_MAX_TOOL_CALL_INPUT_CHARS, HARD_MAX_TOOL_CALL_INPUT_CHARS);
+      if (serialized.truncated) return;
+      callIds.add(id);
+      expected.set(id, { name, arguments: serialized.content });
+    }
+    if (!matchesCoherentToolMirror(readPropertyWithoutAccessors(assistant.additional_kwargs, 'tool_calls'), expected, true)
+      || !matchesCoherentToolMirror(readPropertyWithoutAccessors(assistant.response_metadata, 'output'), expected, false)
+      || getToolCallIds(message).size !== expected.size
+      || projectToolCallInputs([message], HARD_MAX_TOOL_CALL_INPUT_CHARS)[0] !== message) return;
+    const providerIds = readPropertyWithoutAccessors(assistant.additional_kwargs, '__openai_function_call_ids__');
+    if (providerIds.accessor) return;
+    if (providerIds.value !== undefined) {
+      const items = readPropertyWithoutAccessors(assistant.response_metadata, 'output').value;
+      if (providerIds.value == null || typeof providerIds.value !== 'object' || Array.isArray(providerIds.value)
+        || Object.keys(providerIds.value).length !== expected.size || !Array.isArray(items)) return;
+      const itemIds = new Set<string>();
+      for (const item of items) {
+        if (item == null || typeof item !== 'object') return;
+        const id = getStringProperty(item, 'call_id');
+        const itemId = getStringProperty(item, 'id');
+        if (id == null || itemId == null || itemIds.has(itemId)
+          || getStringProperty(providerIds.value, id) !== itemId) return;
+        itemIds.add(itemId);
+      }
+    }
+    if (calls.length === 0) continue;
+    parentIndices.add(index);
+    const remaining = new Set(expected.keys());
+    let endIndex = index + 1;
+    while (endIndex < messages.length && messages[endIndex].getType() === 'tool') {
+      const result = messages[endIndex];
+      const id = getToolResultId(result);
+      if (id == null || !remaining.delete(id) || isComputerCallOutputMessage(result)) return;
+      endIndex++;
+    }
+    if (remaining.size > 0) {
+      if (endIndex === messages.length && endIndex === index + 1) continue;
+      return;
+    }
+    exchanges.push({ startIndex: index, endIndex, evictable: !hasNonEmptyTextContent(assistant.content) });
+    index = endIndex - 1;
+  }
+  return { exchanges, parentIndices };
+}
+
+type CurrentToolExchange = {
+  startIndex: number;
+  entries: { index: number; message: BaseMessage; tokens: number }[];
+};
+
+function collectCurrentToolExchange(params: {
+  canonical: BaseMessage[];
+  messages: BaseMessage[];
+  parentCounts: ReadonlyMap<string, number>;
+  resultCounts: ReadonlyMap<string, number>;
+  indexTokenCountMap: Record<string, number | undefined>;
+  tokenCounter: TokenCounter;
+  maxToolResultChars: number;
+}): CurrentToolExchange | undefined {
+  const { canonical, messages } = params;
+  if (canonical.length !== messages.length || canonical.length < 2) return;
+  let startIndex = canonical.length - 1;
+  while (startIndex >= 0 && canonical[startIndex].getType() === 'tool') startIndex--;
+  if (startIndex < 0 || startIndex === canonical.length - 1) return;
+  const parent = canonical[startIndex];
+  if (parent.getType() !== 'ai') return;
+  const assistant = parent as AIMessage;
+  const calls = assistant.tool_calls;
+  if (
+    calls == null ||
+    isProxy(calls) ||
+    calls.length === 0 ||
+    (assistant.invalid_tool_calls?.length ?? 0) > 0 ||
+    assistant.additional_kwargs.function_call !== undefined ||
+    assistant.additional_kwargs.reasoning_content !== undefined
+  )
+    return;
+  if (
+    Array.isArray(parent.content) &&
+    parent.content.some(
+      (part) =>
+        typeof part !== 'object' ||
+        (part.type !== 'text' && part.type !== 'reasoning')
+    )
+  )
+    return;
+  const expected = new Set<string>();
+  for (const call of calls) {
+    const id = getStringProperty(call, 'id');
+    if (
+      id == null ||
+      id.length === 0 ||
+      expected.has(id) ||
+      params.parentCounts.get(id) !== 1 ||
+      params.resultCounts.get(id) !== 1
+    )
+      return;
+    expected.add(id);
+  }
+  if (
+    getToolCallIds(parent).size !== expected.size ||
+    canonical.length - startIndex - 1 !== expected.size
+  )
+    return;
+  const rawCalls = readPropertyWithoutAccessors(
+    assistant.additional_kwargs,
+    'tool_calls'
+  );
+  if (rawCalls.accessor) return;
+  if (rawCalls.value !== undefined) {
+    if (!Array.isArray(rawCalls.value) || isProxy(rawCalls.value)) return;
+    const mirrored = new Set<string>();
+    for (const call of rawCalls.value) {
+      if (call == null || typeof call !== 'object' || isProxy(call)) return;
+      const id = getStringProperty(call, 'id');
+      if (id == null || !expected.has(id) || mirrored.has(id)) return;
+      mirrored.add(id);
+    }
+    if (mirrored.size !== expected.size) return;
+  }
+  const responseOutput = getResponsesToolOutputSource(parent);
+  if (responseOutput != null) {
+    const mirrored = new Set<string>();
+    for (const item of responseOutput.items) {
+      if (item == null || typeof item !== 'object' || isProxy(item)) return;
+      const type = getStringProperty(item, 'type');
+      if (type === 'reasoning' || type === 'message') continue;
+      const id = getStringProperty(item, 'call_id');
+      if (
+        type !== 'function_call' ||
+        id == null ||
+        !expected.has(id) ||
+        mirrored.has(id)
+      )
+        return;
+      mirrored.add(id);
+    }
+    if (responseOutput.items.length > 0 && mirrored.size !== expected.size) return;
+  }
+  const [preparedParent] = projectToolCallInputs(
+    [parent],
+    HARD_MAX_TOOL_CALL_INPUT_CHARS
+  );
+  const entries: CurrentToolExchange['entries'] = [];
+  for (let index = startIndex; index < canonical.length; index++) {
+    const source = canonical[index];
+    const lineage = inspectProviderSourceMessageIds(source);
+    if (
+      lineage.status === 'invalid' ||
+      (lineage.status === 'valid' && lineage.sourceMessageIds.length !== 1)
+    )
+      return;
+    let message = preparedParent;
+    if (index !== startIndex) {
+      const id = getToolResultId(source);
+      if (
+        id == null ||
+        !expected.delete(id) ||
+        typeof source.content !== 'string' ||
+        isComputerCallOutputMessage(source)
+      )
+        return;
+      const bounded = compactToolMessageContent(
+        source as ToolMessage,
+        params.maxToolResultChars
+      );
+      message = bounded.changed
+        ? cloneToolMessageWithContent(source as ToolMessage, bounded.content)
+        : source;
+    }
+    const tokens = Math.max(
+      params.indexTokenCountMap[index] ?? 0,
+      params.tokenCounter(message)
+    );
+    if (!Number.isFinite(tokens) || tokens < 0) return;
+    entries.push({ index, message, tokens });
+  }
+  return expected.size === 0 ? { startIndex, entries } : undefined;
+}
+
 export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
+  const coherentToolHistory =
+    factoryParams.contextPruningConfig?.enabled === true &&
+    factoryParams.contextPruningConfig.coherentToolHistory === true &&
+    factoryParams.summarizationEnabled !== true;
+  const currentExchangePriority =
+    factoryParams.contextPruningConfig?.enabled === true &&
+    factoryParams.contextPruningConfig.currentExchangePriority === true &&
+    factoryParams.summarizationEnabled !== true;
+  const parentCallCounts = currentExchangePriority
+    ? new Map<string, number>()
+    : undefined;
+  const resultCallCounts = currentExchangePriority
+    ? new Map<string, number>()
+    : undefined;
   const providerFamily =
     factoryParams.provider == null
       ? undefined
@@ -2532,6 +2823,8 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
   const indexTokenCountMap = { ...factoryParams.indexTokenCountMap };
   let lastTurnStartIndex = factoryParams.startIndex;
   let lastCutOffIndex = 0;
+  let previousRetainedIndices: number[] | undefined;
+  let retiredToolExchangeThrough = 0;
   let totalTokens = 0;
   for (const key in indexTokenCountMap) {
     totalTokens += indexTokenCountMap[key] ?? 0;
@@ -2604,7 +2897,12 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     contextBudget?: number;
     /** Calibrated instruction overhead actually applied this call */
     effectiveInstructionTokens?: number;
+    /** Validated ordinary parent indices in this returned context, not canonical indices. */
+    exactToolInputIndices?: ReadonlySet<number>;
   } {
+    if (coherentToolHistory && params.messages === params.canonicalMessages) {
+      return pruneMessages({ ...params, messages: [...params.messages] });
+    }
     const suppliedCanonicalMessages = params.canonicalMessages;
     const derivesCanonicalHistory = suppliedCanonicalMessages == null;
     const canonicalMessages =
@@ -2633,6 +2931,18 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
             (source, index) => canonicalMessages[index] !== source
           ));
     if (widthPrefixChanged) {
+      parentCallCounts?.clear();
+      resultCallCounts?.clear();
+      if (coherentToolHistory) {
+        previousRetainedIndices = undefined;
+        retiredToolExchangeThrough = 0;
+        cumulativeRawSent = 0;
+        cumulativeProviderReported = 0;
+        for (const key in indexTokenCountMap) delete indexTokenCountMap[key];
+        totalTokens = 0;
+        lastTurnStartIndex = 0;
+        lastCutOffIndex = 0;
+      }
       maxToolExchangeWidth = 1;
       toolExchangeWidthThrough = 0;
       toolExchangeWidthSources = [];
@@ -2647,9 +2957,19 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
        *  one assistant message, so their call counts are an artifact of that
        *  reconstruction, not fan-out; only the current turn's are real. The tier
        *  itself stays latched, so a narrower width never loosens it. */
-      maxToolExchangeWidth = startsUserTurn(message)
-        ? 1
-        : Math.max(maxToolExchangeWidth, getToolCallIds(message).size);
+      if (startsUserTurn(message)) {
+        maxToolExchangeWidth = 1;
+      } else {
+        const ids = getToolCallIds(message);
+        maxToolExchangeWidth = Math.max(maxToolExchangeWidth, ids.size);
+        if (parentCallCounts != null) {
+          for (const id of ids) parentCallCounts.set(id, (parentCallCounts.get(id) ?? 0) + 1);
+        }
+      }
+      const resultId = resultCallCounts == null ? null : getToolResultId(message);
+      if (resultCallCounts != null && resultId != null) {
+        resultCallCounts.set(resultId, (resultCallCounts.get(resultId) ?? 0) + 1);
+      }
       toolExchangeWidthSources[i] = message;
     }
     toolExchangeWidthThrough = canonicalMessages.length;
@@ -2891,12 +3211,15 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       // Sum raw tiktoken counts for messages the provider saw (excludes
       // new outputs from this turn — the provider hasn't seen them yet).
       let rawSentThisTurn = 0;
-      const firstIsSystem =
+      const firstIsSystem = previousRetainedIndices == null &&
         params.messages.length > 0 && params.messages[0].getType() === 'system';
       if (firstIsSystem) {
         rawSentThisTurn += indexTokenCountMap[0] ?? 0;
       }
-      for (let i = lastCutOffIndex; i < params.messages.length; i++) {
+      const sentCount = previousRetainedIndices?.length
+        ?? Math.max(0, params.messages.length - lastCutOffIndex);
+      for (let offset = 0; offset < sentCount; offset++) {
+        const i = previousRetainedIndices?.[offset] ?? lastCutOffIndex + offset;
         if ((i === 0 && firstIsSystem) || newOutputs.has(i)) {
           continue;
         }
@@ -2964,6 +3287,8 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         });
       }
     }
+
+    previousRetainedIndices = undefined;
 
     // Computed BEFORE pre-flight truncation so the effective budget can drive
     // truncation thresholds — without this, thresholds based on maxTokens are
@@ -3034,8 +3359,87 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       };
     }
 
+    const coherent = coherentToolHistory && canonicalMessages.length === params.messages.length
+      ? collectCoherentToolHistory(canonicalMessages) : undefined;
+    if (coherent != null) {
+      const candidate = [...canonicalMessages];
+      for (let index = 0; index < candidate.length; index++) {
+        const source = candidate[index];
+        if (source.getType() === 'tool') {
+          const bounded = compactToolMessageContent(source as ToolMessage,
+            factoryParams.maxToolResultChars ?? HARD_MAX_TOOL_RESULT_CHARS);
+          if (bounded.changed) candidate[index] = cloneToolMessageWithContent(source as ToolMessage, bounded.content);
+        }
+        indexTokenCountMap[index] = Math.max(indexTokenCountMap[index] ?? 0,
+          factoryParams.tokenCounter(candidate[index]));
+      }
+      const completeTokens = sumTokenCounts(indexTokenCountMap, candidate.length);
+      const latest = coherent.exchanges.at(-1);
+      const freshStart = latest?.endIndex === candidate.length ? latest.startIndex : candidate.length;
+      const fresh = candidate.slice(freshStart);
+      fadingTier = resolveFadingTier(fadingTier, factoryParams.maxTokens, {
+        contextPressure: pruningBudget > 0 ? Math.round(completeTokens * calibrationRatio) / pruningBudget : 0,
+        effectiveRawTokens: Math.floor(effectiveMaxTokens / calibrationRatio),
+        summarizationEnabled: false, toolExchangeWidth: maxToolExchangeWidth,
+      }, factoryParams.maxToolResultChars);
+      applyFadingCaps({ messages: candidate, canonicalMessages,
+        indexTokenCountMap, tokenCounter: factoryParams.tokenCounter,
+        caps: { ...resolveFadingCaps(fadingTier, factoryParams.maxToolResultChars), inputChars: Infinity },
+        masked: fadingTier.masked });
+      for (let offset = 0; offset < fresh.length; offset++) {
+        const index = freshStart + offset;
+        candidate[index] = fresh[offset];
+        indexTokenCountMap[index] = Math.max(indexTokenCountMap[index] ?? 0,
+          factoryParams.tokenCounter(fresh[offset]));
+      }
+      let retainedTokens = sumTokenCounts(indexTokenCountMap, candidate.length);
+      const omitted = new Set<number>();
+      const requiredTokens = (): number => Math.round(retainedTokens * calibrationRatio)
+        + Math.round(REPLY_PRIMER_TOKENS * calibrationRatio) + currentInstructionTokens;
+      for (const exchange of coherent.exchanges) {
+        if (!exchange.evictable || (exchange === latest && fresh.length > 0)
+          || (exchange.endIndex > retiredToolExchangeThrough && requiredTokens() <= pruningBudget)) continue;
+        for (let index = exchange.startIndex; index < exchange.endIndex; index++) {
+          omitted.add(index);
+          retainedTokens -= indexTokenCountMap[index] ?? 0;
+        }
+        retiredToolExchangeThrough = Math.max(retiredToolExchangeThrough, exchange.endIndex);
+      }
+      const context: BaseMessage[] = [];
+      const exactToolInputIndices = new Set<number>();
+      previousRetainedIndices = [];
+      for (let index = 0; index < candidate.length; index++) {
+        params.messages[index] = candidate[index];
+        if (derivesCanonicalHistory) canonicalByProjection.set(candidate[index], canonicalMessages[index]);
+        if (omitted.has(index)) continue;
+        if (coherent.parentIndices.has(index)) exactToolInputIndices.add(context.length);
+        context.push(candidate[index]);
+        previousRetainedIndices.push(index);
+      }
+      lastTurnStartIndex = candidate.length;
+      lastCutOffIndex = 0;
+      return { context, indexTokenCountMap, messagesToRefine: [],
+        prePruneContextTokens: Math.round(completeTokens * calibrationRatio),
+        remainingContextTokens: pruningBudget - requiredTokens(),
+        contextPressure: pruningBudget > 0 ? Math.round(completeTokens * calibrationRatio) / pruningBudget : 0,
+        calibrationRatio, fadingTier, resolvedInstructionOverhead: bestInstructionOverhead,
+        contextBudget: pruningBudget, effectiveInstructionTokens: currentInstructionTokens,
+        exactToolInputIndices };
+    }
+
+    const currentExchange = parentCallCounts != null && resultCallCounts != null
+      ? collectCurrentToolExchange({
+        canonical: canonicalMessages,
+        messages: params.messages,
+        parentCounts: parentCallCounts,
+        resultCounts: resultCallCounts,
+        indexTokenCountMap,
+        tokenCounter: factoryParams.tokenCounter,
+        maxToolResultChars: factoryParams.maxToolResultChars ?? HARD_MAX_TOOL_RESULT_CHARS,
+      }) : undefined;
+
     // ---------------------------------------------------------------------------
-    // Progressive context fading — inspired by Claude Code's staged compaction.
+    // Progressive context fading, inspired by Claude Code's staged compaction.
     // Every cap comes from the latched fading tier (see ./fading.ts): the fit
     // rung keeps a single tool result within the effective budget, pressure
     // bands deepen the rung when summarization is off, and masking (80%+)
@@ -3193,6 +3597,23 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
 
     const preTruncationTotalTokens = totalTokens;
     totalTokens = sumTokenCounts(indexTokenCountMap, params.messages.length);
+    if (currentExchange != null) {
+      let candidateTokens = totalTokens;
+      for (const entry of currentExchange.entries) {
+        candidateTokens += entry.tokens - (indexTokenCountMap[entry.index] ?? 0);
+      }
+      if (Math.round(candidateTokens * calibrationRatio)
+        + Math.round(REPLY_PRIMER_TOKENS * calibrationRatio)
+        + currentInstructionTokens <= pruningBudget) {
+        for (const entry of currentExchange.entries) {
+          params.messages[entry.index] = entry.message;
+          indexTokenCountMap[entry.index] = entry.tokens;
+          if (derivesCanonicalHistory) canonicalByProjection.set(entry.message, canonicalMessages[entry.index]);
+        }
+        totalTokens = candidateTokens;
+        fadedThrough = Math.min(fadedThrough, currentExchange.startIndex);
+      }
+    }
     calibratedTotalTokens = Math.round(totalTokens * calibrationRatio);
 
     const anyAdjustment =

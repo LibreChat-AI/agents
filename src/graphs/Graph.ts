@@ -3455,6 +3455,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       this.config = config;
 
       let messagesToUse = messages;
+      let exactToolInputIndices: ReadonlySet<number> | undefined;
       let contextUsage: t.ContextUsageEvent | null = null;
       /**
        * Held outside the prune block so overflow recovery — which detours to
@@ -3512,6 +3513,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           resolvedInstructionOverhead,
           contextBudget,
           effectiveInstructionTokens,
+          exactToolInputIndices: retainedExactToolInputIndices,
         } = agentContext.pruneMessages({
           messages: providerMessages,
           canonicalMessages: messages,
@@ -3521,6 +3523,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           totalTokensFresh: agentContext.totalTokensFresh,
         });
         prunedOriginalToolContent = newOriginalToolContent;
+        exactToolInputIndices = retainedExactToolInputIndices;
         /** Preserve the masking record for the existing overflow/summarization
          * path. The graph history itself remains canonical; only the provider
          * projection above is rewritten by fading. */
@@ -3758,7 +3761,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         projectToolMessagesForProvider(
           beforeToolInputProjection,
           calculateMaxToolCallInputChars(agentContext.maxContextTokens),
-          agentContext.provider
+          agentContext.provider,
+          exactToolInputIndices
         )
       );
 
@@ -4787,7 +4791,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                     projectToolMessagesForProvider(
                       source,
                       calculateMaxToolCallInputChars(fallbackMaxContextTokens),
-                      fallbackProvider
+                      fallbackProvider,
+                      exactToolInputIndices
                     )
                   );
                   const artifactSource = projectServingArtifacts(

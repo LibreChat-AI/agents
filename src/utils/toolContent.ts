@@ -1,10 +1,14 @@
 import { isArrayBuffer, isDate, isProxy } from 'node:util/types';
-import { ToolMessage, type BaseMessage } from '@langchain/core/messages';
+import { ToolMessage } from '@langchain/core/messages';
+import type { BaseMessage } from '@langchain/core/messages';
+import type { ReadFileRecovery } from '@/types/tools';
 import {
   HARD_MAX_TOTAL_TOOL_OUTPUT_SIZE,
+  toolResultTruncationIndicator,
   truncateToolResultContent,
   sliceWithoutSplittingSurrogates,
 } from './truncation';
+import { Constants } from '@/common/enum';
 
 type ToolContent = BaseMessage['content'];
 type ToolContentBlock = Exclude<ToolContent, string>[number];
@@ -1162,7 +1166,7 @@ type OwnDataProperty =
   | { found: false; value?: never };
 
 function readOwnEnumerableDataProperty(
-  record: Record<string, unknown>,
+  record: object,
   key: string
 ): OwnDataProperty {
   try {
@@ -2342,6 +2346,104 @@ export function isComputerCallOutputMessage(message: BaseMessage): boolean {
   return (
     hasComputerCallOutputMarker(message) &&
     isComputerCallOutputContent(message.content)
+  );
+}
+
+function matchedReadFileRecovery(
+  message: ToolMessage,
+  content: string
+): ReadFileRecovery | undefined {
+  if (
+    isProxy(message) ||
+    readOwnEnumerableDataProperty(message, 'name').value !== Constants.READ_FILE
+  ) {
+    return undefined;
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(message, 'artifact');
+  const artifact: unknown =
+    descriptor && 'value' in descriptor ? descriptor.value : null;
+  if (!isRecord(artifact) || isProxy(artifact)) {
+    return undefined;
+  }
+  const recovery = readOwnEnumerableDataProperty(artifact, 'recovery').value;
+  if (!isRecord(recovery) || isProxy(recovery)) {
+    return undefined;
+  }
+  const sha256 = readOwnEnumerableDataProperty(recovery, 'sha256').value;
+  const start = readOwnEnumerableDataProperty(recovery, 'start').value;
+  const end = readOwnEnumerableDataProperty(recovery, 'end').value;
+  const unit = readOwnEnumerableDataProperty(recovery, 'unit').value;
+  const bodyChars = readOwnEnumerableDataProperty(recovery, 'bodyChars').value;
+  const nextCursor = readOwnEnumerableDataProperty(recovery, 'nextCursor').value;
+  if (
+    typeof sha256 !== 'string' ||
+    !/^[a-f0-9]{64}$/.test(sha256) ||
+    typeof start !== 'number' ||
+    !Number.isSafeInteger(start) ||
+    start < 0 ||
+    typeof end !== 'number' ||
+    !Number.isSafeInteger(end) ||
+    end <= start ||
+    unit !== 'utf16' ||
+    typeof bodyChars !== 'number' ||
+    !Number.isSafeInteger(bodyChars) ||
+    bodyChars < end - start ||
+    typeof nextCursor !== 'string' ||
+    nextCursor !== `v1:${sha256}:${end}`
+  ) {
+    return undefined;
+  }
+  const footer = `\n[continue with cursor=${nextCursor}]`;
+  if (content.length - footer.length > bodyChars || !content.endsWith(footer)) {
+    return undefined;
+  }
+  return { sha256, start, end, unit, bodyChars, nextCursor };
+}
+
+/** Recovery metadata is a formatting hint; follow-up reads still authorize and validate content. */
+export function compactReadFileToolContent(
+  message: ToolMessage,
+  maxChars: number,
+  content: ToolContent = message.content
+): CompactToolContentResult | undefined {
+  if (typeof content !== 'string') {
+    return undefined;
+  }
+  const recovery = matchedReadFileRecovery(message, content);
+  if (recovery == null) {
+    return undefined;
+  }
+  const footer = `\n[continue with cursor=${recovery.nextCursor}]`;
+  if (typeof message.content !== 'string' || !message.content.endsWith(footer)) {
+    return compactToolContent(message.content, maxChars);
+  }
+  const normalizedMaxChars = Number.isFinite(maxChars)
+    ? Math.max(0, Math.floor(maxChars))
+    : Number.MAX_SAFE_INTEGER;
+  if (content.length <= normalizedMaxChars) {
+    return undefined;
+  }
+  const body = content.slice(0, content.length - footer.length);
+  const bodyBudget = normalizedMaxChars - footer.length;
+  const keepsFooter =
+    bodyBudget > toolResultTruncationIndicator(body.length, bodyBudget).length;
+  return {
+    content: keepsFooter
+      ? truncateToolResultContent(body, bodyBudget) + footer
+      : truncateToolResultContent(body, normalizedMaxChars),
+    changed: true,
+    originalChars: content.length,
+  };
+}
+
+export function compactToolMessageContent(
+  message: ToolMessage,
+  maxChars: number,
+  content: ToolContent = message.content
+): CompactToolContentResult {
+  return (
+    compactReadFileToolContent(message, maxChars, content) ??
+    compactToolContent(content, maxChars)
   );
 }
 

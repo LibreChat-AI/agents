@@ -1017,6 +1017,8 @@ interface AgentInputFields {
   toolEnd?: boolean;
   toolMap?: ToolMap;
   tools?: GraphTools;
+  /** Overrides run-wide programmatic prompt guidance without changing execution or permissions. */
+  programmaticToolInstructions?: ToolExecutionConfig['programmaticToolInstructions'];
   /** Stable/cacheable system instructions. */
   instructions?: string;
   streamBuffer?: number;
@@ -1115,6 +1117,10 @@ export type AgentInputs = AgentInputFields & ProviderClientOptionsConfig;
 
 export interface ContextPruningConfig {
   enabled?: boolean;
+  /** Restore a complete ordinary text tool exchange when the full faded history fits. Requires enabled and summarization off; defaults off. */
+  currentExchangePriority?: boolean;
+  /** Evict complete ordinary tool exchanges instead of shortening retained arguments. Requires enabled and summarization off; defaults off. */
+  coherentToolHistory?: boolean;
   keepLastAssistants?: number;
   softTrimRatio?: number;
   hardClearRatio?: number;

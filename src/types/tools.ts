@@ -988,13 +988,23 @@ export type LocalExecutionConfig = {
   codingToolNames?: readonly string[];
   /**
    * Opt-in cap, in characters, on the results the model reads most:
-   * `read_file` keeps whole lines up to the cap (and its `limit`, when
-   * given) with an `offset` hint to continue, `grep_search` cuts long match lines and stops
+   * `read_file` pages UTF-8 text with a content-bound cursor, including
+   * within a long line; `limit` still bounds lines. Recovery metadata is
+   * additional to this body budget. `grep_search` cuts long match lines and stops
    * at the cap with a count of omitted lines, and `bash_tool` keeps the head
    * and tail of long stdout and stderr with the status lines intact. Unset
    * keeps the existing limits.
    */
   toolResultMaxChars?: number;
+  /**
+   * Override `toolResultMaxChars` only for the outer local programmatic
+   * runner's stdout/stderr. Nested tools retain their existing limits.
+   * Omitted text uses the normal local capture/recovery mechanism; status
+   * and omission metadata are additional to this output-body budget.
+   * Must be a nonnegative safe integer. Zero disables this additional cap;
+   * unset inherits `toolResultMaxChars`. `maxOutputChars` still applies.
+   */
+  programmaticResultMaxChars?: number;
   /**
    * Override the process launcher. When set, replaces
    * `child_process.spawn` for every local tool invocation, allowing
@@ -1247,6 +1257,8 @@ export type SandboxExecutionConfig = {
 };
 
 export type ToolExecutionConfig = {
+  /** Stable discovery guidance, optionally with immediately callable local tools. Requires schema-enabled tool search. */
+  programmaticToolInstructions?: 'inline' | 'discovery' | 'hybrid';
   /** `sandbox` preserves the remote Code API behavior and is the default. */
   engine?: ToolExecutionEngine;
   /** Local process execution settings used when `engine` is `local`. */
@@ -1271,8 +1283,8 @@ export type ProgrammaticCache = {
   disallowedToolDefs?: LCTool[];
   /**
    * Hook context plumbed through by ToolNode for the local
-   * programmatic-tool path so the in-process bridge can run
-   * `PreToolUse` hooks (deny / updatedInput) for inner tool calls.
+   * programmatic-tool path so the in-process bridge can run policy,
+   * denial, result and failure hooks for inner tool calls.
    * Not present for non-local (remote-engine) programmatic calling
    * which dispatches inner tools through the host's own pipeline.
    */
@@ -1298,6 +1310,10 @@ export type McpNameFormat = 'full' | 'base';
 
 /** Parameters for creating a Tool Search tool */
 export type ToolSearchParams = {
+  /** Return canonical invocation schemas in search results for a stable programmatic tool surface. */
+  includeSchemas?: boolean;
+  /** Bound the initial catalog preview in characters (integer >= 128). Search still covers every eligible tool. */
+  maxCatalogChars?: number;
   toolRegistry?: LCToolRegistry;
   onlyDeferred?: boolean;
   baseUrl?: string;
@@ -1513,6 +1529,18 @@ export type CodeExecutionArtifact = {
  * Extend this as new tool session types are added.
  */
 export type ToolSessionContext = CodeSessionContext;
+
+/** Content-bound continuation metadata emitted by the local text reader. */
+export interface ReadFileRecovery {
+  sha256: string;
+  start: number;
+  end: number;
+  unit: 'utf16';
+  /** Original rendered body size; a projected message may contain fewer characters. */
+  bodyChars: number;
+  /** Continues after the original page, without replaying any masked body. */
+  nextCursor?: string;
+}
 
 /**
  * Map of tool names to their session contexts.
