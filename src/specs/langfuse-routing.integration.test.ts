@@ -517,6 +517,8 @@ async function runTenantSummarizationFlow(tenantId: string): Promise<void> {
           maxContextTokens: 340,
           summarizationEnabled: true,
           summarizationConfig: {
+            prompt: 'Write a checkpoint.',
+            maxSummaryTokens: 32,
             retainRecent: { turns: 0 },
           },
         },
