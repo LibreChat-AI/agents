@@ -10,6 +10,7 @@ import { OVERFLOW_SIGNATURES } from '@/utils/__tests__/fixtures/contextOverflowS
 import { prepareProviderRequest } from '@/llm/prepareProviderRequest';
 import { Providers } from '@/common';
 import * as init from '@/llm/init';
+import { RequestBodyBudgetError, RequestBodyLimitError } from '@/llm/requestBodyBudget';
 
 function signatureError(model: string): Error {
   const signature = OVERFLOW_SIGNATURES.find((s) => s.model === model);
@@ -50,6 +51,22 @@ const fallbacks: Array<{ provider: Providers }> = [
 describe('tryFallbackProviders surfacing', () => {
   afterEach(() => {
     jest.restoreAllMocks();
+  });
+
+  it('does not dispatch fallbacks for a primary local body rejection', async () => {
+    const initialize = stubModels(['ok']);
+    const error = new RequestBodyLimitError(140_577, 131_072);
+    await expect(tryFallbackProviders({ fallbacks, messages, primaryError: error })).rejects.toBe(error);
+    expect(initialize).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    new RequestBodyLimitError(140_577, 131_072),
+    new RequestBodyBudgetError('unsupported body'),
+  ])('stops the fallback chain on a local body failure', async (error) => {
+    const initialize = stubModels([error, 'ok']);
+    await expect(tryFallbackProviders({ fallbacks, messages, primaryError: new Error('503 primary') })).rejects.toBe(error);
+    expect(initialize).toHaveBeenCalledTimes(1);
   });
 
   it('sends the exact prepared fallback request without projecting again', async () => {

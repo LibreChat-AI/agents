@@ -130,12 +130,14 @@ export interface SummarizationNodeInput {
    *   the pre-call budget check.
    * - `overflow`: the provider rejected the prompt as too large and the run
    *   is compacting to recover. When summarization is not enabled, this
-   *   variant performs no model call — the corrected budget alone is what the
+   *   variant performs no model call; the corrected budget alone is what the
    *   retry needs.
+   * - `request-body`: a local serialized-byte limit requires deterministic
+   *   re-pruning. This variant never makes a summarization model call.
    * - `manual`: the host asked for a summary outright (a summarize-only run).
    *   Uses the same bounded recent-tail policy as automatic compaction.
    */
-  reason?: 'trigger' | 'overflow' | 'manual';
+  reason?: 'trigger' | 'overflow' | 'request-body' | 'manual';
   /**
    * Whether an overflow recovery may spend a summarization model call.
    *

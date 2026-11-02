@@ -39,6 +39,8 @@ import type { ChatXAIInput } from '@langchain/xai';
 import type * as t from '@langchain/openai';
 import type { SmoothItem, SmoothPiece } from '@/llm/stream/smoother';
 import type { ResponsesReplayPosition } from '@/messages/core';
+import type { RequestBodyBudgetOptions } from '@/types/llm';
+import type { AsyncCallerParams } from '@langchain/core/utils/async_caller';
 import type { SeenScalarMetadata } from './streamMetadata';
 import type { HeaderValue, HeadersLike } from './types';
 import type { PromptCacheTtl } from '@/messages/cache';
@@ -68,6 +70,13 @@ import { isReasoningModel, _convertMessagesToOpenAIParams } from './utils';
 import { smoothStream, resolveStreamDelay } from '@/llm/stream/smoother';
 import { INTENT_ARG, isIntentLabelProperty } from '@/tools/intentArg';
 import { dropRepeatedScalarMetadata } from './streamMetadata';
+import {
+  RequestBodyBudgetError,
+  assertRequestBodyBudget,
+  validateRequestBodyLimit,
+} from '@/llm/requestBodyBudget';
+
+export { RequestBodyBudgetError, RequestBodyLimitError } from '@/llm/requestBodyBudget';
 
 // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
 const iife = <T>(fn: () => T) => fn();
@@ -121,7 +130,7 @@ type OpenAICompletionParam =
 type OpenAIClientConfig = NonNullable<
   ConstructorParameters<typeof OpenAIClient>[0]
 >;
-type LibreChatOpenAIFields = t.ChatOpenAIFields & {
+type LibreChatOpenAIFields = t.ChatOpenAIFields & RequestBodyBudgetOptions & {
   _lc_stream_delay?: number;
   firstPartyEndpoint?: boolean;
   includeReasoningContent?: boolean;
@@ -133,7 +142,7 @@ type LibreChatOpenAIFields = t.ChatOpenAIFields & {
   promptCacheExplicit?: boolean;
   safety_identifier?: string;
 };
-type LibreChatAzureOpenAIFields = t.AzureOpenAIInput & {
+type LibreChatAzureOpenAIFields = t.AzureOpenAIInput & RequestBodyBudgetOptions & {
   _lc_stream_delay?: number;
   firstPartyEndpoint?: boolean;
   promptCacheExplicit?: boolean;
@@ -148,7 +157,7 @@ type OpenAIDeltaWithLibreChatFields = Record<string, unknown> & {
   reasoning_details?: unknown;
   provider_specific_fields?: unknown;
 };
-type OpenAIClientOwner = {
+type OpenAIClientOwner = RequestBodyBudgetOptions & {
   client?: OpenAIClient;
   clientConfig: OpenAIClientConfig;
   timeout?: number;
@@ -1420,7 +1429,10 @@ function getCustomOpenAIClientOptions(
     }
 
     params.defaultHeaders = getHeadersWithUserAgent(params.defaultHeaders);
-    owner.client = new CustomOpenAIClient(params);
+    owner.client = new CustomOpenAIClient({
+      ...params,
+      maxRequestBodyBytes: owner.maxRequestBodyBytes,
+    });
   }
   const requestOptions = {
     ...owner.clientConfig,
@@ -1680,8 +1692,36 @@ export function _convertToOpenAITool(
 
   return toolDef;
 }
+function validateRequestBodyClientOptions(
+  fields: Pick<OpenAIClientConfig, 'provider'> & RequestBodyBudgetOptions
+): void {
+  validateRequestBodyLimit(fields.maxRequestBodyBytes);
+  if (fields.maxRequestBodyBytes != null && fields.provider != null) {
+    throw new RequestBodyBudgetError(
+      'maxRequestBodyBytes does not support custom SDK provider hooks.'
+    );
+  }
+}
+
 export class CustomOpenAIClient extends OpenAIClient {
   abortHandler?: () => void;
+  readonly maxRequestBodyBytes?: number;
+
+  constructor(fields: ConstructorParameters<typeof OpenAIClient>[0] & RequestBodyBudgetOptions = {}) {
+    const { maxRequestBodyBytes, ...options } = fields;
+    validateRequestBodyClientOptions(fields);
+    super(options);
+    this.maxRequestBodyBytes = validateRequestBodyLimit(maxRequestBodyBytes);
+  }
+
+  async buildRequest(
+    ...args: Parameters<OpenAIClient['buildRequest']>
+  ): Promise<Awaited<ReturnType<OpenAIClient['buildRequest']>>> {
+    const request = await super.buildRequest(...args);
+    assertRequestBodyBudget(request.req.body, this.maxRequestBodyBytes);
+    return request;
+  }
+
   async fetchWithTimeout(
     url: RequestInfo,
     init: RequestInit | undefined,
@@ -1717,6 +1757,23 @@ export class CustomOpenAIClient extends OpenAIClient {
 }
 export class CustomAzureOpenAIClient extends AzureOpenAIClient {
   abortHandler?: () => void;
+  readonly maxRequestBodyBytes?: number;
+
+  constructor(fields: ConstructorParameters<typeof AzureOpenAIClient>[0] & RequestBodyBudgetOptions = {}) {
+    const { maxRequestBodyBytes, ...options } = fields;
+    validateRequestBodyClientOptions(fields);
+    super(options);
+    this.maxRequestBodyBytes = validateRequestBodyLimit(maxRequestBodyBytes);
+  }
+
+  async buildRequest(
+    ...args: Parameters<OpenAIClient['buildRequest']>
+  ): Promise<Awaited<ReturnType<OpenAIClient['buildRequest']>>> {
+    const request = await super.buildRequest(...args);
+    assertRequestBodyBudget(request.req.body, this.maxRequestBodyBytes);
+    return request;
+  }
+
   async fetchWithTimeout(
     url: RequestInfo,
     init: RequestInit | undefined,
@@ -1874,8 +1931,25 @@ function astraRulesApply(
   return firstPartyEndpoint === true && isGpt6AstraModel(model);
 }
 
+function withRequestBodyRetryGuard<Fields extends RequestBodyBudgetOptions & Pick<AsyncCallerParams, 'onFailedAttempt'>>(
+  fields?: Fields
+): Fields | undefined {
+  if (fields?.maxRequestBodyBytes == null || fields.onFailedAttempt == null) {
+    return fields;
+  }
+  const onFailedAttempt = fields.onFailedAttempt;
+  return {
+    ...fields,
+    onFailedAttempt: (error): void | Promise<void> => {
+      if (error instanceof RequestBodyBudgetError) throw error;
+      return onFailedAttempt(error);
+    },
+  };
+}
+
 class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
   protected firstPartyEndpoint?: boolean;
+  readonly maxRequestBodyBytes?: number;
 
   /** @see {@link astraRulesApply} */
   protected get astraRulesApply(): boolean {
@@ -1890,7 +1964,8 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
   private safetyIdentifier?: string;
 
   constructor(fields?: LibreChatOpenAIFields) {
-    super(fields);
+    super(withRequestBodyRetryGuard(fields));
+    this.maxRequestBodyBytes = validateRequestBodyLimit(fields?.maxRequestBodyBytes);
     this.includeReasoningContent = fields?.includeReasoningContent;
     this.includeReasoningDetails = fields?.includeReasoningDetails;
     this.convertReasoningDetailsToContent =
@@ -2320,6 +2395,7 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
 
 class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
   protected firstPartyEndpoint?: boolean;
+  readonly maxRequestBodyBytes?: number;
 
   /** @see {@link astraRulesApply} */
   protected get astraRulesApply(): boolean {
@@ -2332,7 +2408,8 @@ class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
   private safetyIdentifier?: string;
 
   constructor(fields?: LibreChatOpenAIFields) {
-    super(fields);
+    super(withRequestBodyRetryGuard(fields));
+    this.maxRequestBodyBytes = validateRequestBodyLimit(fields?.maxRequestBodyBytes);
     this.promptCacheExplicit = fields?.promptCacheExplicit;
     this.firstPartyEndpoint = fields?.firstPartyEndpoint;
     this.responsesPromptCache = fields?.responsesPromptCache;
@@ -2479,6 +2556,7 @@ class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
 
 class LibreChatAzureOpenAICompletions extends OriginalAzureChatOpenAICompletions {
   protected firstPartyEndpoint?: boolean;
+  readonly maxRequestBodyBytes?: number;
 
   /** @see {@link astraRulesApply} */
   protected get astraRulesApply(): boolean {
@@ -2489,7 +2567,8 @@ class LibreChatAzureOpenAICompletions extends OriginalAzureChatOpenAICompletions
   private safetyIdentifier?: string;
 
   constructor(fields?: LibreChatAzureOpenAIFields) {
-    super(fields);
+    super(withRequestBodyRetryGuard(fields));
+    this.maxRequestBodyBytes = validateRequestBodyLimit(fields?.maxRequestBodyBytes);
     this.promptCacheExplicit = fields?.promptCacheExplicit;
     this.firstPartyEndpoint = fields?.firstPartyEndpoint;
     this.safetyIdentifier = fields?.safety_identifier;
@@ -2592,6 +2671,7 @@ class LibreChatAzureOpenAICompletions extends OriginalAzureChatOpenAICompletions
       };
 
       this.client = new CustomAzureOpenAIClient({
+        maxRequestBodyBytes: this.maxRequestBodyBytes,
         apiVersion: this.azureOpenAIApiVersion,
         azureADTokenProvider: this.azureADTokenProvider,
         ...(params as t.AzureOpenAIInput),
@@ -2641,6 +2721,7 @@ class LibreChatAzureOpenAICompletions extends OriginalAzureChatOpenAICompletions
 
 class LibreChatAzureOpenAIResponses extends OriginalAzureChatOpenAIResponses {
   protected firstPartyEndpoint?: boolean;
+  readonly maxRequestBodyBytes?: number;
 
   /** @see {@link astraRulesApply} */
   protected get astraRulesApply(): boolean {
@@ -2651,7 +2732,8 @@ class LibreChatAzureOpenAIResponses extends OriginalAzureChatOpenAIResponses {
   private safetyIdentifier?: string;
 
   constructor(fields?: LibreChatAzureOpenAIFields) {
-    super(fields);
+    super(withRequestBodyRetryGuard(fields));
+    this.maxRequestBodyBytes = validateRequestBodyLimit(fields?.maxRequestBodyBytes);
     this.promptCacheExplicit = fields?.promptCacheExplicit;
     this.firstPartyEndpoint = fields?.firstPartyEndpoint;
     this.safetyIdentifier = fields?.safety_identifier;
@@ -2805,6 +2887,7 @@ class LibreChatAzureOpenAIResponses extends OriginalAzureChatOpenAIResponses {
       };
 
       this.client = new CustomAzureOpenAIClient({
+        maxRequestBodyBytes: this.maxRequestBodyBytes,
         apiVersion: this.azureOpenAIApiVersion,
         azureADTokenProvider: this.azureADTokenProvider,
         ...(params as t.AzureOpenAIInput),
@@ -2833,6 +2916,13 @@ function withLibreChatOpenAIFields(
   fields?: LibreChatOpenAIFields
 ): LibreChatOpenAIFields {
   const nextFields = fields ?? {};
+  validateRequestBodyLimit(nextFields.maxRequestBodyBytes);
+  if (nextFields.maxRequestBodyBytes != null &&
+      (nextFields.completions != null || nextFields.responses != null)) {
+    throw new RequestBodyBudgetError(
+      'maxRequestBodyBytes requires built-in request delegates.'
+    );
+  }
   return {
     ...nextFields,
     completions:
@@ -2843,6 +2933,7 @@ function withLibreChatOpenAIFields(
 
 export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
   protected firstPartyEndpoint?: boolean;
+  readonly maxRequestBodyBytes?: number;
 
   /** @see {@link astraRulesApply} */
   protected get astraRulesApply(): boolean {
@@ -2854,7 +2945,8 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
   constructor(
     fields?: LibreChatOpenAIFields & t.OpenAIChatInput['modelKwargs']
   ) {
-    super(withLibreChatOpenAIFields(fields));
+    super(withLibreChatOpenAIFields(withRequestBodyRetryGuard(fields)));
+    this.maxRequestBodyBytes = validateRequestBodyLimit(fields?.maxRequestBodyBytes);
     this._lc_stream_delay = resolveStreamDelay(fields?._lc_stream_delay);
     this.firstPartyEndpoint = fields?.firstPartyEndpoint;
   }
@@ -2888,7 +2980,10 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
         delete params.baseURL;
       }
 
-      this.client = new CustomOpenAIClient(params);
+      this.client = new CustomOpenAIClient({
+        ...params,
+        maxRequestBodyBytes: this.maxRequestBodyBytes,
+      });
     }
     const requestOptions = {
       ...this.clientConfig,
@@ -2948,6 +3043,7 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
 
 export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
   protected firstPartyEndpoint?: boolean;
+  readonly maxRequestBodyBytes?: number;
 
   /** @see {@link astraRulesApply} */
   protected get astraRulesApply(): boolean {
@@ -2957,7 +3053,8 @@ export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
   _lc_stream_delay: number;
 
   constructor(fields?: LibreChatAzureOpenAIFields) {
-    super(fields);
+    super(withRequestBodyRetryGuard(fields));
+    this.maxRequestBodyBytes = validateRequestBodyLimit(fields?.maxRequestBodyBytes);
     this.completions = new LibreChatAzureOpenAICompletions(fields);
     this.responses = new LibreChatAzureOpenAIResponses(fields);
     this.fields = {
@@ -3041,6 +3138,7 @@ export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
       };
 
       this.client = new CustomAzureOpenAIClient({
+        maxRequestBodyBytes: this.maxRequestBodyBytes,
         apiVersion: this.azureOpenAIApiVersion,
         azureADTokenProvider: this.azureADTokenProvider,
         ...(params as t.AzureOpenAIInput),

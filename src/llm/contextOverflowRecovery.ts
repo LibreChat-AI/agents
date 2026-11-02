@@ -40,7 +40,7 @@ const MIN_RECOVERY_BUDGET_TOKENS = 4_000;
  * themselves. Without it, a budget that merely clears the system prompt and
  * tool schemas is not a budget anything can be compacted into.
  */
-const MIN_MESSAGE_HEADROOM_TOKENS = 2_000;
+export const MIN_MESSAGE_HEADROOM_TOKENS = 2_000;
 
 /** Bound on forced-compaction retries per agent, per run. */
 export const DEFAULT_MAX_OVERFLOW_RECOVERIES = 2;

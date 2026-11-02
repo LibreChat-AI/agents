@@ -65,6 +65,7 @@ import { getContextOverflowInfo, isProviderCancellation } from '@/utils/errors';
 import { ChatModelStreamHandler, dispatchesChatModelStream } from '@/stream';
 import { Constants, ContentTypes, GraphEvents, Providers } from '@/common';
 import { withProviderTextBoundary } from '@/llm/providerTextBoundary';
+import { RequestBodyBudgetError } from '@/llm/requestBodyBudget';
 import { PreparedSubagentError } from '@/tools/preparedSubagents';
 import { assertNotTruncatedToolCall } from '@/llm/truncation';
 import { resolveClientOptionsModel } from '@/llm/request';
@@ -1686,7 +1687,12 @@ export async function tryFallbackProviders({
     config?: RunnableConfig;
   }) => BaseMessage[] | Promise<BaseMessage[]>;
 }): Promise<Partial<t.BaseGraphState> | undefined> {
-  if (primaryError instanceof ProviderTextProtectionError || isProviderCancellation(primaryError)) throw primaryError;
+  if (
+    primaryError instanceof ProviderTextProtectionError ||
+    primaryError instanceof RequestBodyBudgetError ||
+    isProviderCancellation(primaryError)
+  )
+    throw primaryError;
   config?.signal?.throwIfAborted();
   const isOverflow = (
     error: unknown,
@@ -1799,6 +1805,7 @@ export async function tryFallbackProviders({
        * succeeding one would resolve a run that must reject.
        */
       if (
+        e instanceof RequestBodyBudgetError ||
         e instanceof StreamLimitExceededError ||
         e instanceof PreparedSubagentError ||
         e instanceof InvalidModelToolCallError ||
