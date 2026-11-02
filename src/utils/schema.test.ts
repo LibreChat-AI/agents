@@ -1,13 +1,12 @@
 import { z } from 'zod';
-import { z as z4 } from 'zod/v4';
-import { z as currentZod } from 'zod-v4';
+import { z as z3 } from 'zod/v3';
 import { $ZodString, globalRegistry } from 'zod/v4/core';
 import { toJsonSchema } from './schema';
 
 describe('toJsonSchema', () => {
   it('keeps Zod 4 parameters, tool names, and descriptions', () => {
-    const schema = z4.object({
-      questions: z4.array(z4.object({ question: z4.string() })).min(1),
+    const schema = z.object({
+      questions: z.array(z.object({ question: z.string() })).min(1),
     });
 
     expect(
@@ -32,10 +31,10 @@ describe('toJsonSchema', () => {
   });
 
   it('converts Zod 4 inputs without requiring defaulted or optional fields', () => {
-    const schema = z4.object({
-      query: z4.string().transform((value) => value.length),
-      limit: z4.number().default(5),
-      since: z4.date().optional(),
+    const schema = z.object({
+      query: z.string().transform((value) => value.length),
+      limit: z.number().default(5),
+      since: z.date().optional(),
     });
 
     expect(toJsonSchema(schema)).toMatchObject({
@@ -50,8 +49,8 @@ describe('toJsonSchema', () => {
   });
 
   it('overrides a Zod 4 description without changing the schema', () => {
-    const schema = z4
-      .object({ value: z4.string() })
+    const schema = z
+      .object({ value: z.string() })
       .describe('Original description');
 
     expect(toJsonSchema(schema, undefined, 'Tool description')).toMatchObject({
@@ -64,8 +63,8 @@ describe('toJsonSchema', () => {
   });
 
   it('keeps nested Zod 4 validation and descriptions unchanged', () => {
-    const schema = z4.object({
-      filters: z4.object({ query: z4.string() }).describe('Search filters'),
+    const schema = z.object({
+      filters: z.object({ query: z.string() }).describe('Search filters'),
     });
     const input = { filters: { query: 'files', extra: true } };
 
@@ -76,9 +75,9 @@ describe('toJsonSchema', () => {
   });
 
   it('reads nested metadata from another Zod installation', () => {
-    let separateZod = z4;
+    let separateZod = z;
     jest.isolateModules(() => {
-      separateZod = jest.requireActual<typeof import('zod/v4')>('zod/v4').z;
+      separateZod = jest.requireActual<typeof import('zod')>('zod').z;
     });
     const schema = separateZod.object({
       filters: separateZod
@@ -101,10 +100,10 @@ describe('toJsonSchema', () => {
     });
   });
 
-  it('retains current Zod 4 constraints', () => {
-    const schema = currentZod.object({
-      id: currentZod.string().regex(/^[a-z]+$/),
-      count: currentZod.number().int().min(1).max(4),
+  it('retains Zod 4 constraints', () => {
+    const schema = z.object({
+      id: z.string().regex(/^[a-z]+$/),
+      count: z.number().int().min(1).max(4),
     });
 
     expect(toJsonSchema(schema)).toMatchObject({
@@ -116,30 +115,13 @@ describe('toJsonSchema', () => {
   });
 
   it.each([
-    z4.number().prefault(0),
-    z4.boolean().prefault(false),
-    z4.string().prefault(''),
-    z4.null().prefault(null),
-  ])('keeps a falsy early-Zod prefault in the input schema', (field) => {
-    expect(toJsonSchema(z4.object({ value: field }))).toMatchObject({
+    z.number().prefault(0),
+    z.boolean().prefault(false),
+    z.string().prefault(''),
+    z.null().prefault(null),
+  ])('keeps a falsy prefault in the input schema', (field) => {
+    expect(toJsonSchema(z.object({ value: field }))).toMatchObject({
       properties: { value: { default: field.parse(undefined) } },
-    });
-  });
-
-  it('converts an early-Zod field inside a current-Zod object', () => {
-    const query = z4.string().min(1).max(10).describe('Legacy query');
-    const schema = currentZod.object({ query });
-
-    expect(toJsonSchema(schema)).toMatchObject({
-      properties: {
-        query: {
-          type: 'string',
-          minLength: 1,
-          maxLength: 10,
-          description: 'Legacy query',
-        },
-      },
-      required: ['query'],
     });
   });
 
@@ -155,8 +137,8 @@ describe('toJsonSchema', () => {
 
   it('keeps recursive Zod 4 references rooted when the tool is named', () => {
     type Tree = { name: string; children: Tree[] };
-    const schema: z4.ZodType<Tree> = z4.lazy(() =>
-      z4.object({ name: z4.string(), children: z4.array(schema) })
+    const schema: z.ZodType<Tree> = z.lazy(() =>
+      z.object({ name: z.string(), children: z.array(schema) })
     );
 
     expect(toJsonSchema(schema, 'tree')).toMatchObject({
@@ -168,7 +150,7 @@ describe('toJsonSchema', () => {
 
   it('preserves the named Zod 3 conversion contract', () => {
     expect(
-      toJsonSchema(z.object({ query: z.string() }), 'search', 'Search files')
+      toJsonSchema(z3.object({ query: z3.string() }), 'search', 'Search files')
     ).toEqual({
       $ref: '#/definitions/search',
       definitions: {

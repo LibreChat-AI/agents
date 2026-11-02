@@ -21,15 +21,20 @@ import type {
   AnthropicRequestOptions,
   AnthropicMessageStreamEvent,
 } from '@/llm/anthropic/types';
-import type { SmoothItem } from '@/llm/stream/smoother';
 import type { AnthropicUsageData } from './utils/message_outputs';
+import type { SmoothItem } from '@/llm/stream/smoother';
 import {
   _convertMessagesToAnthropicPayload,
   stripUnsupportedAssistantPrefill,
 } from './utils/message_inputs';
+import {
+  smoothStream,
+  resolveStreamDelay,
+  isSignalAborted,
+} from '@/llm/stream/smoother';
 import { _makeMessageChunkFromAnthropicEvent } from './utils/message_outputs';
-import { smoothStream, resolveStreamDelay, isSignalAborted } from '@/llm/stream/smoother';
 import { convertAnthropicStream } from './utils/stream_events';
+import { getCurrentClaudeDefaultMaxTokens } from './defaults';
 import { handleToolChoice } from './utils/tools';
 
 type StreamTokenType = 'string' | 'input' | 'content';
@@ -124,6 +129,11 @@ function isThinkingEnabled(thinking: Anthropic.ThinkingConfigParam): boolean {
 
 function isOpus47Model(model?: string): boolean {
   return /^claude-opus-4-7(?:-|$)/.test(model ?? '');
+}
+
+function resolveDefaultMaxTokens(model: string, inherited: number): number {
+  const current = getCurrentClaudeDefaultMaxTokens(model);
+  return current == null ? inherited : Math.max(inherited, current);
 }
 
 function combineBetas(
@@ -458,6 +468,9 @@ export class CustomAnthropic extends ChatAnthropicMessages {
   contextManagement?: AnthropicContextManagementConfigParam;
   constructor(fields?: CustomAnthropicInput) {
     super(fields);
+    if (fields?.maxTokens == null) {
+      this.maxTokens = resolveDefaultMaxTokens(this.model, this.maxTokens);
+    }
     this.resetTokenEvents();
     this.setDirectFields(fields);
     this._lc_stream_delay = resolveStreamDelay(fields?._lc_stream_delay);
