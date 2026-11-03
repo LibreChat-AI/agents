@@ -3,6 +3,7 @@ import { config } from 'dotenv';
 import { randomUUID } from 'node:crypto';
 import fetch, { RequestInit } from 'node-fetch';
 import { tool, DynamicStructuredTool } from '@langchain/core/tools';
+import type { RunnableConfig } from '@langchain/core/runnables';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type { ProgrammaticToolCallingJsonSchema } from './ptcTimeout';
 import type * as t from '@/types';
@@ -57,8 +58,7 @@ config();
 const DEFAULT_MAX_ROUND_TRIPS = 20;
 
 const DEFAULT_RUN_TIMEOUT_MS = resolveCodeApiRunTimeoutMs();
-const CODE_API_PROGRAMMATIC_REQUEST_HEADER =
-  'X-LibreChat-Code-Request-ID';
+const CODE_API_PROGRAMMATIC_REQUEST_HEADER = 'X-LibreChat-Code-Request-ID';
 const CANCELLATION_REQUEST_TIMEOUT_MS = 2_000;
 
 // ============================================================================
@@ -151,6 +151,8 @@ ${STATELESS_WARNING}
 
 ${CORE_RULES}
 ${ADDITIONAL_RULES}
+
+MCP file downloads return an interpreter_files summary with registered filenames. After awaiting the download, open those filenames under /mnt/data in the same script. Do not decode base64 or search the tool response for binary content.
 
 When to use: loops, conditionals, parallel (\`asyncio.gather\`), multi-step pipelines.
 
@@ -872,10 +874,72 @@ function normalizeToolInput(
  * @param toolMap - Map of tool names to executable tools
  * @returns Array of tool results
  */
+/** Only host-normalized owned file references cross the PTC continuation boundary. */
+export function getProgrammaticFiles(
+  result: unknown,
+  isMCPTool: boolean
+): t.CodeEnvFile[] {
+  if (!isMCPTool) return [];
+  const artifact = (
+    Array.isArray(result)
+      ? result[1]
+      : (result as { artifact?: { files?: t.CodeEnvFile[] } } | null)?.artifact
+  ) as { files?: t.CodeEnvFile[] } | undefined;
+  if (!Array.isArray(artifact?.files)) return [];
+  if (artifact.files.length > 100) throw new Error('ptc_file_limit_exceeded');
+  return artifact.files.map((file) => {
+    if (
+      file.kind !== 'user' ||
+      typeof file.id !== 'string' ||
+      typeof file.storage_session_id !== 'string' ||
+      typeof file.resource_id !== 'string' ||
+      typeof file.name !== 'string'
+    )
+      throw new Error('invalid_ptc_file_reference');
+    return {
+      id: file.id,
+      name: file.name,
+      storage_session_id: file.storage_session_id,
+      resource_id: file.resource_id,
+      kind: 'user',
+    };
+  });
+}
+
+export function programmaticWireResults(
+  results: t.PTCToolResult[]
+): t.PTCToolResult[] {
+  return results.map(({ mcp_files: _hostMetadata, ...result }) => result);
+}
+
+export function retainProgrammaticAttachments(
+  output: [string, t.ProgrammaticExecutionArtifact],
+  results: t.PTCToolResult[]
+): [string, t.ProgrammaticExecutionArtifact] {
+  const metadata = results.flatMap((result) => result.mcp_files ?? []);
+  return metadata.length
+    ? [output[0], { ...output[1], mcp_files: metadata }]
+    : output;
+}
+
+export function requireContinuationFiles(
+  results: t.PTCToolResult[],
+  response: t.ProgrammaticExecutionResponse
+): void {
+  if (
+    results.some((result) => (result.files?.length ?? 0) > 0) &&
+    response.continuation_files !== 1
+  )
+    throw new Error(
+      'ptc_continuation_files_unsupported: downloaded inputs cannot be mounted in this script by the selected Code API'
+    );
+}
+
 export async function executeTools(
   toolCalls: t.PTCToolCall[],
   toolMap: t.ToolMap,
-  programmaticToolName = Constants.PROGRAMMATIC_TOOL_CALLING
+  programmaticToolName = Constants.PROGRAMMATIC_TOOL_CALLING,
+  config?: RunnableConfig
 ): Promise<t.PTCToolResult[]> {
   const executions = toolCalls.map(async (call): Promise<t.PTCToolResult> => {
     const tool = toolMap.get(call.name);
@@ -890,16 +954,53 @@ export async function executeTools(
     }
 
     try {
-      const result = await tool.invoke(normalizeToolInput(call.input, tool), {
-        metadata: { [programmaticToolName]: true },
-      });
+      const input = normalizeToolInput(call.input, tool);
+      const preservesArtifacts =
+        tool.mcp === true && tool instanceof DynamicStructuredTool;
+      const result = await tool.invoke(
+        preservesArtifacts
+          ? {
+            type: 'tool_call',
+            id: call.id,
+            name: call.name,
+            args: input,
+          }
+          : input,
+        {
+          ...config,
+          metadata: { ...config?.metadata, [programmaticToolName]: true },
+        }
+      );
 
       const isMCPTool = tool.mcp === true;
-      const unwrappedResult = unwrapToolResponse(result, isMCPTool);
+      const content =
+        !Array.isArray(result) &&
+        result != null &&
+        typeof result === 'object' &&
+        'artifact' in result &&
+        'content' in result
+          ? result.content
+          : result;
+      const unwrappedResult = unwrapToolResponse(
+        isMCPTool && content !== result ? [content] : content,
+        isMCPTool
+      );
+      const files = getProgrammaticFiles(result, isMCPTool);
+      const artifact =
+        !Array.isArray(result) &&
+        result != null &&
+        typeof result === 'object' &&
+        'artifact' in result
+          ? (result.artifact as { mcp_files?: object[] })
+          : undefined;
 
       return {
         call_id: call.id,
         result: unwrappedResult,
+        ...(files.length ? { files } : {}),
+        ...((artifact?.mcp_files?.length ?? 0) > 0
+          ? { mcp_files: artifact?.mcp_files }
+          : {}),
         is_error: false,
       };
     } catch (error) {
@@ -1168,6 +1269,7 @@ export function createProgrammaticToolCallingTool(
       );
 
       let roundTrip = 0;
+      const attachmentResults: t.PTCToolResult[] = [];
 
       try {
         // ====================================================================
@@ -1272,14 +1374,18 @@ export function createProgrammaticToolCallingTool(
 
           const toolResults = await executeTools(
             response.tool_calls ?? [],
-            effectiveToolMap
+            effectiveToolMap,
+            Constants.PROGRAMMATIC_TOOL_CALLING,
+            config
           );
+          attachmentResults.push(...toolResults);
+          requireContinuationFiles(toolResults, response);
 
           response = await makeRequest(
             EXEC_ENDPOINT,
             {
               continuation_token: response.continuation_token,
-              tool_results: toolResults,
+              tool_results: programmaticWireResults(toolResults),
             },
             proxy,
             initParams.authHeaders,
@@ -1293,7 +1399,10 @@ export function createProgrammaticToolCallingTool(
         // ====================================================================
 
         if (response.status === 'completed') {
-          return formatCompletedResponse(response, code);
+          return retainProgrammaticAttachments(
+            formatCompletedResponse(response, code),
+            attachmentResults
+          );
         }
 
         if (response.status === 'error') {
