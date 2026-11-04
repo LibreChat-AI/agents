@@ -897,7 +897,7 @@ function getDeferredToolsListing(
     return '';
   }
 
-  const toolsByServer: Record<string, string[]> = {};
+  const toolsByServer: Record<string, string[]> = Object.create(null);
 
   for (const lcTool of toolRegistry.values()) {
     if (onlyDeferred && lcTool.defer_loading !== true) {
@@ -971,7 +971,7 @@ function formatServerListing(
   const toolsByServer: Record<
     string,
     Array<{ name: string; description: string }>
-  > = {};
+  > = Object.create(null);
   for (const tool of tools) {
     const server = extractMcpServerName(tool.name) ?? 'unknown';
     if (!(server in toolsByServer)) {
