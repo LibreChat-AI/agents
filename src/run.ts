@@ -79,6 +79,7 @@ import {
   hasToolOutputTracingConfig,
   resolveLangfuseConfig,
   resolveToolOutputTracingConfig,
+  withoutSkillsAvailable,
 } from '@/langfuseConfig';
 import {
   cloneToolApprovalInterruptPayload,
@@ -2411,9 +2412,11 @@ export class Run<_T extends t.BaseGraphState> {
       this.Graph == null
         ? undefined
         : this.Graph.agentContexts.get(this.Graph.defaultAgentId);
+    const titleRunLangfuse = withoutSkillsAvailable(this.langfuse);
+    const titleLangfuseOverlay = withoutSkillsAvailable(titleContext?.langfuse);
     const titleLangfuseConfig = resolveLangfuseConfig(
-      this.langfuse,
-      titleContext?.langfuse
+      titleRunLangfuse,
+      titleLangfuseOverlay
     );
     const traceMetadata = createLangfuseTraceMetadata({
       messageId: 'title-' + this.id,
@@ -2432,8 +2435,8 @@ export class Run<_T extends t.BaseGraphState> {
      *  parent seed is live; otherwise unseeded, matching the other paths. */
     const inheritedTraceSeed = getTraceIdSeed();
     const titleRuntimeScope = resolveLangfuseRuntimeScope({
-      runLangfuse: this.langfuse,
-      langfuseOverlay: titleContext?.langfuse,
+      runLangfuse: titleRunLangfuse,
+      langfuseOverlay: titleLangfuseOverlay,
       traceIdSeed:
         titleLangfuseConfig?.deterministicTraceId === true ||
         inheritedTraceSeed != null
@@ -2681,9 +2684,11 @@ export class Run<_T extends t.BaseGraphState> {
     };
     const labelRunName = labelChainOptions.runName ?? ACTIVITY_LABEL_TRACE_NAME;
     const labelTags = ['librechat', 'activity-label'];
+    const labelRunLangfuse = withoutSkillsAvailable(this.langfuse);
+    const labelLangfuseOverlay = withoutSkillsAvailable(labelContext?.langfuse);
     const labelLangfuseConfig = resolveLangfuseConfig(
-      this.langfuse,
-      labelContext?.langfuse
+      labelRunLangfuse,
+      labelLangfuseOverlay
     );
     initializeLangfuseTracing(labelLangfuseConfig);
     /** A captured source observation parents the label in the agent trace.
@@ -2698,8 +2703,8 @@ export class Run<_T extends t.BaseGraphState> {
     /** Opaque per-execution component: see `titleScopeRunId`. */
     const labelScopeRunId = `activity-label:${this.id}:${labelSeq}:${nanoid()}`;
     const labelRuntimeScope = resolveLangfuseRuntimeScope({
-      runLangfuse: this.langfuse,
-      langfuseOverlay: labelContext?.langfuse,
+      runLangfuse: labelRunLangfuse,
+      langfuseOverlay: labelLangfuseOverlay,
       traceIdSeed: labelTraceSeed,
       runId: labelScopeRunId,
     });
@@ -3031,9 +3036,11 @@ export class Run<_T extends t.BaseGraphState> {
     const reasoningRunName =
       reasoningChainOptions.runName ?? REASONING_LABEL_TRACE_NAME;
     const reasoningTags = ['librechat', 'reasoning-label', 'reasoning-step'];
+    const reasoningRunLangfuse = withoutSkillsAvailable(this.langfuse);
+    const reasoningLangfuseOverlay = withoutSkillsAvailable(reasoningContext?.langfuse);
     const reasoningLangfuseConfig = resolveLangfuseConfig(
-      this.langfuse,
-      reasoningContext?.langfuse
+      reasoningRunLangfuse,
+      reasoningLangfuseOverlay
     );
     initializeLangfuseTracing(reasoningLangfuseConfig);
 
@@ -3050,8 +3057,8 @@ export class Run<_T extends t.BaseGraphState> {
         : undefined;
     const reasoningScopeRunId = `reasoning-label:${this.id}:${reasoningSeq}:${nanoid()}`;
     const reasoningRuntimeScope = resolveLangfuseRuntimeScope({
-      runLangfuse: this.langfuse,
-      langfuseOverlay: reasoningContext?.langfuse,
+      runLangfuse: reasoningRunLangfuse,
+      langfuseOverlay: reasoningLangfuseOverlay,
       traceIdSeed: reasoningTraceSeed,
       runId: reasoningScopeRunId,
     });
@@ -3265,9 +3272,11 @@ export class Run<_T extends t.BaseGraphState> {
       this.Graph == null
         ? undefined
         : this.Graph.agentContexts.get(this.Graph.defaultAgentId);
+    const phaseRunLangfuse = withoutSkillsAvailable(this.langfuse);
+    const phaseLangfuseOverlay = withoutSkillsAvailable(phaseContext?.langfuse);
     const phaseLangfuseConfig = resolveLangfuseConfig(
-      this.langfuse,
-      phaseContext?.langfuse
+      phaseRunLangfuse,
+      phaseLangfuseOverlay
     );
 
     let redaction = hasToolOutputTracingConfig(
@@ -3396,8 +3405,8 @@ export class Run<_T extends t.BaseGraphState> {
         : undefined;
     const phaseScopeRunId = `activity-phase:${this.id}:${phaseSeq}:${nanoid()}`;
     const phaseRuntimeScope = resolveLangfuseRuntimeScope({
-      runLangfuse: this.langfuse,
-      langfuseOverlay: phaseContext?.langfuse,
+      runLangfuse: phaseRunLangfuse,
+      langfuseOverlay: phaseLangfuseOverlay,
       traceIdSeed: phaseTraceSeed,
       runId: phaseScopeRunId,
     });
