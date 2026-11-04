@@ -72,8 +72,12 @@ const GRAPH_INTERRUPT_TOOL_OUTPUT = JSON.stringify(
 
 /**
  * A LangGraph control-flow error that escapes the root graph is a failure.
- * `@langfuse/langchain` records `is_bubble_up` errors as control flow, so the
- * root reports a plain error with the same name and message.
+ * Nested `GraphInterrupt` and `ParentCommand` errors end their observations
+ * successfully in `handleChainError`, and a real pause ends the root run
+ * normally, so one that reaches a root callback has nowhere to go: for
+ * example, a `ParentCommand` with no parent graph. `@langfuse/langchain`
+ * records `is_bubble_up` errors as control flow, so the root reports a plain
+ * error with the same name and message.
  */
 function toRootFailure(error: unknown): unknown {
   if (
