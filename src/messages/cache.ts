@@ -978,10 +978,11 @@ export function getBedrockMessageCachePointBudget(
  * volatile content cannot pin the cache.
  *
  * With `maxCachePoints` of 2, the same pass also anchors the latest real human
- * message before the tail. Bedrock only looks back about 20 content blocks from
- * a cachePoint, so after a tool-heavy turn the previous turn's cached prefix is
- * out of reach of the tail alone; the human message that opened it still ends
- * exactly where an earlier tail cached it.
+ * message before the tail. Bedrock only looks back about 20 positions from a
+ * cachePoint (a run of tool calls or of tool results counts as one), so after
+ * many sequential tool rounds the previous turn's cached prefix is out of reach
+ * of the tail alone; the human message that opened it still ends exactly where
+ * an earlier tail cached it.
  *
  * Returns a new array - only clones messages that require modification.
  */

@@ -743,7 +743,11 @@ describe('getBedrockMessageCachePointBudget', () => {
 });
 
 describe('Bedrock lookback from the message cachePoints (Converse payload)', () => {
-  /** Bedrock finds an earlier entry at most this many added blocks back (21 hits, 22 misses). */
+  /**
+   * Bedrock finds an earlier entry at most this many positions back (21 hits, 22 misses).
+   * A run of tool calls or of tool results counts as one position; in these sequential
+   * fixtures every block is its own run, so positions equal blocks.
+   */
   const MAX_BLOCKS_ADDED = 21;
 
   type Flat = { blocks: ContentBlock[]; points: number[] };
