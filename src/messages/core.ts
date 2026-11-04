@@ -9,13 +9,13 @@ import {
 } from '@langchain/core/messages';
 import type { ContentBlock as LangChainContentBlock } from '@langchain/core/messages';
 import type { ToolCall, ToolCallChunk } from '@langchain/core/messages/tool';
-import type { ProviderMessageProvenancePart } from './provenance';
-import type * as t from '@/types';
 import type {
   ResponsesReplayPosition,
   ToolHistoryPreparation,
   OrderedToolHistoryProjection,
 } from './toolHistoryProjection';
+import type { ProviderMessageProvenancePart } from './provenance';
+import type * as t from '@/types';
 import {
   cloneToolMessageWithContent,
   compactToolContent,
@@ -23,10 +23,18 @@ import {
   getBoundedCacheControlledTextToolContent,
   getBoundedSingleTextToolContent,
   getComputerCallOutputScreenshot,
+  getResponsesToolOutputParts,
   hasComputerCallOutputMarker,
   isComputerCallOutputMessage,
   serializeToolContentBounded,
 } from '@/utils/toolContent';
+import {
+  OPENAI_RESPONSES_REPLAY_POSITIONS_KEY,
+  createToolHistoryPreparation,
+  getGeneratedImageMimeType,
+  getResponsesHistorySource,
+  isResponsesReplayPosition,
+} from './toolHistoryProjection';
 import {
   getProviderMessageProvenance,
   getProviderSourceMessageIds,
@@ -35,17 +43,10 @@ import {
   stampSyntheticProviderMessage,
 } from './provenance';
 import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
-import { stripAnthropicCacheControl } from './cache';
 import { isReasoningContentBlock } from './reasoningTypes';
+import { stripAnthropicCacheControl } from './cache';
 import { ContentTypes, Providers } from '@/common';
 import { toLangChainContent } from './langchain';
-import {
-  OPENAI_RESPONSES_REPLAY_POSITIONS_KEY,
-  createToolHistoryPreparation,
-  getGeneratedImageMimeType,
-  getResponsesHistorySource,
-  isResponsesReplayPosition,
-} from './toolHistoryProjection';
 
 type ReasoningSummary = { summary?: Array<{ text?: string }> };
 type ReasoningDetail = { type?: string; text?: string };
@@ -2237,6 +2238,18 @@ function projectOpenAIToolMessageContentInternal(
       typeof message.content === 'string'
     ) {
       continue;
+    }
+    if (nativeResponsesProjection) {
+      // Validate media before compaction can normalize a malformed source to
+      // opaque JSON text. Generic structured results still use the fallback.
+      getResponsesToolOutputParts(message.content);
+      const bounded = compactToolContent(message.content, maxChars).content;
+      const parts = getResponsesToolOutputParts(bounded);
+      if (parts != null) {
+        projected ??= [...messages];
+        projected[i] = cloneToolMessageWithContent(message, parts);
+        continue;
+      }
     }
     projected ??= [...messages];
     projected[i] = cloneToolMessageWithContent(
