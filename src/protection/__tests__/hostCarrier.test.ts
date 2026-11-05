@@ -50,7 +50,7 @@ it.each(['success', 'error'] as const)('preserves and detaches valid unselected 
   const artifact = Buffer.from([1, 2, 3]);
   const inspect = jest.fn(); const source: ToolExecuteResult = { toolCallId: 'outer', status, content, artifact, outcome: 'Allowed outcome', ...(status === 'error' ? { errorMessage: 'Allowed diagnostic' } : {}) };
   const outcome = await protectToolExecuteResult(policy(inspect), { name: 'other', id: 'outer' }, source);
-  expect(outcome).toEqual(source); expect(outcome).not.toBe(source); expect(outcome.content).not.toBe(content); expect(outcome.artifact).toBe(artifact); expect(inspect).not.toHaveBeenCalled();
+  expect(outcome).toEqual(source); expect(outcome).not.toBe(source); expect(outcome.content).not.toBe(content); expect(outcome.artifact).toEqual(artifact); expect(outcome.artifact).not.toBe(artifact); expect(inspect).not.toHaveBeenCalled();
   content[0].rows[0].count = 99; expect((outcome.content as typeof content)[0].rows[0].count).toBe(42);
 });
 

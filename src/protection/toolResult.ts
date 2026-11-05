@@ -789,6 +789,11 @@ export function validateToolResultStateFields(input: object, native = false, rou
   const fields = snapshotToolCheckpointRecord(input, ['manualSummary']);
   for (const [key, value] of Object.entries(fields)) {
     if (key === 'manualSummary' && value !== undefined && typeof value !== 'string') throw new ToolResultProtectionError('unsupported');
+    if (policy != null && value != null && (key === 'runStepState' || key === 'handoffState')) {
+      const admitted = createToolOutcomeGuard(policy, { [key]: value }, toolOutcomeSourceScope.getStore()).snapshot() as { runStepState?: unknown; handoffState?: unknown };
+      Object.defineProperty(input, key, { value: admitted[key], enumerable: true, configurable: true, writable: true });
+      continue;
+    }
     if (toolResultStateFields.has(key) || key === '__pregel_tasks' || key === '__pregel_push') continue;
     if (native && key.startsWith('branch:to:') && key.length > 'branch:to:'.length && (value === null || (typeof value === 'string' && routing?.has(value) === true && routing.has(key.slice('branch:to:'.length))))) continue;
     if (native && key.startsWith('join:')) {
@@ -1399,13 +1404,59 @@ for (const root of [...opaqueArtifactTypedArrays, ...opaqueArtifactBuffers, Data
   }
 }
 const MAX_ARTIFACT_BINARY_INDICES = 32_768;
+const MAX_ARTIFACT_COPY_BYTES = 16 * 1024 * 1024;
 const MAX_TOOL_CARRIER_VISITS = 8192;
-type ToolArtifactInspection = { opaque: WeakMap<object, boolean>; prototypes: WeakMap<object, boolean>; binaryIndices: number; visits: number; messages: BaseMessage[][]; collected: WeakMap<object, boolean>; guards: WeakMap<object, ToolOutcomeGuard>; results: Map<ToolOutcomeGuard, WeakMap<object, object>> };
-const artifactInspection = (): ToolArtifactInspection => ({ opaque: new WeakMap(), prototypes: new WeakMap(), binaryIndices: 0, visits: 0, messages: [], collected: new WeakMap(), guards: new WeakMap(), results: new Map() });
+type ToolArtifactInspection = { copies: WeakMap<object, object>; copyBytes: number; opaque: WeakMap<object, boolean>; prototypes: WeakMap<object, boolean>; binaryIndices: number; visits: number; messages: BaseMessage[][]; collected: WeakMap<object, boolean>; guards: WeakMap<object, ToolOutcomeGuard>; results: Map<ToolOutcomeGuard, WeakMap<object, object>> };
+const artifactInspection = (): ToolArtifactInspection => ({ copies: new WeakMap(), copyBytes: 0, opaque: new WeakMap(), prototypes: new WeakMap(), binaryIndices: 0, visits: 0, messages: [], collected: new WeakMap(), guards: new WeakMap(), results: new Map() });
 const typedArrayLength = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Uint8Array.prototype), 'length')!.get!;
 const urlSearchParams = Object.getOwnPropertyDescriptor(URL.prototype, 'searchParams')!.get!;
 const typedArrayBuffer = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Uint8Array.prototype), 'buffer')!.get!;
 const dataViewBuffer = Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer')!.get!;
+const typedArrayByteOffset = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Uint8Array.prototype), 'byteOffset')!.get!;
+const dataViewByteOffset = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteOffset')!.get!;
+const dataViewByteLength = Object.getOwnPropertyDescriptor(DataView.prototype, 'byteLength')!.get!;
+const arrayBufferByteLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength')!.get!;
+const sharedBufferByteLength = Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength')!.get!;
+const urlHref = Object.getOwnPropertyDescriptor(URL.prototype, 'href')!.get!;
+const ArtifactArrayBuffer: new (length: number, options?: { maxByteLength: number }) => ArrayBuffer = ArrayBuffer;
+const ArtifactSharedArrayBuffer: new (length: number, options?: { maxByteLength: number }) => SharedArrayBuffer = SharedArrayBuffer;
+const arrayBufferResizable = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'resizable')!.get!;
+const sharedBufferGrowable = Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'growable')!.get!;
+const arrayBufferMaxByteLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'maxByteLength')!.get!;
+const sharedBufferMaxByteLength = Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'maxByteLength')!.get!;
+
+function detachToolArtifact(value: object, inspection: ToolArtifactInspection): object {
+  const previous = inspection.copies.get(value);
+  if (previous != null) return previous;
+  let copy: object;
+  const prototype = Object.getPrototypeOf(value);
+  if (types.isAnyArrayBuffer(value)) {
+    const shared = types.isSharedArrayBuffer(value);
+    const length = (shared ? sharedBufferByteLength : arrayBufferByteLength).call(value) as number;
+    const resizable = (shared ? sharedBufferGrowable : arrayBufferResizable).call(value) as boolean;
+    const maxByteLength = (shared ? sharedBufferMaxByteLength : arrayBufferMaxByteLength).call(value) as number;
+    if (maxByteLength > MAX_ARTIFACT_COPY_BYTES - inspection.copyBytes) throw new ToolResultProtectionError('overflow');
+    inspection.copyBytes += maxByteLength;
+    const options = resizable ? { maxByteLength } : undefined;
+    const buffer = shared ? new ArtifactSharedArrayBuffer(length, options) : new ArtifactArrayBuffer(length, options);
+    new Uint8Array(buffer).set(new Uint8Array(value as ArrayBuffer, 0, length));
+    copy = buffer;
+  } else if (types.isTypedArray(value)) {
+    const buffer = detachToolArtifact(typedArrayBuffer.call(value) as object, inspection) as ArrayBuffer;
+    const offset = typedArrayByteOffset.call(value) as number;
+    const length = typedArrayLength.call(value) as number;
+    const ArrayType = opaqueArtifactArrayTypes.find((Type) => Type.prototype === prototype);
+    copy = prototype === Buffer.prototype ? Buffer.from(buffer, offset, length) : new ArrayType!(buffer, offset, length);
+  } else if (types.isDataView(value)) {
+    const buffer = detachToolArtifact(dataViewBuffer.call(value) as object, inspection) as ArrayBuffer;
+    copy = new DataView(buffer, dataViewByteOffset.call(value) as number, dataViewByteLength.call(value) as number);
+  } else if (types.isDate(value)) copy = new Date(Date.prototype.getTime.call(value));
+  else copy = new URL(urlHref.call(value) as string);
+  inspection.copies.set(value, copy);
+  inspection.copies.set(copy, copy);
+  inspection.opaque.set(copy, true);
+  return copy;
+}
 
 function validateArtifactPrototype(prototype: object, inspection: ToolArtifactInspection): void {
   if (inspection.prototypes.has(prototype)) return;
@@ -1602,7 +1653,15 @@ function buildToolOutcomeGuard(policy: ToolResultProtection, value: unknown, act
         return payload == null ? copy : restoreToolOutcomeMessagePayload(copy, payload(toolOutcomeMessagePayload(copy), inspection) as object);
       };
     }
-    if (isOpaqueToolArtifact(value, context.inspection)) return (current, inspection) => { if (current !== value || !isOpaqueToolArtifact(value, inspection)) throw new ToolResultProtectionError('unsupported'); return value; };
+    if (isOpaqueToolArtifact(value, context.inspection)) {
+      const admitted = new WeakSet<object>([value]);
+      return (current, inspection) => {
+        if (current == null || typeof current !== 'object' || !admitted.has(current) || !isOpaqueToolArtifact(current, inspection)) throw new ToolResultProtectionError('unsupported');
+        const detached = detachToolArtifact(current, inspection);
+        admitted.add(detached);
+        return detached;
+      };
+    }
     if (Object.hasOwn(value, '__overwrite__')) {
       const overwritten = ownMessageValue(value, '__overwrite__');
       const guard = toolOutcomeGuard(policy, overwritten, active, depth + 1, context);

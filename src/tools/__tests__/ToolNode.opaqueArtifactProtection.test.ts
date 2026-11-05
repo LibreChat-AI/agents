@@ -33,13 +33,13 @@ function input(name = 'other') {
 function selectedMessage(): ToolMessage {
   return new ToolMessage({ name: 'lookup', tool_call_id: 'selected-call', content: raw });
 }
-async function invoke(artifact: object, route: Route, options: { name?: string; configured?: boolean; mutate?: () => void } = {}) {
+async function invoke(artifact: object, route: Route, options: { name?: string; configured?: boolean; mutate?: (exposed: object) => void } = {}) {
   const { name = 'other', configured = true, mutate } = options;
   let executions = 0;
   const native: object[] = [];
   const completions: object[] = [];
   const node = new ToolNode({ trace: true, toolCallStepIds: new Map([['artifact-call', 'artifact-step']]), tools: [new DynamicStructuredTool({ name, description: 'Allowed artifact control.', schema: z.object({}), responseFormat: 'content_and_artifact', func: async () => { executions++; return ['Allowed unselected text', artifact]; } })], eventDrivenMode: route === 'host', ...(configured ? { toolResultProtection: policy() } : {}) });
-  const callbacks = BaseCallbackHandler.fromMethods({ handleToolEnd: (output): void => { native.push((output as ToolMessage).artifact as object); mutate?.(); }, handleCustomEvent: (event, data): void => {
+  const callbacks = BaseCallbackHandler.fromMethods({ handleToolEnd: (output): void => { native.push((output as ToolMessage).artifact as object); mutate?.((output as ToolMessage).artifact as object); }, handleCustomEvent: (event, data): void => {
     if (event === GraphEvents.ON_RUN_STEP_COMPLETED) completions.push(data as object);
     if (event !== GraphEvents.ON_TOOL_EXECUTE) return;
     executions++;
@@ -57,7 +57,7 @@ describe.each(opaqueArtifacts)('$name opaque artifacts', ({ make }) => {
     expect(result).not.toBeInstanceOf(Error); expect(executions).toBe(1); expect(completions).toHaveLength(1);
     const message = (result as { messages: ToolMessage[] }).messages[0];
     expect(message.content).toBe('Allowed unselected text'); expect(message.status).toBe('success'); expect(message.artifact).toEqual(artifact);
-    if (nested) { expect(message.artifact).not.toBe(artifact); expect((message.artifact as { data: object }).data).toBe(value); } else expect(message.artifact).toBe(value);
+    if (nested) { expect(message.artifact).not.toBe(artifact); expect((message.artifact as { data: object }).data).not.toBe(value); } else expect(message.artifact).not.toBe(value);
     expect(message.lc_kwargs.artifact).toBe(message.artifact);
     if (route === 'direct') expect(native).toEqual([artifact]);
   });
@@ -87,9 +87,9 @@ it.each(['own-getter', 'symbol', 'subclass', 'proxy', 'backing-buffer', 'late-pr
   if (mode === 'subclass') { class CustomBytes extends Uint8Array {} artifact = new CustomBytes([1, 2, 3]); }
   if (mode === 'proxy') artifact = new Proxy(artifact, { getPrototypeOf: (): never => { reads++; throw new Error(raw); } });
   if (mode === 'backing-buffer') { artifact = new Uint8Array(3); Object.defineProperty((artifact as Uint8Array).buffer, 'selected', { value: selectedMessage() }); }
-  const mutate = (): void => {
-    if (mode === 'late-property') Object.defineProperty(artifact, 'selected', { value: selectedMessage() });
-    if (mode === 'late-prototype') Object.setPrototypeOf(artifact, { selected: selectedMessage() });
+  const mutate = (exposed: object): void => {
+    if (mode === 'late-property') Object.defineProperty(exposed, 'selected', { value: selectedMessage() });
+    if (mode === 'late-prototype') Object.setPrototypeOf(exposed, { selected: selectedMessage() });
   };
   const { result, native } = await invoke(artifact, 'direct', { mutate });
   expect(result).toBeInstanceOf(ToolResultProtectionError); expect(String(result)).not.toContain(raw); expect(reads).toBe(0);
@@ -109,9 +109,9 @@ it.each(['message', 'getter', 'symbol', 'prototype', 'late', 'control'] as const
   if (mode === 'getter') Object.defineProperty(params, 'selected', { get: () => { reads++; throw new Error(raw); } });
   if (mode === 'symbol') Object.defineProperty(params, Symbol('selected'), { value: selectedMessage() });
   if (mode === 'prototype') Object.setPrototypeOf(params, { selected: selectedMessage() });
-  const { result, native } = await invoke(artifact, 'direct', { mutate: () => { if (mode === 'late') Object.defineProperty(params, 'selected', { value: selectedMessage() }); } });
+  const { result, native } = await invoke(artifact, 'direct', { mutate: (exposed) => { if (mode === 'late') Object.defineProperty((exposed as URL).searchParams, 'selected', { value: selectedMessage() }); } });
   expect(reads).toBe(0);
-  if (mode === 'control') { expect((result as { messages: ToolMessage[] }).messages[0].artifact).toBe(artifact); expect(artifact.search).toBe('?a=1'); return; }
+  if (mode === 'control') { expect((result as { messages: ToolMessage[] }).messages[0].artifact).toEqual(artifact); expect((result as { messages: ToolMessage[] }).messages[0].artifact).not.toBe(artifact); expect(artifact.search).toBe('?a=1'); return; }
   expect(result).toBeInstanceOf(ToolResultProtectionError); expect(String(result)).not.toContain(raw); expect(native).toHaveLength(mode === 'late' ? 1 : 0);
 });
 
@@ -144,13 +144,13 @@ it('does not enumerate the same binary twice while collecting and admitting a ca
 
 it.each(['ArrayBuffer', 'DataView'] as const)('preserves large index-free %s artifacts', async (kind) => {
   const buffer = new ArrayBuffer(4 * 1024 * 1024); const artifact = kind === 'DataView' ? new DataView(buffer) : buffer;
-  const { result } = await invoke(artifact, 'direct'); expect((result as { messages: ToolMessage[] }).messages[0].artifact).toBe(artifact);
+  const { result } = await invoke(artifact, 'direct'); expect((result as { messages: ToolMessage[] }).messages[0].artifact).toEqual(artifact); expect((result as { messages: ToolMessage[] }).messages[0].artifact).not.toBe(artifact);
 });
 
 it('preserves the supported binary index limit without changing bytes', async () => {
   const artifact = new Uint8Array(32_768); artifact[0] = 42; artifact[32_767] = 7;
   const { result } = await invoke(artifact, 'direct');
-  expect((result as { messages: ToolMessage[] }).messages[0].artifact).toBe(artifact); expect(artifact[0]).toBe(42); expect(artifact[32_767]).toBe(7);
+  expect((result as { messages: ToolMessage[] }).messages[0].artifact).toEqual(artifact); expect((result as { messages: ToolMessage[] }).messages[0].artifact).not.toBe(artifact); expect(artifact[0]).toBe(42); expect(artifact[32_767]).toBe(7);
 });
 
 it('does not apply the binary traversal limit when protection is off', async () => {

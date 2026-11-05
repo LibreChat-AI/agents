@@ -32,7 +32,7 @@ it.each((['text', 'tuple', 'record', 'blocks'] as const).flatMap((shape) => [fal
   const outcome = await node.invoke(input(), { callbacks: [callback] }).catch((error: Error) => error) as Error | { messages: ToolMessage[] };
   if (mode === 'default-off') { expect(observed.join('')).toContain(raw); expect(outcome).not.toBeInstanceOf(Error); return; }
   safe(observed); safe(completions); safe(outcome);
-  if (mode === 'control') { expect(observations).toBe(1); expect(executions).toBe(1); expect(completions).toHaveLength(1); expect(outcome).not.toBeInstanceOf(Error); if (shape === 'tuple') expect((outcome as { messages: ToolMessage[] }).messages[0].artifact).toBe(artifact); }
+  if (mode === 'control') { expect(observations).toBe(1); expect(executions).toBe(1); expect(completions).toHaveLength(1); expect(outcome).not.toBeInstanceOf(Error); if (shape === 'tuple') expect((outcome as { messages: ToolMessage[] }).messages[0].artifact).toEqual(artifact); }
   else { expect(outcome).toBeInstanceOf(ToolResultProtectionError); expect(observations).toBe(0); expect(completions).toEqual([]); }
 });
 

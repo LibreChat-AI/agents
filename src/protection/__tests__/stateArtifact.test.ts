@@ -98,7 +98,7 @@ it('retains shared-data topology and inert binary slots without retaining plain 
   const tool = new DynamicStructuredTool({ name: 'other', description: 'Allowed', schema: z.object({}), responseFormat: 'content_and_artifact', func: async () => ['Allowed output', artifact] });
   const result = await new ToolNode({ tools: [tool], toolResultProtection: policy() }).invoke({ messages: [new AIMessage({ content: '', tool_calls: [{ id: 'outer', name: 'other', args: {} }] })] }) as { messages: ToolMessage[] };
   const returned = result.messages[0].artifact as typeof artifact;
-  expect(returned).toEqual(artifact); expect(returned).not.toBe(artifact); expect(returned.first).not.toBe(data); expect(returned.first).toBe(returned.second); expect(returned.bytes).toBe(bytes); expect(result.messages[0].lc_kwargs.artifact).toBe(returned);
+  expect(returned).toEqual(artifact); expect(returned).not.toBe(artifact); expect(returned.first).not.toBe(data); expect(returned.first).toBe(returned.second); expect(returned.bytes).toEqual(bytes); expect(returned.bytes).not.toBe(bytes); expect(result.messages[0].lc_kwargs.artifact).toBe(returned);
 });
 
 it.each(['native-message', 'getter', 'proxy', 'function', 'wide'] as const)('rejects unsupported custom-state %s without reading hostile behavior', async (mode) => {
