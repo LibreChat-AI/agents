@@ -8,7 +8,7 @@ import {
   DynamicTool,
   Tool,
 } from '@langchain/core/tools';
-import { BaseCheckpointSaver, GraphInterrupt, ParentCommand, Send, Overwrite, Command } from '@langchain/langgraph';
+import { BaseCheckpointSaver, GraphBubbleUp, GraphInterrupt, NodeInterrupt, ParentCommand, Send, Overwrite, Command } from '@langchain/langgraph';
 import {
   RemoveMessage, ToolMessage, ToolMessageChunk, AIMessage, AIMessageChunk,
   HumanMessage, HumanMessageChunk, SystemMessage, SystemMessageChunk,
@@ -183,6 +183,8 @@ export function detachToolSafetyError(error: unknown, releasedOnly = false): Pre
 function readmitToolResultFailure(error: unknown): unknown {
   const control = detachToolControlInterrupt(error);
   if (control != null) return control;
+  const admittedControl = readmitToolControlPayload(error);
+  if (admittedControl != null) return admittedControl;
   const safety = detachToolSafetyError(error, true);
   if (safety != null) return safety;
   if (error instanceof ProviderTextProtectionError) return normalizeToolResultError(error);
@@ -814,7 +816,9 @@ export function validateToolResultStateWrite(key: string, value: unknown, routin
 }
 
 export function snapshotToolSummarizationRequest(value: SummarizationNodeInput): SummarizationNodeInput {
-  const request = snapshotToolCheckpointRecord(value, ['windowMessages', 'agentId', 'remainingContextTokens', 'reason', 'allowSummarization']);
+  const fields = ['windowMessages', 'agentId', 'remainingContextTokens', 'reason', 'allowSummarization'];
+  plainObject(value, fields, true);
+  const request = snapshotToolCheckpointRecord(value, fields);
   const reason: unknown = request.reason;
   if (typeof request.agentId !== 'string' || request.agentId === '' || typeof request.remainingContextTokens !== 'number' || !Number.isFinite(request.remainingContextTokens) || (reason !== undefined && reason !== 'trigger' && reason !== 'overflow' && reason !== 'manual') || (request.allowSummarization !== undefined && typeof request.allowSummarization !== 'boolean')) throw new ToolResultProtectionError('unsupported');
   if (request.windowMessages != null) request.windowMessages = snapshotToolInputMessages(request.windowMessages);
@@ -1372,7 +1376,7 @@ const opaqueArtifactBuffers = new Set([
 ]);
 type ToolArtifactPrototype = { parent: object | null; descriptors: Map<PropertyKey, PropertyDescriptor> };
 const artifactPrototypeShapes = new Map<object, ToolArtifactPrototype>();
-for (const root of [...opaqueArtifactTypedArrays, ...opaqueArtifactBuffers, DataView.prototype, Date.prototype, URL.prototype, URLSearchParams.prototype]) {
+for (const root of [...opaqueArtifactTypedArrays, ...opaqueArtifactBuffers, DataView.prototype, Date.prototype, URL.prototype, URLSearchParams.prototype, GraphInterrupt.prototype, NodeInterrupt.prototype, ParentCommand.prototype]) {
   let prototype: object | null = root;
   while (prototype != null && !artifactPrototypeShapes.has(prototype)) {
     const parent = Object.getPrototypeOf(prototype) as object | null;
@@ -1450,7 +1454,7 @@ function inspectOpaqueToolArtifact(value: object, inspection: ToolArtifactInspec
 
 type ToolOutcomeGuard = (input: unknown, inspection: ToolArtifactInspection) => unknown;
 type ToolOutcomeAdmission = (input: unknown) => unknown;
-type ToolOutcomeContext = { serialization?: boolean; inspection: ToolArtifactInspection; embedded?: ToolCallSources; preserveData?: boolean; sources?: ToolCallSources; proposals?: Map<string, Pick<ToolCallSource, 'name' | 'batchId'>>; control?: boolean };
+type ToolOutcomeContext = { checkpointData?: boolean; serialization?: boolean; inspection: ToolArtifactInspection; embedded?: ToolCallSources; preserveData?: boolean; sources?: ToolCallSources; proposals?: Map<string, Pick<ToolCallSource, 'name' | 'batchId'>>; control?: boolean };
 const toolOutcomeAdmissions = new WeakMap<object, { policy: ToolResultProtection; guard: ToolOutcomeAdmission }>();
 
 function chargeToolCarrierVisit(inspection: ToolArtifactInspection): void {
@@ -1490,10 +1494,10 @@ function collectToolOutcomeMessages(value: unknown, groups: BaseMessage[][], ins
   } finally { active.delete(value); }
 }
 
-function createToolOutcomeGuard(policy: ToolResultProtection, value: unknown, sources?: ToolCallSources, preserveData = false, carrier = value, inspection = artifactInspection()): { guard: ToolOutcomeAdmission; snapshot: () => unknown } {
+function createToolOutcomeGuard(policy: ToolResultProtection, value: unknown, sources?: ToolCallSources, preserveData = false, carrier = value, inspection = artifactInspection(), checkpointData = false): { guard: ToolOutcomeAdmission; snapshot: () => unknown } {
   const groups = inspection.messages;
   collectToolOutcomeMessages(carrier, groups, inspection);
-  const readmit = toolOutcomeGuard(policy, value, undefined, 0, { sources, embedded: snapshotToolCallSources(groups), preserveData, inspection });
+  const readmit = toolOutcomeGuard(policy, value, undefined, 0, { sources, embedded: snapshotToolCallSources(groups), preserveData, inspection, checkpointData });
   return { guard: (current): unknown => readmit(current, artifactInspection()), snapshot: (): unknown => readmit(value, inspection) };
 }
 
@@ -1615,11 +1619,12 @@ function buildToolOutcomeGuard(policy: ToolResultProtection, value: unknown, act
         return Object.assign(Object.create(Send.prototype) as Send, next, { args: args(next.args, inspection) });
       };
     }
-    plainObject(value, Object.getOwnPropertyNames(value));
+    plainObject(value, Object.getOwnPropertyNames(value), context.checkpointData);
     const record = snapshotToolCheckpointRecord(value, ['messages', 'agentMessages', 'runStepState', 'handoffState', 'subagentResult', 'summarizationRequest']);
     const guards = new Map<string, ToolOutcomeGuard>();
     const snapshots: Array<[string, (input: unknown) => unknown]> = [
       ['runStepState', snapshotToolRunStepWrite],
+      ['__librechat_run_step_resume_state', (input): unknown => snapshotToolRunStepState(input as RunStepResumeState)],
       ['handoffState', snapshotToolHandoffWrite],
       ['subagentResult', (input): unknown => snapshotToolSubagentResult(input as SubagentGraphResult)],
       ['summarizationRequest', (input): unknown => snapshotToolSummarizationRequest(input as SummarizationNodeInput)],
@@ -2202,6 +2207,53 @@ function snapshotToolOutcomeSources(config?: RunnableConfig): ToolCallSources {
   return snapshotToolCallSources(groups);
 }
 
+type ToolControlAdmission = { policy: ToolResultProtection; field: 'interrupts' | 'command'; guard: ToolOutcomeAdmission; empty?: boolean; sources?: ToolCallSources };
+const toolControlAdmissions = new WeakMap<object, ToolControlAdmission>();
+
+function releaseToolControlPayload(admission: ToolControlAdmission, payload: unknown): GraphInterrupt | ParentCommand {
+  validateArtifactPrototype(admission.field === 'interrupts' ? GraphInterrupt.prototype : ParentCommand.prototype, artifactInspection());
+  let result: GraphInterrupt | ParentCommand;
+  if (admission.field === 'interrupts') { result = new GraphInterrupt([]); result.interrupts = payload as GraphInterrupt['interrupts']; result.message = 'Tool execution interrupted.'; }
+  else result = new ParentCommand(payload as Command);
+  toolControlAdmissions.set(result, admission);
+  return result;
+}
+
+function readmitToolControlPayload(error: unknown): GraphInterrupt | ParentCommand | undefined {
+  if (error == null || typeof error !== 'object') return undefined;
+  const admission = toolControlAdmissions.get(error);
+  if (admission == null) return undefined;
+  const payload = ownMessageValue(error, admission.field);
+  if (admission.empty === true && snapshotToolCheckpointArray(payload as readonly object[]).length !== 0) {
+    const current = createToolOutcomeGuard(admission.policy, payload, admission.sources, false, payload, artifactInspection(), true);
+    return releaseToolControlPayload({ ...admission, empty: false, guard: current.guard }, current.snapshot());
+  }
+  return releaseToolControlPayload(admission, admission.guard(payload));
+}
+
+/** Control exceptions carry result payloads too; ordinary unselected diagnostics stay untouched. */
+export function admitToolResultControl(policy: ToolResultProtection | undefined, error: unknown, sources?: ToolCallSources): unknown {
+  if (policy == null || error == null || typeof error !== 'object') return error;
+  if (types.isProxy(error)) throw new ToolResultProtectionError('unsupported');
+  const previous = toolControlAdmissions.get(error);
+  if (previous != null && previous.policy !== policy) throw new ToolResultProtectionError('incompatible');
+  const existing = readmitToolControlPayload(error);
+  if (existing != null) return existing;
+  if (!(error instanceof GraphBubbleUp)) return error;
+  if (!(error instanceof GraphInterrupt) && !(error instanceof ParentCommand)) throw new ToolResultProtectionError('unsupported');
+  const prototype = Object.getPrototypeOf(error);
+  if (prototype !== GraphInterrupt.prototype && prototype !== NodeInterrupt.prototype && prototype !== ParentCommand.prototype) throw new ToolResultProtectionError('unsupported');
+  validateArtifactPrototype(prototype, artifactInspection());
+  const field = error instanceof GraphInterrupt ? 'interrupts' : 'command';
+  const allowed = new Set(['stack', 'message', 'name', 'cause', 'lc_error_code', field]);
+  if (Reflect.ownKeys(error).some((key) => typeof key !== 'string' || !allowed.has(key))) throw new ToolResultProtectionError('unsupported');
+  const payload = ownMessageValue(error, field);
+  if (field === 'interrupts') snapshotToolCheckpointArray(payload as readonly object[]);
+  const authority = sources ?? toolOutcomeSourceScope.getStore();
+  const admission = createToolOutcomeGuard(policy, payload, authority, false, payload, artifactInspection(), true);
+  return releaseToolControlPayload({ policy, field, guard: admission.guard, sources: authority, empty: field === 'interrupts' && (payload as readonly object[]).length === 0 }, admission.snapshot());
+}
+
 /** Unselected prose stays opaque; embedded releases in native control carriers do not. */
 function withToolResultCarrierBoundary(tool: GenericTool, policy: ToolResultProtection): GenericTool {
   if (!isNativeToolResultShell(tool)) throw new ToolResultProtectionError('unsupported');
@@ -2223,7 +2275,9 @@ function withToolResultCarrierBoundary(tool: GenericTool, policy: ToolResultProt
       return detached;
     };
     Object.defineProperty(invocation, '_call', { value: async (input: unknown, manager?: CallbackManagerForToolRun, config?: RunnableConfig): Promise<unknown> => {
-      const raw = await call.call(tool, input, manager, config);
+      let raw: unknown;
+      try { raw = await call.call(tool, input, manager, config); }
+      catch (error) { throw admitToolResultControl(policy, error, sources); }
       if (invocation.responseFormat !== 'content_and_artifact') return admit(raw);
       const tuple = snapshotDataArray(raw as readonly unknown[], 2);
       if (tuple.length !== 2) throw new ToolResultProtectionError('unsupported');
@@ -2232,7 +2286,9 @@ function withToolResultCarrierBoundary(tool: GenericTool, policy: ToolResultProt
       artifactGuard = artifact.guard;
       return [admit(tuple[0], tuple, inspection), artifact.snapshot()];
     } });
-    const output: unknown = await invoke.apply(invocation, args);
+    let output: unknown;
+    try { output = await invoke.apply(invocation, args); }
+    catch (error) { throw readmitToolControlPayload(error) ?? error; }
     if (output == null || typeof output !== 'object') return output;
     const guard = guards.get(output);
     if (guard == null) {

@@ -54,7 +54,7 @@ import type { PreparedSubagents } from '@/tools/preparedSubagents';
 import type { ToolMessageRelease } from '@/protection/toolResult';
 import type { RunBreakerScope } from '@/llm/streamLimits';
 import type * as t from '@/types';
-import { withToolResultCallSources, releaseToolError, captureToolResultOutcome, readmitToolResultOutcome, detachToolControlInterrupt, withToolResultSafetySignal, detachToolSafetyError, validateToolReplayRelease, snapshotToolErrorText, protectToolErrorText, detachReleasedToolError, getToolMessageRelease, replaceReleasedToolMessage, normalizeToolResultError, needsToolReferenceInspection, protectToolReferenceState, bindToolExecuteProtection, validateToolExecuteResults, hasReleasedToolReference, isReleasedToolError, markReleasedToolMessage, protectToolText, protectToolMessage, protectToolExecuteResult, withToolResultBoundary, requiresToolResultProtection, validateToolResultProtection, ToolResultProtectionError } from '@/protection/toolResult';
+import { admitToolResultControl, withToolResultCallSources, releaseToolError, captureToolResultOutcome, readmitToolResultOutcome, detachToolControlInterrupt, withToolResultSafetySignal, detachToolSafetyError, validateToolReplayRelease, snapshotToolErrorText, protectToolErrorText, detachReleasedToolError, getToolMessageRelease, replaceReleasedToolMessage, normalizeToolResultError, needsToolReferenceInspection, protectToolReferenceState, bindToolExecuteProtection, validateToolExecuteResults, hasReleasedToolReference, isReleasedToolError, markReleasedToolMessage, protectToolText, protectToolMessage, protectToolExecuteResult, withToolResultBoundary, requiresToolResultProtection, validateToolResultProtection, ToolResultProtectionError } from '@/protection/toolResult';
 import {
   TOOL_BATCH_REPLAY_KEY,
   TOOL_REPLAY_CONFIGS_KEY,
@@ -1256,7 +1256,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           turnState.directPathTurns = turnState.directPathTurns.filter(
             ({ toolCallId }) => activeCallIds.has(toolCallId)
           );
-          throw new GraphInterrupt(
+          throw admitToolResultControl(toolResultProtection, new GraphInterrupt(
             await Promise.all(
               error.interrupts.map(async (pendingInterrupt) => {
                 const value = await attachToolBatchReplayState(
@@ -1275,7 +1275,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
                 };
               })
             )
-          );
+          ));
         }
         if (createRunStepResumeState == null) {
           return captureToolResultOutcome(toolResultProtection, result);
