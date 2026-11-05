@@ -1270,18 +1270,45 @@ const opaqueArtifactBuffers = new Set([
   ArrayBuffer.prototype, SharedArrayBuffer.prototype, Object.getPrototypeOf(Buffer.alloc(0).buffer),
   ...opaqueArtifactArrayTypes.map((ArrayType) => Object.getPrototypeOf(new ArrayType(0).buffer)),
 ]);
+type ToolArtifactPrototype = { parent: object | null; descriptors: Map<PropertyKey, PropertyDescriptor> };
+const artifactPrototypeShapes = new Map<object, ToolArtifactPrototype>();
+for (const root of [...opaqueArtifactTypedArrays, ...opaqueArtifactBuffers, DataView.prototype, Date.prototype, URL.prototype, URLSearchParams.prototype]) {
+  let prototype: object | null = root;
+  while (prototype != null && !artifactPrototypeShapes.has(prototype)) {
+    const parent = Object.getPrototypeOf(prototype) as object | null;
+    artifactPrototypeShapes.set(prototype, { parent, descriptors: new Map(Reflect.ownKeys(prototype).map((key) => [key, Object.getOwnPropertyDescriptor(prototype!, key)!])) });
+    prototype = parent;
+  }
+}
 const MAX_ARTIFACT_BINARY_INDICES = 32_768;
-type ToolArtifactInspection = { opaque: WeakMap<object, boolean>; binaryIndices: number };
-const artifactInspection = (): ToolArtifactInspection => ({ opaque: new WeakMap(), binaryIndices: 0 });
+type ToolArtifactInspection = { opaque: WeakMap<object, boolean>; prototypes: WeakMap<object, boolean>; binaryIndices: number };
+const artifactInspection = (): ToolArtifactInspection => ({ opaque: new WeakMap(), prototypes: new WeakMap(), binaryIndices: 0 });
 const typedArrayLength = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Uint8Array.prototype), 'length')!.get!;
 const urlSearchParams = Object.getOwnPropertyDescriptor(URL.prototype, 'searchParams')!.get!;
 const typedArrayBuffer = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Uint8Array.prototype), 'buffer')!.get!;
 const dataViewBuffer = Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer')!.get!;
 
-function isOpaqueArtifactBuffer(value: object): boolean {
+function validateArtifactPrototype(prototype: object, inspection: ToolArtifactInspection): void {
+  if (inspection.prototypes.has(prototype)) return;
+  const expected = artifactPrototypeShapes.get(prototype);
+  if (expected == null || Object.getPrototypeOf(prototype) !== expected.parent) throw new ToolResultProtectionError('unsupported');
+  const keys = Reflect.ownKeys(prototype);
+  if (keys.length !== expected.descriptors.size) throw new ToolResultProtectionError('unsupported');
+  for (const key of keys) {
+    const original = expected.descriptors.get(key);
+    const current = Object.getOwnPropertyDescriptor(prototype, key)!;
+    if (original == null || current.configurable !== original.configurable || current.enumerable !== original.enumerable || current.writable !== original.writable || current.value !== original.value || current.get !== original.get || current.set !== original.set) throw new ToolResultProtectionError('unsupported');
+  }
+  if (expected.parent != null) validateArtifactPrototype(expected.parent, inspection);
+  inspection.prototypes.set(prototype, true);
+}
+
+function isOpaqueArtifactBuffer(value: object, inspection: ToolArtifactInspection): boolean {
   if (types.isProxy(value) || !types.isAnyArrayBuffer(value)) return false;
   const prototype = Object.getPrototypeOf(value);
-  return opaqueArtifactBuffers.has(prototype) && Reflect.ownKeys(value).length === 0;
+  if (!opaqueArtifactBuffers.has(prototype)) throw new ToolResultProtectionError('unsupported');
+  validateArtifactPrototype(prototype, inspection);
+  return Reflect.ownKeys(value).length === 0;
 }
 
 /** Native slots cannot carry messages; custom properties and backing-buffer carriers can. */
@@ -1296,21 +1323,25 @@ function isOpaqueToolArtifact(value: object, inspection: ToolArtifactInspection)
 function inspectOpaqueToolArtifact(value: object, inspection: ToolArtifactInspection): boolean {
   if (types.isProxy(value)) return false;
   const prototype = Object.getPrototypeOf(value);
-  if (types.isAnyArrayBuffer(value)) return isOpaqueArtifactBuffer(value);
-  if (opaqueArtifactTypedArrays.has(prototype) && types.isTypedArray(value)) {
+  if (types.isAnyArrayBuffer(value)) return isOpaqueArtifactBuffer(value, inspection);
+  if (types.isTypedArray(value)) {
+    if (!opaqueArtifactTypedArrays.has(prototype)) throw new ToolResultProtectionError('unsupported');
+    validateArtifactPrototype(prototype, inspection);
     const length = typedArrayLength.call(value) as number;
     if (length > MAX_ARTIFACT_BINARY_INDICES - inspection.binaryIndices) throw new ToolResultProtectionError('overflow');
     inspection.binaryIndices += length;
     if (!Reflect.ownKeys(value).every((key, index) => key === String(index))) return false;
-    return isOpaqueArtifactBuffer(typedArrayBuffer.call(value) as object);
+    return isOpaqueArtifactBuffer(typedArrayBuffer.call(value) as object, inspection);
   }
   if (prototype !== DataView.prototype && prototype !== Date.prototype && prototype !== URL.prototype) return false;
+  validateArtifactPrototype(prototype, inspection);
   if (Reflect.ownKeys(value).length !== 0) return false;
-  if (prototype === DataView.prototype && types.isDataView(value)) return isOpaqueArtifactBuffer(dataViewBuffer.call(value) as object);
+  if (prototype === DataView.prototype && types.isDataView(value)) return isOpaqueArtifactBuffer(dataViewBuffer.call(value) as object, inspection);
   if (prototype === Date.prototype) return types.isDate(value);
   if (prototype !== URL.prototype) return false;
   try {
     const params = urlSearchParams.call(value) as URLSearchParams;
+    validateArtifactPrototype(URLSearchParams.prototype, inspection);
     return Object.getPrototypeOf(params) === URLSearchParams.prototype && Reflect.ownKeys(params).length === 0;
   }
   catch { return false; }
@@ -1322,6 +1353,7 @@ type ToolOutcomeContext = { inspection: ToolArtifactInspection; embedded?: ToolC
 const toolOutcomeAdmissions = new WeakMap<object, { policy: ToolResultProtection; guard: ToolOutcomeAdmission }>();
 
 function collectToolOutcomeMessages(value: unknown, groups: BaseMessage[][], inspection: ToolArtifactInspection, active = new WeakSet<object>(), depth = 0): void {
+  if (typeof value === 'function') throw new ToolResultProtectionError('unsupported');
   if (value == null || typeof value !== 'object') return;
   if (depth > 64 || types.isProxy(value) || active.has(value)) throw new ToolResultProtectionError('unsupported');
   active.add(value);
@@ -1347,7 +1379,7 @@ function createToolOutcomeGuard(policy: ToolResultProtection, value: unknown, so
 }
 
 function toolOutcomeGuard(policy: ToolResultProtection, value: unknown, active = new WeakSet<object>(), depth = 0, context: ToolOutcomeContext = { inspection: artifactInspection() }): ToolOutcomeGuard {
-  if (depth > 64) throw new ToolResultProtectionError('unsupported');
+  if (depth > 64 || typeof value === 'function') throw new ToolResultProtectionError('unsupported');
   if (value == null || typeof value !== 'object') return (current) => { if (!Object.is(current, value)) throw new ToolResultProtectionError('unsupported'); return current; };
   if (types.isProxy(value) || active.has(value)) throw new ToolResultProtectionError('unsupported');
   active.add(value);
@@ -2027,7 +2059,7 @@ function snapshotToolOutcomeSources(config?: RunnableConfig): ToolCallSources {
 
 /** Unselected prose stays opaque; embedded releases in native control carriers do not. */
 function withToolResultCarrierBoundary(tool: GenericTool, policy: ToolResultProtection): GenericTool {
-  if (!isNativeToolResultShell(tool)) return tool;
+  if (!isNativeToolResultShell(tool)) throw new ToolResultProtectionError('unsupported');
   const shell = Object.create(Object.getPrototypeOf(tool), Object.getOwnPropertyDescriptors(tool)) as StructuredTool;
   const call: (input: unknown, manager?: CallbackManagerForToolRun, config?: RunnableConfig) => Promise<unknown> = Reflect.get(tool, '_call');
   const invoke = tool.invoke;
@@ -2037,6 +2069,7 @@ function withToolResultCarrierBoundary(tool: GenericTool, policy: ToolResultProt
     const guards = new WeakMap<object, ToolOutcomeAdmission>();
     let artifactGuard: ToolOutcomeAdmission | undefined;
     const admit = (raw: unknown, carrier = raw, inspection = artifactInspection()): unknown => {
+      if (typeof raw === 'function') throw new ToolResultProtectionError('unsupported');
       if (raw == null || typeof raw !== 'object') return raw;
       if (types.isProxy(raw)) throw new ToolResultProtectionError('unsupported');
       if (!(raw instanceof Command) && !trustedMessageImplementations.has(Object.getPrototypeOf(raw)) && Object.getOwnPropertyDescriptor(raw, 'lc_direct_tool_output')?.value !== true) return raw;
