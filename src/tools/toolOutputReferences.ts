@@ -24,6 +24,7 @@
 
 import { ToolMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
+import type { ToolResultProtection } from '@/protection/toolResult';
 import {
   calculateMaxTotalToolOutputSize,
   HARD_MAX_TOOL_RESULT_CHARS,
@@ -95,8 +96,15 @@ export type ToolOutputReferenceRegistryOptions = {
   maxActiveRuns?: number;
 };
 
+export type ToolOutputReferenceProtection = {
+  version: 1;
+  toolName: string;
+  toolCallId: string;
+  protected: boolean;
+};
+
 export interface ToolOutputReferenceState {
-  entries: Array<{ key: string; value: string }>;
+  entries: Array<{ key: string; value: string; protection?: ToolOutputReferenceProtection }>;
   turnCounter: number;
   warnedNonStringTools: string[];
 }
@@ -160,6 +168,8 @@ const EMPTY_ENTRIES: ReadonlyMap<string, string> = new Map<string, string>();
  */
 class RunStateBucket {
   entries: Map<string, string> = new Map();
+  protections: Map<string, ToolOutputReferenceProtection> = new Map();
+  policies: Map<string, ToolResultProtection> = new Map();
   totalSize: number = 0;
   turnCounter: number = 0;
   warnedNonStringTools: Set<string> = new Set();
@@ -265,7 +275,7 @@ export class ToolOutputReferenceRegistry {
   }
 
   /** Registers (or replaces) the output stored under `key` for `runId`. */
-  set(runId: string | undefined, key: string, value: string): void {
+  set(runId: string | undefined, key: string, value: string, protection?: ToolOutputReferenceProtection, policy?: ToolResultProtection): void {
     const bucket = this.getOrCreate(runId);
     const clipped =
       value.length > this.maxOutputSize
@@ -277,8 +287,18 @@ export class ToolOutputReferenceRegistry {
       bucket.entries.delete(key);
     }
     bucket.entries.set(key, clipped);
+    if (protection == null) bucket.protections.delete(key);
+    else bucket.protections.set(key, { ...protection });
+    if (protection?.protected === true && policy != null) bucket.policies.set(key, policy);
+    else bucket.policies.delete(key);
     bucket.totalSize += clipped.length;
     this.evictWithinBucket(bucket);
+  }
+
+  isPolicyBound(runId: string | undefined, entry: ToolOutputReferenceState['entries'][number], policy: ToolResultProtection): boolean {
+    const bucket = this.runStates.get(this.keyFor(runId));
+    const source = bucket?.protections.get(entry.key);
+    return bucket?.policies.get(entry.key) === policy && bucket.entries.get(entry.key) === entry.value && source?.toolName === entry.protection?.toolName && source?.toolCallId === entry.protection?.toolCallId;
   }
 
   /** Returns the stored value for `key` in `runId`'s bucket, or `undefined`. */
@@ -414,6 +434,7 @@ export class ToolOutputReferenceRegistry {
       entries: [...(bucket?.entries ?? EMPTY_ENTRIES)].map(([key, value]) => ({
         key,
         value,
+        ...(bucket?.protections.has(key) === true ? { protection: { ...bucket.protections.get(key)! } } : {}),
       })),
       turnCounter: bucket?.turnCounter ?? 0,
       warnedNonStringTools: [...(bucket?.warnedNonStringTools ?? [])],
@@ -421,11 +442,14 @@ export class ToolOutputReferenceRegistry {
   }
 
   /** Restore batch inputs without rolling back graph-owned concurrent outputs. */
-  resumeBatch(runId: string, state: ToolOutputReferenceState): ToolOutputResolveView {
+  resumeBatch(runId: string, state: ToolOutputReferenceState, canonicalInputs = false, policy?: ToolResultProtection): ToolOutputResolveView {
     if (!this.runStates.has(runId)) {
       this.restoreState(runId, state);
     }
     const bucket = this.getOrCreate(runId);
+    if (canonicalInputs) {
+      for (const { key, value, protection } of state.entries) this.set(runId, key, value, protection, policy);
+    }
     bucket.turnCounter = Math.max(bucket.turnCounter, state.turnCounter + 1);
     const inputs = new ToolOutputReferenceRegistry({
       maxOutputSize: this.maxOutputSize,
@@ -443,8 +467,8 @@ export class ToolOutputReferenceRegistry {
   ): void {
     this.releaseRun(runId);
     const bucket = this.getOrCreate(runId);
-    for (const { key, value } of state.entries) {
-      this.set(runId, key, value);
+    for (const { key, value, protection } of state.entries) {
+      this.set(runId, key, value, protection);
     }
     bucket.turnCounter = state.turnCounter;
     for (const toolName of state.warnedNonStringTools) {
@@ -555,6 +579,8 @@ export class ToolOutputReferenceRegistry {
       }
       bucket.totalSize -= entry.length;
       bucket.entries.delete(key);
+      bucket.protections.delete(key);
+      bucket.policies.delete(key);
     }
   }
 }

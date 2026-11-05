@@ -1,3 +1,7 @@
+import { ToolMessage } from '@langchain/core/messages';
+import type { ToolResultProtection } from '@/protection/toolResult';
+import { detachToolSafetyError, ToolResultProtectionError, normalizeToolResultError, protectToolMessage, protectToolErrorText, protectToolText, withToolResultBoundary, requiresToolResultProtection } from '@/protection/toolResult';
+import { ProviderTextProtectionError } from '@/protection/providerText';
 // src/tools/ProgrammaticToolCalling.ts
 import { config } from 'dotenv';
 import { randomUUID } from 'node:crypto';
@@ -875,7 +879,8 @@ function normalizeToolInput(
 export async function executeTools(
   toolCalls: t.PTCToolCall[],
   toolMap: t.ToolMap,
-  programmaticToolName = Constants.PROGRAMMATIC_TOOL_CALLING
+  programmaticToolName: string = Constants.PROGRAMMATIC_TOOL_CALLING,
+  protection?: { policy?: ToolResultProtection; signal?: AbortSignal }
 ): Promise<t.PTCToolResult[]> {
   const executions = toolCalls.map(async (call): Promise<t.PTCToolResult> => {
     const tool = toolMap.get(call.name);
@@ -885,14 +890,22 @@ export async function executeTools(
         call_id: call.id,
         result: null,
         is_error: true,
-        error_message: `Tool '${call.name}' not found. Available tools: ${Array.from(toolMap.keys()).join(', ')}`,
+        error_message: await protectToolText(protection?.policy, call.name, call.id, `Tool '${call.name}' not found. Available tools: ${Array.from(toolMap.keys()).join(', ')}`, 'error', protection?.signal) as string,
       };
     }
 
     try {
-      const result = await tool.invoke(normalizeToolInput(call.input, tool), {
-        metadata: { [programmaticToolName]: true },
+      protection?.signal?.throwIfAborted();
+      let result = await withToolResultBoundary(tool, protection?.policy, call.id, { signal: protection?.signal }, call.name).invoke(normalizeToolInput(call.input, tool), {
+        metadata: { [programmaticToolName]: true }, signal: protection?.signal,
       });
+      if (requiresToolResultProtection(protection?.policy, call.name)) {
+        if (!(result instanceof ToolMessage)) throw new ToolResultProtectionError('unsupported');
+        result = await protectToolMessage(protection.policy, call.name, call.id, result, protection.signal);
+        return result.status === 'error'
+          ? { call_id: call.id, result: null, is_error: true, error_message: result.content as string }
+          : { call_id: call.id, result: result.content, is_error: false };
+      }
 
       const isMCPTool = tool.mcp === true;
       const unwrappedResult = unwrapToolResponse(result, isMCPTool);
@@ -903,11 +916,16 @@ export async function executeTools(
         is_error: false,
       };
     } catch (error) {
+      if (error instanceof ProviderTextProtectionError) throw protection?.policy == null ? error : normalizeToolResultError(error);
+      if (requiresToolResultProtection(protection?.policy, call.name)) {
+        const safety = detachToolSafetyError(error, true);
+        if (safety != null) throw safety;
+      }
       return {
         call_id: call.id,
         result: null,
         is_error: true,
-        error_message: (error as Error).message || 'Tool execution failed',
+        error_message: await protectToolErrorText(protection?.policy, call.name, call.id, error, protection?.signal),
       };
     }
   });
@@ -1271,8 +1289,8 @@ export function createProgrammaticToolCallingTool(
           }
 
           const toolResults = await executeTools(
-            response.tool_calls ?? [],
-            effectiveToolMap
+            response.tool_calls ?? [], effectiveToolMap, programmaticToolName,
+            { policy: toolCall.toolResultProtection, signal: config.signal }
           );
 
           response = await makeRequest(
@@ -1302,6 +1320,11 @@ export function createProgrammaticToolCallingTool(
 
         throw new CodeApiRequestError();
       } catch (error) {
+        if (error instanceof ProviderTextProtectionError) throw toolCall.toolResultProtection == null ? error : normalizeToolResultError(error);
+        if (toolCall.toolResultProtection != null) {
+          const safety = detachToolSafetyError(error, true);
+          if (safety != null) throw safety;
+        }
         const messageWithReminder = appendFailedExecutionFileReminder(
           (error as Error).message,
           code

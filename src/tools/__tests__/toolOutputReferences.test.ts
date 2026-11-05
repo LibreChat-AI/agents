@@ -1,4 +1,5 @@
 import { describe, it, expect } from '@jest/globals';
+import type { ToolResultProtection } from '@/protection/toolResult';
 import {
   ToolOutputReferenceRegistry,
   annotateToolOutputWithReference,
@@ -530,4 +531,46 @@ describe('ToolOutputReferenceRegistry', () => {
       expect(TOOL_OUTPUT_REF_PATTERN.flags).not.toContain('g');
     });
   });
+});
+
+it('round-trips reference source provenance and clears it on unprotected overwrite', () => {
+  const registry = new ToolOutputReferenceRegistry();
+  const protection = { version: 1 as const, toolName: 'lookup', toolCallId: 'source-control', protected: true };
+  registry.set('source', 'tool0turn0', 'Allowed canonical control', protection);
+  const snapshot = registry.snapshotState('source');
+  expect(snapshot.entries[0].protection).toEqual(protection);
+  snapshot.entries[0].protection!.toolName = 'changed-copy';
+  expect(registry.snapshotState('source').entries[0].protection!.toolName).toBe('lookup');
+  registry.restoreState('resume', registry.snapshotState('source'));
+  expect(registry.snapshotState('resume').entries[0].protection).toEqual(protection);
+  registry.set('resume', 'tool0turn0', 'New uncertified control');
+  expect(registry.snapshotState('resume').entries[0].protection).toBeUndefined();
+});
+
+it('projects canonical replay inputs into the live registry without dropping unrelated concurrent outputs', () => {
+  const registry = new ToolOutputReferenceRegistry();
+  registry.set('resume', 'tool0turn0', 'Previous allowed control');
+  registry.set('resume', 'tool0turn4', 'Concurrent allowed control');
+  const protection = { version: 1 as const, toolName: 'lookup', toolCallId: 'source-control', protected: true };
+  const view = registry.resumeBatch('resume', { entries: [{ key: 'tool0turn0', value: 'Canonical allowed control', protection }], turnCounter: 1, warnedNonStringTools: [] }, true);
+  expect(view.resolve('{{' + 'tool0turn0' + '}}').resolved).toBe('Canonical allowed control');
+  expect(registry.get('resume', 'tool0turn0')).toBe('Canonical allowed control');
+  expect(registry.get('resume', 'tool0turn4')).toBe('Concurrent allowed control');
+  expect(registry.snapshotState('resume').entries[1].protection).toEqual(protection);
+});
+
+it('never restores live policy bindings from serializable reference metadata', () => {
+  const registry = new ToolOutputReferenceRegistry();
+  const policy: ToolResultProtection = { version: 1, toolNames: ['lookup'], timeoutMs: 1000, maxAttemptBytes: 65536, maxBufferedBytes: 262144, classify: () => 'prose', inspect: ({ content }) => ({ version: 1, ok: true, value: { content, replacements: 0, categories: [] } }) };
+  const protection = { version: 1 as const, toolName: 'lookup', toolCallId: 'source-control', protected: true };
+  registry.set('source', 'tool0turn0', 'Allowed canonical control', protection, policy);
+  const snapshot = registry.snapshotState('source');
+  expect(registry.isPolicyBound('source', snapshot.entries[0], policy)).toBe(true);
+  expect(registry.isPolicyBound('source', { ...snapshot.entries[0], value: 'Different control' }, policy)).toBe(false);
+  expect(registry.isPolicyBound('source', snapshot.entries[0], { ...policy })).toBe(false);
+  registry.restoreState('source', snapshot);
+  expect(registry.isPolicyBound('source', snapshot.entries[0], policy)).toBe(false);
+  registry.set('source', 'tool0turn0', 'Allowed canonical control', protection, policy);
+  registry.set('source', 'tool0turn0', 'Allowed canonical control', protection);
+  expect(registry.isPolicyBound('source', snapshot.entries[0], policy)).toBe(false);
 });

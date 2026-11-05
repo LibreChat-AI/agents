@@ -1,4 +1,5 @@
 import type { ProviderTextProtection } from '@/protection/providerText';
+import type { ToolResultProtection } from '@/protection/toolResult';
 // src/types/graph.ts
 import type {
   BaseMessage,
@@ -409,6 +410,7 @@ export type ModelEndData =
   | undefined;
 export type GraphTools = GenericTool[] | BindToolsInput[] | GoogleAIToolType[];
 export type StandardGraphInput = {
+  toolResultProtection?: ToolResultProtection;
   providerTextProtection?: ProviderTextProtection;
   runId?: string;
   signal?: AbortSignal;

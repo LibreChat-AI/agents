@@ -6,6 +6,7 @@ import type { Interrupt } from '@langchain/langgraph';
 import type { SubagentResumeManifest, SubagentToolNodeResumeState } from '@/tools/subagent/SubagentReplay';
 import type { ToolOutputReferenceState } from '@/tools/toolOutputReferences';
 import type { ToolApprovalReviewEvidence } from '@/hitl/approvalReview';
+import type { ToolMessageRelease } from '@/protection/toolResult';
 import {
   isToolNodeResumeState,
   isToolOutputReferenceState,
@@ -42,6 +43,7 @@ export interface SettledToolBatchResult {
   codeSessionBaseline?: Array<[string, string]>;
   completionHandled?: boolean;
   referenceContent?: string;
+  release?: ToolMessageRelease;
   turn?: number;
 }
 

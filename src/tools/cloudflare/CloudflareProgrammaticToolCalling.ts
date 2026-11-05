@@ -1,6 +1,7 @@
 import { tool } from '@langchain/core/tools';
 import type { DynamicStructuredTool } from '@langchain/core/tools';
 import type * as t from '@/types';
+import { ToolResultProtectionError, snapshotToolResultProtection } from '@/protection/toolResult';
 
 /* eslint-disable no-useless-escape -- generated sandbox helper source needs escapes for emitted JS/Python string literals. */
 import {
@@ -1053,6 +1054,12 @@ async function runProgrammatic(args: {
   const toolCall = (args.config?.toolCall ?? {}) as Partial<
     t.ProgrammaticCache
   > & { tools?: t.LCTool[] };
+  const protection = toolCall.toolResultProtection;
+  if (protection != null) {
+    const trusted = snapshotToolResultProtection(protection);
+    // Native helpers execute inside the sandbox, outside the SDK release gate.
+    if (trusted.toolNames.some((name) => NATIVE_TOOL_NAMES.has(name))) throw new ToolResultProtectionError('unsupported');
+  }
   const toolDefs = resolveProgrammaticToolDefinitions(toolCall);
   const programmaticToolName =
     toolCall.programmaticToolName ??

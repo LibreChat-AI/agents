@@ -39,6 +39,7 @@ export type LegacyGraphConfig = BaseGraphConfig & {
     | 'agents'
     | 'streamLimits'
     | 'providerTextProtection'
+    | 'toolResultProtection'
   > &
   Omit<g.AgentInputs, 'provider' | 'clientOptions' | 'agentId'>;
 
@@ -340,6 +341,7 @@ export type RunConfig = {
    * tool-call argument byte cap is ON by default, the per-turn event cap is
    * opt-in. See {@link StreamLimits}.
    */
+  toolResultProtection?: g.StandardGraphInput['toolResultProtection'];
   providerTextProtection?: g.StandardGraphInput['providerTextProtection'];
   streamLimits?: StreamLimits;
   returnContent?: boolean;
