@@ -1,3 +1,5 @@
+import { z } from 'zod';
+import { DynamicStructuredTool } from '@langchain/core/tools';
 import { HumanMessage, ToolMessage } from '@langchain/core/messages';
 import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
 import { MemorySaver, emptyCheckpoint, Send } from '@langchain/langgraph';
@@ -6,6 +8,7 @@ import type { ToolResultProtection } from '@/protection/toolResult';
 import { ToolResultProtectionError } from '@/protection/toolResult';
 import { StandardGraph } from '@/graphs/Graph';
 import { FakeChatModel } from '@/llm/fake';
+import { HookRegistry } from '@/hooks';
 import { Providers } from '@/common';
 import { Run } from '@/run';
 
@@ -87,4 +90,17 @@ it.each(['branch:to:default', 'join:default:default'] as const)('admits only com
   await expect(instance.validateToolResultCheckpointTuple({ config, checkpoint })).resolves.toBeDefined();
   checkpoint.channel_values[channel] = channel.startsWith('join:') ? [raw] : raw;
   await expect(instance.validateToolResultCheckpointTuple({ config, checkpoint })).rejects.toBeInstanceOf(ToolResultProtectionError);
+});
+
+it.each(['__pregel_push', '__pregel_tasks', '__resume__'] as const)('rejects nested reserved Send %s through a real resumed Run before callbacks', async (field) => {
+  const runId = `reserved-send-${field}`; const hooks = new HookRegistry();
+  hooks.register('PreToolUse', { hooks: [async () => ({ decision: 'ask', reason: 'Allowed approval' })] });
+  const tool = new DynamicStructuredTool({ name: 'lookup', description: 'Allowed control.', schema: z.object({}), func: async () => 'Allowed output' });
+  const run = await Run.create({ runId, graphConfig: { type: 'standard', llmConfig: { provider: Providers.OPENAI }, tools: [tool], compileOptions: { checkpointer: new MemorySaver() } }, hooks, humanInTheLoop: { enabled: true }, toolResultProtection: policy() });
+  run.Graph!.overrideModel = new FakeChatModel({ responses: ['', 'Allowed answer'], toolCalls: [{ id: 'selected-call', name: 'lookup', args: {} }] });
+  const config = { version: 'v2' as const, configurable: { thread_id: runId } }; await run.processStream({ messages: [new HumanMessage('Allowed input')] }, config); expect(run.getInterrupt()).toBeDefined();
+  let observations = 0; const callback = BaseCallbackHandler.fromMethods({ handleChainStart: (): void => { observations++; } }); callback.awaitHandlers = true;
+  const packet = new Send('default', { messages: [new HumanMessage('Allowed input')], [field]: selected() });
+  const outcome = await run.resume([{ type: 'approve' }], { ...config, callbacks: [callback] }, undefined, { goto: [packet] }).catch((error: Error) => error);
+  expect(outcome).toBeInstanceOf(ToolResultProtectionError); expect(observations).toBe(0); expect(String(outcome)).not.toContain(raw);
 });
