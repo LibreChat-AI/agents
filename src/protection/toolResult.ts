@@ -1270,6 +1270,11 @@ const opaqueArtifactBuffers = new Set([
   ArrayBuffer.prototype, SharedArrayBuffer.prototype, Object.getPrototypeOf(Buffer.alloc(0).buffer),
   ...opaqueArtifactArrayTypes.map((ArrayType) => Object.getPrototypeOf(new ArrayType(0).buffer)),
 ]);
+const MAX_ARTIFACT_BINARY_INDICES = 32_768;
+type ToolArtifactInspection = { opaque: WeakMap<object, boolean>; binaryIndices: number };
+const artifactInspection = (): ToolArtifactInspection => ({ opaque: new WeakMap(), binaryIndices: 0 });
+const typedArrayLength = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Uint8Array.prototype), 'length')!.get!;
+const urlSearchParams = Object.getOwnPropertyDescriptor(URL.prototype, 'searchParams')!.get!;
 const typedArrayBuffer = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Uint8Array.prototype), 'buffer')!.get!;
 const dataViewBuffer = Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer')!.get!;
 
@@ -1280,11 +1285,22 @@ function isOpaqueArtifactBuffer(value: object): boolean {
 }
 
 /** Native slots cannot carry messages; custom properties and backing-buffer carriers can. */
-function isOpaqueToolArtifact(value: object): boolean {
+function isOpaqueToolArtifact(value: object, inspection: ToolArtifactInspection): boolean {
+  const cached = inspection.opaque.get(value);
+  if (cached != null) return cached;
+  const opaque = inspectOpaqueToolArtifact(value, inspection);
+  inspection.opaque.set(value, opaque);
+  return opaque;
+}
+
+function inspectOpaqueToolArtifact(value: object, inspection: ToolArtifactInspection): boolean {
   if (types.isProxy(value)) return false;
   const prototype = Object.getPrototypeOf(value);
   if (types.isAnyArrayBuffer(value)) return isOpaqueArtifactBuffer(value);
   if (opaqueArtifactTypedArrays.has(prototype) && types.isTypedArray(value)) {
+    const length = typedArrayLength.call(value) as number;
+    if (length > MAX_ARTIFACT_BINARY_INDICES - inspection.binaryIndices) throw new ToolResultProtectionError('overflow');
+    inspection.binaryIndices += length;
     if (!Reflect.ownKeys(value).every((key, index) => key === String(index))) return false;
     return isOpaqueArtifactBuffer(typedArrayBuffer.call(value) as object);
   }
@@ -1293,15 +1309,19 @@ function isOpaqueToolArtifact(value: object): boolean {
   if (prototype === DataView.prototype && types.isDataView(value)) return isOpaqueArtifactBuffer(dataViewBuffer.call(value) as object);
   if (prototype === Date.prototype) return types.isDate(value);
   if (prototype !== URL.prototype) return false;
-  try { URL.prototype.toString.call(value); return true; }
+  try {
+    const params = urlSearchParams.call(value) as URLSearchParams;
+    return Object.getPrototypeOf(params) === URLSearchParams.prototype && Reflect.ownKeys(params).length === 0;
+  }
   catch { return false; }
 }
 
-type ToolOutcomeGuard = (input: unknown) => unknown;
-type ToolOutcomeContext = { embedded?: ToolCallSources; preserveData?: boolean; sources?: ToolCallSources; proposals?: Map<string, Pick<ToolCallSource, 'name' | 'batchId'>>; control?: boolean };
-const toolOutcomeAdmissions = new WeakMap<object, { policy: ToolResultProtection; guard: ToolOutcomeGuard }>();
+type ToolOutcomeGuard = (input: unknown, inspection: ToolArtifactInspection) => unknown;
+type ToolOutcomeAdmission = (input: unknown) => unknown;
+type ToolOutcomeContext = { inspection: ToolArtifactInspection; embedded?: ToolCallSources; preserveData?: boolean; sources?: ToolCallSources; proposals?: Map<string, Pick<ToolCallSource, 'name' | 'batchId'>>; control?: boolean };
+const toolOutcomeAdmissions = new WeakMap<object, { policy: ToolResultProtection; guard: ToolOutcomeAdmission }>();
 
-function collectToolOutcomeMessages(value: unknown, groups: BaseMessage[][], active = new WeakSet<object>(), depth = 0): void {
+function collectToolOutcomeMessages(value: unknown, groups: BaseMessage[][], inspection: ToolArtifactInspection, active = new WeakSet<object>(), depth = 0): void {
   if (value == null || typeof value !== 'object') return;
   if (depth > 64 || types.isProxy(value) || active.has(value)) throw new ToolResultProtectionError('unsupported');
   active.add(value);
@@ -1309,23 +1329,24 @@ function collectToolOutcomeMessages(value: unknown, groups: BaseMessage[][], act
     if (trustedMessageImplementations.has(Object.getPrototypeOf(value))) {
       const message = snapshotToolInputMessages([value as BaseMessage])[0];
       if (message.type === 'ai') groups.push([message]);
-      if (message.type === 'tool') collectToolOutcomeMessages(ownMessageValue(message, 'artifact'), groups, active, depth + 1);
+      if (message.type === 'tool') collectToolOutcomeMessages(ownMessageValue(message, 'artifact'), groups, inspection, active, depth + 1);
     } else if (Array.isArray(value)) {
-      for (const entry of snapshotToolCheckpointArray(value)) collectToolOutcomeMessages(entry, groups, active, depth + 1);
-    } else if (!isOpaqueToolArtifact(value)) {
+      for (const entry of snapshotToolCheckpointArray(value)) collectToolOutcomeMessages(entry, groups, inspection, active, depth + 1);
+    } else if (!isOpaqueToolArtifact(value, inspection)) {
       const record = value instanceof Command ? snapshotToolCommand(value) : snapshotToolCheckpointRecord(value, []);
-      for (const entry of Object.values(record)) collectToolOutcomeMessages(entry, groups, active, depth + 1);
+      for (const entry of Object.values(record)) collectToolOutcomeMessages(entry, groups, inspection, active, depth + 1);
     }
   } finally { active.delete(value); }
 }
 
-function createToolOutcomeGuard(policy: ToolResultProtection, value: unknown, sources?: ToolCallSources, preserveData = false, carrier = value): ToolOutcomeGuard {
+function createToolOutcomeGuard(policy: ToolResultProtection, value: unknown, sources?: ToolCallSources, preserveData = false, carrier = value, inspection = artifactInspection()): { guard: ToolOutcomeAdmission; snapshot: () => unknown } {
   const groups: BaseMessage[][] = [];
-  collectToolOutcomeMessages(carrier, groups);
-  return toolOutcomeGuard(policy, value, undefined, 0, { sources, embedded: snapshotToolCallSources(groups), preserveData });
+  collectToolOutcomeMessages(carrier, groups, inspection);
+  const readmit = toolOutcomeGuard(policy, value, undefined, 0, { sources, embedded: snapshotToolCallSources(groups), preserveData, inspection });
+  return { guard: (current): unknown => readmit(current, artifactInspection()), snapshot: (): unknown => readmit(value, inspection) };
 }
 
-function toolOutcomeGuard(policy: ToolResultProtection, value: unknown, active = new WeakSet<object>(), depth = 0, context: ToolOutcomeContext = {}): ToolOutcomeGuard {
+function toolOutcomeGuard(policy: ToolResultProtection, value: unknown, active = new WeakSet<object>(), depth = 0, context: ToolOutcomeContext = { inspection: artifactInspection() }): ToolOutcomeGuard {
   if (depth > 64) throw new ToolResultProtectionError('unsupported');
   if (value == null || typeof value !== 'object') return (current) => { if (!Object.is(current, value)) throw new ToolResultProtectionError('unsupported'); return current; };
   if (types.isProxy(value) || active.has(value)) throw new ToolResultProtectionError('unsupported');
@@ -1334,10 +1355,10 @@ function toolOutcomeGuard(policy: ToolResultProtection, value: unknown, active =
     if (Array.isArray(value)) {
       const scope = { ...context, proposals: new Map(context.proposals) };
       const guards = snapshotToolCheckpointArray(value).map((entry) => toolOutcomeGuard(policy, entry, active, depth + 1, scope));
-      return (current) => {
+      return (current, inspection) => {
         const entries = snapshotToolCheckpointArray(current as readonly unknown[]);
         if (entries.length !== guards.length) throw new ToolResultProtectionError('unsupported');
-        const detached = entries.map((entry, index) => guards[index](entry));
+        const detached = entries.map((entry, index) => guards[index](entry, inspection));
         return context.preserveData === true && current === value && detached.every((entry, index) => Object.is(entry, entries[index])) ? value : detached;
       };
     }
@@ -1374,7 +1395,7 @@ function toolOutcomeGuard(policy: ToolResultProtection, value: unknown, active =
       }
       const artifact = envelope == null && type === 'tool' ? toolOutcomeGuard(policy, ownMessageValue(message, 'artifact'), active, depth + 1, { ...context, preserveData: true }) : undefined;
       const identity = ['type', 'id', 'name', 'tool_call_id'].map((field) => ownMessageValue(message, field));
-      return (current) => {
+      return (current, inspection) => {
         const copy = snapshotToolInputMessages([current as BaseMessage])[0];
         if (!identity.every((field, index) => field === ownMessageValue(copy, ['type', 'id', 'name', 'tool_call_id'][index]))) throw new ToolResultProtectionError('unsupported');
         if (routing != null && !isDeepStrictEqual(((ownMessageValue(copy, 'tool_calls') ?? []) as Array<{ id?: string; name: string }>).map(({ id, name }) => ({ id, name })), routing)) throw new ToolResultProtectionError('unsupported');
@@ -1384,19 +1405,19 @@ function toolOutcomeGuard(policy: ToolResultProtection, value: unknown, active =
           return markReleasedToolMessage(policy, admission.name, admission.id, new Message(envelope), admission.referenceContent);
         }
         if (artifact != null) {
-          const admitted = artifact(ownMessageValue(copy, 'artifact'));
+          const admitted = artifact(ownMessageValue(copy, 'artifact'), inspection);
           setToolMessageArtifact(copy, admitted);
         }
         return copy;
       };
     }
-    if (context.preserveData === true && isOpaqueToolArtifact(value)) return (current) => { if (current !== value || !isOpaqueToolArtifact(value)) throw new ToolResultProtectionError('unsupported'); return value; };
+    if (context.preserveData === true && isOpaqueToolArtifact(value, context.inspection)) return (current, inspection) => { if (current !== value || !isOpaqueToolArtifact(value, inspection)) throw new ToolResultProtectionError('unsupported'); return value; };
     if (Object.hasOwn(value, '__overwrite__')) {
       const overwritten = ownMessageValue(value, '__overwrite__');
       const guard = toolOutcomeGuard(policy, overwritten, active, depth + 1, context);
-      return (current) => {
+      return (current, inspection) => {
         if (current == null || typeof current !== 'object' || !Object.hasOwn(current, '__overwrite__')) throw new ToolResultProtectionError('unsupported');
-        return new Overwrite(guard(ownMessageValue(current, '__overwrite__')));
+        return new Overwrite(guard(ownMessageValue(current, '__overwrite__'), inspection));
       };
     }
     if (value instanceof Command) {
@@ -1404,21 +1425,21 @@ function toolOutcomeGuard(policy: ToolResultProtection, value: unknown, active =
       const update = toolOutcomeGuard(policy, snapshotToolResumeUpdates(command.update), active, depth + 1, { ...context, control: true });
       const resume = toolOutcomeGuard(policy, command.resume, active, depth + 1, { ...context, control: true });
       const goto = toolOutcomeGuard(policy, command.goto, active, depth + 1, { ...context, control: true });
-      return (current) => {
+      return (current, inspection) => {
         if (current == null || typeof current !== 'object') throw new ToolResultProtectionError('unsupported');
         const candidate = snapshotToolCommand(current as Command);
         if (candidate.graph !== command.graph || candidate.lc_direct_tool_output !== command.lc_direct_tool_output) throw new ToolResultProtectionError('unsupported');
-        const copy = new Command({ graph: candidate.graph, resume: resume(candidate.resume), goto: goto(candidate.goto) as Command['goto'], update: command.update == null ? undefined : update(snapshotToolResumeUpdates(candidate.update)) as Command['update'] });
+        const copy = new Command({ graph: candidate.graph, resume: resume(candidate.resume, inspection), goto: goto(candidate.goto, inspection) as Command['goto'], update: command.update == null ? undefined : update(snapshotToolResumeUpdates(candidate.update), inspection) as Command['update'] });
         copy.lc_direct_tool_output = candidate.lc_direct_tool_output;
         return copy;
       };
     }
     if (value instanceof Send) {
       const packet = snapshotToolSend(value); const args = toolOutcomeGuard(policy, packet.args, active, depth + 1, { ...context, control: true });
-      return (current) => {
+      return (current, inspection) => {
         const next = snapshotToolSend(current);
         if (next.node !== packet.node || !isDeepStrictEqual(next.timeout, packet.timeout)) throw new ToolResultProtectionError('unsupported');
-        return Object.assign(Object.create(Send.prototype) as Send, next, { args: args(next.args) });
+        return Object.assign(Object.create(Send.prototype) as Send, next, { args: args(next.args, inspection) });
       };
     }
     plainObject(value, Object.getOwnPropertyNames(value));
@@ -1435,18 +1456,18 @@ function toolOutcomeGuard(policy: ToolResultProtection, value: unknown, active =
       if (data == null) continue;
       const dataSnapshot = snapshot(data);
       const guard = toolOutcomeGuard(policy, dataSnapshot, active, depth + 1, { ...context, control: true });
-      const expected = guard(dataSnapshot);
-      guards.set(field, (candidate) => { const detached = guard(snapshot(candidate)); if (!isDeepStrictEqual(detached, expected)) throw new ToolResultProtectionError('unsupported'); return detached; });
+      const expected = guard(dataSnapshot, context.inspection);
+      guards.set(field, (candidate, inspection) => { const detached = guard(snapshot(candidate), inspection); if (!isDeepStrictEqual(detached, expected)) throw new ToolResultProtectionError('unsupported'); return detached; });
     }
     const keys = Object.keys(record);
     for (const field of keys) if (!guards.has(field)) guards.set(field, toolOutcomeGuard(policy, Object.getOwnPropertyDescriptor(record, field)!.value, active, depth + 1, context));
-    return (current) => {
+    return (current, inspection) => {
       const next = snapshotToolCheckpointRecord(current as object, keys);
       if (!isDeepStrictEqual(Object.keys(next), keys)) throw new ToolResultProtectionError('unsupported');
       let unchanged = context.preserveData === true && current === value;
       for (const [field, guard] of guards) {
         const original = Object.getOwnPropertyDescriptor(next, field)?.value;
-        const detached = guard(original);
+        const detached = guard(original, inspection);
         unchanged = unchanged && Object.is(original, detached);
         Object.defineProperty(next, field, { value: detached, enumerable: true, writable: true, configurable: true });
       }
@@ -1457,7 +1478,7 @@ function toolOutcomeGuard(policy: ToolResultProtection, value: unknown, active =
 
 /** Capture release provenance before native chain observers receive the outcome. */
 export function captureToolResultOutcome<T>(policy: ToolResultProtection | undefined, output: T): T {
-  if (policy != null && output != null && typeof output === 'object') toolOutcomeAdmissions.set(output, { policy, guard: createToolOutcomeGuard(policy, output, toolOutcomeSourceScope.getStore()) });
+  if (policy != null && output != null && typeof output === 'object') toolOutcomeAdmissions.set(output, { policy, guard: createToolOutcomeGuard(policy, output, toolOutcomeSourceScope.getStore()).guard });
   return output;
 }
 
@@ -2013,15 +2034,15 @@ function withToolResultCarrierBoundary(tool: GenericTool, policy: ToolResultProt
   Object.defineProperty(shell, 'invoke', { value: async (...args: Parameters<StructuredTool['invoke']>): ReturnType<StructuredTool['invoke']> => {
     const sources = toolOutcomeSourceScope.getStore() ?? snapshotToolOutcomeSources(args[1]);
     const invocation = Object.create(Object.getPrototypeOf(shell), Object.getOwnPropertyDescriptors(shell)) as StructuredTool;
-    const guards = new WeakMap<object, ToolOutcomeGuard>();
-    let artifactGuard: ToolOutcomeGuard | undefined;
-    const admit = (raw: unknown, carrier = raw): unknown => {
+    const guards = new WeakMap<object, ToolOutcomeAdmission>();
+    let artifactGuard: ToolOutcomeAdmission | undefined;
+    const admit = (raw: unknown, carrier = raw, inspection = artifactInspection()): unknown => {
       if (raw == null || typeof raw !== 'object') return raw;
       if (types.isProxy(raw)) throw new ToolResultProtectionError('unsupported');
       if (!(raw instanceof Command) && !trustedMessageImplementations.has(Object.getPrototypeOf(raw)) && Object.getOwnPropertyDescriptor(raw, 'lc_direct_tool_output')?.value !== true) return raw;
-      const guard = createToolOutcomeGuard(policy, raw, sources, false, carrier);
-      const detached = guard(raw) as object;
-      guards.set(detached, guard);
+      const admission = createToolOutcomeGuard(policy, raw, sources, false, carrier, inspection);
+      const detached = admission.snapshot() as object;
+      guards.set(detached, admission.guard);
       return detached;
     };
     Object.defineProperty(invocation, '_call', { value: async (input: unknown, manager?: CallbackManagerForToolRun, config?: RunnableConfig): Promise<unknown> => {
@@ -2029,8 +2050,10 @@ function withToolResultCarrierBoundary(tool: GenericTool, policy: ToolResultProt
       if (invocation.responseFormat !== 'content_and_artifact') return admit(raw);
       const tuple = snapshotDataArray(raw as readonly unknown[], 2);
       if (tuple.length !== 2) throw new ToolResultProtectionError('unsupported');
-      artifactGuard = createToolOutcomeGuard(policy, tuple[1], sources, true, tuple);
-      return [admit(tuple[0], tuple), artifactGuard(tuple[1])];
+      const inspection = artifactInspection();
+      const artifact = createToolOutcomeGuard(policy, tuple[1], sources, true, tuple, inspection);
+      artifactGuard = artifact.guard;
+      return [admit(tuple[0], tuple, inspection), artifact.snapshot()];
     } });
     const output: unknown = await invoke.apply(invocation, args);
     if (output == null || typeof output !== 'object') return output;

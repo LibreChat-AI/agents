@@ -99,3 +99,61 @@ it('preserves default-off binary artifact behavior', async () => {
   const artifact = Buffer.from([1, 2, 3]); const { result } = await invoke(artifact, 'direct', { configured: false });
   expect((result as { messages: ToolMessage[] }).messages[0].artifact).toBe(artifact);
 });
+
+it.each(['message', 'getter', 'symbol', 'prototype', 'late', 'control'] as const)('validates reachable URL parameters before release (%s)', async (mode) => {
+  let reads = 0;
+  const artifact = new URL('https://example.invalid/allowed?a=1');
+  const params = artifact.searchParams;
+  if (mode === 'message') Object.defineProperty(params, 'selected', { value: selectedMessage() });
+  if (mode === 'getter') Object.defineProperty(params, 'selected', { get: () => { reads++; throw new Error(raw); } });
+  if (mode === 'symbol') Object.defineProperty(params, Symbol('selected'), { value: selectedMessage() });
+  if (mode === 'prototype') Object.setPrototypeOf(params, { selected: selectedMessage() });
+  const { result, native } = await invoke(artifact, 'direct', { mutate: () => { if (mode === 'late') Object.defineProperty(params, 'selected', { value: selectedMessage() }); } });
+  expect(reads).toBe(0);
+  if (mode === 'control') { expect((result as { messages: ToolMessage[] }).messages[0].artifact).toBe(artifact); expect(artifact.search).toBe('?a=1'); return; }
+  expect(result).toBeInstanceOf(ToolResultProtectionError); expect(String(result)).not.toContain(raw); expect(native).toHaveLength(mode === 'late' ? 1 : 0);
+});
+
+it.each(['Buffer', 'Uint8Array'] as const)('rejects oversized %s before enumerating its indices', async (kind) => {
+  const artifact = kind === 'Buffer' ? Buffer.alloc(4 * 1024 * 1024) : new Uint8Array(4 * 1024 * 1024);
+  const keys = jest.spyOn(Reflect, 'ownKeys');
+  try {
+    const { result, native } = await invoke(artifact, 'direct');
+    const inspected = keys.mock.calls.some(([value]) => value === artifact);
+    expect(inspected).toBe(false); expect(result).toBeInstanceOf(ToolResultProtectionError); expect(result).toMatchObject({ code: 'overflow' }); expect(native).toEqual([]);
+  } finally { keys.mockRestore(); }
+});
+
+it('bounds aggregate binary traversal across repeated artifact branches', async () => {
+  const artifact = Array.from({ length: 33 }, () => new Uint8Array(1024));
+  const { result, native } = await invoke(artifact, 'direct');
+  expect(result).toBeInstanceOf(ToolResultProtectionError); expect(result).toMatchObject({ code: 'overflow' }); expect(native).toEqual([]);
+});
+
+it('does not enumerate the same binary twice while collecting and admitting a carrier', async () => {
+  const value = new Uint8Array(1024); const artifact = { first: value, second: value };
+  let enumerationCount = 0; let beforeNative = 0;
+  const keys = Reflect.ownKeys;
+  const spy = jest.spyOn(Reflect, 'ownKeys').mockImplementation((object) => { if (object === value) enumerationCount++; return keys(object); });
+  try {
+    const { result } = await invoke(artifact, 'direct', { mutate: () => { beforeNative = enumerationCount; } });
+    expect(result).not.toBeInstanceOf(Error); expect(beforeNative).toBe(1);
+  } finally { spy.mockRestore(); }
+});
+
+it.each(['ArrayBuffer', 'DataView'] as const)('preserves large index-free %s artifacts', async (kind) => {
+  const buffer = new ArrayBuffer(4 * 1024 * 1024); const artifact = kind === 'DataView' ? new DataView(buffer) : buffer;
+  const { result } = await invoke(artifact, 'direct'); expect((result as { messages: ToolMessage[] }).messages[0].artifact).toBe(artifact);
+});
+
+it('preserves the supported binary index limit without changing bytes', async () => {
+  const artifact = new Uint8Array(32_768); artifact[0] = 42; artifact[32_767] = 7;
+  const { result } = await invoke(artifact, 'direct');
+  expect((result as { messages: ToolMessage[] }).messages[0].artifact).toBe(artifact); expect(artifact[0]).toBe(42); expect(artifact[32_767]).toBe(7);
+});
+
+it('does not apply the binary traversal limit when protection is off', async () => {
+  const artifact = Buffer.alloc(4 * 1024 * 1024);
+  const { result } = await invoke(artifact, 'direct', { configured: false });
+  expect((result as { messages: ToolMessage[] }).messages[0].artifact).toBe(artifact);
+});
