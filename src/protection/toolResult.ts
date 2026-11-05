@@ -1261,6 +1261,42 @@ function setToolMessageArtifact(message: BaseMessage, artifact: unknown): void {
   if (kwargs != null && typeof kwargs === 'object') Object.defineProperty(kwargs, 'artifact', { value: artifact, enumerable: true, configurable: true, writable: true });
 }
 
+const opaqueArtifactArrayTypes = [
+  Uint8Array, Uint8ClampedArray, Int8Array, Uint16Array, Int16Array,
+  Uint32Array, Int32Array, Float32Array, Float64Array, BigInt64Array, BigUint64Array,
+];
+const opaqueArtifactTypedArrays = new Set([Buffer.prototype, ...opaqueArtifactArrayTypes.map((ArrayType) => ArrayType.prototype)]);
+const opaqueArtifactBuffers = new Set([
+  ArrayBuffer.prototype, SharedArrayBuffer.prototype, Object.getPrototypeOf(Buffer.alloc(0).buffer),
+  ...opaqueArtifactArrayTypes.map((ArrayType) => Object.getPrototypeOf(new ArrayType(0).buffer)),
+]);
+const typedArrayBuffer = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Uint8Array.prototype), 'buffer')!.get!;
+const dataViewBuffer = Object.getOwnPropertyDescriptor(DataView.prototype, 'buffer')!.get!;
+
+function isOpaqueArtifactBuffer(value: object): boolean {
+  if (types.isProxy(value) || !types.isAnyArrayBuffer(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return opaqueArtifactBuffers.has(prototype) && Reflect.ownKeys(value).length === 0;
+}
+
+/** Native slots cannot carry messages; custom properties and backing-buffer carriers can. */
+function isOpaqueToolArtifact(value: object): boolean {
+  if (types.isProxy(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  if (types.isAnyArrayBuffer(value)) return isOpaqueArtifactBuffer(value);
+  if (opaqueArtifactTypedArrays.has(prototype) && types.isTypedArray(value)) {
+    if (!Reflect.ownKeys(value).every((key, index) => key === String(index))) return false;
+    return isOpaqueArtifactBuffer(typedArrayBuffer.call(value) as object);
+  }
+  if (prototype !== DataView.prototype && prototype !== Date.prototype && prototype !== URL.prototype) return false;
+  if (Reflect.ownKeys(value).length !== 0) return false;
+  if (prototype === DataView.prototype && types.isDataView(value)) return isOpaqueArtifactBuffer(dataViewBuffer.call(value) as object);
+  if (prototype === Date.prototype) return types.isDate(value);
+  if (prototype !== URL.prototype) return false;
+  try { URL.prototype.toString.call(value); return true; }
+  catch { return false; }
+}
+
 type ToolOutcomeGuard = (input: unknown) => unknown;
 type ToolOutcomeContext = { embedded?: ToolCallSources; preserveData?: boolean; sources?: ToolCallSources; proposals?: Map<string, Pick<ToolCallSource, 'name' | 'batchId'>>; control?: boolean };
 const toolOutcomeAdmissions = new WeakMap<object, { policy: ToolResultProtection; guard: ToolOutcomeGuard }>();
@@ -1276,7 +1312,7 @@ function collectToolOutcomeMessages(value: unknown, groups: BaseMessage[][], act
       if (message.type === 'tool') collectToolOutcomeMessages(ownMessageValue(message, 'artifact'), groups, active, depth + 1);
     } else if (Array.isArray(value)) {
       for (const entry of snapshotToolCheckpointArray(value)) collectToolOutcomeMessages(entry, groups, active, depth + 1);
-    } else if (!(Object.getPrototypeOf(value) === Date.prototype && Reflect.ownKeys(value).length === 0)) {
+    } else if (!isOpaqueToolArtifact(value)) {
       const record = value instanceof Command ? snapshotToolCommand(value) : snapshotToolCheckpointRecord(value, []);
       for (const entry of Object.values(record)) collectToolOutcomeMessages(entry, groups, active, depth + 1);
     }
@@ -1354,7 +1390,7 @@ function toolOutcomeGuard(policy: ToolResultProtection, value: unknown, active =
         return copy;
       };
     }
-    if (context.preserveData === true && Object.getPrototypeOf(value) === Date.prototype && Reflect.ownKeys(value).length === 0) return (current) => { if (current !== value || Reflect.ownKeys(value).length !== 0) throw new ToolResultProtectionError('unsupported'); return value; };
+    if (context.preserveData === true && isOpaqueToolArtifact(value)) return (current) => { if (current !== value || !isOpaqueToolArtifact(value)) throw new ToolResultProtectionError('unsupported'); return value; };
     if (Object.hasOwn(value, '__overwrite__')) {
       const overwritten = ownMessageValue(value, '__overwrite__');
       const guard = toolOutcomeGuard(policy, overwritten, active, depth + 1, context);
