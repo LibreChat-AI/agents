@@ -45,8 +45,8 @@ import {
   validateProviderTextProtection,
   isProviderTextRestartCancellation,
 } from './providerText';
+import { StreamLimitExceededError, isStreamLimitCanonicalKey } from '@/llm/streamLimits';
 import { PreparedSubagentError } from '@/tools/preparedSubagents';
-import { StreamLimitExceededError } from '@/llm/streamLimits';
 import { isRunStepResumeState } from '@/tools/runStepResume';
 import { ToolCheckpointSaver } from './toolCheckpoint';
 
@@ -865,7 +865,9 @@ export const toolCheckpointSafety: ToolCheckpointSafety = {
 
 export function snapshotToolSend(input: unknown): Send {
   if (input == null || typeof input !== 'object') throw new ToolResultProtectionError('unsupported');
-  const packet = snapshotToolCheckpointRecord(input as Send, ['node', 'args', 'timeout']);
+  plainObject(input, ['lg_name', 'node', 'args', 'timeout'], true);
+  const packet = snapshotToolCheckpointRecord(input as Send, ['lg_name', 'node', 'args', 'timeout']);
+  if (packet.lg_name !== 'Send') throw new ToolResultProtectionError('unsupported');
   if (typeof packet.node !== 'string' || packet.node === '' || packet.args == null || typeof packet.args !== 'object') throw new ToolResultProtectionError('unsupported');
   const args = snapshotToolCheckpointRecord(packet.args as { messages?: BaseMessage[]; agentMessages?: BaseMessage[]; runStepState?: RunStepResumeState; handoffState?: HandoffState; subagentResult?: SubagentGraphResult; summarizationRequest?: SummarizationNodeInput }, ['messages', 'agentMessages', 'runStepState', 'handoffState', 'subagentResult', 'summarizationRequest', '__pregel_tasks', '__pregel_push']);
   if (Object.keys(args).some((key) => key.startsWith('__'))) throw new ToolResultProtectionError('unsupported');
@@ -1321,7 +1323,7 @@ function toolOutcomeCallPayload(value: unknown): unknown {
 /** Tool arguments retain their opaque identity; every other own message field is a carrier. */
 function toolOutcomeMessagePayload(message: BaseMessage): object {
   const descriptors = Object.getOwnPropertyDescriptors(message);
-  for (const key of Reflect.ownKeys(descriptors)) if (typeof key === 'symbol' && (key !== Symbol.for('langchain.message') || descriptors[key as keyof typeof descriptors].value !== true)) throw new ToolResultProtectionError('unsupported');
+  for (const key of Reflect.ownKeys(descriptors)) if (typeof key === 'symbol' && !isStreamLimitCanonicalKey(key) && (key !== Symbol.for('langchain.message') || descriptors[key as keyof typeof descriptors].value !== true)) throw new ToolResultProtectionError('unsupported');
   const fields = Object.fromEntries(Object.entries(descriptors).filter(([key]) => key !== 'type').map(([key, descriptor]) => [key, descriptor.value])) as object & { lc_kwargs?: object };
   const argumentFields = ownMessageValue(message, 'type') === 'ai' ? toolOutcomeCallFields : [];
   for (const key of argumentFields) if (Object.hasOwn(fields, key)) Object.defineProperty(fields, key, { value: toolOutcomeCallPayload(ownMessageValue(fields, key)), enumerable: true, writable: true, configurable: true });
@@ -1354,6 +1356,8 @@ function restoreToolOutcomeMessagePayload(message: BaseMessage, fields: object):
   const brand = Object.getOwnPropertyDescriptor(message, Symbol.for('langchain.message'));
   if (brand != null) Object.defineProperty(descriptors, Symbol.for('langchain.message'), { value: brand, enumerable: true });
   const result = Object.create(Object.getPrototypeOf(message), descriptors) as BaseMessage;
+  const admission = approved.get(message);
+  if (admission != null) approved.set(result, admission);
   return result;
 }
 
@@ -1536,7 +1540,7 @@ function buildToolOutcomeGuard(policy: ToolResultProtection, value: unknown, act
       };
     }
     const type = ownMessageValue(value, 'type');
-    if (trustedMessageImplementations.has(Object.getPrototypeOf(value)) || (context.serialization !== true && typeof type === 'string' && ['ai', 'human', 'system', 'tool', 'function', 'generic', 'remove'].includes(type))) {
+    if (trustedMessageImplementations.has(Object.getPrototypeOf(value)) || (context.serialization !== true && Object.hasOwn(value, 'content') && typeof type === 'string' && ['ai', 'human', 'system', 'tool', 'function', 'generic', 'remove'].includes(type))) {
       const message = snapshotToolInputMessages([value as BaseMessage])[0];
       const admission = approved.get(message);
       const envelope = admission?.policy === policy ? admission.envelope : undefined;
@@ -1662,7 +1666,10 @@ export function readmitToolResultOutcome<T>(policy: ToolResultProtection, output
 /** Historical state is immutable: reject legacy or newly incompatible history before model reuse. */
 export async function validateToolMessageHistory(policy: ToolResultProtection | undefined, messages: readonly BaseMessage[], releases: readonly ToolMessageRelease[], signal?: AbortSignal, sources?: ToolCallSources, requireSource = false): Promise<BaseMessage[]> {
   if (policy == null) return [...messages];
-  const history = snapshotToolHistoryMessages(messages);
+  const originals = snapshotToolInputMessages(messages);
+  const payloadSources = snapshotToolCallSources([originals], releases, sources);
+  const payloads = originals.map((message) => createToolOutcomeGuard(policy, toolOutcomeMessagePayload(message), payloadSources));
+  const history = originals.map((message, index) => restoreToolOutcomeMessagePayload(message, payloads[index].snapshot() as object));
   const byIdentity = new Map<string, ToolMessageRelease>();
   const byMessage = new Map<string, ToolMessageRelease>();
   const certifiedNames = new Map<string, Set<string>>();
@@ -1718,6 +1725,7 @@ export async function validateToolMessageHistory(policy: ToolResultProtection | 
     if (canonical.content !== ownMessageValue(message, 'content')) throw new ToolResultProtectionError('incompatible');
     history[index] = canonical;
   }
+  for (let index = 0; index < originals.length; index++) payloads[index].guard(toolOutcomeMessagePayload(originals[index]));
   return history;
 }
 

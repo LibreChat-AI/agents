@@ -976,6 +976,11 @@ export function sweepStaleStreamLimitEntries(
  * merges. */
 const STREAM_LIMIT_CANONICAL: unique symbol = Symbol('streamLimitCanonical');
 
+/** History copies omit private emission-accounting links rather than exposing their aliases. */
+export function isStreamLimitCanonicalKey(key: symbol): boolean {
+  return key === STREAM_LIMIT_CANONICAL;
+}
+
 export function linkStreamLimitCanonical(
   copy: object,
   canonical: object
