@@ -493,7 +493,7 @@ it.each(['absent', 'unselected'] as const)(
     const error = await node
       .invoke(state('lookup', { count: RAW }), { callbacks: [callback] })
       .catch((value: Error) => value);
-    expect(error).toBe(retained);
+    if (mode === 'absent') expect(error).toBe(retained); else expect(error).not.toBe(retained);
     expect((error as Error).message).toContain(RAW);
   }
 );

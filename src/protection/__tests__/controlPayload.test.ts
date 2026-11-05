@@ -80,7 +80,7 @@ it.each((['interrupt', 'parent'] as const).flatMap((kind) => (['producer', 'tool
   if (mode === 'default-off') { expect(observed.join('')).toContain(raw); return; }
   safe(observed); safe(result);
   if (mode === 'producer' || mode === 'tool-callback' || mode === 'chain-callback') expect(result).toBeInstanceOf(ToolResultProtectionError);
-  else if (mode === 'ordinary-error') { expect(result).toBe(error); expect(result.cause).toBe(error.cause); }
+  else if (mode === 'ordinary-error') { expect(result).not.toBe(error); expect(result.message).toBe(error.message); expect(result.cause).toEqual(error.cause); expect(result.cause).not.toBe(error.cause); }
   else { expect(result).toBeInstanceOf(kind === 'interrupt' ? GraphInterrupt : ParentCommand); expect(result).not.toBe(retained); if (mode === 'late') payload.nested = selected(); safe(result); }
 });
 

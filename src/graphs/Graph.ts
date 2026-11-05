@@ -119,7 +119,7 @@ import {
   disposeLangfuseHandler,
   isLangfuseCallbackHandler,
 } from '@/langfuse';
-import { validateToolResultStateFields, validateToolResultStateWrite, snapshotToolSubagentResult, snapshotToolHandoffState, snapshotToolHandoffWrite, snapshotToolSummarizationRequest, snapshotToolRunStepWrite, mergeToolCallSources, snapshotToolCallSources, snapshotToolSend, snapshotToolInputMessages, snapshotToolCheckpointConfig, snapshotToolCheckpointData, snapshotToolRunStepState, snapshotToolResumeMessages, snapshotToolMessageRemoval, snapshotToolCheckpointRecord, snapshotToolCheckpointArray, snapshotToolHistoryMessages, retainToolMessageReleases, normalizeToolResultError, getLiveToolMessageRelease, commitToolMessageRelease, snapshotToolMessageReleases, validateToolMessageHistory, requiresToolResultProtection, ToolResultProtectionError, validateToolResultProtection } from '@/protection/toolResult';
+import { snapshotToolControlData, validateToolResultStateFields, validateToolResultStateWrite, snapshotToolSubagentResult, snapshotToolHandoffState, snapshotToolHandoffWrite, snapshotToolSummarizationRequest, snapshotToolRunStepWrite, mergeToolCallSources, snapshotToolCallSources, snapshotToolSend, snapshotToolInputMessages, snapshotToolCheckpointConfig, snapshotToolCheckpointData, snapshotToolRunStepState, snapshotToolResumeMessages, snapshotToolMessageRemoval, snapshotToolCheckpointRecord, snapshotToolCheckpointArray, snapshotToolHistoryMessages, retainToolMessageReleases, normalizeToolResultError, getLiveToolMessageRelease, commitToolMessageRelease, snapshotToolMessageReleases, validateToolMessageHistory, requiresToolResultProtection, ToolResultProtectionError, validateToolResultProtection } from '@/protection/toolResult';
 import {
   getBlindRecoveryBudget,
   planContextOverflowRecovery,
@@ -802,10 +802,11 @@ export abstract class Graph<
         }
         if (snapshot.tasks != null) {
           const tasks = snapshotToolCheckpointArray(snapshot.tasks);
+          const controlSources = snapshotToolCallSources([snapshot.values?.messages ?? [], snapshot.values?.agentMessages ?? []], snapshot.values?.runStepState?.toolResultReleases ?? [], sources);
           const admittedTasks: typeof tasks = [];
           for (const entry of tasks) {
             const task = snapshotToolCheckpointRecord(entry, ['state', 'interrupts', 'name']);
-            if (task.interrupts != null) task.interrupts = snapshotToolCheckpointArray(task.interrupts).map((interrupt) => snapshotToolCheckpointData(snapshotToolCheckpointRecord(interrupt, ['id', 'value'])));
+            if (task.interrupts != null) task.interrupts = snapshotToolControlData(this.toolResultProtection, snapshotToolCheckpointArray(task.interrupts), controlSources);
             if (task.state != null) {
               const state = snapshotToolCheckpointRecord(task.state, ['values', 'tasks', 'config']);
               task.state = Object.hasOwn(state, 'values') || Object.hasOwn(state, 'tasks') ? await visit(task.state as ToolResultCheckpoint) : state;
@@ -944,7 +945,6 @@ export abstract class Graph<
       if (write[1] === 'handoffState') write[2] = snapshotToolHandoffWrite(write[2]);
       if (write[1] === 'subagentResult' && write[2] != null) write[2] = snapshotToolSubagentResult(write[2] as t.SubagentGraphResult);
       if (write[1] === 'summarizationRequest' && write[2] != null) write[2] = snapshotToolSummarizationRequest(write[2] as t.SummarizationNodeInput);
-      if (['__interrupt__', '__resume__', '__error__', '__error_source_node__', '__scheduled__', '__return__', '__no_writes__'].includes(write[1])) write[2] = snapshotToolCheckpointData(write[2]);
       if (write[1] === '__pregel_tasks' || write[1] === '__pregel_push') write[2] = Array.isArray(write[2]) ? snapshotToolCheckpointArray(write[2]).map(snapshotToolSend) : snapshotToolSend(write[2]);
       if (write[1] !== 'messages' && write[1] !== 'agentMessages') continue;
       const change = snapshotToolResumeMessages(write[2]);
@@ -982,7 +982,9 @@ export abstract class Graph<
     for (const write of pending) if (write[1] === '__pregel_tasks' || write[1] === '__pregel_push') write[2] = await admitTasks(write[2]);
     if (values.__start__ != null) values.__start__ = (await this.validateToolResultCheckpoint({ values: snapshotToolCheckpointRecord(values.__start__ as NonNullable<ToolResultCheckpoint['values']>, []) }, signal, sources)).values;
     for (const write of pending) if (write[1] === '__start__' && write[2] != null) write[2] = (await this.validateToolResultCheckpoint({ values: snapshotToolCheckpointRecord(write[2] as NonNullable<ToolResultCheckpoint['values']>, []) }, signal, sources)).values;
-    for (const key of ['__interrupt__', '__resume__', '__error__', '__error_source_node__', '__scheduled__', '__return__', '__no_writes__']) if (Object.hasOwn(values, key)) values[key] = snapshotToolCheckpointData(values[key]);
+    const controls = new Set(['__interrupt__', '__resume__', '__error__', '__error_source_node__', '__scheduled__', '__return__', '__no_writes__']);
+    for (const key of controls) if (Object.hasOwn(values, key)) values[key] = snapshotToolControlData(this.toolResultProtection, values[key], sources);
+    for (const write of pending) if (controls.has(write[1])) write[2] = snapshotToolControlData(this.toolResultProtection, write[2], sources);
     if (values.messages != null) values.messages = history.slice(0, primary.length);
     if (values.agentMessages != null) values.agentMessages = history.slice(primary.length);
     let position = 0;

@@ -4097,7 +4097,9 @@ it.each(['stream', 'prepared'] as const)('preserves safety abort semantics witho
 it.each((['stream', 'prepared'] as const).flatMap((type) => [false, true].map((unselected) => [type, unselected] as const)))('retains original producer safety diagnostics when protection is absent or unselected (%s/%s)', async (type, unselected) => {
   const safety = type === 'stream' ? new StreamLimitExceededError({ kind: 'tool_call_args', limit: 10, observed: 11 }) : new PreparedSubagentError(fixtures.canaries[0]); safety.message = fixtures.canaries[0];
   const node = new ToolNode({ trace: true, tools: [direct(() => { throw safety; })], ...(unselected ? { toolResultProtection: policy({ toolNames: ['other'] }) } : {}) });
-  await expect(node.invoke(state())).rejects.toBe(safety);
+  const result = await node.invoke(state()).catch((error: Error) => error);
+  expect(result).toBeInstanceOf(safety.constructor); expect((result as Error).message).toBe(safety.message);
+  if (unselected) expect(result).not.toBe(safety); else expect(result).toBe(safety);
 });
 
 it.each(['kind', 'limit', 'observed', 'inherited', 'getter'] as const)('fails closed on malformed producer safety metadata before native callbacks (%s)', async (field) => {
