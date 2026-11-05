@@ -746,6 +746,8 @@ export abstract class Graph<
   T extends t.BaseGraphState = t.BaseGraphState,
   _TNodeName extends string = string,
 > {
+  /** Default-off mandatory tool-result release. */
+  toolResultProtection?: t.StandardGraphInput['toolResultProtection'];
   protected readonly toolResultRoutingNodes = new Set<string>([START, END]);
   protected captureToolResultRoutingNodes(nodes: object): void {
     for (const name of Object.keys(nodes)) this.toolResultRoutingNodes.add(name);
@@ -780,7 +782,7 @@ export abstract class Graph<
         }
         if (snapshot.values != null) {
           const values = snapshotToolCheckpointRecord(snapshot.values, ['messages', 'agentMessages', 'runStepState', 'summarizationRequest', 'handoffState', 'subagentResult']);
-          validateToolResultStateFields(values);
+          validateToolResultStateFields(values, false, undefined, this.toolResultProtection);
           snapshot.values = values;
           if (values.runStepState != null) values.runStepState = snapshotToolRunStepState(values.runStepState);
           if (values.handoffState != null) values.handoffState = snapshotToolHandoffState(values.handoffState);
@@ -854,7 +856,7 @@ export abstract class Graph<
   async validateToolResultSend(input: unknown, signal?: AbortSignal, fallback?: Pick<t.RunStepResumeState, 'toolResultReleases'>, sources: ToolCallSources = new Map()): Promise<Send> {
     const packet = snapshotToolSend(input);
     const args = packet.args as NonNullable<ToolResultCheckpoint['values']>;
-    validateToolResultStateFields(args);
+    validateToolResultStateFields(args, false, undefined, this.toolResultProtection);
     const primary = args.messages ?? []; const alternate = args.agentMessages ?? [];
     const state = { toolResultReleases: [...fallback?.toolResultReleases ?? [], ...args.runStepState?.toolResultReleases ?? []] };
     const canonical = await this.validateToolResultHistory([...primary, ...alternate], state, signal, sources, true);
@@ -905,7 +907,7 @@ export abstract class Graph<
     checkpoint.channel_versions = snapshotToolCheckpointData(checkpoint.channel_versions);
     checkpoint.versions_seen = snapshotToolCheckpointData(checkpoint.versions_seen);
     const values = snapshotToolCheckpointRecord(checkpoint.channel_values, ['messages', 'agentMessages', 'runStepState', 'handoffState', 'subagentResult', 'summarizationRequest', '__pregel_tasks']);
-    validateToolResultStateFields(values, true, this.toolResultRoutingNodes);
+    validateToolResultStateFields(values, true, this.toolResultRoutingNodes, this.toolResultProtection);
     if (values.messages != null) values.messages = snapshotToolInputMessages(values.messages as BaseMessage[]);
     if (values.agentMessages != null) values.agentMessages = snapshotToolInputMessages(values.agentMessages as BaseMessage[]);
     if (values.handoffState != null) values.handoffState = snapshotToolHandoffState(values.handoffState as t.HandoffState);
@@ -923,7 +925,7 @@ export abstract class Graph<
     const pending = snapshotToolCheckpointArray(tuple.pendingWrites ?? []).map((entry) => {
       const write = snapshotToolCheckpointArray(entry);
       if (write.length !== 3 || typeof write[0] !== 'string' || typeof write[1] !== 'string') throw new ToolResultProtectionError('unsupported');
-      write[2] = validateToolResultStateWrite(write[1], write[2], this.toolResultRoutingNodes);
+      write[2] = validateToolResultStateWrite(write[1], write[2], this.toolResultRoutingNodes, this.toolResultProtection);
       return [write[0], write[1], write[2]] as NonNullable<CheckpointTuple['pendingWrites']>[number];
     });
     const releases: ToolMessageRelease[] = [];
@@ -1679,8 +1681,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    * these on every streamed chunk event.
    */
   streamLimits: ResolvedStreamLimits;
-  /** Default-off mandatory tool-result release. */
-  toolResultProtection?: t.StandardGraphInput['toolResultProtection'];
   /** Default-off mandatory provider prose release. */
   providerTextProtection?: t.StandardGraphInput['providerTextProtection'];
   /**

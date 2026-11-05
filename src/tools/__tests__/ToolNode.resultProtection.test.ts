@@ -4499,7 +4499,7 @@ it.each(['unapproved', 'modified', 'native-mutation', 'alias', 'control', 'defau
   if (mode === 'default-off') { expect(native.join('')).toContain(fixtures.canaries[0]); return; }
   assertNoCanary(native.join('')); if (mode === 'alias') retained!.content = fixtures.canaries[0]; assertNoCanary(outcome);
   if (mode === 'unapproved' || mode === 'modified' || mode === 'native-mutation') expect(outcome).toBeInstanceOf(ToolResultProtectionError);
-  else { expect(outcome).not.toBeInstanceOf(Error); if (mode === 'opaque') expect((outcome as { messages: ToolMessage[] }).messages[0].artifact).toBe(artifact); }
+  else { expect(outcome).not.toBeInstanceOf(Error); if (mode === 'opaque') { expect((outcome as { messages: ToolMessage[] }).messages[0].artifact).toEqual(artifact); expect((outcome as { messages: ToolMessage[] }).messages[0].artifact).not.toBe(artifact); } }
 });
 
 it.each(['nameless', 'renamed', 'unselected', 'duplicate', 'renamed-proposal', 'missing-batch', 'new-batch'] as const)('binds routing result identities to enclosing calls (%s)', async (mode) => {
@@ -4596,7 +4596,7 @@ it.each(['unapproved', 'modified', 'native-mutation', 'alias', 'control', 'opaqu
   const outcome = await node.invoke({ messages: [new AIMessage({ content: '', tool_calls: [{ id: 'shell-call', name: 'shell_control', args: {} }] })] }, { callbacks: [callback] }).catch((error: Error) => error);
   assertNoCanary(native.join('')); if (mode === 'alias') retained!.content = fixtures.canaries[0]; assertNoCanary(outcome);
   if (mode === 'unapproved' || mode === 'modified' || mode === 'native-mutation') expect(outcome).toBeInstanceOf(ToolResultProtectionError);
-  else { expect(outcome).not.toBeInstanceOf(Error); if (mode === 'opaque') expect((outcome as { messages: ToolMessage[] }).messages[0].artifact).toBe(artifact); }
+  else { expect(outcome).not.toBeInstanceOf(Error); if (mode === 'opaque') { expect((outcome as { messages: ToolMessage[] }).messages[0].artifact).toEqual(artifact); expect((outcome as { messages: ToolMessage[] }).messages[0].artifact).not.toBe(artifact); } }
 });
 
 it.each(['producer', 'chain-observer', 'control'] as const)('retains batch authority across native siblings (%s)', async (mode) => {

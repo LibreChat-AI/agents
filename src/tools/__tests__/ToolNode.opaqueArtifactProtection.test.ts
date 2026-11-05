@@ -56,8 +56,9 @@ describe.each(opaqueArtifacts)('$name opaque artifacts', ({ make }) => {
     const { result, native, completions, executions } = await invoke(artifact, route);
     expect(result).not.toBeInstanceOf(Error); expect(executions).toBe(1); expect(completions).toHaveLength(1);
     const message = (result as { messages: ToolMessage[] }).messages[0];
-    expect(message.content).toBe('Allowed unselected text'); expect(message.status).toBe('success'); expect(message.artifact).toBe(artifact);
-    expect(message.lc_kwargs.artifact).toBe(artifact);
+    expect(message.content).toBe('Allowed unselected text'); expect(message.status).toBe('success'); expect(message.artifact).toEqual(artifact);
+    if (nested) { expect(message.artifact).not.toBe(artifact); expect((message.artifact as { data: object }).data).toBe(value); } else expect(message.artifact).toBe(value);
+    expect(message.lc_kwargs.artifact).toBe(message.artifact);
     if (route === 'direct') expect(native).toEqual([artifact]);
   });
 
