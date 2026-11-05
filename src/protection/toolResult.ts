@@ -1361,6 +1361,7 @@ function restoreToolOutcomeMessagePayload(message: BaseMessage, fields: object):
   const brand = Object.getOwnPropertyDescriptor(message, Symbol.for('langchain.message'));
   if (brand != null) Object.defineProperty(descriptors, Symbol.for('langchain.message'), { value: brand, enumerable: true });
   const result = Object.create(Object.getPrototypeOf(message), descriptors) as BaseMessage;
+  if (ownMessageValue(message, 'type') === 'tool' && Object.hasOwn(fields, 'artifact')) setToolMessageArtifact(result, ownMessageValue(fields, 'artifact'));
   const admission = approved.get(message);
   if (admission != null) approved.set(result, admission);
   return result;
@@ -2259,7 +2260,7 @@ export function admitToolResultControl(policy: ToolResultProtection | undefined,
   return releaseToolControlPayload({ policy, field, guard: admission.guard, sources: authority, empty: field === 'interrupts' && (payload as readonly object[]).length === 0 }, admission.snapshot());
 }
 
-/** Unselected prose stays opaque; embedded releases in native control carriers do not. */
+/** Unselected prose stays opaque; every native tool-end envelope still needs carrier admission. */
 function withToolResultCarrierBoundary(tool: GenericTool, policy: ToolResultProtection): GenericTool {
   if (!isNativeToolResultShell(tool)) throw new ToolResultProtectionError('unsupported');
   const shell = Object.create(Object.getPrototypeOf(tool), Object.getOwnPropertyDescriptors(tool)) as StructuredTool;
@@ -2268,43 +2269,46 @@ function withToolResultCarrierBoundary(tool: GenericTool, policy: ToolResultProt
   Object.defineProperty(shell, 'invoke', { value: async (...args: Parameters<StructuredTool['invoke']>): ReturnType<StructuredTool['invoke']> => {
     const sources = toolOutcomeSourceScope.getStore() ?? snapshotToolOutcomeSources(args[1]);
     const invocation = Object.create(Object.getPrototypeOf(shell), Object.getOwnPropertyDescriptors(shell)) as StructuredTool;
-    const guards = new WeakMap<object, ToolOutcomeAdmission>();
-    let artifactGuard: ToolOutcomeAdmission | undefined;
-    const admit = (raw: unknown, carrier = raw, inspection = artifactInspection()): unknown => {
-      if (typeof raw === 'function') throw new ToolResultProtectionError('unsupported');
-      if (raw == null || typeof raw !== 'object') return raw;
-      if (types.isProxy(raw)) throw new ToolResultProtectionError('unsupported');
-      const admission = createToolOutcomeGuard(policy, raw, sources, true, carrier, inspection);
-      const detached = admission.snapshot() as object;
-      guards.set(detached, admission.guard);
-      return detached;
+    const name = ownMessageValue(tool, 'name');
+    const responseFormat = ownMessageValue(tool, 'responseFormat');
+    const metadata = createToolOutcomeGuard(policy, ownMessageValue(tool, 'metadata'), sources);
+    Object.defineProperty(invocation, 'metadata', { value: metadata.snapshot(), writable: true, enumerable: true, configurable: true });
+    const inspection = artifactInspection();
+    let released: { original: unknown; guard: ToolOutcomeAdmission; value: unknown } | undefined;
+    const validateFormatting = (): void => {
+      if (ownMessageValue(tool, 'name') !== name || ownMessageValue(tool, 'responseFormat') !== responseFormat || ownMessageValue(invocation, 'name') !== name || ownMessageValue(invocation, 'responseFormat') !== responseFormat) throw new ToolResultProtectionError('unsupported');
+      metadata.guard(ownMessageValue(tool, 'metadata'));
     };
     Object.defineProperty(invocation, '_call', { value: async (input: unknown, manager?: CallbackManagerForToolRun, config?: RunnableConfig): Promise<unknown> => {
+      if (manager != null) {
+        const end = manager.handleToolEnd;
+        Object.defineProperty(manager, 'handleToolEnd', { value: async (...endArgs: Parameters<CallbackManagerForToolRun['handleToolEnd']>): ReturnType<CallbackManagerForToolRun['handleToolEnd']> => {
+          validateFormatting();
+          const admission = createToolOutcomeGuard(policy, endArgs[0], sources, false, endArgs[0], inspection);
+          const exposed = admission.snapshot();
+          await end.call(manager, exposed);
+          released = { original: endArgs[0], guard: admission.guard, value: admission.guard(exposed) };
+        } });
+      }
       let raw: unknown;
       try { raw = await call.call(tool, input, manager, config); }
       catch (error) { throw admitToolResultControl(policy, error, sources); }
-      if (invocation.responseFormat !== 'content_and_artifact') return admit(raw);
+      validateFormatting();
+      if (responseFormat !== 'content_and_artifact') return createToolOutcomeGuard(policy, raw, sources, true, raw, inspection).snapshot();
       const tuple = snapshotDataArray(raw as readonly unknown[], 2);
       if (tuple.length !== 2) throw new ToolResultProtectionError('unsupported');
-      const inspection = artifactInspection();
       const artifact = createToolOutcomeGuard(policy, tuple[1], sources, true, tuple, inspection);
-      artifactGuard = artifact.guard;
-      return [admit(tuple[0], tuple, inspection), artifact.snapshot()];
+      const content = createToolOutcomeGuard(policy, tuple[0], sources, true, tuple, inspection);
+      return [content.snapshot(), artifact.snapshot()];
     } });
     let output: unknown;
     try { output = await invoke.apply(invocation, args); }
     catch (error) { throw readmitToolControlPayload(error) ?? error; }
-    if (output == null || typeof output !== 'object') return output;
-    const guard = guards.get(output);
-    if (guard == null) {
-      if (artifactGuard == null) return output;
-      const message = snapshotToolInputMessages([output as BaseMessage])[0];
-      const artifact = artifactGuard(ownMessageValue(message, 'artifact'));
-      setToolMessageArtifact(message, artifact);
-      return message;
-    }
-    guards.delete(output);
-    return guard(output);
+    validateFormatting();
+    if (released == null) return createToolOutcomeGuard(policy, output, sources).snapshot();
+    if (!Object.is(output, released.original)) throw new ToolResultProtectionError('unsupported');
+    released.guard(output);
+    return released.value;
   } });
   return shell;
 }
