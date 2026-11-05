@@ -442,7 +442,8 @@ export async function protectToolText(
   status: 'success' | 'error',
   signal?: AbortSignal
 ): Promise<unknown> {
-  if (!requiresToolResultProtection(policy, name)) return text;
+  if (policy == null) return text;
+  if (!requiresToolResultProtection(policy, name)) return createToolOutcomeGuard(policy, text, toolOutcomeSourceScope.getStore()).snapshot();
   validateToolResultProtection(policy);
   const attempt = toolResultAttempt(snapshotToolResultProtection(policy), signal);
   try {
@@ -1825,7 +1826,11 @@ export async function protectToolExecuteResult(
   signal?: AbortSignal
 ): Promise<ToolExecuteResult> {
   request = checkedRequestIdentity(request);
-  if (!requiresToolResultProtection(policy, request.name)) return result;
+  if (policy == null) return result;
+  if (!requiresToolResultProtection(policy, request.name)) {
+    validateToolExecuteResults([result], 1);
+    return createToolOutcomeGuard(policy, result, toolOutcomeSourceScope.getStore()).snapshot() as ToolExecuteResult;
+  }
   plainObject(result, [
     'toolCallId',
     'received_at',

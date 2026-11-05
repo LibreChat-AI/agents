@@ -4836,6 +4836,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               }
             }
             if (requiresToolResultProtection(this.toolResultProtection, toolName) && (hookResult?.additionalContexts.length ?? 0) > 0) throw new ToolResultProtectionError('unsupported');
+            if (this.toolResultProtection != null && !requiresToolResultProtection(this.toolResultProtection, toolName)) finalToolOutput = await protectToolText(this.toolResultProtection, toolName, result.toolCallId, result.content, 'success', config.signal);
             if (hookResult?.updatedOutput != null) {
               hookResult.updatedOutput = await protectToolText(this.toolResultProtection, toolName, result.toolCallId, hookResult.updatedOutput, 'success', config.signal);
               serialized = serializeToolOutputWithinLimits(
