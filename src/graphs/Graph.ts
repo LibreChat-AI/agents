@@ -3960,7 +3960,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         ) {
           return trackProviderMessageOrigins(
             candidate,
-            projectArtifactPayload(candidate, maxChars)
+            projectArtifactPayload(candidate, maxChars, {
+              /* A custom OpenAI-compatible endpoint can front anything, and Mistral-backed
+               * ones (Scaleway) reject a `user` message straight after a `tool` message.
+               * The provider string cannot tell us which, and the extra assistant turn is
+               * valid for the providers that do not need it, so it is enabled for the whole
+               * OpenAI-like/Google branch. */
+              bridgeUserAfterTool: true,
+            })
           );
         }
         return candidate;

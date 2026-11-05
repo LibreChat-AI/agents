@@ -2617,9 +2617,25 @@ export function formatAnthropicArtifactContent(messages: BaseMessage[]): void {
   }
 }
 
+/**
+ * Short assistant turn placed between the tool results and the projected user message.
+ * Strict OpenAI-compatible providers (Mistral, and Scaleway which fronts it) reject a
+ * `user` message that directly follows a `tool` message, so the alternation needs a
+ * bridge; OpenAI and Google accept it either way.
+ */
+const ARTIFACT_BRIDGE_TEXT = 'Here is the tool output:';
+
 export function projectArtifactPayload(
   messages: BaseMessage[],
-  maxChars = HARD_MAX_TOOL_RESULT_CHARS
+  maxChars = HARD_MAX_TOOL_RESULT_CHARS,
+  options?: {
+    /**
+     * Insert an assistant bridge before the projected user message. Required by providers
+     * that enforce role alternation after `tool`; harmless elsewhere. Defaults to false so
+     * existing callers keep the current message shape.
+     */
+    bridgeUserAfterTool?: boolean;
+  }
 ): BaseMessage[] {
   const lastMessageY = messages[messages.length - 1];
   if (!(lastMessageY instanceof ToolMessage)) return messages;
@@ -2715,6 +2731,9 @@ export function projectArtifactPayload(
       content: toLangChainContent(aggregate.blocks),
     });
     setProviderMessageProvenance(artifactPayload, artifactProvenanceParts);
+    if (options?.bridgeUserAfterTool === true) {
+      formattedMessages?.push(new AIMessage({ content: ARTIFACT_BRIDGE_TEXT }));
+    }
     formattedMessages?.push(artifactPayload);
   }
   return formattedMessages ?? messages;
