@@ -1878,6 +1878,7 @@ export class MultiAgentGraph extends StandardGraph {
       }
     }
 
+    this.captureToolResultRoutingNodes(builder.nodes);
     return builder.compile({
       ...this.compileOptions,
       name: MULTI_AGENT_GRAPH_RUN_NAME,

@@ -766,6 +766,41 @@ export function snapshotToolSubagentResult(input: SubagentGraphResult): Subagent
   return result;
 }
 
+const toolResultStateFields = new Set(['messages', 'agentMessages', 'runStepState', 'handoffState', 'subagentResult', 'summarizationRequest', 'manualSummary']);
+const toolResultNativeChannels = new Set(['__start__', '__pregel_tasks', '__pregel_push', '__interrupt__', '__resume__', '__error__', '__error_source_node__', '__scheduled__', '__return__', '__no_writes__']);
+
+/** Closed graph schemas must not smuggle unchecked payloads through unused channels. */
+export function validateToolResultStateFields(input: object, native = false, routing?: ReadonlySet<string>): void {
+  const fields = snapshotToolCheckpointRecord(input, ['manualSummary']);
+  for (const [key, value] of Object.entries(fields)) {
+    if (key === 'manualSummary' && value !== undefined && typeof value !== 'string') throw new ToolResultProtectionError('unsupported');
+    if (toolResultStateFields.has(key) || key === '__pregel_tasks' || key === '__pregel_push') continue;
+    if (native && key.startsWith('branch:to:') && key.length > 'branch:to:'.length && (value === null || (typeof value === 'string' && routing?.has(value) === true && routing.has(key.slice('branch:to:'.length))))) continue;
+    if (native && key.startsWith('join:')) {
+      const parts = key.slice('join:'.length).split(':');
+      const [sources, destination] = parts;
+      const names = sources.split('+');
+      if (parts.length !== 2 || routing?.has(destination) !== true || names.some((name) => !routing.has(name))) throw new ToolResultProtectionError('unsupported');
+      const seen = snapshotToolCheckpointArray((Array.isArray(value) ? value : [value]) as readonly unknown[]);
+      if (seen.some((name) => typeof name !== 'string' || !names.includes(name))) throw new ToolResultProtectionError('unsupported');
+      Object.defineProperty(input, key, { value: Array.isArray(value) ? seen : seen[0], enumerable: true, configurable: true, writable: true });
+      continue;
+    }
+    if (native && toolResultNativeChannels.has(key)) continue;
+    if (!key.startsWith('__') && !key.startsWith('branch:') && !key.startsWith('join:') && value != null && typeof value === 'object') {
+      Object.defineProperty(input, key, { value: snapshotToolCheckpointData(value), enumerable: true, configurable: true, writable: true });
+      continue;
+    }
+    throw new ToolResultProtectionError('unsupported');
+  }
+}
+
+export function validateToolResultStateWrite(key: string, value: unknown, routing?: ReadonlySet<string>): unknown {
+  const fields = { [key]: value };
+  validateToolResultStateFields(fields, routing != null, routing);
+  return fields[key];
+}
+
 export function snapshotToolSummarizationRequest(value: SummarizationNodeInput): SummarizationNodeInput {
   const request = snapshotToolCheckpointRecord(value, ['windowMessages', 'agentId', 'remainingContextTokens', 'reason', 'allowSummarization']);
   const reason: unknown = request.reason;
@@ -812,7 +847,7 @@ export const toolCheckpointSafety: ToolCheckpointSafety = {
     return snapshot;
   },
   delta: (channels): void => {
-    if (channels.some((channel) => ['messages', 'agentMessages', 'runStepState', 'handoffState', 'subagentResult', 'summarizationRequest', '__pregel_tasks', '__pregel_push'].includes(channel))) throw new ToolResultProtectionError('unsupported');
+    if (channels.some((channel) => ['messages', 'agentMessages', 'runStepState', 'handoffState', 'subagentResult', 'summarizationRequest', 'manualSummary', '__start__', '__pregel_tasks', '__pregel_push'].includes(channel))) throw new ToolResultProtectionError('unsupported');
   },
 };
 
@@ -2072,8 +2107,7 @@ function withToolResultCarrierBoundary(tool: GenericTool, policy: ToolResultProt
       if (typeof raw === 'function') throw new ToolResultProtectionError('unsupported');
       if (raw == null || typeof raw !== 'object') return raw;
       if (types.isProxy(raw)) throw new ToolResultProtectionError('unsupported');
-      if (!(raw instanceof Command) && !trustedMessageImplementations.has(Object.getPrototypeOf(raw)) && Object.getOwnPropertyDescriptor(raw, 'lc_direct_tool_output')?.value !== true) return raw;
-      const admission = createToolOutcomeGuard(policy, raw, sources, false, carrier, inspection);
+      const admission = createToolOutcomeGuard(policy, raw, sources, true, carrier, inspection);
       const detached = admission.snapshot() as object;
       guards.set(detached, admission.guard);
       return detached;

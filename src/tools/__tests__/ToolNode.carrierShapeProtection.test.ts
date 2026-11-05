@@ -65,3 +65,21 @@ it.each((['artifact', 'command', 'array'] as const).flatMap((carrier) => (['prod
   const outcome = await invoke(tool, callback);
   expect(outcome).toBeInstanceOf(ToolResultProtectionError); expect(observations).toBe(0); expect(String(outcome)).not.toContain(raw);
 });
+
+it.each(['record', 'array', 'tuple-content', 'getters', 'control', 'default-off'] as const)('admits ordinary native content carriers before observers (%s)', async (mode) => {
+  let observations = 0; let reads = 0;
+  const value = { selected: selected() };
+  if (mode === 'getters') Object.defineProperty(value, 'selected', { get: () => { reads++; throw new Error(raw); } });
+  const tool = new DynamicStructuredTool({ name: 'other', description: 'Allowed ordinary content.', schema: z.object({}), responseFormat: mode === 'tuple-content' ? 'content_and_artifact' : 'content', func: async () => {
+    if (mode === 'control') return { allowed: { count: 42 } };
+    if (mode === 'array') return [value];
+    if (mode === 'tuple-content') return [value, null];
+    return value;
+  } });
+  const observed: string[] = [];
+  const callback = BaseCallbackHandler.fromMethods({ handleToolEnd: (output): void => { observations++; observed.push(JSON.stringify(output)); } }); callback.awaitHandlers = true;
+  const outcome = await invoke(tool, callback, mode !== 'default-off');
+  expect(reads).toBe(0);
+  if (mode === 'control' || mode === 'default-off') { expect(outcome).not.toBeInstanceOf(Error); expect(observations).toBe(1); if (mode === 'control') expect(observed.join('')).toContain('count'); return; }
+  expect(outcome).toBeInstanceOf(ToolResultProtectionError); expect(observations).toBe(0); expect(observed.join('')).not.toContain(raw);
+});

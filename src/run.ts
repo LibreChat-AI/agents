@@ -1,5 +1,5 @@
 import type { ToolCallSources } from '@/protection/toolResult';
-import { snapshotToolSubagentResult, snapshotToolHandoffWrite, snapshotToolHandoffState, snapshotToolSummarizationRequest, snapshotToolRunStepWrite, snapshotToolCallSources, snapshotToolCommand, protectToolApprovalResume, snapshotToolInputMessages, snapshotToolRunStepState, snapshotToolCheckpointRecord, admitToolResultCheckpoints, getToolResultCheckpointLookup, bindToolResultCheckpoint, snapshotToolMessageRemoval, snapshotToolResumeUpdates, snapshotToolResumeMessages, snapshotToolHistoryMessages, normalizeToolResultError, hasRequiredToolExecuteProtection, ToolResultProtectionError } from '@/protection/toolResult';
+import { validateToolResultStateFields, validateToolResultStateWrite, snapshotToolSubagentResult, snapshotToolHandoffWrite, snapshotToolHandoffState, snapshotToolSummarizationRequest, snapshotToolRunStepWrite, snapshotToolCallSources, snapshotToolCommand, protectToolApprovalResume, snapshotToolInputMessages, snapshotToolRunStepState, snapshotToolCheckpointRecord, admitToolResultCheckpoints, getToolResultCheckpointLookup, bindToolResultCheckpoint, snapshotToolMessageRemoval, snapshotToolResumeUpdates, snapshotToolResumeMessages, snapshotToolHistoryMessages, normalizeToolResultError, hasRequiredToolExecuteProtection, ToolResultProtectionError } from '@/protection/toolResult';
 import { messagesStateReducer } from '@/messages/reducer';
 // src/run.ts
 import { nanoid } from 'nanoid';
@@ -2342,6 +2342,7 @@ export class Run<_T extends t.BaseGraphState> {
 
   private async validateToolResultStateInputs(input: t.IState, checkpoint?: InterruptStateSnapshot, signal?: AbortSignal): Promise<t.IState> {
     const source = snapshotToolCheckpointRecord(input as t.IState & { summarizationRequest?: t.SummarizationNodeInput; subagentResult?: t.SubagentGraphResult }, ['messages', 'agentMessages', 'runStepState', 'handoffState', 'subagentResult', 'summarizationRequest', '__pregel_tasks', '__pregel_push']);
+    validateToolResultStateFields(source);
     const runStepState = source.runStepState == null ? undefined : snapshotToolRunStepState(source.runStepState);
     if (source.handoffState != null) source.handoffState = snapshotToolHandoffState(source.handoffState);
     const subagentResult = source.subagentResult == null ? undefined : snapshotToolSubagentResult(source.subagentResult);
@@ -2394,7 +2395,8 @@ export class Run<_T extends t.BaseGraphState> {
     const writes = snapshotToolResumeUpdates(update);
     if (writes.length === 0) return { update, messages };
     const admitted: Array<[string, unknown]> = [];
-    for (const [key, value] of writes) {
+    for (const [key, incoming] of writes) {
+      const value = validateToolResultStateWrite(key, incoming);
       if (key === '__pregel_tasks' || key === '__pregel_push') { admitted.push([key, await graph.validateToolResultTaskWrites(value, signal, this.protectedSendSources)]); continue; }
       if (key === 'runStepState') { admitted.push([key, snapshotToolRunStepWrite(value)]); continue; }
       if (key === 'handoffState') { admitted.push([key, snapshotToolHandoffWrite(value)]); continue; }

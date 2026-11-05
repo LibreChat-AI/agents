@@ -3372,7 +3372,7 @@ it('admits certified pending results and preserves own writes, identities, remov
   const graph = new StandardGraph({ runId: 'certified-restored', agents: [{ agentId: 'worker', provider: Providers.OPENAI }], toolResultProtection: gate });
   const admitted = await graph.validateToolResultCheckpointTuple(tuple);
   const messages = admitted.pendingWrites![0][2] as BaseMessage[];
-  expect(messages[0].id).toBe(result.id); expect(messages[0].content).toBe('[EMAIL_1]'); assertNoCanary(messages); expect(admitted.pendingWrites![2][2]).toBe(opaque); expect(executions).toBe(1);
+  expect(messages[0].id).toBe(result.id); expect(messages[0].content).toBe('[EMAIL_1]'); assertNoCanary(messages); expect(admitted.pendingWrites![2][2]).toEqual(opaque); expect(admitted.pendingWrites![2][2]).not.toBe(opaque); expect(executions).toBe(1);
   expect(tuple.checkpoint.channel_values.messages).toBe(current); expect(tuple.pendingWrites[0][2]).toEqual([result]);
   tuple.pendingWrites = [['task-control', 'messages', [createRemoveAllMessage(), new HumanMessage('Allowed compaction control')]]];
   const compacted = await graph.validateToolResultCheckpointTuple(tuple);
@@ -3569,7 +3569,7 @@ it('preserves certified Send results, packet routing and unrelated state without
   const state = graph.createRunStepResumeState(); state.toolResultReleases = fixture.releases; const authority = { user_id: 'allowed-principal', resource: 'allowed-resource' };
   const packet = new Send('worker', { messages: fixture.messages, runStepState: state, authority });
   const admitted = await graph.validateToolResultSend(packet);
-  expect(admitted).toBeInstanceOf(Send); expect(admitted.node).toBe('worker'); expect(admitted.args).not.toBe(packet.args); expect(admitted.args.authority).toBe(packet.args.authority); expect(admitted.args.authority).toEqual(authority); assertNoCanary(admitted.args.messages);
+  expect(admitted).toBeInstanceOf(Send); expect(admitted.node).toBe('worker'); expect(admitted.args).not.toBe(packet.args); expect(admitted.args.authority).not.toBe(packet.args.authority); expect(admitted.args.authority).toEqual(authority); assertNoCanary(admitted.args.messages);
   (packet.args.messages as ToolMessage[])[1].content = fixtures.canaries[0]; expect(admitted.args.messages[1].content).toBe('[EMAIL_1]');
 });
 

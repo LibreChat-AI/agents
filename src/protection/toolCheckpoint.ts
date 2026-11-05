@@ -2,6 +2,7 @@ import { BaseCheckpointSaver } from '@langchain/langgraph';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { CheckpointTuple } from '@langchain/langgraph';
 import type { ToolCallSources } from './toolResult';
+import { ProviderTextProtectionError } from './providerText';
 
 export type ToolCheckpointAdmission = (tuple: CheckpointTuple) => Promise<CheckpointTuple>;
 export type ToolCheckpointAdmissionContext = {
@@ -67,9 +68,19 @@ export class ToolCheckpointSaver extends BaseCheckpointSaver {
   }
 
   override async *list(...args: Parameters<BaseCheckpointSaver['list']>): ReturnType<BaseCheckpointSaver['list']> {
-    const expected = this.safety.identify(args[0], true);
-    for await (const returned of this.listSource(expected.config, args[1])) {
+    const selected = this.safety.identify(args[0], true);
+    let expected = selected;
+    for await (const returned of this.listSource(selected.config, args[1])) {
       const tuple = this.safety.read(returned, expected);
+      if (typeof selected.checkpointId === 'string') {
+        if (tuple.checkpoint.id > selected.checkpointId) throw this.safety.failure(new ProviderTextProtectionError('incompatible'));
+        if (expected.checkpointId != null) expected = {
+          ...expected,
+          threadId: tuple.config.configurable?.thread_id,
+          namespace: tuple.config.configurable?.checkpoint_ns ?? '',
+          checkpointId: undefined,
+        };
+      }
       yield this.admit == null ? tuple : await this.admit(tuple);
     }
   }

@@ -1,5 +1,5 @@
-import { MemorySaver, emptyCheckpoint } from '@langchain/langgraph';
-import type { BaseCheckpointSaver } from '@langchain/langgraph';
+import { END, START, Annotation, StateGraph, MemorySaver, emptyCheckpoint } from '@langchain/langgraph';
+import type { BaseCheckpointSaver, CheckpointTuple } from '@langchain/langgraph';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import { toolCheckpointSafety, bindToolResultCheckpoint, ToolResultProtectionError } from './toolResult';
 import { ToolCheckpointSaver } from './toolCheckpoint';
@@ -208,4 +208,131 @@ it.each(['read', 'history', 'delta'] as const)('keeps saver-side lookup mutation
   if (route === 'history') for await (const tuple of scoped.list(caller)) expect(tuple).toBeDefined();
   if (route === 'delta') await scoped.getDeltaChannelHistory({ config: caller, channels: ['control'] });
   expect(caller.configurable).toEqual({ thread_id: thread, checkpoint_ns: '', checkpoint_id: '001', user_id: 'allowed-principal', checkpoint_map: { 'agent:task': 'admitted-child' } });
+});
+
+describe('selected checkpoint history', () => {
+  class ThreadHistorySaver extends MemorySaver {
+    override async *list(lookup: RunnableConfig, options?: Parameters<MemorySaver['list']>[1]): ReturnType<MemorySaver['list']> {
+      const scope = { ...lookup.configurable };
+      delete scope.checkpoint_id;
+      delete scope.thread_ts;
+      yield* super.list({ ...lookup, configurable: scope }, options);
+    }
+  }
+
+  const selected = (selector: 'checkpoint_id' | 'thread_ts', id = '003', namespace = ''): RunnableConfig => ({
+    configurable: { thread_id: thread, checkpoint_ns: namespace, [selector]: id },
+  });
+  const collect = async (tuples: AsyncIterable<CheckpointTuple>): Promise<CheckpointTuple[]> => {
+    const result: CheckpointTuple[] = [];
+    for await (const tuple of tuples) result.push(tuple);
+    return result;
+  };
+  const seed = async (saver: BaseCheckpointSaver, namespace = ''): Promise<void> => {
+    await put(saver, namespace, '001');
+    await put(saver, namespace, '002', '001');
+    await put(saver, namespace, '003', '002');
+  };
+
+  it.each(['checkpoint_id', 'thread_ts'] as const)('preserves installed MemorySaver and native getStateHistory semantics for %s', async (selector) => {
+    const source = new MemorySaver();
+    await seed(source);
+    const ids = (tuples: CheckpointTuple[]): string[] => tuples.map((tuple) => tuple.checkpoint.id);
+    expect(ids(await collect(source.list(selected(selector, '002'))))).toEqual(selector === 'checkpoint_id' ? ['002'] : ['003', '002', '001']);
+    const admitted: string[] = [];
+    const saver = new ToolCheckpointSaver(source, thread, new Map([['', '001']]), toolCheckpointSafety, async (tuple) => {
+      admitted.push(tuple.checkpoint.id);
+      return tuple;
+    });
+    const state = Annotation.Root({ control: Annotation<string>() });
+    const workflow = new StateGraph(state).addNode('noop', (value) => value).addEdge(START, 'noop').addEdge('noop', END).compile({ checkpointer: source });
+    const native: string[] = [];
+    for await (const snapshot of workflow.getStateHistory(selected(selector))) native.push(snapshot.config.configurable!.checkpoint_id as string);
+    expect(native).toEqual(selector === 'checkpoint_id' ? ['003'] : ['003', '002', '001']);
+    const protectedHistory: string[] = [];
+    for await (const snapshot of workflow.getStateHistory({ configurable: { ...selected(selector).configurable, __pregel_checkpointer: saver } })) protectedHistory.push(snapshot.config.configurable!.checkpoint_id as string);
+    expect(protectedHistory).toEqual(native);
+    expect(admitted).toEqual(native);
+    expect((await saver.getTuple(config()))?.checkpoint.id).toBe('001');
+    expect((await saver.getTuple(selected(selector, '002')))?.checkpoint.id).toBe('002');
+    await expect(collect(saver.list(selected('thread_ts', '002')))).rejects.toMatchObject({ code: 'incompatible' });
+  });
+
+  it.each(['checkpoint_id', 'thread_ts'] as const)('admits older scoped history after a validated %s anchor without advancing the execution cursor', async (selector) => {
+    const source = new ThreadHistorySaver();
+    await seed(source);
+    await seed(source, 'agent:task');
+    const admitted: string[] = [];
+    const saver = new ToolCheckpointSaver(source, thread, new Map([['agent:task', '002']]), toolCheckpointSafety, async (tuple) => {
+      admitted.push(tuple.checkpoint.id);
+      return tuple;
+    });
+    const lookup = selected(selector, '003', 'agent:task');
+    const history = await collect(saver.list(lookup));
+    expect(history.map((tuple) => tuple.checkpoint.id)).toEqual(['003', '002', '001']);
+    expect(admitted).toEqual(['003', '002', '001']);
+    for (const tuple of history) {
+      expect(tuple.config.configurable).toMatchObject({ thread_id: thread, checkpoint_ns: 'agent:task' });
+      expect(tuple.checkpoint.channel_values).toEqual({ control: 'Allowed checkpoint control' });
+    }
+    expect(lookup).toEqual(selected(selector, '003', 'agent:task'));
+    expect((await saver.getTuple(config('agent:task')))?.checkpoint.id).toBe('002');
+    expect((await saver.getTuple(selected(selector, '001', 'agent:task')))?.checkpoint.id).toBe('001');
+    await put(saver, 'agent:task', '004', '002');
+    expect((await saver.getTuple(config('agent:task')))?.checkpoint.id).toBe('004');
+  });
+
+  it.each((['first', 'later'] as const).flatMap((position) => (['wrong-id', 'thread', 'namespace', 'body-id', 'parent-thread', 'parent-namespace', 'accessor'] as const).map((change) => [position, change] as const)))('rejects adversarial %s history tuples before admission (%s)', async (position, change) => {
+    let reads = 0;
+    class Saver extends ThreadHistorySaver {
+      override async *list(...args: Parameters<MemorySaver['list']>): ReturnType<MemorySaver['list']> {
+        let index = 0;
+        for await (const tuple of super.list(...args)) {
+          if (index++ === (position === 'first' ? 0 : 1)) {
+            const scope = tuple.config.configurable!;
+            if (change === 'wrong-id') { scope.checkpoint_id = position === 'first' ? '002' : '999'; tuple.checkpoint.id = scope.checkpoint_id as string; }
+            if (change === 'thread') scope.thread_id = 'foreign-thread';
+            if (change === 'namespace') scope.checkpoint_ns = 'foreign:namespace';
+            if (change === 'body-id') tuple.checkpoint.id = 'foreign-id';
+            if (change === 'parent-thread') tuple.parentConfig!.configurable!.thread_id = 'foreign-thread';
+            if (change === 'parent-namespace') tuple.parentConfig!.configurable!.checkpoint_ns = 'foreign:namespace';
+            if (change === 'accessor') Object.defineProperty(scope, 'checkpoint_id', { get: () => { reads++; throw new Error('Unreleased history identity'); } });
+          }
+          yield tuple;
+        }
+      }
+    }
+    const source = new Saver();
+    await seed(source);
+    const admitted: string[] = [];
+    const saver = new ToolCheckpointSaver(source, thread, new Map(), toolCheckpointSafety, async (tuple) => { admitted.push(tuple.checkpoint.id); return tuple; });
+    await expect(collect(saver.list(selected('checkpoint_id')))).rejects.toMatchObject({ code: change === 'accessor' ? 'unsupported' : 'incompatible' });
+    expect(admitted).toEqual(position === 'first' ? [] : ['003']);
+    expect(reads).toBe(0);
+  });
+
+  it('binds an otherwise unscoped selected history to the validated anchor namespace', async () => {
+    const source = new ThreadHistorySaver();
+    await seed(source);
+    await seed(source, 'agent:task');
+    const admitted: string[] = [];
+    const saver = new ToolCheckpointSaver(source, thread, new Map(), toolCheckpointSafety, async (tuple) => { admitted.push(tuple.checkpoint.id); return tuple; });
+    const lookup: RunnableConfig = { configurable: { thread_id: thread, checkpoint_id: '003' } };
+    await expect(collect(saver.list(lookup))).rejects.toMatchObject({ code: 'incompatible' });
+    expect(admitted).toEqual(['003', '002', '001']);
+  });
+
+  it('preserves native unselected before/filter/limit controls instead of applying the admitted cursor', async () => {
+    const source = new MemorySaver();
+    await seed(source);
+    const list = jest.spyOn(source, 'list');
+    const saver = new ToolCheckpointSaver(source, thread, new Map([['', '001']]), toolCheckpointSafety);
+    const options = { before: config('', '003'), filter: { source: 'input' }, limit: 1 };
+    const history = await collect(saver.list(config(), options));
+    expect(history.map((tuple) => tuple.checkpoint.id)).toEqual(['002']);
+    expect(list).toHaveBeenCalledWith(config(), options);
+    expect(await collect(saver.list(selected('checkpoint_id', 'absent')))).toEqual([]);
+    expect(await collect(saver.list(selected('checkpoint_id'), { filter: { source: 'missing' } }))).toEqual([]);
+    expect(await collect(saver.list(selected('checkpoint_id'), { limit: 0 }))).toEqual([]);
+  });
 });
