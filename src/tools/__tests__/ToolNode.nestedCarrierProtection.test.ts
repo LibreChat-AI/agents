@@ -75,7 +75,12 @@ it.each(['inert', 'selected', 'callback', 'control-off'] as const)('bounds share
   const recordRead = Object.getOwnPropertyDescriptors; let reads = 0; const target = tree;
   const spy = jest.spyOn(Object, 'getOwnPropertyDescriptors').mockImplementation((object) => { reads++; return recordRead(object); });
   try {
-    const { result, observed } = await invoke(() => target, () => { if (mode === 'callback') Object.defineProperty(leaf, 'selected', { value: selected() }); }, mode !== 'control-off', true);
+    const { result, observed } = await invoke(() => target, (output) => {
+      if (mode !== 'callback') return;
+      let current = (output as ToolMessage).artifact as object;
+      for (let index = 0; index < 16; index++) current = Object.getOwnPropertyDescriptor(current, 'left')!.value as object;
+      Object.defineProperty(current, 'selected', { value: selected() });
+    }, mode !== 'control-off', true);
     const totalReads = reads;
     if (mode !== 'control-off') expect(totalReads).toBeLessThan(5000);
     if (mode === 'selected' || mode === 'callback') expect(result).toBeInstanceOf(ToolResultProtectionError);
