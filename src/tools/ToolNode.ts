@@ -54,7 +54,7 @@ import type { PreparedSubagents } from '@/tools/preparedSubagents';
 import type { ToolMessageRelease } from '@/protection/toolResult';
 import type { RunBreakerScope } from '@/llm/streamLimits';
 import type * as t from '@/types';
-import { releaseToolError, captureToolResultOutcome, readmitToolResultOutcome, detachToolControlInterrupt, withToolResultSafetySignal, detachToolSafetyError, validateToolReplayRelease, snapshotToolErrorText, protectToolErrorText, detachReleasedToolError, getToolMessageRelease, replaceReleasedToolMessage, normalizeToolResultError, needsToolReferenceInspection, protectToolReferenceState, bindToolExecuteProtection, validateToolExecuteResults, hasReleasedToolReference, isReleasedToolError, markReleasedToolMessage, protectToolText, protectToolMessage, protectToolExecuteResult, withToolResultBoundary, requiresToolResultProtection, validateToolResultProtection, ToolResultProtectionError } from '@/protection/toolResult';
+import { withToolResultCallSources, releaseToolError, captureToolResultOutcome, readmitToolResultOutcome, detachToolControlInterrupt, withToolResultSafetySignal, detachToolSafetyError, validateToolReplayRelease, snapshotToolErrorText, protectToolErrorText, detachReleasedToolError, getToolMessageRelease, replaceReleasedToolMessage, normalizeToolResultError, needsToolReferenceInspection, protectToolReferenceState, bindToolExecuteProtection, validateToolExecuteResults, hasReleasedToolReference, isReleasedToolError, markReleasedToolMessage, protectToolText, protectToolMessage, protectToolExecuteResult, withToolResultBoundary, requiresToolResultProtection, validateToolResultProtection, ToolResultProtectionError } from '@/protection/toolResult';
 import {
   TOOL_BATCH_REPLAY_KEY,
   TOOL_REPLAY_CONFIGS_KEY,
@@ -1378,10 +1378,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   ): Promise<any> {
     if (this.toolResultProtection == null) return this.withToolScope(options, (scoped) => super.invoke(input, scoped));
     const policy = this.toolResultProtection;
-    return withToolResultSafetySignal(options?.signal, async (signal) => {
+    return withToolResultCallSources(input, () => withToolResultSafetySignal(options?.signal, async (signal) => {
       const outcome = await this.withToolScope({ ...options, signal }, (scoped) => super.invoke(input, scoped));
       return readmitToolResultOutcome(policy, outcome);
-    });
+    }));
   }
 
   private withToolScope<R>(

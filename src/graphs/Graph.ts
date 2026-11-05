@@ -820,7 +820,18 @@ export abstract class Graph<
     const message = result.message;
     const match = candidates.find((candidate) => candidate.type === 'ai' && candidate.id === message.id && isDeepStrictEqual(candidate.content, message.content) && isDeepStrictEqual((candidate as AIMessage).tool_calls, (message as AIMessage).tool_calls));
     if (match == null) throw new ToolResultProtectionError('incompatible');
-    return result;
+    const canonical = snapshotToolSubagentResult({ agentId: result.agentId, message: match });
+    const admitted = canonical.message as AIMessage;
+    const { content: _content, tool_calls: _toolCalls, ...serialization } = admitted.lc_kwargs;
+    const metadata = snapshotToolCheckpointData({
+      ...serialization,
+      additional_kwargs: admitted.additional_kwargs,
+      response_metadata: admitted.response_metadata,
+    });
+    admitted.additional_kwargs = metadata.additional_kwargs;
+    admitted.response_metadata = metadata.response_metadata;
+    admitted.lc_kwargs = { ...metadata, content: admitted.content, tool_calls: admitted.tool_calls };
+    return canonical;
   }
 
   async validateToolResultWindow(input: t.SummarizationNodeInput, state?: Pick<t.RunStepResumeState, 'toolResultReleases'>, signal?: AbortSignal, sources?: ToolCallSources, requireSource = false): Promise<t.SummarizationNodeInput> {
