@@ -1334,6 +1334,11 @@ function toolOutcomeMessagePayload(message: BaseMessage): object {
   for (const key of argumentFields) if (Object.hasOwn(fields, key)) Object.defineProperty(fields, key, { value: toolOutcomeCallPayload(ownMessageValue(fields, key)), enumerable: true, writable: true, configurable: true });
   if (fields.lc_kwargs != null) {
     fields.lc_kwargs = snapshotToolCheckpointRecord(fields.lc_kwargs, []);
+    for (const key of ['type', 'name', 'tool_call_id']) {
+      const serialized = ownMessageValue(fields.lc_kwargs, key);
+      if (serialized != null && serialized !== ownMessageValue(message, key)) throw new ToolResultProtectionError('unsupported');
+    }
+    Reflect.deleteProperty(fields.lc_kwargs, 'type');
     for (const key of argumentFields) if (Object.hasOwn(fields.lc_kwargs, key)) Object.defineProperty(fields.lc_kwargs, key, { value: toolOutcomeCallPayload(ownMessageValue(fields.lc_kwargs, key)), enumerable: true, writable: true, configurable: true });
   }
   return fields;
@@ -1355,6 +1360,12 @@ function restoreToolOutcomeMessagePayload(message: BaseMessage, fields: object):
     restoreToolOutcomeCallArguments(fields, message);
     const kwargs = ownMessageValue(fields, 'lc_kwargs');
     if (kwargs != null && typeof kwargs === 'object') restoreToolOutcomeCallArguments(kwargs, ownMessageValue(message, 'lc_kwargs') as object);
+  }
+  const kwargs = ownMessageValue(fields, 'lc_kwargs');
+  const original = ownMessageValue(message, 'lc_kwargs');
+  if (kwargs != null && typeof kwargs === 'object' && original != null && typeof original === 'object') {
+    const type = Object.getOwnPropertyDescriptor(original, 'type');
+    if (type != null) Object.defineProperty(kwargs, 'type', type);
   }
   const descriptors = Object.getOwnPropertyDescriptors(fields);
   descriptors.type = Object.getOwnPropertyDescriptor(message, 'type')!;
@@ -1456,7 +1467,7 @@ function inspectOpaqueToolArtifact(value: object, inspection: ToolArtifactInspec
 
 type ToolOutcomeGuard = (input: unknown, inspection: ToolArtifactInspection) => unknown;
 type ToolOutcomeAdmission = (input: unknown) => unknown;
-type ToolOutcomeContext = { checkpointData?: boolean; serialization?: boolean; inspection: ToolArtifactInspection; embedded?: ToolCallSources; preserveData?: boolean; sources?: ToolCallSources; proposals?: Map<string, Pick<ToolCallSource, 'name' | 'batchId'>>; control?: boolean };
+type ToolOutcomeContext = { checkpointData?: boolean; inspection: ToolArtifactInspection; embedded?: ToolCallSources; preserveData?: boolean; sources?: ToolCallSources; proposals?: Map<string, Pick<ToolCallSource, 'name' | 'batchId'>>; control?: boolean };
 const toolOutcomeAdmissions = new WeakMap<object, { policy: ToolResultProtection; guard: ToolOutcomeAdmission }>();
 
 function chargeToolCarrierVisit(inspection: ToolArtifactInspection): void {
@@ -1546,7 +1557,7 @@ function buildToolOutcomeGuard(policy: ToolResultProtection, value: unknown, act
       };
     }
     const type = ownMessageValue(value, 'type');
-    if (trustedMessageImplementations.has(Object.getPrototypeOf(value)) || (context.serialization !== true && Object.hasOwn(value, 'content') && typeof type === 'string' && ['ai', 'human', 'system', 'tool', 'function', 'generic', 'remove'].includes(type))) {
+    if (trustedMessageImplementations.has(Object.getPrototypeOf(value)) || (Object.hasOwn(value, 'content') && typeof type === 'string' && ['ai', 'human', 'system', 'tool', 'function', 'generic', 'remove'].includes(type))) {
       const message = snapshotToolInputMessages([value as BaseMessage])[0];
       const admission = approved.get(message);
       const envelope = admission?.policy === policy ? admission.envelope : undefined;
@@ -1640,7 +1651,7 @@ function buildToolOutcomeGuard(policy: ToolResultProtection, value: unknown, act
       guards.set(field, (candidate, inspection) => { const detached = guard(snapshot(candidate), inspection); if (!isDeepStrictEqual(detached, expected)) throw new ToolResultProtectionError('unsupported'); return detached; });
     }
     const keys = Object.keys(record);
-    for (const field of keys) if (!guards.has(field)) guards.set(field, toolOutcomeGuard(policy, Object.getOwnPropertyDescriptor(record, field)!.value, active, depth + 1, { ...context, preserveData: field === 'artifact' || context.preserveData, serialization: field === 'lc_kwargs' || field === 'kwargs' }));
+    for (const field of keys) if (!guards.has(field)) guards.set(field, toolOutcomeGuard(policy, Object.getOwnPropertyDescriptor(record, field)!.value, active, depth + 1, { ...context, preserveData: field === 'artifact' || context.preserveData }));
     return (current, inspection) => {
       const next = snapshotToolCheckpointRecord(current as object, keys);
       if (!isDeepStrictEqual(Object.keys(next), keys)) throw new ToolResultProtectionError('unsupported');
@@ -1673,15 +1684,16 @@ export function readmitToolResultOutcome<T>(policy: ToolResultProtection, output
 /** Historical state is immutable: reject legacy or newly incompatible history before model reuse. */
 export async function validateToolMessageHistory(policy: ToolResultProtection | undefined, messages: readonly BaseMessage[], releases: readonly ToolMessageRelease[], signal?: AbortSignal, sources?: ToolCallSources, requireSource = false): Promise<BaseMessage[]> {
   if (policy == null) return [...messages];
+  const persisted = snapshotToolMessageReleases(releases);
+  if (persisted.some((release) => !requiresToolResultProtection(policy, release.name))) throw new ToolResultProtectionError('incompatible');
   const originals = snapshotToolInputMessages(messages);
-  const payloadSources = snapshotToolCallSources([originals], releases, sources);
+  const payloadSources = snapshotToolCallSources([originals], persisted, sources);
   const payloads = originals.map((message) => createToolOutcomeGuard(policy, toolOutcomeMessagePayload(message), payloadSources));
   const history = originals.map((message, index) => restoreToolOutcomeMessagePayload(message, payloads[index].snapshot() as object));
   const byIdentity = new Map<string, ToolMessageRelease>();
   const byMessage = new Map<string, ToolMessageRelease>();
   const certifiedNames = new Map<string, Set<string>>();
-  for (const release of snapshotToolMessageReleases(releases)) {
-    if (!requiresToolResultProtection(policy, release.name)) throw new ToolResultProtectionError('incompatible');
+  for (const release of persisted) {
     const names = certifiedNames.get(release.id) ?? new Set<string>(); names.add(release.name); certifiedNames.set(release.id, names);
     const key = JSON.stringify([release.id, release.envelope.id]);
     const existing = byIdentity.get(key);
@@ -1689,7 +1701,7 @@ export async function validateToolMessageHistory(policy: ToolResultProtection | 
     if (!byIdentity.has(key)) byIdentity.set(key, release);
     if (release.envelope.id != null && !byMessage.has(release.envelope.id)) byMessage.set(release.envelope.id, release);
   }
-  const boundSources = sources == null ? undefined : snapshotToolCallSources([], releases, sources);
+  const boundSources = sources == null ? undefined : snapshotToolCallSources([], persisted, sources);
   const calls = new Map<string, { name: string; batchId?: string }>();
   for (let index = 0; index < history.length; index++) {
     const message = history[index];
