@@ -26,42 +26,24 @@ function makeToolMessage(fields: {
 }
 
 describe('annotateMessagesForLLM', () => {
-  it('returns the input array reference when registry is undefined', () => {
+  it('returns the input array reference without a registry when no ToolMessage carries metadata', () => {
     const messages = [
       new HumanMessage('hi'),
-      makeToolMessage({
-        content: 'data',
-        additional_kwargs: { _refKey: 'tool0turn0' },
-      }),
+      makeToolMessage({ content: 'data' }),
     ];
     const out = annotateMessagesForLLM(messages, undefined, 'r1');
     expect(out).toBe(messages);
   });
 
-  it('does not iterate any message when the feature is disabled (registry undefined)', () => {
-    /**
-     * Hard guarantee: when the host hasn't enabled
-     * `RunConfig.toolOutputReferences`, calling
-     * `annotateMessagesForLLM` must short-circuit at O(1) without
-     * touching a single ToolMessage. We assert by spying on
-     * `_getType` — the first per-message call inside the loop — and
-     * confirming it was never invoked.
-     */
-    const messages = [
-      makeToolMessage({ content: 'a' }),
-      makeToolMessage({ content: 'b' }),
-      makeToolMessage({
-        content: 'c',
-        additional_kwargs: { _refKey: 'tool0turn0' },
-      }),
-    ];
-    const spies = messages.map((m) => jest.spyOn(m, '_getType'));
-    const out = annotateMessagesForLLM(messages, undefined, undefined);
-    expect(out).toBe(messages);
-    for (const spy of spies) {
-      expect(spy).not.toHaveBeenCalled();
-      spy.mockRestore();
-    }
+  it('labels a restored _refKey without a registry (feature off in this run)', () => {
+    const tm = makeToolMessage({
+      content: 'data',
+      additional_kwargs: { _refKey: 'tool0turn0', keep: 1 },
+    });
+    const out = annotateMessagesForLLM([tm], undefined, undefined);
+    expect(out[0].content).toBe('[ref: tool0turn0]\ndata');
+    expect(out[0].additional_kwargs).toEqual({ keep: 1 });
+    expect(tm.content).toBe('data');
   });
 
   it('returns the input array reference when no ToolMessage carries metadata', () => {

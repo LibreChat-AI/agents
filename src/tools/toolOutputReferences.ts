@@ -778,19 +778,16 @@ function arraysShallowEqual(a: unknown, b: readonly string[]): boolean {
  * every later run, whether or not the registry still holds the output.
  * Resolving a placeholder is what depends on the registry.
  *
- * **Feature-disabled fast path:** when the host hasn't enabled the
- * tool-output-reference feature, the registry is `undefined` and this
- * function returns the input array reference-equal *without iterating
- * a single message*. The loop is exclusive to the feature-enabled
- * code path.
+ * This holds in a run with the feature off as well (no registry, e.g.
+ * code execution switched off since the round ran): a restored round
+ * keeps the label the earlier turns sent, so the request stays a prefix
+ * continuation of theirs.
  */
 export function annotateMessagesForLLM(
   messages: BaseMessage[],
-  registry: ToolOutputReferenceRegistry | undefined,
+  _registry: ToolOutputReferenceRegistry | undefined,
   _runId?: string
 ): BaseMessage[] {
-  if (registry == null) return messages;
-
   /**
    * Lazy-allocate the output array so the common case (no ToolMessage
    * carries framework metadata) returns the input reference-equal with

@@ -25,7 +25,8 @@ import { _convertMessagesToOpenAIParams } from '@/llm/openai/utils';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { StreamLimitExceededError } from '@/llm/streamLimits';
 import { toLangChainContent } from '@/messages/langchain';
-import { Constants, Providers } from '@/common';
+import { formatAgentMessages } from '@/messages/format';
+import { Constants, ContentTypes, Providers } from '@/common';
 import { ToolNode } from '@/tools/ToolNode';
 import { ChatOpenAI } from '@/llm/openai';
 
@@ -159,7 +160,7 @@ describe('attemptInvoke applies lazy ref annotation', () => {
     expect(messages[0].content).toBe('output');
   });
 
-  it('passes messages unchanged when no registry is exposed on context (e.g. summarization)', async () => {
+  it('labels a restored _refKey when no registry is exposed on context (e.g. summarization)', async () => {
     const messages: BaseMessage[] = [
       new ToolMessage({
         name: 'echo',
@@ -179,7 +180,7 @@ describe('attemptInvoke applies lazy ref annotation', () => {
     });
 
     expect(invokeMessages).toHaveLength(1);
-    expect(invokeMessages[0][0].content).toBe('output');
+    expect(invokeMessages[0][0].content).toBe('[ref: tool0turn0]\noutput');
   });
 
   it('replaces native computer screenshots for non-Responses providers', async () => {
@@ -701,6 +702,50 @@ describe('attemptInvoke applies lazy ref annotation', () => {
     const sent = invokeMessages[0];
     expect(sent[0].content).toBe('[ref: tool5turn5]\nold-output');
     expect(sent[1].content).toBe('[ref: tool0turn0]\nnew-output');
+  });
+
+  it('sends a restored tool round with the same bytes when tool output references are off in this run', async () => {
+    // Code execution switched off since the round ran: this run has no
+    // registry, while the earlier turns sent the round labelled.
+    const { messages: history } = formatAgentMessages([
+      { role: 'user', content: 'list files' },
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: 'c1',
+              name: 'bash_tool',
+              args: '{"command":"ls"}',
+              output: 'a.txt',
+              ref: 'tool0turn0',
+            },
+          },
+        ],
+      },
+      { role: 'user', content: 'thanks' },
+    ]);
+    const send = async (
+      registry: ToolOutputReferenceRegistry | undefined
+    ): Promise<string> => {
+      const { invokeMessages, model } = buildCapturingModel();
+      await attemptInvoke({
+        model: model as t.ChatModel,
+        messages: history,
+        provider: Providers.OPENAI,
+        context: {
+          getOrCreateToolOutputRegistry: () => registry,
+        } as unknown as Parameters<typeof attemptInvoke>[0]['context'],
+      });
+      return JSON.stringify(_convertMessagesToOpenAIParams(invokeMessages[0]));
+    };
+
+    const codeOn = await send(new ToolOutputReferenceRegistry());
+    const codeOff = await send(undefined);
+
+    expect(codeOn).toContain('"content":"[ref: tool0turn0]\\na.txt"');
+    expect(codeOff).toBe(codeOn);
   });
 
   it('applies unresolved-refs annotation regardless of registry presence', async () => {
