@@ -1,6 +1,8 @@
 import { describe, it, expect } from '@jest/globals';
+import { HumanMessage, ToolMessage } from '@langchain/core/messages';
 import {
   ToolOutputReferenceRegistry,
+  nextReferenceTurn,
   annotateToolOutputWithReference,
   buildReferenceKey,
   buildReferencePrefix,
@@ -529,5 +531,34 @@ describe('ToolOutputReferenceRegistry', () => {
     it('is non-global so callers cannot trip on stale lastIndex', () => {
       expect(TOOL_OUTPUT_REF_PATTERN.flags).not.toContain('g');
     });
+  });
+});
+
+describe('turn counter continuity across runs', () => {
+  const toolMsg = (key?: string): ToolMessage =>
+    new ToolMessage({
+      content: 'x',
+      tool_call_id: 'id',
+      additional_kwargs: key == null ? {} : { _refKey: key },
+    });
+
+  it('nextReferenceTurn is one past the highest restored turn', () => {
+    const history = [
+      new HumanMessage('hi'),
+      toolMsg('tool0turn0'),
+      toolMsg('tool3turn4'),
+      toolMsg(),
+      toolMsg('garbage'),
+    ];
+    expect(nextReferenceTurn(history)).toBe(5);
+    expect(nextReferenceTurn([new HumanMessage('hi')])).toBe(0);
+  });
+
+  it('seedTurn raises but never lowers the counter', () => {
+    const registry = new ToolOutputReferenceRegistry();
+    registry.seedTurn('r', 3);
+    expect(registry.nextTurn('r')).toBe(3);
+    registry.seedTurn('r', 1);
+    expect(registry.nextTurn('r')).toBe(4);
   });
 });
