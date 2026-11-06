@@ -975,10 +975,10 @@ export class AgentContext {
     }
 
     const promptCacheProvider = this.getPromptCacheProvider();
+    // Moved also without stable instructions: per-turn text left in the system
+    // message would sit ahead of the history and invalidate it on every turn.
     const shouldMoveDynamicInstructions =
-      promptCacheProvider != null &&
-      stableInstructions !== '' &&
-      dynamicInstructions !== '';
+      promptCacheProvider != null && dynamicInstructions !== '';
     const systemMessage = this.buildSystemMessage({
       stableInstructions,
       dynamicInstructions,
@@ -1227,7 +1227,10 @@ export class AgentContext {
     promptCacheProvider: PromptCacheProvider | undefined;
     shouldMoveDynamicInstructions: boolean;
   }): SystemMessage | undefined {
-    if (!stableInstructions && !dynamicInstructions) {
+    if (
+      !stableInstructions &&
+      (!dynamicInstructions || shouldMoveDynamicInstructions)
+    ) {
       return undefined;
     }
 
@@ -1246,10 +1249,6 @@ export class AgentContext {
         content.push({ type: 'text', text: dynamicInstructions });
       }
       return new SystemMessage({ content } as BaseMessageFields);
-    }
-
-    if (promptCacheProvider === Providers.OPENROUTER && !stableInstructions) {
-      return new SystemMessage(dynamicInstructions);
     }
 
     if (promptCacheProvider === Providers.OPENROUTER) {

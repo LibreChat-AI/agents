@@ -1,5 +1,6 @@
 // src/agents/__tests__/AgentContext.test.ts
 import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
+import type { BaseMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
 import { markTokenCounterCacheCompatible } from '@/llm/tokenCounterCacheCompatibility';
 import { buildSummaryCarrierText } from '@/summarization/shared';
@@ -294,7 +295,7 @@ describe('AgentContext', () => {
       ]);
     });
 
-    it('omits Anthropic cache control when only dynamic system text exists', async () => {
+    it('sends dynamic-only Anthropic instructions without a system message', async () => {
       const ctx = createBasicContext({
         agentConfig: {
           provider: Providers.ANTHROPIC,
@@ -305,9 +306,56 @@ describe('AgentContext', () => {
       });
 
       const result = await ctx.systemRunnable!.invoke([]);
-      const content = result[0].content as TestSystemContentBlock[];
-      expect(content).toEqual([{ type: 'text', text: 'Dynamic only' }]);
-      expect(content[0]).not.toHaveProperty('cache_control');
+      expect(result).toHaveLength(1);
+      expect(result[0].getType()).toBe('human');
+      expect(result[0].content).toBe('Dynamic only');
+    });
+
+    it('keeps the Anthropic history prefix when only per-turn context changes', async () => {
+      const turn = async (context: string, messages: BaseMessage[]) =>
+        createBasicContext({
+          agentConfig: {
+            provider: Providers.ANTHROPIC,
+            clientOptions: { model: 'claude-3-5-sonnet', promptCache: true },
+            instructions: undefined,
+            additional_instructions: context,
+          },
+        }).systemRunnable!.invoke(messages);
+      const history = [new HumanMessage('First'), new AIMessage('Answer')];
+
+      const second = await turn('Chunks for the second question', [
+        ...history,
+        new HumanMessage('Second'),
+      ]);
+      const third = await turn('Chunks for the third question', [
+        ...history,
+        new HumanMessage('Second'),
+        new AIMessage('Answer 2'),
+        new HumanMessage('Third'),
+      ]);
+
+      const text = (message: BaseMessage): string => {
+        if (typeof message.content === 'string') {
+          return message.content;
+        }
+        const blocks = message.content as { text?: string }[];
+        return blocks.map((block) => block.text ?? '').join('');
+      };
+
+      expect(second.map(text)).toEqual([
+        'First',
+        'Answer',
+        'Chunks for the second question',
+        'Second',
+      ]);
+      expect(third.map(text)).toEqual([
+        'First',
+        'Answer',
+        'Second',
+        'Answer 2',
+        'Chunks for the third question',
+        'Third',
+      ]);
     });
 
     it('keeps cross-run summaries in the dynamic Anthropic tail', async () => {
@@ -424,7 +472,7 @@ describe('AgentContext', () => {
       ]);
     });
 
-    it('keeps dynamic-only OpenRouter instructions as system text', async () => {
+    it('moves dynamic-only OpenRouter instructions next to the latest user message', async () => {
       const tokenCounter = (msg: { content: unknown }): number => {
         const content =
           typeof msg.content === 'string'
@@ -453,16 +501,16 @@ describe('AgentContext', () => {
       const secondContent = result[2].content as TestSystemContentBlock[];
 
       expect(result).toHaveLength(3);
-      expect(result[0].content).toBe('Dynamic only');
-      expect(result[1].content).toBe('First');
+      expect(result[0].content).toBe('First');
+      expect(result[1].content).toBe('Dynamic only');
       expect(secondContent[0]).toMatchObject({
         type: 'text',
         text: 'Second',
         cache_control: { type: 'ephemeral' },
       });
-      expect(ctx.systemMessageTokens).toBeGreaterThan(0);
-      expect(ctx.dynamicInstructionTokens).toBe(0);
-      expect(ctx.instructionTokens).toBe(ctx.systemMessageTokens);
+      expect(ctx.systemMessageTokens).toBe(0);
+      expect(ctx.dynamicInstructionTokens).toBeGreaterThan(0);
+      expect(ctx.instructionTokens).toBe(ctx.dynamicInstructionTokens);
     });
 
     it('caches the latest OpenRouter body message after dynamic instructions', async () => {
