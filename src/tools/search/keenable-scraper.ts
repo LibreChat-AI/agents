@@ -1,4 +1,5 @@
 import axios from 'axios';
+import type { AxiosResponse } from 'axios';
 import type * as t from './types';
 import { createDefaultLogger } from './utils';
 
@@ -8,6 +9,26 @@ const DEFAULT_KEENABLE_SCRAPE_TIMEOUT = 15000;
  * without a key via the public endpoint; a key only lifts rate limits. */
 const KEENABLE_FETCH_API_URL = 'https://api.keenable.ai/v1/fetch';
 const KEENABLE_FETCH_PUBLIC_URL = 'https://api.keenable.ai/v1/fetch/public';
+
+/** Keenable enforces a per-second rate limit and answers bursts with 429 and
+ * `Retry-After`; such requests are retried a bounded number of times. */
+const KEENABLE_MAX_RATE_LIMIT_RETRIES = 2;
+const KEENABLE_DEFAULT_RETRY_DELAY_MS = 1000;
+const KEENABLE_MAX_RETRY_DELAY_MS = 3000;
+const KEENABLE_RETRY_JITTER_MS = 500;
+
+/** Delay before retrying a 429 response, or undefined for any other failure. */
+const getRateLimitRetryDelayMs = (error: unknown): number | undefined => {
+  if (!axios.isAxiosError(error) || error.response?.status !== 429) {
+    return undefined;
+  }
+  const retryAfterSeconds = Number(error.response.headers['retry-after']);
+  const baseDelayMs =
+    Number.isFinite(retryAfterSeconds) && retryAfterSeconds >= 0
+      ? Math.min(retryAfterSeconds * 1000, KEENABLE_MAX_RETRY_DELAY_MS)
+      : KEENABLE_DEFAULT_RETRY_DELAY_MS;
+  return baseDelayMs + Math.random() * KEENABLE_RETRY_JITTER_MS;
+};
 
 export class KeenableScraper implements t.BaseScraper {
   private apiKey: string | undefined;
@@ -48,6 +69,32 @@ export class KeenableScraper implements t.BaseScraper {
     return headers;
   }
 
+  private async fetchPage(
+    url: string,
+    timeout: number,
+    retriesLeft = KEENABLE_MAX_RATE_LIMIT_RETRIES
+  ): Promise<AxiosResponse<t.KeenableFetchResult>> {
+    try {
+      return await axios.get<t.KeenableFetchResult>(this.apiUrl, {
+        params: { url },
+        headers: this.buildHeaders(),
+        timeout,
+        httpAgent: this.httpAgent,
+        httpsAgent: this.httpsAgent,
+      });
+    } catch (error) {
+      const delayMs = getRateLimitRetryDelayMs(error);
+      if (delayMs == null || retriesLeft <= 0) {
+        throw error;
+      }
+      this.logger.debug(
+        `Keenable Fetch rate limited (429), retrying in ${Math.round(delayMs)} ms`
+      );
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      return this.fetchPage(url, timeout, retriesLeft - 1);
+    }
+  }
+
   async scrapeUrl(
     url: string,
     options: t.KeenableScrapeOptions = {}
@@ -57,13 +104,10 @@ export class KeenableScraper implements t.BaseScraper {
     }
 
     try {
-      const response = await axios.get<t.KeenableFetchResult>(this.apiUrl, {
-        params: { url },
-        headers: this.buildHeaders(),
-        timeout: options.timeout ?? this.timeout,
-        httpAgent: this.httpAgent,
-        httpsAgent: this.httpsAgent,
-      });
+      const response = await this.fetchPage(
+        url,
+        options.timeout ?? this.timeout
+      );
 
       const data = response.data;
       const content = data.content ?? '';
