@@ -156,6 +156,12 @@ const customHandlers = composeEventHandlers(
 );
 ```
 
+Final-content fallback is scoped to the model invocation that started it. A host
+may mark caller-executed tools as invoked before the model stream closes without
+replaying already-streamed text or reasoning as a second message. Later model
+invocations retain their own fallback eligibility, including post-tool answers
+from providers that do not emit streaming deltas.
+
 ### Accepted tool-call projection (opt-in)
 
 `createOpenAIToolCallStream` from `@librechat/agents/openai` formats finalized

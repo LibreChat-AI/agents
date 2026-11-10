@@ -449,12 +449,11 @@ function hasReasoningDeltaContent(
 
 function getCurrentStepIds({
   graph,
-  metadata,
+  baseStepKey,
 }: {
   graph: Graph<t.BaseGraphState>;
-  metadata: Record<string, unknown>;
+  baseStepKey: string;
 }): string[] {
-  const baseStepKey = graph.getStepBaseKey(metadata);
   const currentStepIds: string[] = [];
   for (const [stepKey, stepIds] of graph.stepKeyIds) {
     if (stepKey !== baseStepKey && !stepKey.startsWith(`${baseStepKey}_`)) {
@@ -469,36 +468,36 @@ function getCurrentStepIds({
 
 function hasCurrentTextDeltaStep({
   graph,
-  metadata,
+  baseStepKey,
 }: {
   graph: Graph<t.BaseGraphState>;
-  metadata: Record<string, unknown>;
+  baseStepKey: string;
 }): boolean {
-  return getCurrentStepIds({ graph, metadata }).some((stepId) =>
+  return getCurrentStepIds({ graph, baseStepKey }).some((stepId) =>
     graph.messageStepHasTextDeltas.has(stepId)
   );
 }
 
 function hasCurrentReasoningDeltaStep({
   graph,
-  metadata,
+  baseStepKey,
 }: {
   graph: Graph<t.BaseGraphState>;
-  metadata: Record<string, unknown>;
+  baseStepKey: string;
 }): boolean {
-  return getCurrentStepIds({ graph, metadata }).some((stepId) =>
+  return getCurrentStepIds({ graph, baseStepKey }).some((stepId) =>
     graph.reasoningStepHasDeltas.has(stepId)
   );
 }
 
 function clearCurrentDeltaStepMarkers({
   graph,
-  metadata,
+  baseStepKey,
 }: {
   graph: Graph<t.BaseGraphState>;
-  metadata: Record<string, unknown>;
+  baseStepKey: string;
 }): void {
-  for (const stepId of getCurrentStepIds({ graph, metadata })) {
+  for (const stepId of getCurrentStepIds({ graph, baseStepKey })) {
     graph.messageStepHasTextDeltas.delete(stepId);
     graph.reasoningStepHasDeltas.delete(stepId);
   }
@@ -4438,6 +4437,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         }
       }
       const metadata = config.metadata as Record<string, unknown>;
+      /** Caller-tool handoff may change invokedToolIds before this invocation finishes. */
+      const invocationStepBaseKey = this.getStepBaseKey(metadata);
 
       try {
         if (preInvokeContextOverflowError != null) {
@@ -4476,7 +4477,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       } catch (primaryError) {
         clearCurrentDeltaStepMarkers({
           graph: this,
-          metadata,
+          baseStepKey: invocationStepBaseKey,
         });
         /**
          * A tripped stream circuit breaker is a deliberate abort, not a
@@ -4950,11 +4951,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       );
       const hasStreamedTextDeltaStep = hasCurrentTextDeltaStep({
         graph: this,
-        metadata,
+        baseStepKey: invocationStepBaseKey,
       });
       const hasStreamedReasoningDeltaStep = hasCurrentReasoningDeltaStep({
         graph: this,
-        metadata,
+        baseStepKey: invocationStepBaseKey,
       });
       const dispatchableFinalReasoningContent =
         getDispatchableFinalReasoningContent({

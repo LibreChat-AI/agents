@@ -1159,6 +1159,75 @@ describe('StandardGraph final response reasoning fallback', () => {
     expect(run.getRunMessages()?.[0]?.content).toBe(replayWithSuffix);
   });
 
+  it('does not replay a streamed plan after the host marks its caller tool', async () => {
+    const text = 'Checking the presentation.';
+    const callId = 'call_read_deck';
+    const reasoningDeltas: t.ReasoningDeltaEvent[] = [];
+    const messageDeltas: t.MessageDeltaEvent[] = [];
+    const { contentParts, aggregateContent } = createContentAggregator();
+    const handlers = createReasoningHandlers(
+      aggregateContent,
+      reasoningDeltas,
+      messageDeltas
+    );
+    const run = await Run.create<t.IState>({
+      runId: 'caller-tool-streamed-plan',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: { provider: Providers.OPENAI, streamUsage: false },
+      },
+      returnContent: true,
+      skipCleanup: true,
+      customHandlers: {
+        ...handlers,
+        [GraphEvents.ON_RUN_STEP]: {
+          handle: async (event, data, metadata, graph): Promise<void> => {
+            await handlers[GraphEvents.ON_RUN_STEP].handle(
+              event,
+              data,
+              metadata,
+              graph
+            );
+            const step = data as t.RunStep;
+            if (step.stepDetails.type !== StepTypes.TOOL_CALLS) return;
+            if (graph == null)
+              throw new Error('Expected graph for caller tool handoff');
+            graph.invokedToolIds ??= new Set();
+            for (const call of step.stepDetails.tool_calls) {
+              if (call.id != null) graph.invokedToolIds.add(call.id);
+            }
+          },
+        },
+      },
+    });
+    if (!run.Graph) throw new Error('Expected graph to be initialized');
+    run.Graph.overrideModel = new StreamingReasoningModel([
+      new AIMessageChunk({ content: text }),
+      new AIMessageChunk({
+        content: '',
+        tool_call_chunks: [
+          { name: 'read_deck', args: '{}', id: callId, index: 0 },
+        ],
+      }),
+    ]);
+
+    await run.processStream(
+      {
+        messages: [
+          new HumanMessage('Inspect the presentation without changing it'),
+        ],
+      },
+      config
+    );
+
+    expect(
+      contentParts.filter((part) => part.type === ContentTypes.TEXT)
+    ).toEqual([{ type: ContentTypes.TEXT, text }]);
+    expect(messageDeltas.map((delta) => delta.delta.content?.[0])).toEqual([
+      { type: ContentTypes.TEXT, text },
+    ]);
+  });
+
   it('keeps post-tool final text when an earlier invocation streamed text', async () => {
     const streamedBeforeTool = 'I will check that. ';
     const finalAfterTool = 'The answer is 391.';
