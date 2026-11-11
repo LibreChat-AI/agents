@@ -25,12 +25,14 @@ export type SearchProvider =
   | 'searxng'
   | 'tavily'
   | 'keenable'
+  | 'kagi'
   | 'crw';
 export type ScraperProvider =
   | 'firecrawl'
   | 'serper'
   | 'tavily'
   | 'crw'
+  | 'kagi'
   | 'keenable';
 export type RerankerType = 'infinity' | 'jina' | 'cohere' | 'rag-api' | 'none';
 
@@ -196,7 +198,29 @@ export interface SearxNGSearchOptions extends HttpAgentConfig {
   timeout?: number;
 }
 
+export interface KagiSearchOptions extends HttpAgentConfig {
+  /** Maximum results returned (clamped to an integer in 1..1024). */
+  limit?: number;
+  /** HTTP timeout in milliseconds, not Kagi's server time budget. Default: 10000. */
+  timeout?: number;
+}
+
+export interface KagiScraperConfig extends HttpAgentConfig {
+  apiKey?: string;
+  /** HTTP timeout in milliseconds. Default: 7500. */
+  timeout?: number;
+  logger?: Logger;
+}
+
+export interface KagiScrapeResponse {
+  success: boolean;
+  data?: { url: string; markdown: string };
+  error?: string;
+}
+
 export interface SearchConfig extends HttpAgentConfig {
+  kagiApiKey?: string;
+  kagiSearchOptions?: KagiSearchOptions;
   searchProvider?: SearchProvider;
   serperApiKey?: string;
   searxngInstanceUrl?: string;
@@ -507,6 +531,7 @@ export interface SearchToolConfig
   extends SearchConfig,
     ProcessSourcesConfig,
     FirecrawlConfig {
+  kagiScraperOptions?: KagiScraperConfig;
   tavilyScraperOptions?: TavilyScraperConfig;
   crwScraperOptions?: CrwScraperConfig;
   keenableScraperOptions?: KeenableScraperConfig;
@@ -561,7 +586,8 @@ export type AnyScraperResponse =
   | SerperScrapeResponse
   | TavilyScrapeResponse
   | CrwScrapeResponse
-  | KeenableScrapeResponse;
+  | KeenableScrapeResponse
+  | KagiScrapeResponse;
 
 /** Base Scraper Interface */
 export interface BaseScraper {
