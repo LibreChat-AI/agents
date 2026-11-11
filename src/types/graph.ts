@@ -998,6 +998,12 @@ export interface LangfuseConfig {
    * from the run/message id, without a trace lookup. Default: random ids.
    */
   deterministicTraceId?: boolean;
+  /**
+   * Skills the agent can load with the `skill` tool, reported to Langfuse on
+   * the observations its run starts. `name` matches the tool's `skillName`;
+   * `version` is the skill's Langfuse version, when it has one.
+   */
+  skillsAvailable?: { name: string; version?: number }[];
 }
 
 interface AgentInputFields {
