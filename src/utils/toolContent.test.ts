@@ -593,6 +593,53 @@ describe('toolContent', () => {
     expect(serializeToolContent(result.content)).not.toContain(base64);
   });
 
+  it.each([600_000, 3_200_000])(
+    'keeps a %i-character inline image that fits the cap',
+    (payloadChars) => {
+      const base64 = 'A'.repeat(payloadChars);
+      const content = [
+        { type: 'text', text: 'generated_image_id: "img-1"' },
+        {
+          type: 'image_url',
+          image_url: { url: `data:image/png;base64,${base64}` },
+        },
+      ] as ToolContent;
+      const contentChars = JSON.stringify(content).length;
+
+      const kept = compactToolContent(content, 8_000_000);
+      const capped = compactToolContent(content, 400_000);
+
+      expect(getToolContentCharLength(content)).toBe(contentChars);
+      expect(kept.changed).toBe(false);
+      expect(kept.originalChars).toBe(contentChars);
+      expect(kept.content).toBe(content);
+      expect(capped.changed).toBe(true);
+      expect(serializeToolContent(capped.content)).toContain(
+        '[omitted 1 oversized atomic tool-content block: image_url]'
+      );
+      expect(serializeToolContent(capped.content)).not.toContain(base64);
+    }
+  );
+
+  it('keeps the character allowance for strings that are not bounded base64 data URLs', () => {
+    const urls = [
+      `data:image/png;base64,${'A'.repeat(1_100_000)}"`,
+      `data:image/png;base64,${'A'.repeat(5_000_000)}`,
+      'A'.repeat(1_100_000),
+    ];
+
+    for (const url of urls) {
+      const content = [
+        { type: 'image_url', image_url: { url } },
+      ] as ToolContent;
+
+      const result = compactToolContent(content, 8_000_000);
+
+      expect(result.changed).toBe(true);
+      expect(result.originalChars).toBe(Number.MAX_SAFE_INTEGER);
+    }
+  });
+
   it('sizes large native byte payloads without JSON-expanding them', () => {
     const bytes = new Uint8Array(1_000_000);
     const content = [
