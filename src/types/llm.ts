@@ -130,6 +130,12 @@ export type AnthropicClientOptions = Omit<AnthropicInput, 'thinking'> &
      * 5-minute behavior.
      */
     promptCacheTtl?: PromptCacheTtl;
+    /**
+     * Ask the API to drop replayed thinking blocks that no longer match the
+     * conversation prefix instead of rejecting the request. Set by the SDK
+     * when `AgentInputs.providerReasoningReplay` is enabled.
+     */
+    dropMismatchedThinkingBlocks?: boolean;
   };
 export type MistralAIClientOptions = ChatMistralAIInput &
   StreamSmoothingOptions;
@@ -150,6 +156,12 @@ export type BedrockAnthropicInput = ChatBedrockConverseInput &
      * server-side, so the default is safe to leave on.
      */
     promptCacheTtl?: PromptCacheTtl;
+    /**
+     * Retry a request once without signed reasoning when Bedrock rejects the
+     * replayed blocks. Set by the SDK when `AgentInputs.providerReasoningReplay`
+     * is enabled.
+     */
+    retryWithoutReasoningOnRejection?: boolean;
   };
 export type BedrockConverseClientOptions = BedrockAnthropicInput;
 export type BedrockAnthropicClientOptions = BedrockAnthropicInput;

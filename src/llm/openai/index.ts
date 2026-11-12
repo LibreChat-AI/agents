@@ -63,6 +63,11 @@ import {
   hasToolCallChunks,
   getReasoningKwargsText,
 } from '@/llm/stream/chunkAdapters';
+import {
+  getResponsesReplayOrigin,
+  gateResponsesProviderOutput,
+  OPENAI_RESPONSES_ORIGIN_KEY,
+} from '@/messages/responsesToolRounds';
 import { registerProviderTextChunkConstructor } from '@/llm/providerTextChunk';
 import { isReasoningModel, _convertMessagesToOpenAIParams } from './utils';
 import { smoothStream, resolveStreamDelay } from '@/llm/stream/smoother';
@@ -221,14 +226,37 @@ function stripResponsesToolCacheControl<T>(tools: T): T {
   }) as T;
 }
 
+type ResponsesReplayTarget = {
+  replayOrigin: string;
+  zdrEnabled?: boolean;
+};
+
 function projectOpenAIResponsesProviderMessages(
-  messages: BaseMessage[]
+  messages: BaseMessage[],
+  target: ResponsesReplayTarget
 ): BaseMessage[] {
-  return projectOpenAIResponsesToolMessageContent(
-    stripAnthropicCacheControl(
-      stripBedrockCacheControl(projectToolStreamContentForProvider(messages))
-    )
+  return gateResponsesProviderOutput(
+    projectOpenAIResponsesToolMessageContent(
+      stripAnthropicCacheControl(
+        stripBedrockCacheControl(projectToolStreamContentForProvider(messages))
+      )
+    ),
+    target.replayOrigin,
+    target.zdrEnabled === true,
+    Math.floor(Date.now() / 1000)
   );
+}
+
+/** Marks a finished response's output with the origin that produced it. */
+function stampResponsesReplayOrigin(
+  message: BaseMessage,
+  replayOrigin: string
+): void {
+  const metadata = (message as AIMessage).response_metadata;
+  if (!Array.isArray(metadata.output)) {
+    return;
+  }
+  metadata[OPENAI_RESPONSES_ORIGIN_KEY] = replayOrigin;
 }
 
 type ResponsesRequest =
@@ -241,6 +269,7 @@ type ResponsesStreamChunkOptions = {
   promptIndex?: number;
   signal?: AbortSignal;
 };
+type ResponsesStreamTarget = { replayOrigin: string };
 type CacheableChatPart = {
   type: 'text' | 'image_url' | 'input_audio' | 'file' | 'refusal';
   prompt_cache_breakpoint?: { mode: 'explicit' };
@@ -678,7 +707,7 @@ export function shouldIncludeEncryptedReasoning(
       | undefined
   )?.context;
   return (
-    (/^gpt-5\.6(?:-|$)/i.test(model) || astraRulesApply) &&
+    (/(?:^|[./:])gpt-5\.6(?:-|$)/i.test(model) || astraRulesApply) &&
     (params.store === false || reasoningContext !== 'current_turn')
   );
 }
@@ -1196,6 +1225,7 @@ function getResponsesStreamError(
 async function* convertLibreChatResponsesStream(
   stream: AsyncIterable<OpenAIClient.Responses.ResponseStreamEvent>,
   options: ResponsesStreamChunkOptions,
+  target: ResponsesStreamTarget,
   runManager?: CallbackManagerForLLMRun
 ): AsyncGenerator<ChatGenerationChunk> {
   const seenReplayPositions = new Set<string>();
@@ -1218,6 +1248,7 @@ async function* convertLibreChatResponsesStream(
       remapResponsesTextBlockIndex(chunk, event, responsesTextBlockIndices);
       attachResponsesReplayPosition(chunk, event, seenReplayPositions);
       attachCacheWriteUsage(chunk.message);
+      stampResponsesReplayOrigin(chunk.message, target.replayOrigin);
       await runManager?.handleLLMNewToken(
         chunk.text || '',
         {
@@ -2387,6 +2418,13 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
 class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
   protected firstPartyEndpoint?: boolean;
 
+  get replayOrigin(): string {
+    return getResponsesReplayOrigin(
+      this.model,
+      this.clientConfig.baseURL ?? ''
+    );
+  }
+
   /** @see {@link astraRulesApply} */
   protected get astraRulesApply(): boolean {
     return astraRulesApply(this.model, this.firstPartyEndpoint);
@@ -2487,12 +2525,13 @@ class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
     runManager?: CallbackManagerForLLMRun
   ): Promise<ChatResult> {
     const result = await super._generate(
-      projectOpenAIResponsesProviderMessages(messages),
+      projectOpenAIResponsesProviderMessages(messages, this),
       options,
       runManager
     );
     for (const generation of result.generations) {
       attachCacheWriteUsage(generation.message);
+      stampResponsesReplayOrigin(generation.message, this.replayOrigin);
     }
     return result;
   }
@@ -2502,7 +2541,7 @@ class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
     options: this['ParsedCallOptions'],
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
-    const projectedMessages = projectOpenAIResponsesProviderMessages(messages);
+    const projectedMessages = projectOpenAIResponsesProviderMessages(messages, this);
     const stream = await this.completionWithRetry(
       {
         ...this.invocationParams(options),
@@ -2515,7 +2554,7 @@ class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
       },
       options
     );
-    yield* convertLibreChatResponsesStream(stream, options, runManager);
+    yield* convertLibreChatResponsesStream(stream, options, this, runManager);
   }
 
   async *_streamChatModelEvents(
@@ -2524,7 +2563,7 @@ class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatModelStreamEvent> {
     yield* super._streamChatModelEvents(
-      projectOpenAIResponsesProviderMessages(messages),
+      projectOpenAIResponsesProviderMessages(messages, this),
       options,
       runManager
     );
@@ -2708,6 +2747,18 @@ class LibreChatAzureOpenAICompletions extends OriginalAzureChatOpenAICompletions
 class LibreChatAzureOpenAIResponses extends OriginalAzureChatOpenAIResponses {
   protected firstPartyEndpoint?: boolean;
 
+  get replayOrigin(): string {
+    return getResponsesReplayOrigin(
+      this.model,
+      [
+        this.azureOpenAIEndpoint,
+        this.azureOpenAIBasePath,
+        this.azureOpenAIApiInstanceName,
+        this.azureOpenAIApiDeploymentName,
+      ].join('|')
+    );
+  }
+
   /** @see {@link astraRulesApply} */
   protected get astraRulesApply(): boolean {
     return astraRulesApply(this.model, this.firstPartyEndpoint);
@@ -2777,12 +2828,13 @@ class LibreChatAzureOpenAIResponses extends OriginalAzureChatOpenAIResponses {
     runManager?: CallbackManagerForLLMRun
   ): Promise<ChatResult> {
     const result = await super._generate(
-      projectOpenAIResponsesProviderMessages(messages),
+      projectOpenAIResponsesProviderMessages(messages, this),
       options,
       runManager
     );
     for (const generation of result.generations) {
       attachCacheWriteUsage(generation.message);
+      stampResponsesReplayOrigin(generation.message, this.replayOrigin);
     }
     return result;
   }
@@ -2792,7 +2844,7 @@ class LibreChatAzureOpenAIResponses extends OriginalAzureChatOpenAIResponses {
     options: this['ParsedCallOptions'],
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
-    const projectedMessages = projectOpenAIResponsesProviderMessages(messages);
+    const projectedMessages = projectOpenAIResponsesProviderMessages(messages, this);
     const stream = await this.completionWithRetry(
       {
         ...this.invocationParams(options),
@@ -2805,7 +2857,7 @@ class LibreChatAzureOpenAIResponses extends OriginalAzureChatOpenAIResponses {
       },
       options
     );
-    yield* convertLibreChatResponsesStream(stream, options, runManager);
+    yield* convertLibreChatResponsesStream(stream, options, this, runManager);
   }
 
   async *_streamChatModelEvents(
@@ -2814,7 +2866,7 @@ class LibreChatAzureOpenAIResponses extends OriginalAzureChatOpenAIResponses {
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatModelStreamEvent> {
     yield* super._streamChatModelEvents(
-      projectOpenAIResponsesProviderMessages(messages),
+      projectOpenAIResponsesProviderMessages(messages, this),
       options,
       runManager
     );

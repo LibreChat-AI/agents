@@ -123,6 +123,7 @@ export class AgentContext {
       streamBuffer,
       maxContextTokens,
       reasoningKey,
+      providerReasoningReplay,
       useLegacyContent,
       discoveredTools,
       summarizationEnabled,
@@ -189,6 +190,20 @@ export class AgentContext {
           | t.GenericTool[]
           | undefined) ?? []),
       ] as t.GraphTools;
+    }
+    if (providerReasoningReplay === true) {
+      agentContext.providerReasoningReplay = true;
+      if (provider === Providers.ANTHROPIC) {
+        agentContext.clientOptions = {
+          ...clientOptions,
+          dropMismatchedThinkingBlocks: true,
+        } as t.ClientOptions;
+      } else if (provider === Providers.BEDROCK) {
+        agentContext.clientOptions = {
+          ...clientOptions,
+          retryWithoutReasoningOnRejection: true,
+        } as t.ClientOptions;
+      }
     }
 
     if (initialSummary?.text != null && initialSummary.text !== '') {
@@ -394,6 +409,8 @@ export class AgentContext {
   tokenTypeSwitch?: 'reasoning' | 'content';
   /** Tracks how many reasoning→text transitions have occurred (ensures unique post-reasoning step keys) */
   reasoningTransitionCount = 0;
+  /** Streamed reasoning carries signed provider blocks (`provider_replay`). */
+  providerReasoningReplay = false;
   /** Current token type being processed */
   currentTokenType: ContentTypes.TEXT | ContentTypes.THINK | 'think_and_text' =
     ContentTypes.TEXT;

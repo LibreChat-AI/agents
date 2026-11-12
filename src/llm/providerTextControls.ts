@@ -1,6 +1,7 @@
 import type { AIMessageChunk } from '@langchain/core/messages';
 import type { ProviderTextAttempt } from '@/protection/providerText';
 import { ProviderTextProtectionError } from '@/protection/providerText';
+import { OPENAI_RESPONSES_ORIGIN_KEY } from '@/messages/responsesToolRounds';
 
 export const GEMINI_SIGNATURES = '__gemini_function_call_thought_signatures__';
 export const RESPONSES_POSITIONS = '__openai_responses_replay_positions__';
@@ -35,7 +36,7 @@ const scalarKeys = new Set([
   'id', 'model', 'model_name', 'model_provider', 'created_at', 'object', 'status', 'user', 'service_tier',
   'max_output_tokens', 'max_tool_calls', 'parallel_tool_calls', 'temperature', 'top_p', 'truncation',
   'store', 'background', 'previous_response_id', 'prompt_cache_key', 'prompt_cache_retention',
-  'safety_identifier', 'completed_at',
+  'safety_identifier', 'completed_at', OPENAI_RESPONSES_ORIGIN_KEY,
 ]);
 
 interface OutputText {
