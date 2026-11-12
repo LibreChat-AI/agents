@@ -1023,8 +1023,22 @@ interface AgentInputFields {
   maxContextTokens?: number;
   /** Per-agent Langfuse tracing configuration. */
   langfuse?: LangfuseConfig;
-  /** Dynamic system tail appended after stable instructions without provider cache markers. */
+  /**
+   * Per-turn volatile context appended after the other instructions without
+   * provider cache markers. With Anthropic or OpenRouter prompt caching it
+   * travels as a user message ahead of the newest human message, so a change
+   * every turn leaves the cached history intact.
+   */
   additional_instructions?: string;
+  /**
+   * Per-conversation context that stays the same for a whole conversation
+   * (for example its start time, memory, attached file lists). Kept in the
+   * system message right after `instructions`, never moved, with its own
+   * prompt-cache breakpoint where the provider supports one, so each request
+   * of the conversation extends the previous one while `instructions` stays
+   * shared across conversations. The compaction summary follows it.
+   */
+  conversation_instructions?: string;
   reasoningKey?: 'reasoning_content' | 'reasoning';
   /** Format content blocks as strings (for legacy compatibility i.e. Ollama/Azure Serverless) */
   useLegacyContent?: boolean;
@@ -1070,7 +1084,9 @@ interface AgentInputFields {
    */
   compactionSemanticIndex?: CompactionSemanticIndex;
   /** Cross-run summary from a previous run, forwarded from formatAgentMessages.
-   *  Injected into the dynamic system tail via AgentContext. */
+   *  With `conversation_instructions` set it is sent as its own user message
+   *  right after the system message, where the run that created it placed it;
+   *  without it, it is injected into the dynamic system tail. */
   initialSummary?: { text: string; tokenCount: number };
   contextPruningConfig?: ContextPruningConfig;
   maxToolResultChars?: number;
