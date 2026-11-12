@@ -5342,6 +5342,46 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
     expect(graph.eagerEventToolExecutions.has('call_cf2')).toBe(false);
   });
 
+  it('does not prestart dispatcher calls', async () => {
+    const graph = createGraph({
+      eagerEventToolExecution: { enabled: true },
+      getAgentContext: jest.fn(() => ({
+        provider: Providers.ANTHROPIC,
+        reasoningKey: 'reasoning',
+        toolDefinitions: [{ name: 'call_tool' }],
+        toolDispatch: true,
+        agentId: 'agent_1',
+      })) as unknown as StandardGraph['getAgentContext'],
+    });
+    const toolExecute = jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockResolvedValue(undefined);
+
+    await new ChatModelStreamHandler().handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_calls: [
+            {
+              id: 'call_dispatch',
+              name: 'call_tool',
+              args: { name: 'late_tool', arguments: '{"query":"x"}' },
+            },
+          ],
+          response_metadata: finalToolCallResponseMetadata,
+        } as unknown as t.StreamChunk,
+      },
+      { langgraph_node: 'agent' },
+      graph
+    );
+
+    expect(
+      toolExecute.mock.calls.some(([event]) => event === GraphEvents.ON_TOOL_EXECUTE)
+    ).toBe(false);
+    expect(graph.eagerEventToolExecutions.size).toBe(0);
+  });
+
   it('keeps the direct-tool batch guard when an excluded tool is also direct', async () => {
     // edit_file is both a direct graph tool AND excluded from eager. A mixed
     // batch with a direct tool must suppress eager for the whole batch, so the
