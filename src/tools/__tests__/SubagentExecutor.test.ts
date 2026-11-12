@@ -2348,6 +2348,41 @@ describe('SubagentExecutor', () => {
     expect(clearHeavyState).toHaveBeenCalled();
   });
 
+  it('resolves the advertised name of an opaque subagent type', async () => {
+    const { factory } = makeStubGraphFactory({
+      messages: [new AIMessage('child done')],
+    });
+    const opaque = {
+      ...config,
+      type: 'agent_bqFVwJV0dwKDSyqMnrIIC',
+      name: 'Exchange (read-only)',
+    };
+    const executor = createExecutor({
+      configs: new Map([[opaque.type, opaque]]),
+      createChildGraph: factory,
+    });
+
+    const byName = await executor.execute({
+      description: 'Count unread mail',
+      subagentType: 'exchange-read-only',
+    });
+    expect(byName.content).toBe('child done');
+
+    const byType = await executor.execute({
+      description: 'Count unread mail',
+      subagentType: opaque.type,
+    });
+    expect(byType.content).toBe('child done');
+
+    const mistyped = await executor.execute({
+      description: 'Count unread mail',
+      subagentType: 'agent_bqFVwJV0dwKDSyqMnrIlC',
+    });
+    expect(mistyped.content).toContain(
+      'Available types: exchange-read-only'
+    );
+  });
+
   it('passes parent Langfuse config to the child graph', async () => {
     const langfuse = {
       enabled: true,
