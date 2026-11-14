@@ -2,6 +2,7 @@ import { GenerativeModel } from '@google/generative-ai';
 import { AIMessage, HumanMessage } from '@langchain/core/messages';
 import { afterEach, describe, expect, jest, test } from '@jest/globals';
 import type { EnhancedGenerateContentResponse } from '@google/generative-ai';
+import { toLangChainContent } from '@/messages/langchain';
 import { CustomChatGoogleGenerativeAI } from './index';
 
 const response: EnhancedGenerateContentResponse = {
@@ -29,6 +30,34 @@ function createModel(): CustomChatGoogleGenerativeAI {
 }
 
 describe('Google Hydrogen request configuration', () => {
+  test.each(['application/pdf', 'image/png', 'audio/wav', 'video/mp4'])(
+    'serializes supported media %s @scenario:google-hydrogen-media',
+    async (mimeType) => {
+      const model = createModel();
+      const generate = jest
+        .spyOn(GenerativeModel.prototype, 'generateContent')
+        .mockResolvedValue({ response });
+      const message = new HumanMessage({
+        content: toLangChainContent([
+          { type: 'text', text: 'Describe.' },
+          { type: 'media', mimeType, data: 'AA==' },
+        ]),
+      });
+      await model._generate([message], {});
+      expect(generate.mock.calls[0][0]).toMatchObject({
+        contents: [
+          {
+            role: 'user',
+            parts: [
+              { text: 'Describe.' },
+              { inlineData: { mimeType, data: 'AA==' } },
+            ],
+          },
+        ],
+      });
+    }
+  );
+
   afterEach(() => {
     jest.restoreAllMocks();
   });

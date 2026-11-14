@@ -1,14 +1,21 @@
 import { describe, expect, test } from '@jest/globals';
-import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
+import {
+  AIMessage,
+  AIMessageChunk,
+  HumanMessage,
+  ToolMessage,
+} from '@langchain/core/messages';
 import type {
   GoogleLLMResponse,
   GeminiRequest,
 } from '@langchain/google-common';
+import type { ChatGenerationChunk } from '@langchain/core/outputs';
 import type { BaseMessage } from '@langchain/core/messages';
 import {
   GEMINI_PARTS,
   restoreGeminiReplayParts,
 } from '@/llm/google/utils/signatures';
+import { toLangChainContent } from '@/messages/langchain';
 import { ChatVertexAI } from './index';
 
 class InspectableVertex extends ChatVertexAI {
@@ -17,6 +24,9 @@ class InspectableVertex extends ChatVertexAI {
       messages,
       this.invocationParams({})
     ) as Promise<GeminiRequest>;
+  }
+  decodeGeneration(response: GoogleLLMResponse): ChatGenerationChunk | null {
+    return this.connection.api.responseToChatGeneration(response);
   }
   decodeBlocked(response: GoogleLLMResponse, stream: boolean): void {
     if (stream) this.connection.api.responseToChatGeneration(response);
@@ -85,6 +95,40 @@ const createModel = () =>
   });
 
 describe('Vertex Hydrogen native history', () => {
+  test.each(['application/pdf', 'image/png', 'audio/wav', 'video/mp4'])(
+    'serializes supported media %s @scenario:vertex-hydrogen-media',
+    async (mimeType) => {
+      const message = new HumanMessage({
+        content: toLangChainContent([
+          { type: 'text', text: 'Describe.' },
+          { type: 'media', mimeType, data: 'AA==' },
+        ]),
+      });
+      const formatted = await createModel().format([message]);
+      expect(formatted.contents).toEqual([
+        {
+          role: 'user',
+          parts: [
+            { text: 'Describe.' },
+            { inlineData: { mimeType, data: 'AA==' } },
+          ],
+        },
+      ]);
+    }
+  );
+
+  test('counts response usage once for multiple native parts @scenario:vertex-stream-usage', () => {
+    const generation = createModel().decodeGeneration(response)!;
+    expect(generation.generationInfo?.usage_metadata).toMatchObject({
+      input_tokens: 3,
+      output_tokens: 2,
+      total_tokens: 5,
+    });
+    if (!(generation.message instanceof AIMessageChunk))
+      throw new Error('Expected AI chunk');
+    expect(generation.message.usage_metadata).toBeUndefined();
+  });
+
   test.each([false, true])(
     'preserves the safety error for contentless candidates in stream=%s @scenario:vertex-safety-failure',
     (stream) => {

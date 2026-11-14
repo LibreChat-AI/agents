@@ -117,13 +117,13 @@ export function fixThoughtSignatures(
 
     const content = modelContents[i];
     const callCount = aiMessages[i].tool_calls?.length ?? 0;
-    const callSignatures = signatures.slice(-callCount);
-    const mergedUnsignedText = callCount > 0 && signatures.length > content.parts.length &&
-      signatures.slice(0, signatures.length - callCount).every((signature) => signature == null || signature === '');
+    const callSignatureOffset = signatures.length - callCount;
+    const mergedText = callCount > 0 && signatures.length > content.parts.length &&
+      content.parts.some((part) => 'text' in part);
     let callIndex = 0;
     for (let index = 0; index < content.parts.length; index++) {
       const part = content.parts[index];
-      const signature = 'functionCall' in part && mergedUnsignedText ? callSignatures[callIndex++] : signatures[index];
+      const signature = 'functionCall' in part && mergedText ? signatures[callSignatureOffset + callIndex++] : signatures[index];
       if ((part.thoughtSignature == null || part.thoughtSignature === '') &&
           typeof signature === 'string' && signature !== '') {
         part.thoughtSignature = signature;

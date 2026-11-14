@@ -12,6 +12,30 @@ const buildContents = (
   blocks.map(([role, parts]) => ({ role, parts }) as GeminiContent);
 
 describe('fixThoughtSignatures', () => {
+  test('recovers call offsets after signed text chunks merged @scenario:vertex-signed-legacy-history', () => {
+    const ai = new AIMessage({
+      content: 'Merged text.',
+      tool_calls: [
+        { id: 'a', name: 'a', args: {} },
+        { id: 'b', name: 'b', args: {} },
+      ],
+      additional_kwargs: { signatures: [SIG_A, '', SIG_B, ''] },
+    });
+    const contents = buildContents([
+      [
+        'model',
+        [
+          { text: 'Merged text.' },
+          { functionCall: { name: 'a', args: {} } },
+          { functionCall: { name: 'b', args: {} } },
+        ],
+      ],
+    ]);
+    fixThoughtSignatures(contents, [ai]);
+    expect(contents[0].parts[1].thoughtSignature).toBe(SIG_B);
+    expect(contents[0].parts[2].thoughtSignature).toBeUndefined();
+  });
+
   test('recovers legacy tool signatures after unsigned text chunks merged @scenario:vertex-merged-legacy-history', () => {
     const ai = new AIMessage({
       content: 'Merged text.',
@@ -150,7 +174,7 @@ describe('fixThoughtSignatures', () => {
         { name: 'a', args: {}, id: 'a' },
         { name: 'b', args: {}, id: 'b' },
       ],
-      additional_kwargs: { signatures: [SIG_A, '', SIG_B, ''] },
+      additional_kwargs: { signatures: [SIG_A, '', SIG_B] },
     });
     const contents = buildContents([
       [
