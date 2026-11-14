@@ -54,7 +54,7 @@ const nativeParts = [
   {
     functionCall: {
       id: 'native-second',
-      name: 'weather',
+      name: 'time',
       args: { city: 'Paris' },
     },
   },
@@ -178,13 +178,20 @@ describe('Vertex Hydrogen native history', () => {
           tool_call_id: 'native-first',
         }),
         new ToolMessage({
-          content: 'Rainy.',
-          name: 'weather',
+          content: 'Noon.',
+          name: 'time',
           tool_call_id: 'native-second',
         }),
       ]);
       expect(formatted.contents?.[1].parts).toEqual(nativeParts);
       expect(formatted.contents?.[2].role).toBe('user');
+      expect(
+        formatted.contents?.flatMap((content) =>
+          content.parts.flatMap((part) =>
+            'functionResponse' in part ? [part.functionResponse.name] : []
+          )
+        )
+      ).toEqual(['weather', 'time']);
       expect(formatted.generationConfig?.thinkingConfig).toMatchObject({
         thinkingLevel: 'XHIGH',
       });

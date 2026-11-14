@@ -1,6 +1,6 @@
 import { ChatGoogle } from '@langchain/google-gauth';
 import { ChatConnection } from '@langchain/google-common';
-import { AIMessageChunk, isAIMessage } from '@langchain/core/messages';
+import { AIMessageChunk, isAIMessage, isToolMessage } from '@langchain/core/messages';
 import type {
   GeminiContent,
   GoogleAIAPI,
@@ -250,8 +250,26 @@ class CustomChatConnection extends ChatConnection<VertexAIClientOptions> {
         formattedData.contents,
         this.model
       );
+      const functionResponseNames: Array<string | undefined> = [];
+      const callNames = new Map<string, string>();
+      for (const message of input) {
+        if (isAIMessage(message)) {
+          callNames.clear();
+          for (const call of message.tool_calls ?? []) {
+            if (call.id != null) callNames.set(call.id, call.name);
+          }
+        } else if (isToolMessage(message)) {
+          functionResponseNames.push(callNames.get(message.tool_call_id) ?? message.name);
+        }
+      }
+      let responseIndex = 0;
       // gemini-3.1+ models reject role="function"; convert to role="user"
       for (const content of formattedData.contents ?? []) {
+        for (const part of content.parts) {
+          if (!('functionResponse' in part)) continue;
+          const name = functionResponseNames[responseIndex++];
+          if (name != null && name !== '') part.functionResponse.name = name;
+        }
         if (content.role === 'function') {
           (content as { role: string }).role = 'user';
         }

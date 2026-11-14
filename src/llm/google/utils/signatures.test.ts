@@ -48,6 +48,18 @@ function plain(message: AIMessage | AIMessageChunk): AIMessage {
 }
 
 describe('Gemini native part replay', () => {
+  test('preserves fresh native hashes through graph legacy projection @scenario:gemini-graph-history', () => {
+    const message = mapGenerateContentResultToChatResult(response(parts))
+      .generations[0].message;
+    message.content = parts.flatMap((part) =>
+      typeof part.text === 'string'
+        ? [{ type: 'text' as const, text: part.text }]
+        : []
+    );
+    const projected = formatContentStrings([message])[0];
+    expect(restoreGeminiReplayParts(projected)).toEqual(parts);
+  });
+
   test('retains older-model stream signatures without partially capturing text @scenario:gemini-older-stream-history', () => {
     let message = new AIMessageChunk('');
     const nativeParts = [
