@@ -167,6 +167,14 @@ describe('rejectsModelTurnPrefill', () => {
     expect(rejectsModelTurnPrefill('google/gemini-3.8-flash-lite')).toBe(true);
   });
 
+  test.each([
+    'gemini-4-hydrogen',
+    'models/gemini-4-hydrogen',
+    'gemini-4-hydrogen-preview',
+  ])('rejects Hydrogen prefill for %s', (model) => {
+    expect(rejectsModelTurnPrefill(model)).toBe(true);
+  });
+
   test('covers Gemini 4 Argon and its variants', () => {
     expect(rejectsModelTurnPrefill('gemini-4-argon')).toBe(true);
     expect(rejectsModelTurnPrefill('models/gemini-4-argon')).toBe(true);

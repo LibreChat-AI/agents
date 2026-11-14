@@ -119,6 +119,31 @@ describe('fixThoughtSignatures', () => {
     expect(contents[1].parts[0].thoughtSignature).toBe(SIG_B);
   });
 
+  test('preserves unsigned legacy slots instead of shifting a text signature onto a call', () => {
+    const ai = new AIMessage({
+      content: 'Checking.',
+      tool_calls: [
+        { name: 'a', args: {}, id: 'a' },
+        { name: 'b', args: {}, id: 'b' },
+      ],
+      additional_kwargs: { signatures: [SIG_A, '', SIG_B, ''] },
+    });
+    const contents = buildContents([
+      [
+        'model',
+        [
+          { text: 'Checking.' },
+          { functionCall: { name: 'a', args: {} } },
+          { functionCall: { name: 'b', args: {} } },
+        ],
+      ],
+    ]);
+    fixThoughtSignatures(contents, [ai]);
+    expect(contents[0].parts[0].thoughtSignature).toBe(SIG_A);
+    expect(contents[0].parts[1].thoughtSignature).toBeUndefined();
+    expect(contents[0].parts[2].thoughtSignature).toBe(SIG_B);
+  });
+
   test('no-op when AI message has no signatures', () => {
     const ai = new AIMessage({
       content: '',

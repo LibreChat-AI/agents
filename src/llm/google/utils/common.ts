@@ -44,6 +44,10 @@ import {
   jsonSchemaToGeminiParameters,
   schemaToGenerativeAIParameters,
 } from './zod_to_genai_parameters';
+import {
+  captureGeminiReplayParts,
+  restoreGeminiReplayParts,
+} from './signatures';
 import { toLangChainContent } from '@/messages/langchain';
 import { GoogleGenerativeAIToolType } from '../types';
 
@@ -519,6 +523,9 @@ export function convertMessageContentToParts(
     ];
   }
 
+  const replayParts = restoreGeminiReplayParts(message);
+  if (replayParts != null) return replayParts as Part[];
+
   let functionCalls: FunctionCallPart[] = [];
   const messageParts: Part[] = [];
 
@@ -549,7 +556,7 @@ export function convertMessageContentToParts(
             return signature;
           }
         }
-        if (isGemini3PlusModel(model)) {
+        if (isGemini3PlusModel(model) && functionThoughtSignatures == null) {
           return DUMMY_SIGNATURE;
         }
         return '';
@@ -700,6 +707,7 @@ const GEMINI_FLASH_VERSION_PATTERN = /^gemini-(\d+)(?:\.(\d+))?-flash(?:$|-)/;
 const NO_PREFILL_GEMINI_MODELS = [
   'gemini-3.5-flash-lite',
   'gemini-4-argon',
+  'gemini-4-hydrogen',
 ] as const;
 
 export function rejectsModelTurnPrefill(model?: string): boolean {
@@ -732,10 +740,10 @@ export function rejectsModelTurnPrefill(model?: string): boolean {
  * HTTP 400 for it, so we drop it and let the model generate fresh from the
  * preceding user turn. No-op for every other model, preserving working prefill.
  */
-export function dropUnsupportedModelTurnPrefill(
-  contents: Content[] | undefined,
+export function dropUnsupportedModelTurnPrefill<T extends { role: string }>(
+  contents: T[] | undefined,
   model?: string
-): Content[] | undefined {
+): T[] | undefined {
   if (
     contents == null ||
     contents.length === 0 ||
@@ -906,7 +914,7 @@ export function convertResponseContentToChatGenerationChunk(
       }
       : undefined;
 
-  return new ChatGenerationChunk({
+  const chunk = new ChatGenerationChunk({
     text,
     message: new AIMessageChunk({
       content: content,
@@ -920,6 +928,8 @@ export function convertResponseContentToChatGenerationChunk(
     }),
     generationInfo,
   });
+  captureGeminiReplayParts(chunk.message, candidateContent?.parts ?? []);
+  return chunk;
 }
 
 /**
@@ -1060,6 +1070,7 @@ export function mapGenerateContentResultToChatResult(
     }),
     generationInfo,
   };
+  captureGeminiReplayParts(generation.message, candidateContent?.parts ?? []);
   return {
     generations: [generation],
     llmOutput: {

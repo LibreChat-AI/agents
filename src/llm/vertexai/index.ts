@@ -3,19 +3,26 @@ import { ChatConnection } from '@langchain/google-common';
 import { AIMessageChunk, isAIMessage } from '@langchain/core/messages';
 import type {
   GeminiContent,
+  GoogleAIAPI,
+  GenerateContentResponseData,
   GeminiRequest,
   GoogleAIModelRequestParams,
   GoogleAbstractedClient,
 } from '@langchain/google-common';
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
+import type { ChatResult, ChatGenerationChunk } from '@langchain/core/outputs';
 import type { BaseMessage, UsageMetadata } from '@langchain/core/messages';
-import type { ChatGenerationChunk } from '@langchain/core/outputs';
 import type { GoogleThinkingConfig, VertexAIClientOptions } from '@/types';
 import {
   STREAMED_TOOL_CALL_SEAL_METADATA_KEY,
   STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY,
   GOOGLE_STREAMED_TOOL_CALL_ADAPTER,
 } from '@/tools/streamedToolCallSeals';
+import {
+  captureGeminiReplayParts,
+  restoreGeminiReplayParts,
+} from '@/llm/google/utils/signatures';
+import { dropUnsupportedModelTurnPrefill } from '@/llm/google/utils/common';
 import { smoothGenerationChunks } from '@/llm/stream/chunkAdapters';
 import { resolveStreamDelay } from '@/llm/stream/smoother';
 
@@ -86,56 +93,34 @@ type AdditionalKwargs =
       signatures?: Array<string | undefined>;
     });
 
-/**
- * Fixes thought signatures on functionCall parts in the formatted Gemini request.
- *
- * `@langchain/google-common` stores signatures as a flat array in
- * `additional_kwargs.signatures` (one per response part) and re-attaches them
- * by index only when `signatures.length === parts.length`. This fails when:
- * - The API omits a signature (length mismatch)
- * - Streaming chunks merge with different part counts
- * - The signature for a functionCall part is an empty string
- *
- * This function correlates each "model" content block in the formatted request
- * back to its originating AI message by *position*, then re-attaches non-empty
- * signatures that the library failed to apply. AI messages without signatures
- * still consume their slot — filtering them out shifted later messages onto
- * the wrong content block and dropped real signatures on the floor.
- */
+/** Restores native part order, with positional signatures as a fallback for legacy history. */
 export function fixThoughtSignatures(
   contents: GeminiContent[],
   input: BaseMessage[]
 ): void {
-  // All AI messages, in order — non-signature ones still consume positional
+  // All AI messages, in order, non-signature ones still consume positional
   // slots so later messages line up with their model content blocks.
   const aiMessages = input.filter(isAIMessage);
   const modelContents = contents.filter((c) => c.role === 'model');
 
   const count = Math.min(aiMessages.length, modelContents.length);
   for (let i = 0; i < count; i++) {
+    const replay = restoreGeminiReplayParts(aiMessages[i]);
+    if (replay != null) {
+      modelContents[i].parts = replay;
+      continue;
+    }
     const signatures = (aiMessages[i].additional_kwargs as AdditionalKwargs)
       ?.signatures;
     if (!Array.isArray(signatures) || signatures.length === 0) continue;
 
     const content = modelContents[i];
-    const attachedSignatures = new Set(
-      content.parts
-        .map((p) => p.thoughtSignature)
-        .filter((s): s is string => s != null && s !== '')
-    );
-    const availableSignatures = signatures.filter(
-      (s): s is string => s != null && s !== '' && !attachedSignatures.has(s)
-    );
-
-    let sigIdx = 0;
-    for (const part of content.parts) {
-      if (
-        'functionCall' in part &&
-        (part.thoughtSignature == null || part.thoughtSignature === '') &&
-        sigIdx < availableSignatures.length
-      ) {
-        part.thoughtSignature = availableSignatures[sigIdx];
-        sigIdx++;
+    for (let index = 0; index < content.parts.length; index++) {
+      const part = content.parts[index];
+      const signature = signatures[index];
+      if ((part.thoughtSignature == null || part.thoughtSignature === '') &&
+          typeof signature === 'string' && signature !== '') {
+        part.thoughtSignature = signature;
       }
     }
   }
@@ -143,6 +128,56 @@ export function fixThoughtSignatures(
 
 class CustomChatConnection extends ChatConnection<VertexAIClientOptions> {
   thinkingConfig?: GoogleThinkingConfig;
+
+  buildGeminiAPI(): GoogleAIAPI {
+    const api = super.buildGeminiAPI();
+    return {
+      ...api,
+      responseToChatResult: (response): ChatResult => {
+        const result = api.responseToChatResult(response);
+        const data = response.data as Partial<GenerateContentResponseData>;
+        const message = result.generations[0]?.message;
+        if (result.generations.length > 0)
+          captureGeminiReplayParts(
+            message,
+            data.candidates?.[0]?.content.parts ?? []
+          );
+        return result;
+      },
+      responseToChatGeneration: (response): ChatGenerationChunk | null => {
+        const data = response.data as Partial<GenerateContentResponseData>;
+        const candidate = data.candidates?.[0];
+        if (candidate == null) return api.responseToChatGeneration(response);
+        const parts = candidate.content.parts;
+        if (parts.length === 0)
+          return api.responseToChatGeneration(response);
+        let combined: ChatGenerationChunk | undefined;
+        let generationInfo: ChatGenerationChunk['generationInfo'];
+        for (const part of parts) {
+          const chunk = api.responseToChatGeneration({
+            data: {
+              ...data,
+              candidates: [
+                {
+                  ...candidate,
+                  content: { ...candidate.content, parts: [part] },
+                },
+              ],
+            } as GenerateContentResponseData,
+          });
+          if (chunk != null) {
+            generationInfo ??= chunk.generationInfo;
+            chunk.generationInfo = undefined;
+            combined = combined == null ? chunk : combined.concat(chunk);
+          }
+        }
+        if (combined == null) return null;
+        combined.generationInfo = generationInfo;
+        captureGeminiReplayParts(combined.message, parts);
+        return combined;
+      },
+    };
+  }
 
   async formatData(
     input: BaseMessage[],
@@ -163,7 +198,7 @@ class CustomChatConnection extends ChatConnection<VertexAIClientOptions> {
     }
     if (this.thinkingConfig?.thinkingLevel != null) {
       formattedData.generationConfig ??= {};
-      // thinkingLevel and thinkingBudget cannot coexist — the API rejects the request.
+      // thinkingLevel and thinkingBudget cannot coexist, the API rejects the request.
       // Remove thinkingBudget when thinkingLevel is set.
       const { thinkingBudget: _, ...existingThinkingConfig } =
         (formattedData.generationConfig.thinkingConfig as
@@ -181,8 +216,12 @@ class CustomChatConnection extends ChatConnection<VertexAIClientOptions> {
     }
     if (formattedData.contents) {
       fixThoughtSignatures(formattedData.contents, input);
+      formattedData.contents = dropUnsupportedModelTurnPrefill(
+        formattedData.contents,
+        this.model
+      );
       // gemini-3.1+ models reject role="function"; convert to role="user"
-      for (const content of formattedData.contents) {
+      for (const content of formattedData.contents ?? []) {
         if (content.role === 'function') {
           (content as { role: string }).role = 'user';
         }

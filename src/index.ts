@@ -129,3 +129,11 @@ export type {
   ProviderTextProtectionResult,
   ProviderTextProtectionErrorCode,
 } from './protection/providerText';
+
+export {
+  GEMINI_PARTS,
+  captureGeminiReplayParts,
+  restoreGeminiReplayParts,
+  isGeminiReplayParts,
+} from './llm/google/utils/signatures';
+export type { GeminiReplayPart } from './llm/google/utils/signatures';
