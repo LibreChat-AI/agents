@@ -1,7 +1,12 @@
 import { GenerativeModel } from '@google/generative-ai';
-import { AIMessage, HumanMessage } from '@langchain/core/messages';
 import { afterEach, describe, expect, jest, test } from '@jest/globals';
+import {
+  AIMessage,
+  AIMessageChunk,
+  HumanMessage,
+} from '@langchain/core/messages';
 import type { EnhancedGenerateContentResponse } from '@google/generative-ai';
+import type { BaseMessage } from '@langchain/core/messages';
 import { toLangChainContent } from '@/messages/langchain';
 import { CustomChatGoogleGenerativeAI } from './index';
 
@@ -30,6 +35,58 @@ function createModel(): CustomChatGoogleGenerativeAI {
 }
 
 describe('Google Hydrogen request configuration', () => {
+  test.each([false, true])(
+    'counts thinking as output and cached input on stream=%s @scenario:google-thinking-usage',
+    async (stream) => {
+      const usageMetadata = {
+        promptTokenCount: 3,
+        candidatesTokenCount: 2,
+        totalTokenCount: 9,
+        thoughtsTokenCount: 4,
+        cachedContentTokenCount: 1,
+        promptTokensDetails: [],
+      };
+      const responseWithUsage = { ...response, usageMetadata };
+      const model = createModel();
+      let message: BaseMessage;
+      if (stream) {
+        async function* responses(): AsyncGenerator<EnhancedGenerateContentResponse> {
+          yield responseWithUsage;
+        }
+        jest
+          .spyOn(GenerativeModel.prototype, 'generateContentStream')
+          .mockResolvedValue({
+            stream: responses(),
+            response: Promise.resolve(responseWithUsage),
+          });
+        let combined = new AIMessageChunk('');
+        for await (const chunk of model._streamResponseChunks(
+          [new HumanMessage('Question.')],
+          {}
+        )) {
+          if (!(chunk.message instanceof AIMessageChunk))
+            throw new Error('Expected AI chunk');
+          combined = combined.concat(chunk.message);
+        }
+        message = combined;
+      } else {
+        jest
+          .spyOn(GenerativeModel.prototype, 'generateContent')
+          .mockResolvedValue({ response: responseWithUsage });
+        message = (await model._generate([new HumanMessage('Question.')], {}))
+          .generations[0].message;
+      }
+      expect(message).toMatchObject({
+        usage_metadata: {
+          input_tokens: 3,
+          output_tokens: 6,
+          total_tokens: 9,
+          input_token_details: { cache_read: 1 },
+        },
+      });
+    }
+  );
+
   test.each(['application/pdf', 'image/png', 'audio/wav', 'video/mp4'])(
     'serializes supported media %s @scenario:google-hydrogen-media',
     async (mimeType) => {

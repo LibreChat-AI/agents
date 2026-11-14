@@ -74,10 +74,10 @@ const response: GoogleLLMResponse = {
     usageMetadata: {
       promptTokenCount: 3,
       candidatesTokenCount: 2,
-      totalTokenCount: 5,
-      thoughtsTokenCount: 0,
+      totalTokenCount: 9,
+      thoughtsTokenCount: 4,
       toolUsePromptTokenCount: 0,
-      cachedContentTokenCount: 0,
+      cachedContentTokenCount: 1,
       promptTokensDetails: [],
       toolUsePromptTokensDetails: [],
       cacheTokensDetails: [],
@@ -137,8 +137,10 @@ describe('Vertex Hydrogen native history', () => {
     const generation = createModel().decodeGeneration(response)!;
     expect(generation.generationInfo?.usage_metadata).toMatchObject({
       input_tokens: 3,
-      output_tokens: 2,
-      total_tokens: 5,
+      output_tokens: 6,
+      total_tokens: 9,
+      input_token_details: { cache_read: 1 },
+      output_token_details: { reasoning: 4 },
     });
     if (!(generation.message instanceof AIMessageChunk))
       throw new Error('Expected AI chunk');
