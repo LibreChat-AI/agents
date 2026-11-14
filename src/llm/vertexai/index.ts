@@ -20,6 +20,8 @@ import {
   GOOGLE_STREAMED_TOOL_CALL_ADAPTER,
 } from '@/tools/streamedToolCallSeals';
 import {
+  GEMINI_PARTS,
+  GEMINI_SIGNATURES,
   captureGeminiReplayParts,
   restoreGeminiReplayParts,
 } from '@/llm/google/utils/signatures';
@@ -94,7 +96,7 @@ type AdditionalKwargs =
       signatures?: Array<string | undefined>;
     });
 
-/** Restores native part order, with positional signatures as a fallback for legacy history. */
+/** Restores native part order. Legacy text with merged positional slots has lost its boundaries and requires regeneration. */
 export function fixThoughtSignatures(
   contents: GeminiContent[],
   input: BaseMessage[]
@@ -111,19 +113,34 @@ export function fixThoughtSignatures(
       modelContents[i].parts = replay;
       continue;
     }
+    if (Object.hasOwn(aiMessages[i].additional_kwargs, GEMINI_PARTS)) {
+      for (const part of modelContents[i].parts) delete part.thoughtSignature;
+      continue;
+    }
+    const signatureMap = aiMessages[i].additional_kwargs[GEMINI_SIGNATURES] as Record<string, string> | undefined;
+    if (signatureMap != null) {
+      let callIndex = 0;
+      for (const part of modelContents[i].parts) {
+        if (!('functionCall' in part)) continue;
+        const id = aiMessages[i].tool_calls?.[callIndex++]?.id;
+        const signature = id != null ? signatureMap[id] : undefined;
+        if (typeof signature === 'string' && signature !== '') part.thoughtSignature = signature;
+        else delete part.thoughtSignature;
+      }
+      continue;
+    }
     const signatures = (aiMessages[i].additional_kwargs as AdditionalKwargs)
       ?.signatures;
     if (!Array.isArray(signatures) || signatures.length === 0) continue;
 
     const content = modelContents[i];
     const callCount = aiMessages[i].tool_calls?.length ?? 0;
-    const callSignatureOffset = signatures.length - callCount;
-    const mergedText = callCount > 0 && signatures.length > content.parts.length &&
-      content.parts.some((part) => 'text' in part);
-    let callIndex = 0;
+    const mismatchedSlots = signatures.length !== content.parts.length;
+    if (mismatchedSlots && content.parts.some((part) => 'text' in part)) continue;
+    if (mismatchedSlots && signatures.slice(callCount).some((signature) => signature != null && signature !== '')) continue;
     for (let index = 0; index < content.parts.length; index++) {
       const part = content.parts[index];
-      const signature = 'functionCall' in part && mergedText ? signatures[callSignatureOffset + callIndex++] : signatures[index];
+      const signature = signatures[index];
       if ((part.thoughtSignature == null || part.thoughtSignature === '') &&
           typeof signature === 'string' && signature !== '') {
         part.thoughtSignature = signature;
@@ -152,7 +169,8 @@ class CustomChatConnection extends ChatConnection<VertexAIClientOptions> {
         if (result.generations.length > 0)
           captureGeminiReplayParts(
             message,
-            data.candidates?.[0]?.content?.parts ?? []
+            data.candidates?.[0]?.content?.parts ?? [],
+            this.model
           );
         return result;
       },
@@ -185,7 +203,7 @@ class CustomChatConnection extends ChatConnection<VertexAIClientOptions> {
         }
         if (combined == null) return null;
         combined.generationInfo = generationInfo;
-        captureGeminiReplayParts(combined.message, parts);
+        captureGeminiReplayParts(combined.message, parts, this.model);
         return combined;
       },
     };

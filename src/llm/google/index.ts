@@ -288,6 +288,7 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
     /** @ts-ignore */
     const generationResult = mapGenerateContentResultToChatResult(response, {
       usageMetadata,
+      model: this.model,
     });
 
     await runManager?.handleLLMNewToken(
@@ -362,6 +363,7 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
 
       const chunk = convertResponseContentToChatGenerationChunk(response, {
         usageMetadata: undefined,
+        model: this.model,
         index,
       });
       index += 1;

@@ -2,6 +2,7 @@ import { describe, expect, test } from '@jest/globals';
 import { AIMessage, AIMessageChunk } from '@langchain/core/messages';
 import type { EnhancedGenerateContentResponse } from '@google/generative-ai';
 import type { GeminiPart } from '@langchain/google-common';
+import type { TPayload } from '@/types';
 import {
   convertMessageContentToParts,
   convertResponseContentToChatGenerationChunk,
@@ -13,6 +14,9 @@ import {
   restoreGeminiReplayParts,
   captureGeminiReplayParts,
 } from './signatures';
+import { formatContentStrings } from '@/messages/content';
+import { formatAgentMessages } from '@/messages/format';
+import { ContentTypes } from '@/common';
 
 const parts = [
   { text: 'Checking ', thoughtSignature: 'text-signature' },
@@ -44,15 +48,230 @@ function plain(message: AIMessage | AIMessageChunk): AIMessage {
 }
 
 describe('Gemini native part replay', () => {
+  test('retains older-model stream signatures without partially capturing text @scenario:gemini-older-stream-history', () => {
+    let message = new AIMessageChunk('');
+    const nativeParts = [
+      { text: 'Checking ' },
+      {
+        functionCall: { id: 'legacy', name: 'weather', args: {} },
+        thoughtSignature: 'original',
+      },
+    ];
+    for (const part of nativeParts) {
+      message = message.concat(
+        convertResponseContentToChatGenerationChunk(response([part]), {
+          index: 0,
+          model: 'gemini-2.5-pro',
+        })!.message as AIMessageChunk
+      );
+    }
+    expect(message.additional_kwargs[GEMINI_PARTS]).toBeUndefined();
+    expect(
+      convertMessageContentToParts(message, true, [], 'gemini-4-hydrogen')
+    ).toContainEqual({
+      functionCall: { id: 'legacy', name: 'weather', args: {} },
+      thoughtSignature: 'original',
+    });
+  });
+
+  test('preserves signed text bytes through subsequent legacy flattening @scenario:gemini-formatted-text', () => {
+    const nativeParts = [
+      { text: ' Leading', thoughtSignature: 'one' },
+      { text: ' ' },
+      { text: 'and trailing. ', thoughtSignature: 'two' },
+    ];
+    const native = mapGenerateContentResultToChatResult(response(nativeParts))
+      .generations[0].message;
+    const payload: TPayload = [
+      {
+        role: 'assistant',
+        content: nativeParts.map((part) => ({
+          type: ContentTypes.TEXT,
+          text: part.text,
+        })),
+      },
+    ];
+    const formatted = formatAgentMessages(
+      payload,
+      undefined,
+      undefined,
+      undefined,
+      { preserveTextContent: true }
+    ).messages;
+    const projected = formatContentStrings(formatted);
+    expect(projected[0].content).toBe(' Leading and trailing. ');
+    expect(
+      restoreGeminiReplayParts(
+        projected[0],
+        native.additional_kwargs[GEMINI_PARTS]
+      )
+    ).toEqual(nativeParts);
+  });
+
+  test.each([false, true])(
+    'restores actual formatter reasoning and exact text with legacyContent=%s @scenario:gemini-formatted-history',
+    (legacyContent) => {
+      const nativeParts = [
+        {
+          text: 'First thought. ',
+          thought: true,
+          thoughtSignature: 'thought-one',
+        },
+        { text: 'Second thought.', thought: true },
+        { text: ' Answer', thoughtSignature: 'text-one' },
+        { text: ' ' },
+        { text: 'continues. ', thoughtSignature: 'text-two' },
+      ];
+      const native = mapGenerateContentResultToChatResult(response(nativeParts))
+        .generations[0].message;
+      const payload: TPayload = [
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: ContentTypes.THINK,
+              think: 'First thought. Second thought.',
+            },
+            { type: ContentTypes.TEXT, text: ' Answer' },
+            { type: ContentTypes.TEXT, text: ' ' },
+            { type: ContentTypes.TEXT, text: 'continues. ' },
+          ],
+        },
+      ];
+      const formatted = formatAgentMessages(
+        payload,
+        undefined,
+        undefined,
+        undefined,
+        {
+          preserveTextContent: true,
+          preserveReasoningContent: true,
+          legacyContent,
+        }
+      ).messages[0];
+      expect(formatted.content).toBe(' Answer continues. ');
+      expect(formatted.additional_kwargs.reasoning_content).toBe(
+        'First thought. Second thought.'
+      );
+      expect(
+        restoreGeminiReplayParts(
+          formatted,
+          native.additional_kwargs[GEMINI_PARTS]
+        )
+      ).toEqual(nativeParts);
+    }
+  );
+
+  test('restores exact text and reasoning across the actual formatter tool boundary @scenario:gemini-formatted-tools', () => {
+    const nativeParts = [
+      { text: 'Planning.', thought: true, thoughtSignature: 'thought' },
+      { text: 'Checking ', thoughtSignature: 'text' },
+      { text: 'now.' },
+      {
+        functionCall: { id: 'a', name: 'weather', args: { city: 'Rome' } },
+        thoughtSignature: 'call',
+      },
+      { functionCall: { id: 'b', name: 'weather', args: { city: 'Paris' } } },
+    ];
+    const native = mapGenerateContentResultToChatResult(response(nativeParts))
+      .generations[0].message;
+    const payload: TPayload = [
+      {
+        role: 'assistant',
+        content: [
+          { type: ContentTypes.THINK, think: 'Planning.' },
+          { type: ContentTypes.TEXT, text: 'Checking ' },
+          { type: ContentTypes.TEXT, text: 'now.', tool_call_ids: ['a', 'b'] },
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: 'a',
+              name: 'weather',
+              args: '{"city":"Rome"}',
+              output: 'Sunny',
+            },
+          },
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: 'b',
+              name: 'weather',
+              args: '{"city":"Paris"}',
+              output: 'Rainy',
+            },
+          },
+        ],
+      },
+    ];
+    const formatted = formatAgentMessages(
+      payload,
+      undefined,
+      undefined,
+      undefined,
+      { preserveTextContent: true, preserveReasoningContent: true }
+    ).messages[0];
+    expect(formatted.content).toBe('Checking now.');
+    expect(
+      restoreGeminiReplayParts(
+        formatted,
+        native.additional_kwargs[GEMINI_PARTS]
+      )
+    ).toEqual(nativeParts);
+  });
+
+  test('preserves reasoning-only history through the formatter @scenario:gemini-reasoning-only-history', () => {
+    const nativeParts = [
+      { text: 'Still thinking.', thought: true, thoughtSignature: 'thought' },
+    ];
+    const native = mapGenerateContentResultToChatResult(response(nativeParts))
+      .generations[0].message;
+    const payload: TPayload = [
+      {
+        role: 'assistant',
+        content: [{ type: ContentTypes.THINK, think: 'Still thinking.' }],
+      },
+    ];
+    const formatted = formatAgentMessages(
+      payload,
+      undefined,
+      undefined,
+      undefined,
+      { preserveTextContent: true, preserveReasoningContent: true }
+    ).messages[0];
+    expect(
+      restoreGeminiReplayParts(
+        formatted,
+        native.additional_kwargs[GEMINI_PARTS]
+      )
+    ).toEqual(nativeParts);
+  });
+
+  test('keeps older unsigned model history eligible for cross-model fallback @scenario:gemini-cross-model-history', () => {
+    const nativeParts = [
+      { functionCall: { id: 'old-call', name: 'weather', args: {} } },
+    ];
+    const message = mapGenerateContentResultToChatResult(
+      response(nativeParts),
+      { usageMetadata: undefined, model: 'gemini-2.0-flash' }
+    ).generations[0].message;
+    expect(message.additional_kwargs[GEMINI_PARTS]).toBeUndefined();
+    expect(
+      convertMessageContentToParts(message, true, [], 'gemini-4-hydrogen')[0]
+    ).toHaveProperty('thoughtSignature');
+  });
+
   test.each([
     null,
     [null],
     new Array(1),
     [{ type: 'text', length: -1, hash: 'invalid' }],
     [{ type: 'text', length: 0, hash: 'a'.repeat(64), thoughtSignature: null }],
-  ])('rejects malformed descriptors %p @scenario:gemini-malformed-history', (value) => {
-    expect(isGeminiReplayParts(value)).toBe(false);
-  });
+  ])(
+    'rejects malformed descriptors %p @scenario:gemini-malformed-history',
+    (value) => {
+      expect(isGeminiReplayParts(value)).toBe(false);
+    }
+  );
   test('round-trips signed text and unsigned parallel calls through nonstream history @scenario:gemini-native-history', () => {
     const message = mapGenerateContentResultToChatResult(response(parts))
       .generations[0].message as AIMessage;
@@ -102,6 +321,13 @@ describe('Gemini native part replay', () => {
     edited.content = message.content;
     edited.tool_calls![0].args = { city: 'Milan' };
     expect(restoreGeminiReplayParts(edited)).toBeUndefined();
+    const wire = convertMessageContentToParts(
+      edited,
+      true,
+      [],
+      'gemini-4-hydrogen'
+    );
+    expect(wire.every((part) => !('thoughtSignature' in part))).toBe(true);
     edited.tool_calls = [];
     expect(restoreGeminiReplayParts(edited)).toBeUndefined();
   });

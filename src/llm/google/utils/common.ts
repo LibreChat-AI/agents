@@ -45,6 +45,7 @@ import {
   schemaToGenerativeAIParameters,
 } from './zod_to_genai_parameters';
 import {
+  GEMINI_PARTS,
   captureGeminiReplayParts,
   restoreGeminiReplayParts,
 } from './signatures';
@@ -541,11 +542,9 @@ export function convertMessageContentToParts(
     );
   }
 
-  const functionThoughtSignatures = (
-    message.additional_kwargs as BaseMessage['additional_kwargs'] | undefined
-  )?.[_FUNCTION_CALL_THOUGHT_SIGNATURES_MAP_KEY] as
-    | Record<string, string>
-    | undefined;
+  const storedSignatures = message.additional_kwargs[_FUNCTION_CALL_THOUGHT_SIGNATURES_MAP_KEY] as Record<string, string> | undefined;
+  let functionThoughtSignatures = storedSignatures != null && Object.keys(storedSignatures).length > 0 ? storedSignatures : undefined;
+  if (Object.hasOwn(message.additional_kwargs, GEMINI_PARTS)) functionThoughtSignatures = {};
 
   if (isAIMessage(message) && (message.tool_calls?.length ?? 0) > 0) {
     functionCalls = (message.tool_calls ?? []).map((tc) => {
@@ -763,6 +762,7 @@ export function convertResponseContentToChatGenerationChunk(
   extra: {
     usageMetadata?: UsageMetadata | undefined;
     index: number;
+    model?: string;
   }
 ): ChatGenerationChunk | null {
   if (!response.candidates || response.candidates.length === 0) {
@@ -928,7 +928,7 @@ export function convertResponseContentToChatGenerationChunk(
     }),
     generationInfo,
   });
-  captureGeminiReplayParts(chunk.message, candidateContent?.parts ?? []);
+  captureGeminiReplayParts(chunk.message, candidateContent?.parts ?? [], extra.model);
   return chunk;
 }
 
@@ -939,6 +939,7 @@ export function mapGenerateContentResultToChatResult(
   response: EnhancedGenerateContentResponse,
   extra?: {
     usageMetadata: UsageMetadata | undefined;
+    model?: string;
   }
 ): ChatResult {
   if (!response.candidates || response.candidates.length === 0) {
@@ -1070,7 +1071,7 @@ export function mapGenerateContentResultToChatResult(
     }),
     generationInfo,
   };
-  captureGeminiReplayParts(generation.message, candidateContent?.parts ?? []);
+  captureGeminiReplayParts(generation.message, candidateContent?.parts ?? [], extra?.model);
   return {
     generations: [generation],
     llmOutput: {

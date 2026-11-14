@@ -67,12 +67,15 @@ export function isGeminiReplayParts(
   );
 }
 
-/** Captures original native part boundaries without storing a second copy of prose. */
+/** Captures native boundaries without duplicating prose. Known Gemini 1/2 models retain their existing signature formats for cross-model compatibility. */
 export function captureGeminiReplayParts(
   message: BaseMessage,
-  parts: readonly (Part | GeminiPart)[]
+  parts: readonly (Part | GeminiPart)[],
+  model?: string
 ): void {
   if (!isAIMessage(message)) return;
+  const sourceModel = model?.toLowerCase().split('/').pop() ?? '';
+  if (/^gemini-(?:[12](?:[.-]|$)|pro(?:-|$))/.test(sourceModel)) return;
   const replay: GeminiReplayPart[] = [];
   const signatures: Record<string, string> = {};
   let callIndex = 0;
@@ -150,10 +153,11 @@ export function restoreGeminiReplayParts(
         contentReasoning += block.thinking;
       else if (!('functionCall' in block)) return undefined;
     }
-  const reasoning =
-    typeof message.additional_kwargs.reasoning === 'string'
-      ? message.additional_kwargs.reasoning
-      : contentReasoning;
+  let reasoning = contentReasoning;
+  if (typeof message.additional_kwargs.reasoning_content === 'string')
+    reasoning = message.additional_kwargs.reasoning_content;
+  if (typeof message.additional_kwargs.reasoning === 'string')
+    reasoning = message.additional_kwargs.reasoning;
   const calls = new Map(
     (message.tool_calls ?? []).map((call) => [call.id, call])
   );

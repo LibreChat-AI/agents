@@ -12,7 +12,49 @@ const buildContents = (
   blocks.map(([role, parts]) => ({ role, parts }) as GeminiContent);
 
 describe('fixThoughtSignatures', () => {
-  test('recovers call offsets after signed text chunks merged @scenario:vertex-signed-legacy-history', () => {
+  test('restores reliable legacy call maps without signing unsigned siblings @scenario:vertex-legacy-call-map', () => {
+    const ai = new AIMessage({
+      content: 'Checking.',
+      tool_calls: [
+        { id: 'a', name: 'a', args: {} },
+        { id: 'b', name: 'b', args: {} },
+      ],
+      additional_kwargs: {
+        __gemini_function_call_thought_signatures__: { a: SIG_A },
+      },
+    });
+    const contents = buildContents([
+      [
+        'model',
+        [
+          { text: 'Checking.' },
+          { functionCall: { name: 'a', args: {} } },
+          { functionCall: { name: 'b', args: {} }, thoughtSignature: SIG_B },
+        ],
+      ],
+    ]);
+    fixThoughtSignatures(contents, [ai]);
+    expect(contents[0].parts[1].thoughtSignature).toBe(SIG_A);
+    expect(contents[0].parts[2].thoughtSignature).toBeUndefined();
+  });
+
+  test('declines legacy text-call-text ambiguity @scenario:vertex-ambiguous-legacy-history', () => {
+    const ai = new AIMessage({
+      content: 'Merged text.',
+      tool_calls: [{ id: 'a', name: 'a', args: {} }],
+      additional_kwargs: { signatures: ['', SIG_A, SIG_B] },
+    });
+    const contents = buildContents([
+      [
+        'model',
+        [{ text: 'Merged text.' }, { functionCall: { name: 'a', args: {} } }],
+      ],
+    ]);
+    fixThoughtSignatures(contents, [ai]);
+    expect(contents[0].parts[1].thoughtSignature).toBeUndefined();
+  });
+
+  test('declines ambiguous call offsets after signed text chunks merged @scenario:vertex-signed-legacy-history', () => {
     const ai = new AIMessage({
       content: 'Merged text.',
       tool_calls: [
@@ -32,11 +74,11 @@ describe('fixThoughtSignatures', () => {
       ],
     ]);
     fixThoughtSignatures(contents, [ai]);
-    expect(contents[0].parts[1].thoughtSignature).toBe(SIG_B);
+    expect(contents[0].parts[1].thoughtSignature).toBeUndefined();
     expect(contents[0].parts[2].thoughtSignature).toBeUndefined();
   });
 
-  test('recovers legacy tool signatures after unsigned text chunks merged @scenario:vertex-merged-legacy-history', () => {
+  test('declines merged legacy text without original boundaries @scenario:vertex-merged-legacy-history', () => {
     const ai = new AIMessage({
       content: 'Merged text.',
       tool_calls: [
@@ -56,7 +98,7 @@ describe('fixThoughtSignatures', () => {
       ],
     ]);
     fixThoughtSignatures(contents, [ai]);
-    expect(contents[0].parts[1].thoughtSignature).toBe(SIG_A);
+    expect(contents[0].parts[1].thoughtSignature).toBeUndefined();
     expect(contents[0].parts[2].thoughtSignature).toBeUndefined();
   });
 

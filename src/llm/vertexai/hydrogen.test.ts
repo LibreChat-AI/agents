@@ -95,6 +95,22 @@ const createModel = () =>
   });
 
 describe('Vertex Hydrogen native history', () => {
+  test('never restores stale native signatures through legacy fallback @scenario:vertex-stale-history', async () => {
+    const model = createModel();
+    const message = model.decode(response, false);
+    message.content = 'Changed.';
+    const formatted = await model.format([
+      new HumanMessage('Question.'),
+      message,
+      new HumanMessage('Next.'),
+    ]);
+    expect(
+      formatted.contents?.[1].parts.every(
+        (part) => part.thoughtSignature == null
+      )
+    ).toBe(true);
+  });
+
   test.each(['application/pdf', 'image/png', 'audio/wav', 'video/mp4'])(
     'serializes supported media %s @scenario:vertex-hydrogen-media',
     async (mimeType) => {
