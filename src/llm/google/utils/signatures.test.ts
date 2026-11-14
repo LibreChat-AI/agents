@@ -1,19 +1,25 @@
+import { Outcome } from '@google/generative-ai';
 import { describe, expect, test } from '@jest/globals';
 import { AIMessage, AIMessageChunk } from '@langchain/core/messages';
-import type { EnhancedGenerateContentResponse } from '@google/generative-ai';
+import type {
+  EnhancedGenerateContentResponse,
+  Part,
+} from '@google/generative-ai';
 import type { GeminiPart } from '@langchain/google-common';
 import type { TPayload } from '@/types';
+import {
+  GEMINI_PARTS,
+  GEMINI_REPLAY_UNSUPPORTED,
+  GEMINI_SIGNATURES,
+  isGeminiReplayParts,
+  restoreGeminiReplayParts,
+  captureGeminiReplayParts,
+} from './signatures';
 import {
   convertMessageContentToParts,
   convertResponseContentToChatGenerationChunk,
   mapGenerateContentResultToChatResult,
 } from './common';
-import {
-  GEMINI_PARTS,
-  isGeminiReplayParts,
-  restoreGeminiReplayParts,
-  captureGeminiReplayParts,
-} from './signatures';
 import { formatContentStrings } from '@/messages/content';
 import { formatAgentMessages } from '@/messages/format';
 import { ContentTypes } from '@/common';
@@ -29,7 +35,9 @@ const parts = [
   { text: 'finishing.', thoughtSignature: 'last-signature' },
 ];
 
-function response(nativeParts: GeminiPart[]): EnhancedGenerateContentResponse {
+function response(
+  nativeParts: Array<GeminiPart | Part>
+): EnhancedGenerateContentResponse {
   return {
     candidates: [{ content: { role: 'model', parts: nativeParts }, index: 0 }],
   } as EnhancedGenerateContentResponse;
@@ -48,6 +56,48 @@ function plain(message: AIMessage | AIMessageChunk): AIMessage {
 }
 
 describe('Gemini native part replay', () => {
+  test.each([false, true])(
+    'retains call signatures with unsupported output in split=%s @scenario:gemini-mixed-output-history',
+    (split) => {
+      const unsupported = {
+        codeExecutionResult: { outcome: Outcome.OUTCOME_OK, output: '1' },
+      };
+      const mixed = [
+        parts[0],
+        unsupported,
+        ...parts.slice(1, 4),
+        unsupported,
+        parts[4],
+      ];
+      const chunks = split ? mixed.map((part) => [part]) : [mixed];
+      let message = new AIMessageChunk('');
+      for (const chunk of chunks)
+        message = message.concat(
+          convertResponseContentToChatGenerationChunk(response(chunk), {
+            index: 0,
+          })!.message as AIMessageChunk
+        );
+      expect(message.additional_kwargs[GEMINI_REPLAY_UNSUPPORTED]).toBe(true);
+      const fresh = new AIMessage({
+        content: message.content,
+        tool_calls: message.tool_calls,
+      });
+      captureGeminiReplayParts(fresh, mixed, 'gemini-4-hydrogen');
+      expect(fresh.additional_kwargs[GEMINI_SIGNATURES]).toEqual({
+        first: 'call-signature',
+      });
+      expect(fresh.additional_kwargs[GEMINI_REPLAY_UNSUPPORTED]).toBe(true);
+      expect(
+        convertMessageContentToParts(
+          message,
+          true,
+          [],
+          'gemini-4-hydrogen'
+        ).filter((part) => 'functionCall' in part)
+      ).toEqual(parts.filter((part) => 'functionCall' in part));
+    }
+  );
+
   test('preserves fresh native hashes through graph legacy projection @scenario:gemini-graph-history', () => {
     const message = mapGenerateContentResultToChatResult(response(parts))
       .generations[0].message;

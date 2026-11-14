@@ -388,6 +388,7 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
 
 export {
   GEMINI_PARTS,
+  GEMINI_REPLAY_UNSUPPORTED,
   captureGeminiReplayParts,
   restoreGeminiReplayParts,
   isGeminiReplayParts,

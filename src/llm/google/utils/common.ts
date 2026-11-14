@@ -41,14 +41,15 @@ import {
   GOOGLE_STREAMED_TOOL_CALL_ADAPTER,
 } from '@/tools/streamedToolCallSeals';
 import {
-  jsonSchemaToGeminiParameters,
-  schemaToGenerativeAIParameters,
-} from './zod_to_genai_parameters';
-import {
   GEMINI_PARTS,
+  GEMINI_REPLAY_UNSUPPORTED,
   captureGeminiReplayParts,
   restoreGeminiReplayParts,
 } from './signatures';
+import {
+  jsonSchemaToGeminiParameters,
+  schemaToGenerativeAIParameters,
+} from './zod_to_genai_parameters';
 import { toLangChainContent } from '@/messages/langchain';
 import { GoogleGenerativeAIToolType } from '../types';
 
@@ -544,7 +545,7 @@ export function convertMessageContentToParts(
 
   const storedSignatures = message.additional_kwargs[_FUNCTION_CALL_THOUGHT_SIGNATURES_MAP_KEY] as Record<string, string> | undefined;
   let functionThoughtSignatures = storedSignatures != null && Object.keys(storedSignatures).length > 0 ? storedSignatures : undefined;
-  if (Object.hasOwn(message.additional_kwargs, GEMINI_PARTS)) functionThoughtSignatures = {};
+  if (Object.hasOwn(message.additional_kwargs, GEMINI_PARTS) && message.additional_kwargs[GEMINI_REPLAY_UNSUPPORTED] !== true) functionThoughtSignatures = {};
 
   if (isAIMessage(message) && (message.tool_calls?.length ?? 0) > 0) {
     functionCalls = (message.tool_calls ?? []).map((tc) => {

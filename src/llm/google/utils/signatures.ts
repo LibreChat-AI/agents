@@ -5,6 +5,7 @@ import type { GeminiPart } from '@langchain/google-common';
 import type { Part } from '@google/generative-ai';
 
 export const GEMINI_PARTS = '__gemini_parts__';
+export const GEMINI_REPLAY_UNSUPPORTED = '__gemini_replay_unsupported__';
 export const GEMINI_SIGNATURES = '__gemini_function_call_thought_signatures__';
 
 export type GeminiReplayPart =
@@ -76,6 +77,7 @@ export function captureGeminiReplayParts(
   if (!isAIMessage(message)) return;
   const sourceModel = model?.toLowerCase().split('/').pop() ?? '';
   if (/^gemini-(?:[12](?:[.-]|$)|pro(?:-|$))/.test(sourceModel)) return;
+  message.additional_kwargs[GEMINI_REPLAY_UNSUPPORTED] = true;
   const replay: GeminiReplayPart[] = [];
   const signatures: Record<string, string> = {};
   let callIndex = 0;
@@ -101,10 +103,10 @@ export function captureGeminiReplayParts(
       if (thought === true) reasoning += part.text;
       continue;
     }
-    if (!('functionCall' in part) || part.functionCall == null) return;
+    if (!('functionCall' in part) || part.functionCall == null) continue;
     const index = callIndex++;
     const call = message.tool_calls?.[index];
-    if (call?.id == null || call.id === '') return;
+    if (call?.id == null || call.id === '') continue;
     const nativeId =
       'id' in part.functionCall && typeof part.functionCall.id === 'string'
         ? part.functionCall.id
@@ -127,13 +129,15 @@ export function captureGeminiReplayParts(
     });
     if (thoughtSignature != null) signatures[call.id] = thoughtSignature;
   }
-  message.additional_kwargs[GEMINI_PARTS] = replay;
   message.additional_kwargs[GEMINI_SIGNATURES] = signatures;
+  if (replay.length !== parts.length) return;
+  message.additional_kwargs[GEMINI_PARTS] = replay;
   const hasThinkingContent =
     Array.isArray(message.content) &&
     message.content.some((block) => block.type === 'thinking');
   if (reasoning !== '' && !hasThinkingContent)
     message.additional_kwargs.reasoning = reasoning;
+  delete message.additional_kwargs[GEMINI_REPLAY_UNSUPPORTED];
 }
 
 /** Returns original parts only when the current message still matches every text hash and call id. */
@@ -141,7 +145,12 @@ export function restoreGeminiReplayParts(
   message: BaseMessage,
   replay: unknown = message.additional_kwargs[GEMINI_PARTS]
 ): GeminiPart[] | undefined {
-  if (!isAIMessage(message) || !isGeminiReplayParts(replay)) return undefined;
+  if (
+    message.additional_kwargs[GEMINI_REPLAY_UNSUPPORTED] === true ||
+    !isAIMessage(message) ||
+    !isGeminiReplayParts(replay)
+  )
+    return undefined;
   let text = '';
   let contentReasoning = '';
   if (typeof message.content === 'string') text = message.content;

@@ -21,6 +21,7 @@ import {
 } from '@/tools/streamedToolCallSeals';
 import {
   GEMINI_PARTS,
+  GEMINI_REPLAY_UNSUPPORTED,
   GEMINI_SIGNATURES,
   captureGeminiReplayParts,
   restoreGeminiReplayParts,
@@ -113,7 +114,7 @@ export function fixThoughtSignatures(
       modelContents[i].parts = replay;
       continue;
     }
-    if (Object.hasOwn(aiMessages[i].additional_kwargs, GEMINI_PARTS)) {
+    if (Object.hasOwn(aiMessages[i].additional_kwargs, GEMINI_PARTS) && aiMessages[i].additional_kwargs[GEMINI_REPLAY_UNSUPPORTED] !== true) {
       for (const part of modelContents[i].parts) delete part.thoughtSignature;
       continue;
     }

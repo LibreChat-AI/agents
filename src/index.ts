@@ -132,6 +132,7 @@ export type {
 
 export {
   GEMINI_PARTS,
+  GEMINI_REPLAY_UNSUPPORTED,
   captureGeminiReplayParts,
   restoreGeminiReplayParts,
   isGeminiReplayParts,
