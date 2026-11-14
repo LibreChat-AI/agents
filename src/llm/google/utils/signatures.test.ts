@@ -50,10 +50,10 @@ describe('Gemini native part replay', () => {
     new Array(1),
     [{ type: 'text', length: -1, hash: 'invalid' }],
     [{ type: 'text', length: 0, hash: 'a'.repeat(64), thoughtSignature: null }],
-  ])('rejects malformed descriptors %p', (value) => {
+  ])('rejects malformed descriptors %p @scenario:gemini-malformed-history', (value) => {
     expect(isGeminiReplayParts(value)).toBe(false);
   });
-  test('round-trips signed text and unsigned parallel calls through nonstream history', () => {
+  test('round-trips signed text and unsigned parallel calls through nonstream history @scenario:gemini-native-history', () => {
     const message = mapGenerateContentResultToChatResult(response(parts))
       .generations[0].message as AIMessage;
     const restored = plain(message);
@@ -66,7 +66,7 @@ describe('Gemini native part replay', () => {
     ).not.toContain('Checking');
   });
 
-  test('preserves boundaries and signatures when streaming chunks concatenate', () => {
+  test('preserves boundaries and signatures when streaming chunks concatenate @scenario:gemini-stream-history', () => {
     let message = new AIMessageChunk('');
     for (const part of parts) {
       const chunk = convertResponseContentToChatGenerationChunk(
@@ -78,7 +78,7 @@ describe('Gemini native part replay', () => {
     expect(restoreGeminiReplayParts(plain(message))).toEqual(parts);
   });
 
-  test('retains signed reasoning text separately from visible text', () => {
+  test('retains signed reasoning text separately from visible text @scenario:gemini-thought-history', () => {
     const nativeParts = [
       {
         text: 'Reasoning.',
@@ -93,7 +93,7 @@ describe('Gemini native part replay', () => {
     expect(restoreGeminiReplayParts(plain(message))).toEqual(nativeParts);
   });
 
-  test('rejects stale replay after a same-length edit or missing call', () => {
+  test('rejects stale replay after a same-length edit or missing call @scenario:gemini-stale-history', () => {
     const message = mapGenerateContentResultToChatResult(response(parts))
       .generations[0].message as AIMessage;
     const edited = plain(message);

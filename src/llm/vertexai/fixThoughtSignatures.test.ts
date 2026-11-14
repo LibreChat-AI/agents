@@ -119,7 +119,7 @@ describe('fixThoughtSignatures', () => {
     expect(contents[1].parts[0].thoughtSignature).toBe(SIG_B);
   });
 
-  test('preserves unsigned legacy slots instead of shifting a text signature onto a call', () => {
+  test('preserves unsigned legacy slots instead of shifting a text signature onto a call @scenario:vertex-legacy-history', () => {
     const ai = new AIMessage({
       content: 'Checking.',
       tool_calls: [

@@ -32,7 +32,7 @@ describe('Google Hydrogen request configuration', () => {
   afterEach(() => {
     jest.restoreAllMocks();
   });
-  test('forwards XHIGH and strips trailing model prefill on invoke', async () => {
+  test('forwards XHIGH and strips trailing model prefill on invoke @scenario:google-hydrogen-invoke', async () => {
     const model = createModel();
     const generate = jest
       .spyOn(GenerativeModel.prototype, 'generateContent')
@@ -50,7 +50,7 @@ describe('Google Hydrogen request configuration', () => {
     );
   });
 
-  test('strips trailing model prefill on stream', async () => {
+  test('strips trailing model prefill on stream @scenario:google-hydrogen-stream', async () => {
     const model = createModel();
     async function* responses(): AsyncGenerator<EnhancedGenerateContentResponse> {
       yield response;

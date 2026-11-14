@@ -25,7 +25,7 @@ describe('convertMessageContentToParts cross-provider tool calls', () => {
     ['models/gemini-4-argon-cyber-permissive', true],
     ['gemini-2.5-pro', false],
   ])(
-    'adds a placeholder thought signature to unsigned tool calls on %s: %s',
+    'adds a placeholder thought signature to unsigned tool calls on %s: %s @scenario:gemini-foreign-history',
     (model, expected) => {
       const message = new AIMessage({
         content: '',

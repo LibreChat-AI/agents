@@ -82,7 +82,7 @@ const createModel = () =>
 
 describe('Vertex Hydrogen native history', () => {
   test.each([false, true])(
-    'retains signed text and unsigned parallel calls from stream=%s through request formatting',
+    'retains signed text and unsigned parallel calls from stream=%s through request formatting @scenario:vertex-native-history',
     async (stream) => {
       const model = createModel();
       const message = model.decode(response, stream);
@@ -110,7 +110,7 @@ describe('Vertex Hydrogen native history', () => {
     }
   );
 
-  test('removes Hydrogen prefill while retaining previous signed turns', async () => {
+  test('removes Hydrogen prefill while retaining previous signed turns @scenario:vertex-hydrogen-prefill', async () => {
     const model = createModel();
     const message = model.decode(response, false);
     const formatted = await model.format([
