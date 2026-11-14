@@ -5,6 +5,7 @@ import type {
   GeminiContent,
   GoogleAIAPI,
   GenerateContentResponseData,
+  GeminiResponseCandidate,
   GeminiRequest,
   GoogleAIModelRequestParams,
   GoogleAbstractedClient,
@@ -115,9 +116,14 @@ export function fixThoughtSignatures(
     if (!Array.isArray(signatures) || signatures.length === 0) continue;
 
     const content = modelContents[i];
+    const callCount = aiMessages[i].tool_calls?.length ?? 0;
+    const callSignatures = signatures.slice(-callCount);
+    const mergedUnsignedText = callCount > 0 && signatures.length > content.parts.length &&
+      signatures.slice(0, signatures.length - callCount).every((signature) => signature == null || signature === '');
+    let callIndex = 0;
     for (let index = 0; index < content.parts.length; index++) {
       const part = content.parts[index];
-      const signature = signatures[index];
+      const signature = 'functionCall' in part && mergedUnsignedText ? callSignatures[callIndex++] : signatures[index];
       if ((part.thoughtSignature == null || part.thoughtSignature === '') &&
           typeof signature === 'string' && signature !== '') {
         part.thoughtSignature = signature;
@@ -125,6 +131,12 @@ export function fixThoughtSignatures(
     }
   }
 }
+
+type VertexResponseData = Omit<Partial<GenerateContentResponseData>, 'candidates'> & {
+  candidates?: Array<Omit<Partial<GeminiResponseCandidate>, 'content'> & {
+    content?: GeminiResponseCandidate['content'];
+  }>;
+};
 
 class CustomChatConnection extends ChatConnection<VertexAIClientOptions> {
   thinkingConfig?: GoogleThinkingConfig;
@@ -135,19 +147,19 @@ class CustomChatConnection extends ChatConnection<VertexAIClientOptions> {
       ...api,
       responseToChatResult: (response): ChatResult => {
         const result = api.responseToChatResult(response);
-        const data = response.data as Partial<GenerateContentResponseData>;
+        const data = response.data as VertexResponseData;
         const message = result.generations[0]?.message;
         if (result.generations.length > 0)
           captureGeminiReplayParts(
             message,
-            data.candidates?.[0]?.content.parts ?? []
+            data.candidates?.[0]?.content?.parts ?? []
           );
         return result;
       },
       responseToChatGeneration: (response): ChatGenerationChunk | null => {
-        const data = response.data as Partial<GenerateContentResponseData>;
+        const data = response.data as VertexResponseData;
         const candidate = data.candidates?.[0];
-        if (candidate == null) return api.responseToChatGeneration(response);
+        if (candidate?.content == null) return api.responseToChatGeneration(response);
         const parts = candidate.content.parts;
         if (parts.length === 0)
           return api.responseToChatGeneration(response);

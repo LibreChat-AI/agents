@@ -12,6 +12,30 @@ const buildContents = (
   blocks.map(([role, parts]) => ({ role, parts }) as GeminiContent);
 
 describe('fixThoughtSignatures', () => {
+  test('recovers legacy tool signatures after unsigned text chunks merged @scenario:vertex-merged-legacy-history', () => {
+    const ai = new AIMessage({
+      content: 'Merged text.',
+      tool_calls: [
+        { id: 'a', name: 'a', args: {} },
+        { id: 'b', name: 'b', args: {} },
+      ],
+      additional_kwargs: { signatures: ['', '', SIG_A, ''] },
+    });
+    const contents = buildContents([
+      [
+        'model',
+        [
+          { text: 'Merged text.' },
+          { functionCall: { name: 'a', args: {} } },
+          { functionCall: { name: 'b', args: {} } },
+        ],
+      ],
+    ]);
+    fixThoughtSignatures(contents, [ai]);
+    expect(contents[0].parts[1].thoughtSignature).toBe(SIG_A);
+    expect(contents[0].parts[2].thoughtSignature).toBeUndefined();
+  });
+
   test('attaches signature to functionCall part when prior turn is a plain-text AI message (issue LibreChat#13006-followup)', () => {
     // Reproduces the live failure from the issue: a Gemini 3 conversation
     // where turn 1 was plain text ("Hello!") and turn 2 emitted a tool call

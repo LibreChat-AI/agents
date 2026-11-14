@@ -18,6 +18,10 @@ class InspectableVertex extends ChatVertexAI {
       this.invocationParams({})
     ) as Promise<GeminiRequest>;
   }
+  decodeBlocked(response: GoogleLLMResponse, stream: boolean): void {
+    if (stream) this.connection.api.responseToChatGeneration(response);
+    else this.connection.api.responseToChatResult(response);
+  }
   decode(response: GoogleLLMResponse, stream: boolean): BaseMessage {
     if (stream)
       return this.connection.api.responseToChatGeneration(response)!.message;
@@ -81,6 +85,21 @@ const createModel = () =>
   });
 
 describe('Vertex Hydrogen native history', () => {
+  test.each([false, true])(
+    'preserves the safety error for contentless candidates in stream=%s @scenario:vertex-safety-failure',
+    (stream) => {
+      const model = createModel();
+      const blocked = structuredClone(response);
+      if (!('candidates' in blocked.data))
+        throw new Error('Invalid response fixture');
+      blocked.data.candidates[0].finishReason = 'SAFETY';
+      Reflect.deleteProperty(blocked.data.candidates[0], 'content');
+      expect(() => model.decodeBlocked(blocked, stream)).toThrow(
+        'Finish reason: SAFETY'
+      );
+    }
+  );
+
   test.each([false, true])(
     'retains signed text and unsigned parallel calls from stream=%s through request formatting @scenario:vertex-native-history',
     async (stream) => {
