@@ -8,15 +8,21 @@
  * counts.
  */
 import { AIMessageChunk } from '@langchain/core/messages';
-import { describe, it, expect } from '@jest/globals';
+import { describe, it, expect, jest, afterEach } from '@jest/globals';
 import type { StreamLimitState } from '@/llm/streamLimits';
+import type { OnChunk } from '@/llm/invoke';
+import type * as t from '@/types';
 import {
   STREAM_LIMIT_ATTEMPT_KEY,
   StreamLimitExceededError,
   enforceStreamLimitsForWireChunk,
   resolveStreamLimits,
 } from '@/llm/streamLimits';
-import { createSummarizationChunkHandler } from '@/summarization/node';
+import {
+  createSummarizationChunkHandler,
+  createSummaryDeltaStream,
+} from '@/summarization/node';
+import * as events from '@/utils/events';
 import { Providers } from '@/common';
 
 const makeHandler = (graph: StreamLimitState) =>
@@ -77,9 +83,9 @@ describe('createSummarizationChunkHandler stream limits', () => {
         ],
       });
     await onChunk!(toolChunk('x'.repeat(40)));
-    await expect(async () => onChunk!(toolChunk('x'.repeat(20)))).rejects.toThrow(
-      '(tool call: db_query)'
-    );
+    await expect(async () =>
+      onChunk!(toolChunk('x'.repeat(20)))
+    ).rejects.toThrow('(tool call: db_query)');
   });
 
   it('trips the run breaker when its own enforcement breaches', async () => {
@@ -108,9 +114,9 @@ describe('createSummarizationChunkHandler stream limits', () => {
     /** This producer claim wins the race, so the wire consumer's
      * breaker-aborting catch never fires for the same chunk — the trip has
      * to happen here or sibling branches keep consuming quota. */
-    await expect(async () => onChunk!(toolChunk('x'.repeat(60)))).rejects.toThrow(
-      StreamLimitExceededError
-    );
+    await expect(async () =>
+      onChunk!(toolChunk('x'.repeat(60)))
+    ).rejects.toThrow(StreamLimitExceededError);
     expect(breaker.signal.aborted).toBe(true);
     expect(breaker.signal.reason).toMatchObject({ kind: 'tool_call_args' });
   });
@@ -155,9 +161,9 @@ describe('createSummarizationChunkHandler stream limits', () => {
     });
 
     /** Enforcement stays armed: two more bytes cross the 100-byte cap. */
-    await expect(async () => onChunk!(toolChunk('xx'), metadata)).rejects.toThrow(
-      StreamLimitExceededError
-    );
+    await expect(async () =>
+      onChunk!(toolChunk('xx'), metadata)
+    ).rejects.toThrow(StreamLimitExceededError);
   });
 
   it('counts dual-consumed events once against the event cap', async () => {
@@ -192,5 +198,123 @@ describe('createSummarizationChunkHandler stream limits', () => {
     for (let i = 0; i < 10; i++) {
       await onChunk!(textChunk());
     }
+  });
+});
+
+describe('createSummarizationChunkHandler deltas', () => {
+  const capture = (): Array<{ event: string; data: t.SummarizeDeltaEvent }> => {
+    const emitted: Array<{ event: string; data: t.SummarizeDeltaEvent }> = [];
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data) => {
+        emitted.push({ event, data: data as t.SummarizeDeltaEvent });
+      });
+    return emitted;
+  };
+  const handler = (deltas = createSummaryDeltaStream('step_1')): OnChunk =>
+    createSummarizationChunkHandler({
+      stepId: 'step_1',
+      config: { metadata: { langgraph_node: 'summarize' } },
+      provider: Providers.OPENAI,
+      deltas,
+    }) as OnChunk;
+  const texts = (emitted: Array<{ data: t.SummarizeDeltaEvent }>): unknown[] =>
+    emitted.map(({ data }) => data.delta.summary.content);
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  it('dispatches a text chunk at once, before the next chunk is handled', async () => {
+    const emitted = capture();
+    const onChunk = handler();
+    await onChunk(new AIMessageChunk({ content: 'Summary ' }));
+    expect(texts(emitted)).toEqual([[{ type: 'text', text: 'Summary ' }]]);
+    await onChunk(
+      new AIMessageChunk({ content: [{ type: 'text', text: 'text' }] })
+    );
+    await onChunk(
+      new AIMessageChunk({
+        content: [{ index: 0, type: 'text_delta', text: ' streamed' }],
+      })
+    );
+    expect(texts(emitted)).toEqual([
+      [{ type: 'text', text: 'Summary ' }],
+      [{ type: 'text', text: 'text' }],
+      [{ type: 'text', text: ' streamed' }],
+    ]);
+    expect(emitted.every(({ data }) => data.reset == null)).toBe(true);
+  });
+
+  /**
+   * The Responses API sends a reasoning item as `additional_kwargs.reasoning`.
+   * Before it has summary text the item itself used to become the delta's
+   * `content`, which is not a list of blocks, and every aggregator appending it
+   * threw `incoming.content is not iterable`.
+   */
+  it.each([
+    { reasoning: { type: 'reasoning', id: 'rs_1', summary: [] } },
+    {
+      reasoning: {
+        type: 'reasoning',
+        summary: [{ text: 'PRIVATE_REASONING' }],
+      },
+    },
+    { reasoning_content: 'PRIVATE_REASONING' },
+  ])('dispatches nothing for a chunk of reasoning: %j', async (kwargs) => {
+    const emitted = capture();
+    const onChunk = handler();
+    await onChunk(
+      new AIMessageChunk({ content: '', additional_kwargs: kwargs })
+    );
+    await onChunk(
+      new AIMessageChunk({
+        content: [{ type: 'thinking', thinking: 'PRIVATE_REASONING' }],
+      })
+    );
+    expect(emitted).toHaveLength(0);
+  });
+
+  it('marks the first delta of a new attempt so it replaces the earlier one', async () => {
+    const emitted = capture();
+    const deltas = createSummaryDeltaStream('step_1');
+    const onChunk = handler(deltas);
+    const first = { [STREAM_LIMIT_ATTEMPT_KEY]: 1 };
+    const second = { [STREAM_LIMIT_ATTEMPT_KEY]: 2 };
+    await onChunk(new AIMessageChunk({ content: 'abandoned' }), first);
+    await onChunk(new AIMessageChunk({ content: 'Second ' }), second);
+    await onChunk(new AIMessageChunk({ content: 'attempt' }), second);
+    expect(emitted.map(({ data }) => data.reset === true)).toEqual([
+      false,
+      true,
+      false,
+    ]);
+  });
+
+  it('withdraws an abandoned attempt only when nothing replaced it', async () => {
+    const emitted = capture();
+    const deltas = createSummaryDeltaStream('step_1');
+    const onChunk = handler(deltas);
+    const config = { metadata: {} };
+
+    await deltas.retract(config);
+    expect(emitted).toHaveLength(0);
+
+    await onChunk(new AIMessageChunk({ content: 'abandoned' }));
+    await deltas.retract(config);
+    expect(emitted).toHaveLength(1);
+
+    deltas.abandon();
+    await deltas.retract(config);
+    expect(emitted.at(-1)?.data).toEqual({
+      id: 'step_1',
+      reset: true,
+      delta: { summary: { type: 'summary', content: [] } },
+    });
+
+    await deltas.retract(config);
+    deltas.abandon();
+    await deltas.retract(config);
+    expect(emitted).toHaveLength(2);
   });
 });
