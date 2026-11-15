@@ -47,3 +47,14 @@ This is the first shared host-service capability. It does not yet wire LibreChat
 to host tools, add remote model-policy enforcement, or claim complete feature parity. The HTTP
 contract tests deliberately use loopback without production authentication; production bridge
 adapters must supply that authority and the existing bounded/recoverable transport.
+
+Services may accept a third `onResult` callback and publish individual tool results while the
+batch is running. It is supplied only when ToolNode permits early completion (approval/result
+policy may disable it). The final returned array remains authoritative and must contain all
+results. Duplicate early receipts are suppressed; invalid identities fail the batch, and late or
+cancelled callbacks are ignored. Callback messages must be delivered before settling the batch
+RPC, so a final response cannot overtake them on a multiplexed transport.
+
+`request.identity.agentId` is the authenticated root binding. `request.executingAgentId` is the
+SDK execution subject from the batch, and `executionContext` carries child lineage. Hosts must
+authorize the execution subject against that root binding; the two IDs must not be conflated.

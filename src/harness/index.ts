@@ -32,6 +32,8 @@ export interface HostToolRequest {
   version: 1;
   identity: Readonly<ExecutionIdentity>;
   calls: HostToolInvocation[];
+  /** SDK execution subject; distinct from the authenticated root binding. */
+  executingAgentId?: string;
   executionContext?: ToolExecuteBatchRequest['executionContext'];
   callerCapabilityProjection?: ToolExecuteBatchRequest['callerCapabilityProjection'];
 }
@@ -41,7 +43,8 @@ export interface HostToolService {
   version: 1;
   invoke(
     request: HostToolRequest,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    onResult?: (result: ToolExecuteResult) => void
   ): Promise<ToolExecuteResult[]>;
 }
 
@@ -114,32 +117,58 @@ export function createHostToolBindings(options: {
               ids.add(call.id);
               return { reference, call: structuredClone(call) };
             });
-            const results = await service.invoke(
-              {
-                version: 1,
-                identity,
-                calls,
-                executionContext: batch.executionContext,
-                callerCapabilityProjection: batch.callerCapabilityProjection,
-              },
-              batch.signal
-            );
+            let accepting = true;
+            const earlyState = { invalid: false };
+            const earlyIds = new Set<string>();
+            const receipt = (result: ToolExecuteResult): ToolExecuteResult => {
+              if (
+                !ids.has(result.toolCallId) ||
+                !['success', 'error'].includes(result.status)
+              )
+                throw new Error('Invalid host tool result identity');
+              const copy = { ...result };
+              delete copy.received_at;
+              return copy;
+            };
+            const publishResult = (result: ToolExecuteResult): void => {
+              if (!accepting || batch.signal?.aborted === true) return;
+              try {
+                const value = receipt(result);
+                if (earlyIds.has(value.toolCallId)) return;
+                earlyIds.add(value.toolCallId);
+                batch.onResult?.(value);
+              } catch {
+                earlyState.invalid = true;
+              }
+            };
+            const onResult = batch.onResult ? publishResult : undefined;
+            let results: ToolExecuteResult[];
+            try {
+              results = await service.invoke(
+                {
+                  version: 1,
+                  identity,
+                  calls,
+                  executingAgentId: batch.agentId,
+                  executionContext: batch.executionContext,
+                  callerCapabilityProjection: batch.callerCapabilityProjection,
+                },
+                batch.signal,
+                onResult
+              );
+            } finally {
+              accepting = false;
+            }
+            if (earlyState.invalid)
+              throw new Error('Invalid incremental host result');
             batch.signal?.throwIfAborted();
             if (results.length !== ids.size)
               throw new Error('Incomplete host tool results');
-            const validStatuses = new Set(['success', 'error']);
             const byId = new Map<string, ToolExecuteResult>();
             for (const result of results) {
-              if (
-                !ids.has(result.toolCallId) ||
-                byId.has(result.toolCallId) ||
-                !validStatuses.has(result.status)
-              ) {
-                throw new Error('Invalid host tool result identity');
-              }
-              const receipt = { ...result };
-              delete receipt.received_at;
-              byId.set(result.toolCallId, receipt);
+              if (byId.has(result.toolCallId))
+                throw new Error('Duplicate host tool result');
+              byId.set(result.toolCallId, receipt(result));
             }
             batch.resolve(calls.map(({ call }) => byId.get(call.id)!));
           } catch {

@@ -187,6 +187,83 @@ describe('host tool harness', () => {
     expect(tools[0].definition.name).toBe('echo');
   });
 
+  it('forwards executing agent and publishes fast results before batch settlement', async () => {
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let first!: () => void;
+    const ready = new Promise<void>((resolve) => {
+      first = resolve;
+    });
+    let late: ((result: ToolExecuteResult) => void) | undefined;
+    const received: ToolExecuteResult[] = [];
+    const bindings = createHostToolBindings({
+      identity,
+      tools,
+      service: {
+        version: 1,
+        invoke: async (request, _signal, onResult) => {
+          expect(request.identity.agentId).toBe('agent');
+          expect(request.executingAgentId).toBe('child-agent');
+          late = onResult;
+          onResult?.({
+            toolCallId: 'fast',
+            status: 'success',
+            content: 'fast',
+            received_at: 1,
+          });
+          onResult?.({
+            toolCallId: 'fast',
+            status: 'success',
+            content: 'fast',
+          });
+          first();
+          await held;
+          return [
+            { toolCallId: 'slow', status: 'success', content: 'slow' },
+            { toolCallId: 'fast', status: 'success', content: 'fast' },
+          ];
+        },
+      },
+    });
+    const result = new Promise<ToolExecuteResult[]>((resolve, reject) => {
+      void bindings.customHandlers[GraphEvents.ON_TOOL_EXECUTE].handle(
+        GraphEvents.ON_TOOL_EXECUTE,
+        {
+          agentId: 'child-agent',
+          toolCalls: ['fast', 'slow'].map((id) => ({
+            id,
+            name: 'echo',
+            args: {},
+          })),
+          onResult: (r: ToolExecuteResult) => received.push(r),
+          resolve,
+          reject,
+        }
+      );
+    });
+    await ready;
+    expect(received).toEqual([
+      { toolCallId: 'fast', status: 'success', content: 'fast' },
+    ]);
+    release();
+    expect((await result).map((r) => r.toolCallId)).toEqual(['fast', 'slow']);
+    late?.({ toolCallId: 'slow', status: 'success', content: 'late' });
+    expect(received).toHaveLength(1);
+  });
+  it('does not enable early completion when the SDK has gated it off', async () => {
+    await dispatch(
+      {
+        version: 1,
+        invoke: async (_request, _signal, onResult) => {
+          expect(onResult).toBeUndefined();
+          return [{ toolCallId: 'one', status: 'success', content: 'ok' }];
+        },
+      },
+      [{ id: 'one', name: 'echo', args: {} }]
+    );
+  });
   describe.each(['direct', 'http'] as const)('%s service', (mode) => {
     it.each(['approve', 'edit', 'reject'] as const)(
       'uses native SDK approval %s and a real graph',
