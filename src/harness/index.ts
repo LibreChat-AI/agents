@@ -38,13 +38,28 @@ export interface HostToolRequest {
   callerCapabilityProjection?: ToolExecuteBatchRequest['callerCapabilityProjection'];
 }
 
+export interface HostToolSessionUpdate {
+  toolCallId: string;
+  context: Pick<
+    ToolCallRequest,
+    | 'codeSessionContext'
+    | 'codeSessionBaselineId'
+    | 'retainCodeSessionInputs'
+    | 'runtimeSessionHint'
+  >;
+}
+export interface HostToolEvents {
+  onResult?: (result: ToolExecuteResult) => void;
+  onSessionUpdate: (update: HostToolSessionUpdate) => void;
+}
+
 /** Implementations authenticate the transport, authorize every reference, and validate arguments. */
 export interface HostToolService {
   version: 1;
   invoke(
     request: HostToolRequest,
     signal?: AbortSignal,
-    onResult?: (result: ToolExecuteResult) => void
+    events?: HostToolEvents
   ): Promise<ToolExecuteResult[]>;
 }
 
@@ -142,6 +157,32 @@ export function createHostToolBindings(options: {
               }
             };
             const onResult = batch.onResult ? publishResult : undefined;
+            const byCallId = new Map(calls.map(({ call }) => [call.id, call]));
+            const reconcile = (
+              target: ToolCallRequest,
+              context: HostToolSessionUpdate['context']
+            ): void => {
+              for (const key of [
+                'codeSessionContext',
+                'codeSessionBaselineId',
+                'retainCodeSessionInputs',
+                'runtimeSessionHint',
+              ] as const) {
+                if (key in context)
+                  Object.assign(target, {
+                    [key]: structuredClone(context[key]),
+                  });
+              }
+            };
+            const onSessionUpdate = (update: HostToolSessionUpdate): void => {
+              if (!accepting) return;
+              const call = byCallId.get(update.toolCallId);
+              if (!call) {
+                earlyState.invalid = true;
+                return;
+              }
+              reconcile(call, update.context);
+            };
             let results: ToolExecuteResult[];
             try {
               results = await service.invoke(
@@ -154,10 +195,14 @@ export function createHostToolBindings(options: {
                   callerCapabilityProjection: batch.callerCapabilityProjection,
                 },
                 batch.signal,
-                onResult
+                { onResult, onSessionUpdate }
               );
             } finally {
               accepting = false;
+              for (const original of batch.toolCalls) {
+                const updated = byCallId.get(original.id);
+                if (updated) reconcile(original, updated);
+              }
             }
             if (earlyState.invalid)
               throw new Error('Invalid incremental host result');

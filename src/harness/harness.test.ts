@@ -203,7 +203,8 @@ describe('host tool harness', () => {
       tools,
       service: {
         version: 1,
-        invoke: async (request, _signal, onResult) => {
+        invoke: async (request, _signal, events) => {
+          const onResult = events?.onResult;
           expect(request.identity.agentId).toBe('agent');
           expect(request.executingAgentId).toBe('child-agent');
           late = onResult;
@@ -256,7 +257,8 @@ describe('host tool harness', () => {
     await dispatch(
       {
         version: 1,
-        invoke: async (_request, _signal, onResult) => {
+        invoke: async (_request, _signal, events) => {
+          const onResult = events?.onResult;
           expect(onResult).toBeUndefined();
           return [{ toolCallId: 'one', status: 'success', content: 'ok' }];
         },
@@ -264,6 +266,46 @@ describe('host tool harness', () => {
       [{ id: 'one', name: 'echo', args: {} }]
     );
   });
+  it.each([false, true])(
+    'retains local and explicitly transported session refreshes even on failure=%s',
+    async (fail) => {
+      for (const remote of [false, true]) {
+        const call = {
+          id: 'one',
+          name: 'echo',
+          args: {},
+          codeSessionContext: { session_id: 'old' },
+        };
+        const bindings = createHostToolBindings({
+          identity,
+          tools,
+          service: {
+            version: 1,
+            invoke: async (request, _signal, events) => {
+              const context = {
+                codeSessionContext: { session_id: 'refreshed' },
+              };
+              if (remote)
+                events?.onSessionUpdate({ toolCallId: 'one', context });
+              else Object.assign(request.calls[0].call, context);
+              if (fail) throw new Error('failed after refresh');
+              return [{ toolCallId: 'one', status: 'success', content: 'ok' }];
+            },
+          },
+        });
+        const result = new Promise<ToolExecuteResult[]>((resolve, reject) => {
+          void bindings.customHandlers[GraphEvents.ON_TOOL_EXECUTE].handle(
+            GraphEvents.ON_TOOL_EXECUTE,
+            { toolCalls: [call], resolve, reject }
+          );
+        });
+        if (fail)
+          await expect(result).rejects.toThrow('Host tool execution failed');
+        else await result;
+        expect(call.codeSessionContext.session_id).toBe('refreshed');
+      }
+    }
+  );
   describe.each(['direct', 'http'] as const)('%s service', (mode) => {
     it.each(['approve', 'edit', 'reject'] as const)(
       'uses native SDK approval %s and a real graph',

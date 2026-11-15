@@ -48,8 +48,8 @@ to host tools, add remote model-policy enforcement, or claim complete feature pa
 contract tests deliberately use loopback without production authentication; production bridge
 adapters must supply that authority and the existing bounded/recoverable transport.
 
-Services may accept a third `onResult` callback and publish individual tool results while the
-batch is running. It is supplied only when ToolNode permits early completion (approval/result
+Services may accept a third `HostToolEvents` argument and publish individual results through
+`events.onResult` while the batch is running. It is supplied only when ToolNode permits early completion (approval/result
 policy may disable it). The final returned array remains authoritative and must contain all
 results. Duplicate early receipts are suppressed; invalid identities fail the batch, and late or
 cancelled callbacks are ignored. Callback messages must be delivered before settling the batch
@@ -58,3 +58,9 @@ RPC, so a final response cannot overtake them on a multiplexed transport.
 `request.identity.agentId` is the authenticated root binding. `request.executingAgentId` is the
 SDK execution subject from the batch, and `executionContext` carries child lineage. Hosts must
 authorize the execution subject against that root binding; the two IDs must not be conflated.
+
+`events.onSessionUpdate({toolCallId, context})` transports host-refreshed code session state.
+Local services that update their request also retain that state; the harness reconciles only the
+SDK session fields, including when execution fails. Remote adapters must deliver session updates
+before settling either a successful or failed invocation. This preserves lazy input provisioning
+and sandbox refresh semantics without copying request credentials or arbitrary configuration.
