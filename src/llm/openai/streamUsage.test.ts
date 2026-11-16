@@ -4,22 +4,27 @@ import { AIMessageChunk, isAIMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
 import type { LLMResult } from '@langchain/core/outputs';
 import type { OpenAIClient } from '@langchain/openai';
-import { AzureChatOpenAI } from './index';
+import { ChatXAI, AzureChatOpenAI } from './index';
 
 type RawChunk = OpenAIClient.Chat.Completions.ChatCompletionChunk;
 
+type StreamingClient = {
+  completionWithRetry(
+    request: OpenAIClient.Chat.ChatCompletionCreateParamsStreaming
+  ): Promise<AsyncIterable<RawChunk>>;
+};
+
+function stubStream(client: StreamingClient, chunks: RawChunk[]): void {
+  client.completionWithRetry = async () => ({
+    async *[Symbol.asyncIterator]() {
+      yield* chunks;
+    },
+  });
+}
+
 class OfflineAzureChatOpenAI extends AzureChatOpenAI {
   setStream(chunks: RawChunk[]): void {
-    const client: {
-      completionWithRetry(
-        request: OpenAIClient.Chat.ChatCompletionCreateParamsStreaming
-      ): Promise<AsyncIterable<RawChunk>>;
-    } = this.completions;
-    client.completionWithRetry = async () => ({
-      async *[Symbol.asyncIterator]() {
-        yield* chunks;
-      },
-    });
+    stubStream(this.completions, chunks);
   }
 }
 
@@ -32,7 +37,7 @@ const usage = {
 };
 
 class UsageCallback extends BaseCallbackHandler {
-  name = 'azure-stream-usage-test';
+  name = 'stream-usage-test';
   override awaitHandlers = true;
   message?: BaseMessage;
 
@@ -44,7 +49,10 @@ class UsageCallback extends BaseCallbackHandler {
   }
 }
 
-function createModel(usageLocation: 'tail' | 'choice'): AzureChatOpenAI {
+function createModel(
+  provider: 'azure' | 'xai',
+  usageLocation: 'tail' | 'choice'
+): AzureChatOpenAI | ChatXAI {
   const base: Omit<RawChunk, 'choices'> = {
     id: 'chatcmpl-usage',
     object: 'chat.completion.chunk',
@@ -77,6 +85,11 @@ function createModel(usageLocation: 'tail' | 'choice'): AzureChatOpenAI {
     },
     ...(usageLocation === 'tail' ? [{ ...base, choices: [], usage }] : []),
   ];
+  if (provider === 'xai') {
+    const model = new ChatXAI({ apiKey: 'offline-test', _lc_stream_delay: 0 });
+    stubStream(model, chunks);
+    return model;
+  }
   const model = new OfflineAzureChatOpenAI({
     azureOpenAIApiKey: 'offline-test',
     azureOpenAIApiInstanceName: 'offline-instance',
@@ -102,11 +115,15 @@ function expectUsage(message: BaseMessage | undefined): void {
   });
 }
 
-describe.each(['tail', 'choice'] as const)(
-  'Azure Chat Completions usage on %s chunk',
-  (usageLocation) => {
-    test('preserves raw usage through stream concat and handleLLMEnd', async () => {
-      const model = createModel(usageLocation);
+describe('Chat Completions usage', () => {
+  test.each([
+    ['azure', 'tail'],
+    ['azure', 'choice'],
+    ['xai', 'tail'],
+  ] as const)(
+    'preserves %s usage on %s through stream concat and handleLLMEnd',
+    async (provider, usageLocation) => {
+      const model = createModel(provider, usageLocation);
       const callback = new UsageCallback();
       const stream = await model.stream('hi', { callbacks: [callback] });
       let result: AIMessageChunk | undefined;
@@ -115,6 +132,6 @@ describe.each(['tail', 'choice'] as const)(
       }
       expectUsage(result);
       expectUsage(callback.message);
-    });
-  }
-);
+    }
+  );
+});

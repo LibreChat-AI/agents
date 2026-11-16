@@ -15,6 +15,43 @@ function chunkWithGenerationInfo(
 }
 
 describe('dropRepeatedScalarMetadata', () => {
+  test.each(['generationInfo', 'response_metadata'] as const)(
+    'preserves populated usage after an empty %s snapshot',
+    (location) => {
+      const seen: SeenScalarMetadata = new Map();
+      const usage = {
+        prompt_tokens: 21,
+        completion_tokens: 39,
+        total_tokens: 60,
+      };
+      const createChunk = (
+        snapshot: Record<string, number>
+      ): ChatGenerationChunk =>
+        new ChatGenerationChunk({
+          text: '',
+          message: new AIMessageChunk({
+            content: '',
+            response_metadata:
+              location === 'response_metadata' ? { usage: snapshot } : {},
+          }),
+          generationInfo: {
+            completion: 0,
+            ...(location === 'generationInfo' && { usage: snapshot }),
+          },
+        });
+      const first = createChunk({});
+      const last = createChunk(usage);
+      dropRepeatedScalarMetadata(first, seen);
+      dropRepeatedScalarMetadata(last, seen);
+      const merged = first.concat(last);
+      expect(
+        location === 'generationInfo'
+          ? merged.generationInfo?.usage
+          : merged.message.response_metadata.usage
+      ).toEqual(usage);
+    }
+  );
+
   test('drops a scalar repeated within the same completion (keep-first)', () => {
     const seen: SeenScalarMetadata = new Map();
     const first = chunkWithGenerationInfo({

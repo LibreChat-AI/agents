@@ -2638,9 +2638,6 @@ class LibreChatAzureOpenAICompletions extends OriginalAzureChatOpenAICompletions
       rawResponse,
       defaultRole
     );
-    if ('usage' in message.response_metadata) {
-      delete message.response_metadata.usage;
-    }
     if (
       isFirstPartyAzureEndpoint({
         baseURL: this.clientConfig.baseURL,
