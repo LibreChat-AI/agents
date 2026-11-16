@@ -576,6 +576,34 @@ describe('formatAgentMessages with tools parameter', () => {
       ]);
     });
 
+    it('keeps the exact text before a call when preserveTextContent is on', () => {
+      const payload: TPayload = [
+        { role: 'user', content: 'go' },
+        {
+          role: 'assistant',
+          content: [
+            { type: ContentTypes.TEXT, text: 'Checking ' },
+            { type: ContentTypes.TEXT, text: 'now. ' },
+            toolCall('a'),
+          ],
+        },
+      ];
+
+      const { messages } = formatAgentMessages(
+        payload,
+        undefined,
+        undefined,
+        undefined,
+        { preserveTextContent: true }
+      );
+      const [message] = messages.filter(
+        (m) => m instanceof AIMessage
+      ) as AIMessage[];
+
+      expect(message.content).toBe('Checking now. ');
+      expect(message.tool_calls?.map((c) => c.id)).toEqual(['a']);
+    });
+
     it('puts stored Responses items back on the assistant message', () => {
       const items = [
         { id: 'rs_1', type: 'reasoning', summary: [] },

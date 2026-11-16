@@ -13,6 +13,7 @@ import {
   STREAMED_TOOL_CALL_SEAL_METADATA_KEY,
 } from '@/tools/streamedToolCallSeals';
 import { GEMINI_SIGNATURES, RESPONSES_POSITIONS, stringMap, safetyRatings, replayPositions, ResponsesTextProjection, keys } from '@/llm/providerTextControls';
+import { GEMINI_PARTS, GEMINI_REPLAY_UNSUPPORTED, isGeminiReplayParts } from '@/llm/google/utils/signatures';
 import {
   ProviderTextAttempt,
   ProviderTextProtectionError,
@@ -48,6 +49,8 @@ const additionalControls: Readonly<Partial<Record<string, (value: unknown) => bo
 
 const geminiControls: Readonly<Partial<Record<string, (value: unknown) => boolean>>> = {
   [GEMINI_SIGNATURES]: stringMap,
+  [GEMINI_PARTS]: isGeminiReplayParts,
+  [GEMINI_REPLAY_UNSUPPORTED]: (value) => value === true,
   finishReason: (value) => ['STOP', 'MAX_TOKENS', 'SAFETY', 'RECITATION', 'OTHER', 'MALFORMED_FUNCTION_CALL', 'FINISH_REASON_UNSPECIFIED'].includes(String(value)),
   safetyRatings,
   avgLogprobs: (value) => typeof value === 'number' && Number.isFinite(value),
