@@ -123,7 +123,10 @@ export type {
 export * from './decisions';
 export * from './rerank';
 
-export { PROVIDER_TEXT_PROTECTION_VERSION, ProviderTextProtectionError } from './protection/providerText';
+export {
+  PROVIDER_TEXT_PROTECTION_VERSION,
+  ProviderTextProtectionError,
+} from './protection/providerText';
 export type {
   ProviderTextProtection,
   ProviderTextProtectionResult,
@@ -138,3 +141,6 @@ export {
   isGeminiReplayParts,
 } from './llm/google/utils/signatures';
 export type { GeminiReplayPart } from './llm/google/utils/signatures';
+
+/* Host execution harness */
+export * from './harness';
