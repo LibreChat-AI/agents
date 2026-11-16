@@ -57,6 +57,9 @@ describe('buildBashExecutionToolDescription', () => {
     );
     expect(BashToolOutputReferencesGuide).toContain('`\\{{tool0turn0}}`');
     expect(BashToolOutputReferencesGuide).not.toContain('left in place');
+    expect(BashToolOutputReferencesGuide).toContain(
+      '`C:\\out\\\\{{tool0turn0}}`'
+    );
   });
 
   it('separates base and guide with a blank line', () => {

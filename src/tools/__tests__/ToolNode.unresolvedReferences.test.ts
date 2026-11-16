@@ -530,6 +530,39 @@ it('escapes serialized JSON values without changing object keys', () => {
   expect(result.unresolved).toEqual([]);
 });
 
+describe('backslashes before a placeholder', () => {
+  const registry = new ToolOutputReferenceRegistry();
+  registry.set('current', 'tool0turn2', 'report.txt');
+  const resolve = (input: string) => registry.resolve('current', input);
+
+  it.each([
+    ['\\{{tool0turn2}}', '{{tool0turn2}}'],
+    ['\\\\{{tool0turn2}}', '\\report.txt'],
+    ['\\\\\\{{tool0turn2}}', '\\{{tool0turn2}}'],
+    ['\\\\\\\\{{tool0turn2}}', '\\\\report.txt'],
+    ['type C:\\out\\\\{{tool0turn2}}', 'type C:\\out\\report.txt'],
+    ['{{tool0turn2}}\\{{tool0turn2}}', 'report.txt{{tool0turn2}}'],
+    ['{{tool0turn2}}\\\\{{tool0turn2}}', 'report.txt\\report.txt'],
+    ['a\\b {{tool0turn2}} c\\\\d', 'a\\b report.txt c\\\\d'],
+  ])('resolves %j to %j', (input, expected) => {
+    expect(resolve(input)).toEqual({ resolved: expected, unresolved: [] });
+  });
+
+  it('looks up an unescaped key behind an even run and skips an escaped one', () => {
+    expect(resolve('\\\\{{tool8turn8}} \\{{tool9turn9}}').unresolved).toEqual([
+      'tool8turn8',
+    ]);
+  });
+
+  it('resolves a reference after a long backslash run', () => {
+    const run = '\\'.repeat(200_000);
+    expect(resolve(`${run}{{tool0turn2}}`).resolved).toBe(
+      `${'\\'.repeat(100_000)}report.txt`
+    );
+    expect(resolve(`{{tool0turn2}}${run}x`).resolved).toBe(`report.txt${run}x`);
+  });
+});
+
 it('detaches only reference-bearing comparison inputs', () => {
   const plain = { command: 'initial', nested: { value: 'plain' } };
   const clone = jest.spyOn(globalThis, 'structuredClone');

@@ -129,7 +129,7 @@ Referencing previous tool outputs:
 - For payloads that may contain quotes, parentheses, backticks, or arbitrary bytes (random/binary data, JSON with embedded quotes, multi-line strings), prefer a quoted-delimiter heredoc over \`echo '…'\`. The heredoc body is not interpreted by the shell, so substituted payloads pass through unchanged.
 - Heredoc example: \`wc -c << 'EOF'\\n{{tool0turn0}}\\nEOF\` (the quotes around \`'EOF'\` disable interpolation inside the body).
 - A call that uses an unknown reference key is rejected before anything runs. The error names the unknown keys and lists the most recent available ones; correct the key or fetch the output again.
-- To pass a placeholder as literal text, prefix it with a backslash: \`\\{{tool0turn0}}\` reaches the tool as \`{{tool0turn0}}\` with no substitution.
+- To pass a placeholder as literal text, prefix it with a backslash: \`\\{{tool0turn0}}\` reaches the tool as \`{{tool0turn0}}\` with no substitution. For a real backslash directly before a reference (for example a Windows path), double it: \`C:\\out\\\\{{tool0turn0}}\`.
 `.trim();
 
 /**
