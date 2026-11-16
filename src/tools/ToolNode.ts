@@ -2356,7 +2356,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       status: 'error',
       name: call.name,
       tool_call_id: call.id ?? '',
-      content: `Unknown tool output references: ${missing.join(', ')}${resolution.unresolved.length > missing.length ? ', …' : ''}; nothing was run. Available keys (up to 10): ${available.join(', ') || '(none)'}. Use a prior batch's key, fetch the output again, or prefix a literal placeholder with a backslash.`,
+      content: `Unknown tool output references: ${missing.join(', ')}${resolution.unresolved.length > missing.length ? ', …' : ''}; nothing was run. Available keys (most recent, up to 10): ${available.join(', ') || '(none)'}. Use a prior batch's key, fetch the output again, or prefix a literal placeholder with a backslash.`,
       additional_kwargs: { _unresolvedRefs: missing },
     });
   }

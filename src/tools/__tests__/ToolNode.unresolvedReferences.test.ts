@@ -494,7 +494,10 @@ it('bounds and deduplicates hints without leaking values or foreign-run keys', a
   expect(result.additional_kwargs._unresolvedRefs).toHaveLength(10);
   expect(result.content).not.toContain('secret');
   expect(result.content).not.toContain('tool999turn999');
-  expect(result.content).toContain('tool0turn2');
+  const hint = /Available keys[^:]*: ([^.]*)\./.exec(String(result.content));
+  expect(hint?.[1].split(', ')).toEqual(
+    Array.from({ length: 10 }, (_, i) => `tool${i + 10}turn2`)
+  );
 });
 
 it('keeps key and injected intent exemptions and resolves business intent', () => {

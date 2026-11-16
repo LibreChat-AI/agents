@@ -157,6 +157,9 @@ export type ResolvedArgsByCallId = Map<string, Record<string, unknown>>;
 
 const EMPTY_ENTRIES: ReadonlyMap<string, string> = new Map<string, string>();
 
+/** Keys a snapshot offers as a correction hint for an unknown reference. */
+const AVAILABLE_KEY_HINT_LIMIT = 10;
+
 /**
  * Per-run state bucket held inside the registry. Each distinct
  * `run_id` gets its own bucket so overlapping concurrent runs on a
@@ -407,13 +410,9 @@ export class ToolOutputReferenceRegistry {
       ? new Map(bucket.entries)
       : EMPTY_ENTRIES;
     return {
+      /** Newest registrations: the key a model mistyped is usually recent. */
       get availableKeys(): readonly string[] {
-        const keys: string[] = [];
-        for (const key of entries.keys()) {
-          keys.push(key);
-          if (keys.length === 10) break;
-        }
-        return keys;
+        return [...entries.keys()].slice(-AVAILABLE_KEY_HINT_LIMIT);
       },
       resolve: <T>(args: T, options?: ResolveOptions): ResolveResult<T> =>
         this.resolveAgainst(entries, args, options),
