@@ -115,13 +115,14 @@ import {
   outcomeFieldsFromResult,
 } from '@/tools/intentArg';
 import {
-  resolveLangfuseRuntimeScope,
-  withLangfuseRuntimeScope,
-} from '@/langfuseRuntimeScope';
-import {
+  snapshotResolvedArgs,
   buildReferenceKey,
   ToolOutputReferenceRegistry,
 } from '@/tools/toolOutputReferences';
+import {
+  resolveLangfuseRuntimeScope,
+  withLangfuseRuntimeScope,
+} from '@/langfuseRuntimeScope';
 import {
   calculateMaxToolResultChars,
   truncateToolResultContent,
@@ -2631,11 +2632,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       unresolved: [],
     };
     const resolveDirectArgs = (
-      args: Record<string, unknown>
+      args: Record<string, unknown>,
+      previouslyResolved?: Record<string, unknown>
     ): Record<string, unknown> => {
       inputResolution = referenceView?.resolve(args, {
         ...hookResolveOptions,
-        previouslyResolved: inputResolution.resolved,
+        previouslyResolved,
       }) ?? {
         resolved: args,
         unresolved: [],
@@ -2669,6 +2671,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       reviewedApproval != null ||
       approvalReviewEvidence != null
     ) {
+      const hookBaseline =
+        referenceView == null ? undefined : snapshotResolvedArgs(resolvedArgs);
       const preResult: AggregatedHookResult | undefined =
         hookRegistry == null
           ? {
@@ -2713,44 +2717,32 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               }
           );
 
-      if (preResult != null) {
-        // Forward any additionalContext strings hooks returned into
-        // the per-batch sink so the caller materializes them as a
-        // HumanMessage for the next model turn — same shape as the
-        // event-driven path's `injected[]`. Codex P2 #39.
-        if (preResult.additionalContexts.length > 0) {
-          replayAdditionalContexts.push(...preResult.additionalContexts);
-          batchContext.additionalContextsSink?.push(
-            ...preResult.additionalContexts
-          );
-        }
-        // Apply any input rewrite first — `ask`-with-`updatedInput` is
-        // a valid combination (one matcher sanitises args, another asks
-        // for approval); the reviewer should see the sanitised args.
-        if (preResult.updatedInput != null) {
-          resolvedArgs = resolveDirectArgs(
-            preResult.updatedInput as Record<string, unknown>
-          );
-          effectiveCall = {
-            ...call,
-            args: resolvedArgs,
-          };
-        } else if (reviewedApproval != null) {
-          resolvedArgs = reviewedApproval.request.arguments;
-          inputResolution = { resolved: resolvedArgs, unresolved: [] };
-          effectiveCall = {
-            ...call,
-            args: resolvedArgs,
-          };
-        }
-
-        const referenceError = this.unresolvedReferenceMessage(
-          call,
-          inputResolution,
-          referenceView
+      if (preResult != null && preResult.additionalContexts.length > 0) {
+        replayAdditionalContexts.push(...preResult.additionalContexts);
+        batchContext.additionalContextsSink?.push(
+          ...preResult.additionalContexts
         );
-        if (referenceError != null) return persistOutput(referenceError);
+      }
 
+      if (preResult?.updatedInput != null) {
+        resolvedArgs = resolveDirectArgs(preResult.updatedInput, hookBaseline);
+        effectiveCall = { ...call, args: resolvedArgs };
+      } else if (preResult != null && reviewedApproval != null) {
+        resolvedArgs = reviewedApproval.request.arguments;
+        inputResolution = { resolved: resolvedArgs, unresolved: [] };
+        effectiveCall = { ...call, args: resolvedArgs };
+      } else if (referenceView != null) {
+        resolvedArgs = resolveDirectArgs(resolvedArgs, hookBaseline);
+        effectiveCall = { ...call, args: resolvedArgs };
+      }
+      const referenceError = this.unresolvedReferenceMessage(
+        call,
+        inputResolution,
+        referenceView
+      );
+      if (referenceError != null) return persistOutput(referenceError);
+
+      if (preResult != null) {
         if (
           preResult.hasHookFailures === true &&
           isBackgroundDenyMode(this.humanInTheLoop)
@@ -2886,6 +2878,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             this.executionContext,
             this.executingAgentId
           );
+          const approvalBaseline =
+            referenceView == null
+              ? undefined
+              : snapshotResolvedArgs(effectiveCall.args);
           const resumeValue = AsyncLocalStorageProviderSingleton.runWithConfig(
             config,
             () =>
@@ -3021,7 +3017,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             }
             effectiveCall = {
               ...call,
-              args: resolveDirectArgs(updatedInput as Record<string, unknown>),
+              args: resolveDirectArgs(
+                updatedInput as Record<string, unknown>,
+                approvalBaseline
+              ),
             };
             // fall through to executing the edited call
           }
@@ -3844,6 +3843,15 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           }
         }
       }
+      const referenceBaselines =
+        referenceView == null
+          ? undefined
+          : new Map(
+            preToolCalls.map((entry) => [
+              entry,
+              snapshotResolvedArgs(entry.args),
+            ])
+          );
       const preResults =
         hookRegistry == null
           ? preToolCalls.map(() => HOOK_FALLBACK)
@@ -3990,26 +3998,14 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         deferredBlockedSideEffects.length = 0;
       };
 
-      /**
-       * Apply a hook-supplied or host-supplied input override to a pending
-       * entry, re-running the `{{tool<i>turn<n>}}` resolver so any new
-       * placeholders introduced by the override are substituted (and any
-       * formerly-unresolved refs cleared from the unresolved set).
-       *
-       * Mixed direct+event batches must use the pre-batch snapshot so a
-       * hook-introduced placeholder cannot accidentally resolve to a
-       * same-turn direct output that has just registered. Pure event
-       * batches don't have a snapshot and resolve against the live
-       * registry — safe because no event-side registrations have happened
-       * yet.
-       */
+      /** Validate edits against the batch snapshot and detached input baseline. */
       const applyInputOverride = (
         entry: PendingEntry,
         nextArgs: Record<string, unknown>
       ): void => {
         if (registry != null) {
           const { resolved, unresolved } = referenceView!.resolve(nextArgs, {
-            previouslyResolved: entry.args,
+            previouslyResolved: referenceBaselines?.get(entry),
             substituteIntentKey: this.toolDeclaresBusinessIntent(
               entry.call.name
             ),
@@ -4065,6 +4061,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           continue;
         }
 
+        if (hookResult.updatedInput != null || referenceView != null) {
+          applyInputOverride(entry, hookResult.updatedInput ?? entry.args);
+          if (rejectReferences(entry)) continue;
+        }
+
         if (hookResult.decision === 'ask') {
           /**
            * HITL is OFF by default — hosts must explicitly opt in via
@@ -4097,10 +4098,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
            * reviewer AND the post-approve execution would run with
            * the original args, silently dropping the hook's rewrite.
            */
-          if (hookResult.updatedInput != null) {
-            applyInputOverride(entry, hookResult.updatedInput);
-            if (rejectReferences(entry)) continue;
-          } else {
+          if (hookResult.updatedInput == null) {
             const reviewed = getReviewedToolApproval(
               approvalReviewEvidence?.payload,
               entry.call.id
@@ -4123,10 +4121,6 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           continue;
         }
 
-        if (hookResult.updatedInput != null) {
-          applyInputOverride(entry, hookResult.updatedInput);
-          if (rejectReferences(entry)) continue;
-        }
         const reviewedApproval = getReviewedToolApproval(
           approvalReviewEvidence?.payload,
           entry.call.id
@@ -4171,6 +4165,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
        * consumed one-shot hooks replay their pending approval aggregate.
        */
       if (askEntries.length > 0) {
+        if (referenceBaselines != null) {
+          for (const { entry } of askEntries) {
+            referenceBaselines.set(entry, snapshotResolvedArgs(entry.args));
+          }
+        }
         const payload = buildToolApprovalInterruptPayload(
           askEntries,
           runId,

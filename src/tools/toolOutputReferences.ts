@@ -133,8 +133,8 @@ export interface ToolOutputResolveView {
  */
 export type ResolveOptions = {
   substituteIntentKey?: boolean;
-  /** Resolved input supplied to an editor; unchanged string leaves stay literal. */
-  previouslyResolved?: Record<string, unknown>;
+  /** Detached pre-editor input; unchanged string leaves stay literal. */
+  previouslyResolved?: Record<string, unknown> | string;
 };
 
 /**
@@ -383,7 +383,7 @@ export class ToolOutputReferenceRegistry {
     args: T,
     options?: ResolveOptions
   ): ResolveResult<T> {
-    if (!hasAnyPlaceholder(args)) {
+    if (options?.previouslyResolved == null && !hasAnyPlaceholder(args)) {
       return { resolved: args, unresolved: [] };
     }
     const bucket = this.runStates.get(this.keyFor(runId));
@@ -473,7 +473,7 @@ export class ToolOutputReferenceRegistry {
     args: T,
     options?: ResolveOptions
   ): ResolveResult<T> {
-    if (!hasAnyPlaceholder(args)) {
+    if (options?.previouslyResolved == null && !hasAnyPlaceholder(args)) {
       return { resolved: args, unresolved: [] };
     }
     const exemptIntentKey = options?.substituteIntentKey !== true;
@@ -489,7 +489,9 @@ export class ToolOutputReferenceRegistry {
             parsedRoot,
             unresolved,
             exemptIntentKey,
-            options?.previouslyResolved
+            typeof options?.previouslyResolved === 'string'
+              ? parseStringifiedArgsObject(options.previouslyResolved)
+              : options?.previouslyResolved
           )
         ) as T;
         return { resolved, unresolved: Array.from(unresolved) };
@@ -626,6 +628,15 @@ function hasAnyPlaceholder(value: unknown): boolean {
     return false;
   }
   return false;
+}
+
+const EMPTY_RESOLVED_ARGS: Record<string, unknown> = Object.freeze({});
+
+/** Detached editor baseline; reference-free inputs need no retained values. */
+export function snapshotResolvedArgs(
+  args: Record<string, unknown>
+): Record<string, unknown> {
+  return hasAnyPlaceholder(args) ? structuredClone(args) : EMPTY_RESOLVED_ARGS;
 }
 
 /**

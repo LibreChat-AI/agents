@@ -11,7 +11,10 @@ import {
 } from '@langchain/langgraph';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type * as t from '@/types';
-import { ToolOutputReferenceRegistry } from '../toolOutputReferences';
+import {
+  ToolOutputReferenceRegistry,
+  snapshotResolvedArgs,
+} from '../toolOutputReferences';
 import * as events from '@/utils/events';
 import { HookRegistry } from '@/hooks';
 import { ToolNode } from '../ToolNode';
@@ -36,21 +39,24 @@ function harness(
   eventDrivenMode = false,
   hooks?: HookRegistry,
   mixed = false,
-  approval = false
+  approval = false,
+  references = true
 ) {
   const mutations: string[] = [];
   const dispatched: string[] = [];
+  const executedArgs: Array<Record<string, unknown>> = [];
   const registry = new ToolOutputReferenceRegistry({ maxTotalSize: 100 });
   const makeTool = (name: string) =>
     tool(
-      async ({ command }) => {
-        mutations.push(command);
-        return command;
+      async (input) => {
+        executedArgs.push(input);
+        mutations.push(input.command);
+        return input.command;
       },
       {
         name,
         description: 'counter only, no external effects',
-        schema: z.object({ command: z.string() }),
+        schema: z.object({ command: z.string() }).passthrough(),
       }
     );
   jest
@@ -60,6 +66,7 @@ function harness(
       const batch = data as t.ToolExecuteBatchRequest;
       batch.resolve(
         batch.toolCalls.map((request) => {
+          executedArgs.push(request.args);
           dispatched.push(String(request.args.command));
           return {
             toolCallId: request.id,
@@ -73,14 +80,14 @@ function harness(
     tools: [makeTool('mutate'), makeTool('direct')],
     eventDrivenMode,
     directToolNames: mixed ? new Set(['direct']) : undefined,
-    toolOutputRegistry: registry,
+    toolOutputRegistry: references ? registry : undefined,
     hookRegistry: hooks,
     humanInTheLoop: { enabled: approval },
     toolCallStepIds: new Map(
       ['bad', 'good', 'retry'].map((id) => [id, `step-${id}`])
     ),
   });
-  return { node, registry, mutations, dispatched };
+  return { node, registry, mutations, dispatched, executedArgs };
 }
 afterEach(() => jest.restoreAllMocks());
 describe.each([false, true])('unresolved references, event=%s', (eventMode) => {
@@ -129,6 +136,214 @@ describe.each([false, true])('unresolved references, event=%s', (eventMode) => {
     expect([...mutations, ...dispatched]).toEqual(['safe']);
     await invoke(node, [call('retry', '{{tool0turn2}}')]);
     expect([...mutations, ...dispatched]).toEqual(['safe', 'safe']);
+  });
+  it.each([
+    ['same-object', false],
+    ['same-object', true],
+    ['new-object', false],
+    ['new-object', true],
+    ['no-override', false],
+    ['no-override', true],
+    ['later-hook', false],
+    ['later-hook', true],
+    ['failure', false],
+    ['failure', true],
+  ] as const)(
+    'rejects in-place hook mutation (%s, nested=%s)',
+    async (mode, nested) => {
+      const hooks = new HookRegistry();
+      const mutate = (input: { toolInput: Record<string, unknown> }) => {
+        if (nested) {
+          const payload = input.toolInput.payload as {
+            items: Array<{ value: string }>;
+          };
+          payload.items[0].value = '{{tool8turn8}}';
+        } else {
+          input.toolInput.command = '{{tool8turn8}}';
+        }
+      };
+      hooks.register('PreToolUse', {
+        hooks: [
+          async (input) => {
+            mutate(input);
+            if (mode === 'failure') throw new Error('fake hook failure');
+            if (mode === 'same-object')
+              return { updatedInput: input.toolInput };
+            if (mode === 'new-object')
+              return { updatedInput: { ...input.toolInput } };
+            return {};
+          },
+        ],
+      });
+      if (mode === 'later-hook') {
+        hooks.register('PreToolUse', {
+          hooks: [
+            async (input) => {
+              await Promise.resolve();
+              return { updatedInput: { ...input.toolInput } };
+            },
+          ],
+        });
+      }
+      const { node, mutations, dispatched } = harness(eventMode, hooks);
+      const request = call('bad', 'initial');
+      request.args.payload = { items: [{ value: 'initial' }] };
+      const [result] = await invoke(node, [request]);
+      expect({ mutations, dispatched }).toEqual({
+        mutations: [],
+        dispatched: [],
+      });
+      expect(result.status).toBe('error');
+      expect(result.tool_call_id).toBe('bad');
+      expect(result.content).toContain('tool8turn8');
+    }
+  );
+  it.each(['escaped', 'substituted'])(
+    'rejects mutations of a protected %s field',
+    async (initial) => {
+      const hooks = new HookRegistry();
+      hooks.register('PreToolUse', {
+        hooks: [
+          async (input) => {
+            input.toolInput.command = '{{tool8turn8}}';
+            return { updatedInput: input.toolInput };
+          },
+        ],
+      });
+      const { node, registry, mutations, dispatched } = harness(
+        eventMode,
+        hooks
+      );
+      registry.set('current', 'tool0turn2', '{{tool9turn9}}');
+      const [result] = await invoke(node, [
+        call(
+          'bad',
+          initial === 'escaped' ? '\\{{tool9turn9}}' : '{{tool0turn2}}'
+        ),
+      ]);
+      expect(result.status).toBe('error');
+      expect([...mutations, ...dispatched]).toEqual([]);
+    }
+  );
+  it.each(['escaped', 'substituted'])(
+    'preserves %s fields while resolving in-place valid edits',
+    async (initial) => {
+      const hooks = new HookRegistry();
+      hooks.register('PreToolUse', {
+        hooks: [
+          async (input) => {
+            input.toolInput.extra = { value: '{{tool1turn2}}' };
+            return {};
+          },
+        ],
+      });
+      const { node, registry, mutations, dispatched, executedArgs } = harness(
+        eventMode,
+        hooks
+      );
+      registry.set('current', 'tool0turn2', '{{tool8turn8}}');
+      registry.set('current', 'tool1turn2', 'safe');
+      const [result] = await invoke(node, [
+        call(
+          'good',
+          initial === 'escaped' ? '\\{{tool8turn8}}' : '{{tool0turn2}}'
+        ),
+      ]);
+      expect(result.status).toBe('success');
+      expect([...mutations, ...dispatched]).toEqual(['{{tool8turn8}}']);
+      expect(executedArgs).toEqual([
+        { command: '{{tool8turn8}}', extra: { value: 'safe' } },
+      ]);
+    }
+  );
+  it('validates no-return mutations before asking for approval', async () => {
+    const hooks = new HookRegistry();
+    hooks.register('PreToolUse', {
+      hooks: [
+        async (input) => {
+          input.toolInput.command = '{{tool8turn8}}';
+          return { decision: 'ask' as const };
+        },
+      ],
+    });
+    const { node, mutations, dispatched } = harness(
+      eventMode,
+      hooks,
+      false,
+      true
+    );
+    const [result] = await invoke(node, [call('bad', 'initial')]);
+    expect(result.status).toBe('error');
+    expect([...mutations, ...dispatched]).toEqual([]);
+  });
+  it('keeps reference-looking output literal through an approval edit', async () => {
+    const hooks = new HookRegistry();
+    hooks.register('PreToolUse', {
+      hooks: [async () => ({ decision: 'ask' as const })],
+    });
+    const { node, registry, mutations, dispatched } = harness(
+      eventMode,
+      hooks,
+      false,
+      true
+    );
+    registry.set('current', 'tool0turn2', '{{tool8turn8}}');
+    const graph = new StateGraph(MessagesAnnotation)
+      .addNode('tools', (state, options) => node.invoke(state, options))
+      .addEdge(START, 'tools')
+      .addEdge('tools', END)
+      .compile({ checkpointer: new MemorySaver() });
+    const options = {
+      configurable: {
+        run_id: 'current',
+        thread_id: `literal-edit-${eventMode}`,
+      },
+    };
+    await graph.invoke(
+      {
+        messages: [
+          new AIMessage({
+            content: '',
+            tool_calls: [call('good', '{{tool0turn2}}')],
+          }),
+        ],
+      },
+      options
+    );
+    const resumed = await graph.invoke(
+      new Command({
+        resume: [
+          {
+            type: 'edit',
+            updatedInput: { command: '{{tool8turn8}}', extra: 'changed' },
+          },
+        ],
+      }),
+      options
+    );
+    expect((resumed.messages.at(-1) as ToolMessage).status).toBe('success');
+    expect([...mutations, ...dispatched]).toEqual(['{{tool8turn8}}']);
+  });
+  it('preserves in-place hook semantics when references are disabled', async () => {
+    const hooks = new HookRegistry();
+    hooks.register('PreToolUse', {
+      hooks: [
+        async (input) => {
+          input.toolInput.command = '{{tool8turn8}}';
+          return { updatedInput: input.toolInput };
+        },
+      ],
+    });
+    const { node, mutations, dispatched } = harness(
+      eventMode,
+      hooks,
+      false,
+      false,
+      false
+    );
+    const [result] = await invoke(node, [call('good', 'initial')]);
+    expect(result.status).toBe('success');
+    expect([...mutations, ...dispatched]).toEqual(['{{tool8turn8}}']);
   });
   it('validates hook edits and hints against the frozen pre-batch registry', async () => {
     const hooks = new HookRegistry();
@@ -310,4 +525,51 @@ it('escapes serialized JSON values without changing object keys', () => {
     '{{tool8turn8}}': '{{tool8turn8}}',
   });
   expect(result.unresolved).toEqual([]);
+});
+
+it('detaches only reference-bearing comparison inputs', () => {
+  const plain = { command: 'initial', nested: { value: 'plain' } };
+  const clone = jest.spyOn(globalThis, 'structuredClone');
+  expect(snapshotResolvedArgs(plain)).toEqual({});
+  expect(clone).not.toHaveBeenCalled();
+  const input = {
+    command: 'literal {{tool8turn8}}',
+    nested: { value: '{{tool9turn9}}' },
+  };
+  const baseline = snapshotResolvedArgs(input);
+  input.nested.value = '{{tool8turn8}}';
+  expect(baseline).toEqual({
+    command: 'literal {{tool8turn8}}',
+    nested: { value: '{{tool9turn9}}' },
+  });
+  expect(clone).toHaveBeenCalledTimes(1);
+});
+it('preserves the reference-free fast path but detaches edited values', () => {
+  const registry = new ToolOutputReferenceRegistry();
+  const input = { command: 'initial', nested: [{ value: 'plain' }] };
+  expect(registry.resolve('current', input).resolved).toBe(input);
+  const edited = registry.resolve('current', input, {
+    previouslyResolved: snapshotResolvedArgs(input),
+  }).resolved;
+  expect(edited).toEqual(input);
+  expect(edited).not.toBe(input);
+  expect(edited.nested[0]).not.toBe(input.nested[0]);
+});
+it('preserves serialized resolved fields and validates new serialized edits', () => {
+  const registry = new ToolOutputReferenceRegistry();
+  registry.set('current', 'tool0turn2', '{{tool8turn8}}');
+  const first = registry.resolve(
+    'current',
+    JSON.stringify({ command: '{{tool0turn2}}', nested: { value: 'initial' } })
+  ).resolved;
+  const edited = registry.resolve(
+    'current',
+    JSON.stringify({
+      command: '{{tool8turn8}}',
+      nested: { value: '{{tool9turn9}}' },
+    }),
+    { previouslyResolved: first }
+  );
+  expect(JSON.parse(edited.resolved).command).toBe('{{tool8turn8}}');
+  expect(edited.unresolved).toEqual(['tool9turn9']);
 });
