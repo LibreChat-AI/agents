@@ -14,6 +14,8 @@ const REPEATED_SCALAR_METADATA_FIELDS = [
   'finish_reason',
   'service_tier',
   'system_fingerprint',
+  'provider',
+  'usage',
 ] as const;
 
 /** Per-completion-index set of scalar fields already emitted this stream. */

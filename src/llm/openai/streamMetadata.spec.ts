@@ -83,4 +83,42 @@ describe('dropRepeatedScalarMetadata', () => {
     expect(second.generationInfo?.finish_reason).toBeUndefined();
     expect(second.generationInfo).not.toBe(first.generationInfo);
   });
+
+  test('drops repeated usage and provider fields in response_metadata within the same completion', () => {
+    const seen: SeenScalarMetadata = new Map();
+    const first = new ChatGenerationChunk({
+      text: 'Hi',
+      message: new AIMessageChunk({
+        content: 'Hi',
+        response_metadata: {
+          provider: 'Google',
+          usage: { prompt_tokens: 21, completion_tokens: 39, total_tokens: 60 },
+        },
+      }),
+      generationInfo: { completion: 0 },
+    });
+    const second = new ChatGenerationChunk({
+      text: '',
+      message: new AIMessageChunk({
+        content: '',
+        response_metadata: {
+          provider: 'Google',
+          usage: { prompt_tokens: 21, completion_tokens: 39, total_tokens: 60 },
+        },
+      }),
+      generationInfo: { completion: 0 },
+    });
+
+    dropRepeatedScalarMetadata(first, seen);
+    dropRepeatedScalarMetadata(second, seen);
+
+    expect(first.message.response_metadata.provider).toBe('Google');
+    expect(first.message.response_metadata.usage).toEqual({
+      prompt_tokens: 21,
+      completion_tokens: 39,
+      total_tokens: 60,
+    });
+    expect(second.message.response_metadata.provider).toBeUndefined();
+    expect(second.message.response_metadata.usage).toBeUndefined();
+  });
 });

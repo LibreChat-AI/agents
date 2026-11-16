@@ -558,4 +558,75 @@ describe('ChatOpenRouter Responses prompt caching', () => {
 
     expect(router.invocationParams().cache_control).toBeUndefined();
   });
+
+  it('does not double response_metadata.usage and preserves top-level provider when usage arrives on a choice chunk', async () => {
+    const router = new ChatOpenRouter({
+      model: 'anthropic/claude-haiku-5.5',
+      apiKey: 'test-key',
+      streaming: true,
+    });
+    const usage = {
+      prompt_tokens: 21,
+      completion_tokens: 39,
+      total_tokens: 60,
+      cost: 0.0000216,
+      is_byok: false,
+      cost_details: { upstream_inference_cost: 0.0000216 },
+    };
+    const base = {
+      id: 'gen-123',
+      object: 'chat.completion.chunk',
+      created: 1,
+      model: 'anthropic/claude-haiku-5.5',
+      provider: 'Google',
+    };
+    const rawChunks = [
+      {
+        ...base,
+        choices: [
+          {
+            index: 0,
+            delta: { role: 'assistant', content: 'Hi' },
+            finish_reason: null,
+          },
+        ],
+      },
+      {
+        ...base,
+        choices: [
+          {
+            index: 0,
+            delta: { role: 'assistant', content: '' },
+            finish_reason: 'stop',
+          },
+        ],
+        usage,
+      },
+    ];
+    const completions = (
+      router as unknown as {
+        completions: {
+          completionWithRetry: (
+            request: unknown
+          ) => Promise<AsyncIterable<unknown>>;
+        };
+      }
+    ).completions;
+    completions.completionWithRetry = async () => ({
+      async *[Symbol.asyncIterator]() {
+        for (const chunk of rawChunks) {
+          yield chunk;
+        }
+      },
+    });
+
+    const result = await router.invoke([new HumanMessage('hi')]);
+    expect(result.response_metadata.provider).toBe('Google');
+    expect(result.response_metadata.usage).toEqual(usage);
+    expect(result.usage_metadata).toMatchObject({
+      input_tokens: 21,
+      output_tokens: 39,
+      total_tokens: 60,
+    });
+  });
 });

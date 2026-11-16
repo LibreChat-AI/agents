@@ -1147,7 +1147,10 @@ type ResponsesAnnotationsBoundaryEvent = {
 export function ensureResponsesOutputAnnotations(
   event: ResponsesAnnotationsBoundaryEvent
 ): void {
-  if (event.type !== 'response.completed' && event.type !== 'response.incomplete') {
+  if (
+    event.type !== 'response.completed' &&
+    event.type !== 'response.incomplete'
+  ) {
     return;
   }
   const output = event.response?.output;
@@ -1418,7 +1421,8 @@ async function completionWithFilteredOpenAIStream(
 
 function attachLibreChatDeltaFields(
   chunk: BaseMessageChunk,
-  delta: Record<string, unknown>
+  delta: Record<string, unknown>,
+  rawResponse?: unknown
 ): BaseMessageChunk {
   if (!AIMessageChunk.isInstance(chunk)) {
     return chunk;
@@ -1439,12 +1443,32 @@ function attachLibreChatDeltaFields(
     chunk.additional_kwargs.provider_specific_fields =
       libreChatDelta.provider_specific_fields;
   }
+  if ('usage' in chunk.response_metadata) {
+    delete chunk.response_metadata.usage;
+  }
+  const rawRecord = rawResponse as
+    | {
+        provider?: unknown;
+        choices?: Array<{ finish_reason?: unknown }>;
+      }
+    | undefined;
+  const provider = rawRecord?.provider;
+  if (
+    typeof provider === 'string' &&
+    provider.length > 0 &&
+    (chunk.response_metadata.finish_reason != null ||
+      rawRecord?.choices?.some((choice) => choice.finish_reason != null) ===
+        true)
+  ) {
+    chunk.response_metadata.provider = provider;
+  }
   return chunk;
 }
 
 function attachLibreChatMessageFields(
   message: BaseMessage,
-  rawMessage: Record<string, unknown>
+  rawMessage: Record<string, unknown>,
+  rawResponse?: unknown
 ): BaseMessage {
   if (!isAIMessage(message)) {
     return message;
@@ -1461,6 +1485,11 @@ function attachLibreChatMessageFields(
   if (rawMessage.provider_specific_fields != null) {
     message.additional_kwargs.provider_specific_fields =
       rawMessage.provider_specific_fields;
+  }
+  const provider = (rawResponse as { provider?: unknown } | undefined)
+    ?.provider;
+  if (typeof provider === 'string' && provider.length > 0) {
+    message.response_metadata.provider = provider;
   }
   return message;
 }
@@ -2036,7 +2065,8 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
         rawResponse,
         defaultRole
       ),
-      delta
+      delta,
+      rawResponse
     );
     if (isOfficialOpenAIBaseURL(this.clientConfig.baseURL)) {
       return stampSequentialStreamedToolCallAdapter(message);
@@ -2050,7 +2080,8 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
   ): BaseMessage {
     return attachLibreChatMessageFields(
       super._convertCompletionsMessageToBaseMessage(message, rawResponse),
-      message as unknown as Record<string, unknown>
+      message as unknown as Record<string, unknown>,
+      rawResponse
     );
   }
 
@@ -2440,7 +2471,9 @@ class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
         cache_control: cacheControl,
       }),
     };
-    if (shouldIncludeEncryptedReasoning(this.model, params, this.astraRulesApply)) {
+    if (
+      shouldIncludeEncryptedReasoning(this.model, params, this.astraRulesApply)
+    ) {
       params.include = [
         ...new Set([
           ...(params.include ?? []),
@@ -2730,7 +2763,9 @@ class LibreChatAzureOpenAIResponses extends OriginalAzureChatOpenAIResponses {
       promptCacheExplicit: this.promptCacheExplicit,
       safetyIdentifier: this.safetyIdentifier,
     });
-    if (shouldIncludeEncryptedReasoning(this.model, params, this.astraRulesApply)) {
+    if (
+      shouldIncludeEncryptedReasoning(this.model, params, this.astraRulesApply)
+    ) {
       params.include = [
         ...new Set([
           ...(params.include ?? []),
@@ -3476,6 +3511,9 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
         data,
         defaultRole
       );
+      if ('usage' in messageChunk.response_metadata) {
+        delete messageChunk.response_metadata.usage;
+      }
       defaultRole = delta.role ?? defaultRole;
 
       if (typeof messageChunk.content !== 'string') {
