@@ -64,3 +64,66 @@ Local services that update their request also retain that state; the harness rec
 SDK session fields, including when execution fails. Remote adapters must deliver session updates
 before settling either a successful or failed invocation. This preserves lazy input provisioning
 and sandbox refresh semantics without copying request credentials or arbitrary configuration.
+
+## Host provider-text protection
+
+`createHostProviderTextService` and `createHostProviderTextProtection` connect the existing SDK
+provider-text release boundary to a host-owned policy. The host keeps classification, inspection,
+credentials, deadlines and aggregate raw-text budgets. The worker receives a versioned limits
+descriptor and an authenticated service implementation. The SDK's normal protected model path
+buffers each complete attempt and releases only the canonical text returned by the host; it does
+not issue an RPC per token.
+
+```typescript
+// Authenticated host: retain this service for the bound execution.
+const { descriptor, service } = createHostProviderTextService({
+  identity: authenticatedIdentity,
+  policy: hostProviderTextProtection,
+});
+
+// Worker: the transport forwards cancellation and maps typed policy errors.
+const providerTextProtection = createHostProviderTextProtection({
+  identity: authenticatedIdentity,
+  descriptor,
+  service: authenticatedPolicyTransport,
+});
+const run = await Run.create({ ...config, providerTextProtection });
+```
+
+Transport endpoints must validate the request shape, authenticate the connection, select its
+pre-bound service, enforce frame/queue limits, propagate invocation cancellation, and negotiate
+capability support before graph execution. Identity data is not authentication. Service calls
+reject a mismatch in any execution identity field before calling the host policy. Serialize only
+the policy error code (`ProviderTextProtectionError.code`); reconstruct that typed error on the
+caller, and sanitize all other failures. This SDK layer does not choose endpoints, authenticate
+connections, retry calls, or journal raw candidates. A transport must explicitly account for
+candidate retention in its own memory, persistence and tracing policy.
+
+Host limits are enforced even if a worker enlarges its local descriptor or calls the service
+directly. Bindings sharing one policy object share its host byte budget, including outstanding
+inspection that ignores cancellation. Timeout/cancellation can reject a request before an inspector
+settles; its budget remains charged until the inspector actually drains. Inspection statistics
+remain host-owned; the worker adapter records no additional replacements/categories.
+
+This protects the SDK provider-text output boundary only. Builder model selection, input/model
+callbacks, provider credentials, accounting, tracing/export policy and non-SDK model calls require
+their own adapters. A trusted custom graph must install the supplied policy on every applicable SDK
+Run; this service does not sandbox or attest arbitrary worker code. LibreChat's remote runtime does
+not automatically enable this service until its transport adapter and required policy negotiation
+are implemented. Existing unsupported-policy rejection must remain in place for those deployments.
+
+Absent `tenantId` and `conversationId` fields must be omitted (or `undefined` for direct calls);
+`null` is invalid and is never normalized to another identity. Tool and provider-text bindings use
+the same exported `snapshotExecutionIdentity` helper for identity validation and immutable snapshots.
+
+The policy-wide byte budget has no per-binding cap. Until per-binding admission is implemented,
+transports must limit concurrent inspections per binding and must not expose a shared policy to
+multiple tenants without that isolation. `timeoutMs` covers the whole model attempt on the worker,
+but starts a fresh inspection window on the host; it does not provide a separate, shorter host
+inspection deadline. Transports must supply that deadline before multi-tenant rollout.
+
+Before enabling a shared multi-tenant transport, add per-binding admission and an independent host
+inspection deadline. Further work includes visibility into cancelled inspections retaining budget,
+validation of transport-provided signals before attempt construction, and an explicitly versioned
+policy request/error contract for execution subjects, new targets and multiple SDK module copies.
+Do not free a cancelled inspector's budget solely because time elapsed while it still owns raw text.
