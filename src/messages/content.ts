@@ -2,6 +2,10 @@ import type {
   BaseMessage,
   MessageContentComplex,
 } from '@langchain/core/messages';
+import {
+  GEMINI_PARTS,
+  isGeminiReplayParts,
+} from '@/llm/google/utils/signatures';
 import { ContentTypes } from '@/common';
 import { cloneMessage } from './cache';
 
@@ -53,12 +57,16 @@ export const formatContentStrings = (
       continue;
     }
 
-    result.push(
-      cloneMessage(
-        message,
-        flattenLegacyContent(message.content as MessageContentComplex[])
-      )
-    );
+    const blocks = message.content as MessageContentComplex[];
+    const preserveNativeText =
+      message.getType() === 'ai' &&
+      isGeminiReplayParts(message.additional_kwargs[GEMINI_PARTS]);
+    const content = preserveNativeText
+      ? blocks
+        .map((block) => ('text' in block && typeof block.text === 'string' ? block.text : ''))
+        .join('')
+      : flattenLegacyContent(blocks);
+    result.push(cloneMessage(message, content));
   }
 
   return result;

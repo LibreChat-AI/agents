@@ -133,5 +133,14 @@ export type {
   ProviderTextProtectionErrorCode,
 } from './protection/providerText';
 
+export {
+  GEMINI_PARTS,
+  GEMINI_REPLAY_UNSUPPORTED,
+  captureGeminiReplayParts,
+  restoreGeminiReplayParts,
+  isGeminiReplayParts,
+} from './llm/google/utils/signatures';
+export type { GeminiReplayPart } from './llm/google/utils/signatures';
+
 /* Host execution harness */
 export * from './harness';
