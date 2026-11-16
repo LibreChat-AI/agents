@@ -2090,31 +2090,23 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
     options: this['ParsedCallOptions'],
     runManager?: CallbackManagerForLLMRun
   ): Promise<ChatResult> {
+    options.signal?.throwIfAborted();
+    const params = this.invocationParams(options);
     if (
+      params.stream !== true &&
       this.includeReasoningContent !== true &&
       this.includeReasoningDetails !== true
     ) {
       return super._generate(messages, options, runManager);
     }
 
-    options.signal?.throwIfAborted();
     const usageMetadata: Partial<UsageMetadata> = {};
-    const params = this.invocationParams(options);
-    const messagesMapped = _convertMessagesToOpenAIParams(
-      messages,
-      this.model,
-      {
-        includeReasoningContent: this.includeReasoningContent,
-        includeReasoningDetails: this.includeReasoningDetails,
-        convertReasoningDetailsToContent: this.convertReasoningDetailsToContent,
-        preserveToolCacheControl: this.preserveToolCacheControl,
-      }
-    );
-
     if (params.stream === true) {
       const stream = this._streamResponseChunks(messages, options, runManager);
       const finalChunks = new Map<number, ChatGenerationChunk>();
+      const seenScalarMetadata: SeenScalarMetadata = new Map();
       for await (const chunk of stream) {
+        dropRepeatedScalarMetadata(chunk, seenScalarMetadata);
         chunk.message.response_metadata = {
           ...chunk.generationInfo,
           ...chunk.message.response_metadata,
@@ -2156,6 +2148,16 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
       };
     }
 
+    const messagesMapped = _convertMessagesToOpenAIParams(
+      messages,
+      this.model,
+      {
+        includeReasoningContent: this.includeReasoningContent,
+        includeReasoningDetails: this.includeReasoningDetails,
+        convertReasoningDetailsToContent: this.convertReasoningDetailsToContent,
+        preserveToolCacheControl: this.preserveToolCacheControl,
+      }
+    );
     const data = await this.completionWithRetry(
       {
         ...params,
