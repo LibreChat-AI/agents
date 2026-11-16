@@ -1938,13 +1938,6 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         ? buildReferenceKey(batchIndex, turn)
         : undefined;
     /**
-     * Hoisted outside the try so the catch branch can append
-     * `[unresolved refs: …]` to error messages — otherwise the LLM
-     * only sees a generic error when it references a bad key, losing
-     * the self-correction signal this feature is meant to provide.
-     */
-    let unresolvedRefs: string[] = [];
-    /**
      * Use the caller-provided `batchScopeId` when threaded from
      * `run()` (so anonymous batches get their own unique scope).
      * Fall back to the config's `run_id` when runTool is invoked
@@ -1992,9 +1985,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       let args = call.args;
       if (resolveFn != null) {
         const resolution = batchContext.resolvedInput ?? resolveFn(runId, args);
-        const { resolved, unresolved } = resolution;
+        const { resolved } = resolution;
         args = resolved;
-        unresolvedRefs = unresolved;
         const referenceError = this.unresolvedReferenceMessage(
           call,
           resolution,
@@ -2141,30 +2133,17 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         }
         const isError = toolMsg.status === 'error';
         if (isError) {
-          /**
-           * Error ToolMessages bypass registration but still stamp the
-           * unresolved-refs hint into `additional_kwargs` so the lazy
-           * annotation transform surfaces it to the LLM, letting the
-           * model self-correct when its reference key caused the
-           * failure. Persisted `content` stays clean.
-           */
-          if (unresolvedRefs.length > 0) {
-            toolMsg.additional_kwargs = {
-              ...toolMsg.additional_kwargs,
-              _unresolvedRefs: unresolvedRefs,
-            };
-          }
+          /** Error ToolMessages are never registered under a reference key. */
           return toolMsg;
         }
-        if (this.toolOutputRegistry != null || unresolvedRefs.length > 0) {
+        if (this.toolOutputRegistry != null) {
           if (typeof originalContent === 'string') {
             const rawContent = originalContent;
             const registryContent = stripCodeSessionFileSummary(rawContent);
             const refMeta = this.recordOutputReference(
               runId,
               registryContent,
-              refKey,
-              unresolvedRefs
+              refKey
             );
             if (refMeta != null) {
               toolMsg.additional_kwargs = {
@@ -2178,20 +2157,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
              * image). It is now bounded for the LLM, but cannot register under a
              * reference key because there's no canonical serialized
              * form. Warn once per tool per run when the caller
-             * intended to register. The unresolved-refs hint is still
-             * stamped as metadata; the lazy transform prepends a text
-             * block at request time so the LLM gets the self-correction
-             * signal.
+             * intended to register.
              */
-            if (unresolvedRefs.length > 0) {
-              toolMsg.additional_kwargs = {
-                ...toolMsg.additional_kwargs,
-                _unresolvedRefs: unresolvedRefs,
-              };
-            }
             if (
               refKey != null &&
-              this.toolOutputRegistry!.claimWarnOnce(runId, call.name)
+              this.toolOutputRegistry.claimWarnOnce(runId, call.name)
             ) {
               // eslint-disable-next-line no-console
               console.warn(
@@ -2213,8 +2183,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       const refMeta = this.recordOutputReference(
         runId,
         stripCodeSessionFileSummary(serialized.registryContent),
-        refKey,
-        unresolvedRefs
+        refKey
       );
       return new ToolMessage({
         status: 'success',
@@ -2315,23 +2284,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         config.signal,
         e
       );
-      const refMeta =
-        unresolvedRefs.length > 0
-          ? this.recordOutputReference(
-            runId,
-            errorContent,
-            undefined,
-            unresolvedRefs
-          )
-          : undefined;
       return new ToolMessage({
         status: 'error',
         content: errorContent,
         name: call.name,
         tool_call_id: call.id ?? '',
-        ...(refMeta != null && {
-          additional_kwargs: refMeta as Record<string, unknown>,
-        }),
       });
     }
   }
@@ -2860,9 +2817,6 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             preResult.decision === 'ask'
               ? preResult.reason
               : reviewedApproval?.request.description;
-          if (effectiveCall === call) {
-            effectiveCall = { ...call, args: resolvedArgs };
-          }
           const askEntry: AskEntry = {
             entry: {
               call: effectiveCall,
@@ -3045,16 +2999,13 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     }
 
     /**
-     * A hook (`PreToolUse.updatedInput`) or HITL `edit` decision rewrote the
-     * args: expose the EFFECTIVE args to downstream completion handling
-     * (`handleRunToolCompletions` reads this sink), so the emitted
-     * `tool_call.args` — and any intent/outcome label resolved from them —
-     * reflect what the tool actually ran with. `runTool`'s own placeholder
-     * substitution may overwrite this entry with the post-substitution args,
-     * which is strictly more accurate.
+     * Expose the EFFECTIVE args (references substituted, plus any
+     * `PreToolUse.updatedInput` or HITL `edit` rewrite) to downstream
+     * completion handling (`handleRunToolCompletions` reads this sink), so
+     * the emitted `tool_call.args` — and any intent/outcome label resolved
+     * from them — reflect what the tool actually ran with.
      */
     if (
-      effectiveCall !== call &&
       batchContext.resolvedArgsByCallId != null &&
       call.id != null &&
       call.id !== ''
@@ -3285,37 +3236,28 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
    * @param refKey  Precomputed `tool<i>turn<n>` key, or undefined when
    *   the output is not to be registered (errors, disabled feature,
    *   unavailable batch/turn).
-   * @param unresolved  Placeholder keys that did not resolve; surfaced
-   *   to the LLM lazily so it can self-correct.
-   * @returns A `ToolMessageRefMetadata` object when there is anything
-   *   to stamp, otherwise `undefined`.
+   * @returns A `ToolMessageRefMetadata` object when the output was
+   *   registered, otherwise `undefined`.
    */
   private recordOutputReference(
     runId: string | undefined,
     registryContent: string,
-    refKey: string | undefined,
-    unresolved: string[]
+    refKey: string | undefined
   ): t.ToolMessageRefMetadata | undefined {
-    if (this.toolOutputRegistry != null && refKey != null) {
-      this.toolOutputRegistry.set(runId, refKey, registryContent);
-    }
-    if (refKey == null && unresolved.length === 0) return undefined;
-    const meta: t.ToolMessageRefMetadata = {};
-    if (refKey != null) {
-      meta._refKey = refKey;
-      /**
-       * Stamp the registry scope alongside the key so the lazy
-       * annotation transform can look up the right bucket. Anonymous
-       * invocations get a synthetic per-batch scope (`\0anon-<n>`)
-       * that `attemptInvoke` cannot derive from
-       * `config.configurable.run_id` — without this, anonymous-run
-       * refs would silently fail registry lookup and the LLM would
-       * never see `[ref: …]` markers for outputs that were registered.
-       */
-      if (runId != null) meta._refScope = runId;
-    }
-    if (unresolved.length > 0) meta._unresolvedRefs = unresolved;
-    return meta;
+    if (refKey == null) return undefined;
+    this.toolOutputRegistry?.set(runId, refKey, registryContent);
+    /**
+     * Stamp the registry scope alongside the key so the lazy
+     * annotation transform can look up the right bucket. Anonymous
+     * invocations get a synthetic per-batch scope (`\0anon-<n>`)
+     * that `attemptInvoke` cannot derive from
+     * `config.configurable.run_id` — without this, anonymous-run
+     * refs would silently fail registry lookup and the LLM would
+     * never see `[ref: …]` markers for outputs that were registered.
+     */
+    return runId == null
+      ? { _refKey: refKey }
+      : { _refKey: refKey, _refScope: runId };
   }
 
   /**
@@ -4108,9 +4050,6 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
                 entry.call.name,
                 reviewed.request.arguments
               );
-              if (entry.call.id != null) {
-                unresolvedByCallId.delete(entry.call.id);
-              }
             }
           }
           askEntries.push({
@@ -4135,9 +4074,6 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               entry.call.name,
               reviewedApproval.request.arguments
             );
-            if (entry.call.id != null) {
-              unresolvedByCallId.delete(entry.call.id);
-            }
           }
           askEntries.push({
             entry,
@@ -4785,31 +4721,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             this.maxToolResultChars,
             config.signal
           );
-          /**
-           * Error results bypass registration but stamp the
-           * unresolved-refs hint into `additional_kwargs` so the lazy
-           * annotation transform surfaces it to the LLM at request
-           * time, letting the model self-correct when its reference
-           * key caused the failure. Persisted `content` stays clean.
-           */
-          const unresolved = unresolvedByCallId.get(result.toolCallId) ?? [];
-          const errorRefMeta =
-            unresolved.length > 0
-              ? this.recordOutputReference(
-                registryRunId,
-                contentString,
-                undefined,
-                unresolved
-              )
-              : undefined;
+          /** Error results are never registered under a reference key. */
           toolMessage = new ToolMessage({
             status: 'error',
             content: contentString,
             name: toolName,
             tool_call_id: result.toolCallId,
-            ...(errorRefMeta != null && {
-              additional_kwargs: errorRefMeta as Record<string, unknown>,
-            }),
           });
 
           if (hasFailureHook) {
@@ -4913,12 +4830,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             }
           }
 
-          const unresolved = unresolvedByCallId.get(result.toolCallId) ?? [];
           const successRefMeta = this.recordOutputReference(
             registryRunId,
             stripCodeSessionFileSummary(registryRaw),
-            refKey,
-            unresolved
+            refKey
           );
 
           toolMessage = new ToolMessage({
