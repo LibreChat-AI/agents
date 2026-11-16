@@ -82,10 +82,7 @@ function createModel(usageLocation: 'tail' | 'choice'): AzureChatOpenAI {
     azureOpenAIApiInstanceName: 'offline-instance',
     azureOpenAIApiDeploymentName: 'offline-deployment',
     azureOpenAIApiVersion: '2024-08-01-preview',
-    model: 'gpt-4o',
-    useResponsesApi: false,
     _lc_stream_delay: 0,
-    maxRetries: 0,
   });
   model.setStream(chunks);
   return model;
@@ -93,9 +90,9 @@ function createModel(usageLocation: 'tail' | 'choice'): AzureChatOpenAI {
 
 function expectUsage(message: BaseMessage | undefined): void {
   expect(message?.content).toBe('Hi');
-  expect(message?.response_metadata.usage).toEqual(usage);
-  expect(isAIMessage(message!)).toBe(true);
+  expect(message != null && isAIMessage(message)).toBe(true);
   if (message == null || !isAIMessage(message)) return;
+  expect(message.response_metadata.usage).toEqual(usage);
   expect(message.usage_metadata).toMatchObject({
     input_tokens: 21,
     output_tokens: 39,

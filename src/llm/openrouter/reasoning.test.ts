@@ -1,5 +1,7 @@
+import { concat } from '@langchain/core/utils/stream';
 import { tools as openAITools } from '@langchain/openai';
 import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
+import type { AIMessageChunk } from '@langchain/core/messages';
 import type { OpenAIChatInput } from '@langchain/openai';
 import type { OpenRouterReasoning, ChatOpenRouterCallOptions } from './index';
 import type { GraphTools } from '@/types';
@@ -620,10 +622,14 @@ describe('ChatOpenRouter Responses prompt caching', () => {
       },
     });
 
-    const result = await router.invoke([new HumanMessage('hi')]);
-    expect(result.response_metadata.provider).toBe('Google');
-    expect(result.response_metadata.usage).toEqual(usage);
-    expect(result.usage_metadata).toMatchObject({
+    const stream = await router.stream([new HumanMessage('hi')]);
+    let result: AIMessageChunk | undefined;
+    for await (const chunk of stream) {
+      result = result == null ? chunk : concat(result, chunk);
+    }
+    expect(result?.response_metadata.provider).toBe('Google');
+    expect(result?.response_metadata.usage).toEqual(usage);
+    expect(result?.usage_metadata).toMatchObject({
       input_tokens: 21,
       output_tokens: 39,
       total_tokens: 60,
