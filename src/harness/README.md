@@ -111,3 +111,19 @@ their own adapters. A trusted custom graph must install the supplied policy on e
 Run; this service does not sandbox or attest arbitrary worker code. LibreChat's remote runtime does
 not automatically enable this service until its transport adapter and required policy negotiation
 are implemented. Existing unsupported-policy rejection must remain in place for those deployments.
+
+Absent `tenantId` and `conversationId` fields must be omitted (or `undefined` for direct calls);
+`null` is invalid and is never normalized to another identity. Tool and provider-text bindings use
+the same exported `snapshotExecutionIdentity` helper for identity validation and immutable snapshots.
+
+The policy-wide byte budget has no per-binding cap. Until per-binding admission is implemented,
+transports must limit concurrent inspections per binding and must not expose a shared policy to
+multiple tenants without that isolation. `timeoutMs` covers the whole model attempt on the worker,
+but starts a fresh inspection window on the host; it does not provide a separate, shorter host
+inspection deadline. Transports must supply that deadline before multi-tenant rollout.
+
+Before enabling a shared multi-tenant transport, add per-binding admission and an independent host
+inspection deadline. Further work includes visibility into cancelled inspections retaining budget,
+validation of transport-provided signals before attempt construction, and an explicitly versioned
+policy request/error contract for execution subjects, new targets and multiple SDK module copies.
+Do not free a cancelled inspector's budget solely because time elapsed while it still owns raw text.

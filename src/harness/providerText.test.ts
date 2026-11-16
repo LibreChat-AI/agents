@@ -316,3 +316,101 @@ it('times out an unavailable host inspector without releasing any candidate text
     clearTimeout(timer);
   }
 });
+
+it.each([
+  null,
+  {},
+  { version: 1, content: 'x' },
+  { version: 1, content: 'x', identity: null },
+  { version: 2, identity, content: 'x' },
+  { version: '1', identity, content: 'x' },
+  { version: 1, identity, content: 42 },
+  { version: 1, identity: { ...identity, tenantId: null }, content: 'x' },
+])(
+  'rejects malformed request %j with a typed contract failure',
+  async (input) => {
+    const inspect = jest.fn(policy().inspect);
+    const bound = createHostProviderTextService({
+      identity,
+      policy: policy({ inspect }),
+    });
+    // Model deserialized input at a transport boundary, before its own schema checks.
+    const request = JSON.parse(JSON.stringify(input)) as Parameters<
+      typeof bound.service.inspect
+    >[0];
+    await expect(bound.service.inspect(request)).rejects.toBeInstanceOf(
+      ProviderTextProtectionError
+    );
+    await expect(bound.service.inspect(request)).rejects.toMatchObject({
+      code: 'incompatible',
+    });
+    expect(inspect).not.toHaveBeenCalled();
+  }
+);
+
+it.each(['service', 'descriptor'] as const)(
+  'rejects incompatible %s versions at worker binding',
+  (field) => {
+    const bound = createHostProviderTextService({ identity, policy: policy() });
+    for (const version of [0, 2, '1', null]) {
+      const options = JSON.parse(
+        JSON.stringify({ identity, descriptor: bound.descriptor })
+      ) as { identity: typeof identity; descriptor: typeof bound.descriptor };
+      const changed = JSON.parse(JSON.stringify({ version })) as { version: 1 };
+      expect(() =>
+        createHostProviderTextProtection({
+          ...options,
+          descriptor:
+            field === 'descriptor'
+              ? { ...options.descriptor, ...changed }
+              : options.descriptor,
+          service: {
+            ...bound.service,
+            ...(field === 'service' ? changed : {}),
+          },
+        })
+      ).toThrow(ProviderTextProtectionError);
+    }
+  }
+);
+
+it('forwards worker attempt cancellation to the service and discards a late reply', async () => {
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let started!: () => void;
+  const ready = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  let serviceSignal: AbortSignal | undefined;
+  const bound = createHostProviderTextService({ identity, policy: policy() });
+  const worker = createHostProviderTextProtection({
+    identity,
+    descriptor: bound.descriptor,
+    service: {
+      version: 1,
+      inspect: async (_request, signal) => {
+        serviceSignal = signal;
+        started();
+        await held;
+        return 'late PRIVATE';
+      },
+    },
+  });
+  const controller = new AbortController();
+  const attempt = new ProviderTextAttempt(worker, controller.signal);
+  try {
+    attempt.append('PRIVATE');
+    const result = attempt.release();
+    const rejected = result.catch((error: Error) => error);
+    await ready;
+    expect(serviceSignal).toBe(attempt.signal);
+    controller.abort();
+    expect(serviceSignal?.aborted).toBe(true);
+    expect(await rejected).toMatchObject({ code: 'cancelled' });
+  } finally {
+    release();
+    attempt.finish();
+  }
+});

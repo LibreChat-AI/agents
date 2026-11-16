@@ -1,10 +1,16 @@
+import { z } from 'zod';
 import type { ProviderTextProtection } from '@/protection/providerText';
-import type { ExecutionIdentity } from './index';
+import type { ExecutionIdentity } from './identity';
 import {
   ProviderTextAttempt,
   ProviderTextProtectionError,
   validateProviderTextProtection,
 } from '@/protection/providerText';
+import {
+  executionIdentitySchema,
+  snapshotExecutionIdentity,
+  matchesExecutionIdentity,
+} from './identity';
 
 /** Host-owned limits, negotiated before executing a graph. Contains no credentials or callbacks. */
 export type HostProviderTextDescriptor = Pick<
@@ -27,30 +33,20 @@ export interface HostProviderTextService {
   ): Promise<string>;
 }
 
-const identityKeys = [
-  'runtimeId',
-  'agentId',
-  'runId',
-  'userId',
-  'tenantId',
-  'conversationId',
-] as const;
+const requestSchema = z.object({
+  version: z.literal(1),
+  content: z.string(),
+  identity: executionIdentitySchema,
+});
 
 function boundIdentity(
   source: Readonly<ExecutionIdentity>
 ): Readonly<ExecutionIdentity> {
-  for (const key of ['runtimeId', 'agentId', 'runId', 'userId'] as const) {
-    if (typeof source[key] !== 'string' || !source[key].trim())
-      throw new ProviderTextProtectionError('incompatible');
+  try {
+    return snapshotExecutionIdentity(source);
+  } catch {
+    throw new ProviderTextProtectionError('incompatible');
   }
-  return Object.freeze({
-    runtimeId: source.runtimeId,
-    agentId: source.agentId,
-    runId: source.runId,
-    userId: source.userId,
-    tenantId: source.tenantId,
-    conversationId: source.conversationId,
-  });
 }
 
 /** Classification, inspection, deadlines and shared raw-text budgets remain authoritative on the host. */
@@ -74,16 +70,15 @@ export function createHostProviderTextService(options: {
     service: {
       version: 1,
       inspect: async (request, signal): Promise<string> => {
-        const version: number = request.version;
+        const parsed = requestSchema.safeParse(request);
         if (
-          version !== 1 ||
-          typeof request.content !== 'string' ||
-          identityKeys.some((key) => request.identity[key] !== identity[key])
+          !parsed.success ||
+          !matchesExecutionIdentity(parsed.data.identity, identity)
         )
           throw new ProviderTextProtectionError('incompatible');
         const attempt = new ProviderTextAttempt(policy, signal);
         try {
-          attempt.append(request.content);
+          attempt.append(parsed.data.content);
           return await attempt.release();
         } finally {
           attempt.finish();
@@ -117,19 +112,10 @@ export function createHostProviderTextProtection(options: {
     // The synchronous SDK classification gate defers to authoritative host classification.
     classify: () => 'prose',
     inspect: async ({ content, signal }) => {
-      let canonical: string;
-      try {
-        canonical = await service.inspect(
-          { version: 1, identity, content },
-          signal
-        );
-      } catch (error) {
-        if (error instanceof ProviderTextProtectionError) throw error;
-        throw new ProviderTextProtectionError('unavailable');
-      }
-      signal.throwIfAborted();
-      if (typeof canonical !== 'string')
-        throw new ProviderTextProtectionError('incompatible');
+      const canonical = await service.inspect(
+        { version: 1, identity, content },
+        signal
+      );
       return {
         version: 1,
         ok: true,
