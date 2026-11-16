@@ -71,7 +71,7 @@ export function dropRepeatedScalarMetadata(
     if (
       field === 'usage' &&
       (!inGenerationInfo ||
-        Object.keys(generationInfo?.usage ?? {}).length === 0) &&
+        Object.keys(generationInfo.usage ?? {}).length === 0) &&
       (!inResponseMetadata ||
         Object.keys(responseMetadata.usage ?? {}).length === 0)
     ) {
