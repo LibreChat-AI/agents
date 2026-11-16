@@ -10,7 +10,9 @@
  * Subsequent tool calls can pipe a previous output into their args by
  * embedding `{{tool<idx>turn<turn>}}` inside any string argument;
  * {@link ToolOutputReferenceRegistry.resolve} walks the args and
- * substitutes the placeholders immediately before invocation.
+ * substitutes the placeholders immediately before invocation. A backslash
+ * before a placeholder escapes it: the backslash is removed and the literal
+ * placeholder is passed through without a registry lookup.
  *
  * The registry stores the *raw, untruncated* tool output so a later
  * `{{…}}` substitution pipes the full payload into the next tool —
@@ -118,6 +120,7 @@ export type ResolveResult<T> = {
  * point in time, ignoring any subsequent registrations.
  */
 export interface ToolOutputResolveView {
+  readonly availableKeys?: readonly string[];
   resolve<T>(args: T, options?: ResolveOptions): ResolveResult<T>;
 }
 
@@ -130,6 +133,8 @@ export interface ToolOutputResolveView {
  */
 export type ResolveOptions = {
   substituteIntentKey?: boolean;
+  /** Detached pre-editor input; unchanged string leaves stay literal. */
+  previouslyResolved?: Record<string, unknown> | string;
 };
 
 /**
@@ -151,6 +156,9 @@ export type PreResolvedArgsMap = Map<
 export type ResolvedArgsByCallId = Map<string, Record<string, unknown>>;
 
 const EMPTY_ENTRIES: ReadonlyMap<string, string> = new Map<string, string>();
+
+/** Keys a snapshot offers as a correction hint for an unknown reference. */
+const AVAILABLE_KEY_HINT_LIMIT = 10;
 
 /**
  * Per-run state bucket held inside the registry. Each distinct
@@ -200,7 +208,7 @@ export class ToolOutputReferenceRegistry {
    * off-module so callers of the exported `TOOL_OUTPUT_REF_PATTERN`
    * never see a stale `lastIndex`.
    */
-  private static readonly PLACEHOLDER_MATCHER = /\{\{(tool\d+turn\d+)\}\}/g;
+  private static readonly PLACEHOLDER_MATCHER = /\\?\{\{(tool\d+turn\d+)\}\}/g;
 
   constructor(options: ToolOutputReferenceRegistryOptions = {}) {
     /**
@@ -378,7 +386,7 @@ export class ToolOutputReferenceRegistry {
     args: T,
     options?: ResolveOptions
   ): ResolveResult<T> {
-    if (!hasAnyPlaceholder(args)) {
+    if (options?.previouslyResolved == null && !hasAnyPlaceholder(args)) {
       return { resolved: args, unresolved: [] };
     }
     const bucket = this.runStates.get(this.keyFor(runId));
@@ -402,6 +410,10 @@ export class ToolOutputReferenceRegistry {
       ? new Map(bucket.entries)
       : EMPTY_ENTRIES;
     return {
+      /** Newest registrations: the key a model mistyped is usually recent. */
+      get availableKeys(): readonly string[] {
+        return [...entries.keys()].slice(-AVAILABLE_KEY_HINT_LIMIT);
+      },
       resolve: <T>(args: T, options?: ResolveOptions): ResolveResult<T> =>
         this.resolveAgainst(entries, args, options),
     };
@@ -421,7 +433,10 @@ export class ToolOutputReferenceRegistry {
   }
 
   /** Restore batch inputs without rolling back graph-owned concurrent outputs. */
-  resumeBatch(runId: string, state: ToolOutputReferenceState): ToolOutputResolveView {
+  resumeBatch(
+    runId: string,
+    state: ToolOutputReferenceState
+  ): ToolOutputResolveView {
     if (!this.runStates.has(runId)) {
       this.restoreState(runId, state);
     }
@@ -457,24 +472,26 @@ export class ToolOutputReferenceRegistry {
     args: T,
     options?: ResolveOptions
   ): ResolveResult<T> {
-    if (!hasAnyPlaceholder(args)) {
+    if (options?.previouslyResolved == null && !hasAnyPlaceholder(args)) {
       return { resolved: args, unresolved: [] };
     }
     const exemptIntentKey = options?.substituteIntentKey !== true;
     const unresolved = new Set<string>();
-    /**
-     * Providers may deliver the args OBJECT as a JSON string. A plain
-     * string-root transform would expand placeholders inside the `intent`
-     * label too, bypassing the top-level exclusion below — parse, transform
-     * key-aware, and re-serialize so the label stays verbatim while every
-     * other field still substitutes. Only taken when an `intent` key is
-     * actually present; other strings keep the fast raw-string path.
-     */
-    if (exemptIntentKey && typeof args === 'string') {
+    /** Parse object-shaped provider args before substitution so keys, intent
+     * labels and JSON escaping obey the same contract as object inputs. */
+    if (typeof args === 'string') {
       const parsedRoot = parseStringifiedArgsObject(args);
-      if (parsedRoot != null && INTENT_ARG in parsedRoot) {
+      if (parsedRoot != null) {
         const resolved = JSON.stringify(
-          this.transform(entries, parsedRoot, unresolved, true)
+          this.transform(
+            entries,
+            parsedRoot,
+            unresolved,
+            exemptIntentKey,
+            typeof options?.previouslyResolved === 'string'
+              ? parseStringifiedArgsObject(options.previouslyResolved)
+              : options?.previouslyResolved
+          )
         ) as T;
         return { resolved, unresolved: Array.from(unresolved) };
       }
@@ -483,7 +500,8 @@ export class ToolOutputReferenceRegistry {
       entries,
       args,
       unresolved,
-      exemptIntentKey
+      exemptIntentKey,
+      options?.previouslyResolved
     ) as T;
     return { resolved, unresolved: Array.from(unresolved) };
   }
@@ -492,13 +510,25 @@ export class ToolOutputReferenceRegistry {
     entries: ReadonlyMap<string, string>,
     value: unknown,
     unresolved: Set<string>,
-    exemptRootIntent = false
+    exemptRootIntent = false,
+    previouslyResolved?: unknown
   ): unknown {
     if (typeof value === 'string') {
+      if (value === previouslyResolved) return value;
       return this.replaceInString(entries, value, unresolved);
     }
     if (Array.isArray(value)) {
-      return value.map((item) => this.transform(entries, item, unresolved));
+      return value.map((item, index) =>
+        this.transform(
+          entries,
+          item,
+          unresolved,
+          false,
+          Array.isArray(previouslyResolved)
+            ? previouslyResolved[index]
+            : undefined
+        )
+      );
     }
     if (value !== null && typeof value === 'object') {
       const source = value as Record<string, unknown>;
@@ -513,7 +543,16 @@ export class ToolOutputReferenceRegistry {
         next[key] =
           exemptRootIntent && key === INTENT_ARG
             ? item
-            : this.transform(entries, item, unresolved);
+            : this.transform(
+              entries,
+              item,
+              unresolved,
+              false,
+              previouslyResolved != null &&
+                  typeof previouslyResolved === 'object'
+                ? (previouslyResolved as Record<string, unknown>)[key]
+                : undefined
+            );
       }
       return next;
     }
@@ -531,6 +570,9 @@ export class ToolOutputReferenceRegistry {
     return input.replace(
       ToolOutputReferenceRegistry.PLACEHOLDER_MATCHER,
       (match, key: string) => {
+        if (match.startsWith('\\')) {
+          return match.slice(1);
+        }
         const stored = entries.get(key);
         if (stored == null) {
           unresolved.add(key);
@@ -585,6 +627,15 @@ function hasAnyPlaceholder(value: unknown): boolean {
     return false;
   }
   return false;
+}
+
+const EMPTY_RESOLVED_ARGS: Record<string, unknown> = Object.freeze({});
+
+/** Detached editor baseline; reference-free inputs need no retained values. */
+export function snapshotResolvedArgs(
+  args: Record<string, unknown>
+): Record<string, unknown> {
+  return hasAnyPlaceholder(args) ? structuredClone(args) : EMPTY_RESOLVED_ARGS;
 }
 
 /**
