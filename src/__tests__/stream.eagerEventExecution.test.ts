@@ -4207,7 +4207,7 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
     ]);
   });
 
-  it('does not prestart streamed code tools whose args contain output references', async () => {
+  it.each(['tool0turn0', 'tool7turn9'])('does not prestart streamed code tools with reference %s', async (key) => {
     const graph = createGraph({
       toolOutputReferences: { enabled: true },
       getAgentContext: jest.fn(
@@ -4236,7 +4236,7 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
             {
               id: 'toolu_ref',
               name: Constants.BASH_TOOL,
-              args: '{"command":"cat <<EOF\\n{{tool0turn0}}\\nEOF"}',
+              args: JSON.stringify({ command: `cat <<EOF\n{{${key}}}\nEOF` }),
               index: 2,
             },
           ],

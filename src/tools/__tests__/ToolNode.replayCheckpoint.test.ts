@@ -53,7 +53,7 @@ describe('ToolNode checkpoint authority', () => {
     const registry = new ToolOutputReferenceRegistry();
     const config = { configurable: { thread_id: 'checkpoint-replay', run_id: 'shared' } };
     const input = { messages: [new AIMessage({ id: 'batch', content: '', tool_calls: [
-      { id: 'work', name: 'work', args: { value: '{{tool0turn1}}' } },
+      { id: 'work', name: 'work', args: { value: '\\{{tool0turn1}}' } },
     ] })] };
     const paused = capturePause(new ToolNode({ tools: [work], toolOutputRegistry: registry }), input, config);
     await new ToolNode({ tools: [sibling], toolOutputRegistry: registry }).invoke({ messages: [new AIMessage({ content: '', tool_calls: [
@@ -215,7 +215,7 @@ describe('ToolNode checkpoint authority', () => {
               {
                 id: 'pending',
                 name: 'work',
-                args: { value: '{{tool0turn1}}', pause: true },
+                args: { value: '{{tool0turn0}}', pause: true },
               },
             ],
           }),
@@ -240,7 +240,7 @@ describe('ToolNode checkpoint authority', () => {
       expect(registry.get(scope, 'tool0turn0')).toBe('old-value');
       expect(pending.additional_kwargs._refKey).not.toBe('tool0turn0');
       expect(pending.additional_kwargs._refKey).toBe('tool1turn1');
-      expect(pending.content).toBe('{{tool0turn1}}');
+      expect(pending.content).toBe('old-value');
       expect(completed.additional_kwargs._refScope).toBe(scope);
       expect(
         annotateMessagesForLLM([completed], registry, resumedRunId)[0].content
