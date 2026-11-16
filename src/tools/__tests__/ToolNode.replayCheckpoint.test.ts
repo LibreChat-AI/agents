@@ -38,64 +38,157 @@ function replayConfig(payload: unknown): RunnableConfig {
 }
 
 describe('ToolNode checkpoint authority', () => {
-  it.each([false, true])('keeps concurrently checkpointed references while replaying its frozen inputs (claimed=%s)', async (claimed) => {
-    let release: () => void = () => { throw new Error('not initialized'); };
-    const barrier = new Promise<void>((resolve) => { release = resolve; });
-    let shouldPause = true;
-    const work = tool(async ({ value }) => {
-      if (shouldPause) {
-        await barrier;
-        throw new GraphInterrupt([{ id: 'pause', value: 'confirm' }]);
-      }
-      return value;
-    }, { name: 'work', description: 'work', schema: z.object({ value: z.string() }) });
-    const sibling = tool(async () => 'sibling-result', { name: 'sibling', description: 'sibling', schema: z.object({}) });
-    const registry = new ToolOutputReferenceRegistry();
-    const config = { configurable: { thread_id: 'checkpoint-replay', run_id: 'shared' } };
-    const input = { messages: [new AIMessage({ id: 'batch', content: '', tool_calls: [
-      { id: 'work', name: 'work', args: { value: '\\{{tool0turn1}}' } },
-    ] })] };
-    const paused = capturePause(new ToolNode({ tools: [work], toolOutputRegistry: registry }), input, config);
-    await new ToolNode({ tools: [sibling], toolOutputRegistry: registry }).invoke({ messages: [new AIMessage({ content: '', tool_calls: [
-      { id: 'sibling', name: 'sibling', args: {} },
-    ] })] }, config);
-    release();
-    const checkpoint = await paused;
-    const sharedState = registry.snapshotState('shared');
-    expect(sharedState.turnCounter).toBe(2);
-    const restoredRegistry = new ToolOutputReferenceRegistry();
-    restoredRegistry.restoreState('shared', sharedState);
-    const resume = replayConfig(checkpoint);
-    resume.configurable = { ...resume.configurable, run_id: 'shared' };
-    shouldPause = false;
-    const result = await new ToolNode({ tools: [work], toolOutputRegistry: restoredRegistry, onToolCallsClaimed: claimed ? async () => { await Promise.resolve(); } : undefined }).invoke(input, resume) as { messages: ToolMessage[] };
-    expect(result.messages[0].content).toBe('{{tool0turn1}}');
-    expect(restoredRegistry.get('shared', 'tool0turn1')).toBe('sibling-result');
-    expect(restoredRegistry.nextTurn('shared')).toBe(2);
-  });
+  it.each([false, true])(
+    'keeps concurrently checkpointed references while replaying its frozen inputs (claimed=%s)',
+    async (claimed) => {
+      let release: () => void = () => {
+        throw new Error('not initialized');
+      };
+      const barrier = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let shouldPause = true;
+      const work = tool(
+        async ({ value }) => {
+          if (shouldPause) {
+            await barrier;
+            throw new GraphInterrupt([{ id: 'pause', value: 'confirm' }]);
+          }
+          return value;
+        },
+        {
+          name: 'work',
+          description: 'work',
+          schema: z.object({ value: z.string() }),
+        }
+      );
+      const sibling = tool(async () => 'sibling-result', {
+        name: 'sibling',
+        description: 'sibling',
+        schema: z.object({}),
+      });
+      const registry = new ToolOutputReferenceRegistry();
+      const config = {
+        configurable: { thread_id: 'checkpoint-replay', run_id: 'shared' },
+      };
+      const input = {
+        messages: [
+          new AIMessage({
+            id: 'batch',
+            content: '',
+            tool_calls: [
+              { id: 'work', name: 'work', args: { value: '\\{{tool0turn1}}' } },
+            ],
+          }),
+        ],
+      };
+      const paused = capturePause(
+        new ToolNode({ tools: [work], toolOutputRegistry: registry }),
+        input,
+        config
+      );
+      await new ToolNode({
+        tools: [sibling],
+        toolOutputRegistry: registry,
+      }).invoke(
+        {
+          messages: [
+            new AIMessage({
+              content: '',
+              tool_calls: [{ id: 'sibling', name: 'sibling', args: {} }],
+            }),
+          ],
+        },
+        config
+      );
+      release();
+      const checkpoint = await paused;
+      const sharedState = registry.snapshotState('shared');
+      expect(sharedState.turnCounter).toBe(2);
+      const restoredRegistry = new ToolOutputReferenceRegistry();
+      restoredRegistry.restoreState('shared', sharedState);
+      const resume = replayConfig(checkpoint);
+      resume.configurable = { ...resume.configurable, run_id: 'shared' };
+      shouldPause = false;
+      const result = (await new ToolNode({
+        tools: [work],
+        toolOutputRegistry: restoredRegistry,
+        onToolCallsClaimed: claimed
+          ? async () => {
+            await Promise.resolve();
+          }
+          : undefined,
+      }).invoke(input, resume)) as { messages: ToolMessage[] };
+      expect(result.messages[0].content).toBe('{{tool0turn1}}');
+      expect(restoredRegistry.get('shared', 'tool0turn1')).toBe(
+        'sibling-result'
+      );
+      expect(restoredRegistry.nextTurn('shared')).toBe(2);
+    }
+  );
 
-  it.each([undefined, ''])('restores an ID-less completed sibling (%j) without repeating it', async (id) => {
-    let executions = 0;
-    let shouldPause = true;
-    const work = tool(async () => { executions += 1; return `result-${executions}`; }, { name: 'work', description: 'work', schema: z.object({}) });
-    const pause = tool(async () => {
-      if (shouldPause) throw new GraphInterrupt([{ id: 'pause', value: 'confirm' }]);
-      return 'resumed';
-    }, { name: 'pause', description: 'pause', schema: z.object({}) });
-    const alreadyDone = tool(async () => 'done', { name: 'done', description: 'done', schema: z.object({}) });
-    const input = { messages: [new AIMessage({ id: 'batch', content: '', tool_calls: [
-      { id: 'done', name: 'done', args: {} }, { id, name: 'work', args: {} }, { id, name: 'work', args: {} }, { id: 'pause', name: 'pause', args: {} },
-    ] })] };
-    const checkpoint = await capturePause(new ToolNode({ tools: [work, pause, alreadyDone] }), input, { configurable: { thread_id: 'checkpoint-replay' } });
-    expect(executions).toBe(2);
-    shouldPause = false;
-    const result = await new ToolNode({ tools: [work, pause, alreadyDone] }).invoke({ messages: [
-      ...input.messages, new ToolMessage({ tool_call_id: 'done', content: 'done' }),
-    ] }, replayConfig(checkpoint));
-    expect(executions).toBe(2);
-    expect(JSON.stringify(result)).toContain('result-1');
-    expect(JSON.stringify(result)).toContain('result-2');
-  });
+  it.each([undefined, ''])(
+    'restores an ID-less completed sibling (%j) without repeating it',
+    async (id) => {
+      let executions = 0;
+      let shouldPause = true;
+      const work = tool(
+        async () => {
+          executions += 1;
+          return `result-${executions}`;
+        },
+        { name: 'work', description: 'work', schema: z.object({}) }
+      );
+      const pause = tool(
+        async () => {
+          if (shouldPause)
+            throw new GraphInterrupt([{ id: 'pause', value: 'confirm' }]);
+          return 'resumed';
+        },
+        { name: 'pause', description: 'pause', schema: z.object({}) }
+      );
+      const alreadyDone = tool(async () => 'done', {
+        name: 'done',
+        description: 'done',
+        schema: z.object({}),
+      });
+      const input = {
+        messages: [
+          new AIMessage({
+            id: 'batch',
+            content: '',
+            tool_calls: [
+              { id: 'done', name: 'done', args: {} },
+              { id, name: 'work', args: {} },
+              { id, name: 'work', args: {} },
+              { id: 'pause', name: 'pause', args: {} },
+            ],
+          }),
+        ],
+      };
+      const checkpoint = await capturePause(
+        new ToolNode({ tools: [work, pause, alreadyDone] }),
+        input,
+        { configurable: { thread_id: 'checkpoint-replay' } }
+      );
+      expect(executions).toBe(2);
+      shouldPause = false;
+      const result = await new ToolNode({
+        tools: [work, pause, alreadyDone],
+      }).invoke(
+        {
+          messages: [
+            ...input.messages,
+            new ToolMessage({ tool_call_id: 'done', content: 'done' }),
+          ],
+        },
+        replayConfig(checkpoint)
+      );
+      expect(executions).toBe(2);
+      expect(JSON.stringify(result)).toContain('result-1');
+      expect(JSON.stringify(result)).toContain('result-2');
+    }
+  );
 
   it.each([false, true])(
     'restores an older checkpoint despite newer cached output (append=%s)',

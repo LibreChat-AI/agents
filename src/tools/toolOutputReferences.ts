@@ -434,7 +434,10 @@ export class ToolOutputReferenceRegistry {
   }
 
   /** Restore batch inputs without rolling back graph-owned concurrent outputs. */
-  resumeBatch(runId: string, state: ToolOutputReferenceState): ToolOutputResolveView {
+  resumeBatch(
+    runId: string,
+    state: ToolOutputReferenceState
+  ): ToolOutputResolveView {
     if (!this.runStates.has(runId)) {
       this.restoreState(runId, state);
     }

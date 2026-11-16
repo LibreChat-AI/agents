@@ -134,14 +134,20 @@ describe.each([false, true])('unresolved references, event=%s', (eventMode) => {
     const hooks = new HookRegistry();
     const { node, registry, mutations, dispatched } = harness(eventMode, hooks);
     registry.set('current', 'tool0turn2', 'safe');
-    hooks.register('PreToolUse', { hooks: [async () => {
-      registry.set('current', 'tool8turn8', 'concurrent-output');
-      return { updatedInput: { command: '{{tool8turn8}}' } };
-    }] });
+    hooks.register('PreToolUse', {
+      hooks: [
+        async () => {
+          registry.set('current', 'tool8turn8', 'concurrent-output');
+          return { updatedInput: { command: '{{tool8turn8}}' } };
+        },
+      ],
+    });
     const [result] = await invoke(node, [call('bad', 'initial')]);
     expect([...mutations, ...dispatched]).toEqual([]);
     expect(result.status).toBe('error');
-    expect(String(result.content).split('Available keys')[1]).not.toContain('tool8turn8');
+    expect(String(result.content).split('Available keys')[1]).not.toContain(
+      'tool8turn8'
+    );
   });
   it('blocks hook-introduced missing references', async () => {
     const hooks = new HookRegistry();
@@ -215,7 +221,9 @@ describe.each([false, true])('unresolved references, event=%s', (eventMode) => {
         options
       );
       expect(paused.messages.at(-1)).toBeInstanceOf(AIMessage);
-      expect((await graph.getState(options)).tasks[0].interrupts).toHaveLength(1);
+      expect((await graph.getState(options)).tasks[0].interrupts).toHaveLength(
+        1
+      );
       const resumed = await graph.invoke(
         new Command({
           resume: [
@@ -277,14 +285,29 @@ it('bounds and deduplicates hints without leaking values or foreign-run keys', a
 it('keeps key and injected intent exemptions and resolves business intent', () => {
   const registry = new ToolOutputReferenceRegistry();
   registry.set('current', 'tool0turn2', 'data');
-  const input = { '{{tool8turn8}}': 'unchanged', intent: '{{tool8turn8}}', nested: ['{{tool0turn2}}'] };
-  expect(registry.resolve('current', input)).toEqual({ resolved: { ...input, nested: ['data'] }, unresolved: [] });
-  expect(registry.resolve('current', { intent: '{{tool0turn2}}' }, { substituteIntentKey: true }).resolved).toEqual({ intent: 'data' });
+  const input = {
+    '{{tool8turn8}}': 'unchanged',
+    intent: '{{tool8turn8}}',
+    nested: ['{{tool0turn2}}'],
+  };
+  expect(registry.resolve('current', input)).toEqual({
+    resolved: { ...input, nested: ['data'] },
+    unresolved: [],
+  });
+  expect(
+    registry.resolve(
+      'current',
+      { intent: '{{tool0turn2}}' },
+      { substituteIntentKey: true }
+    ).resolved
+  ).toEqual({ intent: 'data' });
 });
 it('escapes serialized JSON values without changing object keys', () => {
   const registry = new ToolOutputReferenceRegistry();
   const input = { '{{tool8turn8}}': '\\{{tool8turn8}}' };
   const result = registry.resolve('current', JSON.stringify(input));
-  expect(JSON.parse(result.resolved)).toEqual({ '{{tool8turn8}}': '{{tool8turn8}}' });
+  expect(JSON.parse(result.resolved)).toEqual({
+    '{{tool8turn8}}': '{{tool8turn8}}',
+  });
   expect(result.unresolved).toEqual([]);
 });

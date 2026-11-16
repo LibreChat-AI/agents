@@ -187,7 +187,10 @@ function stripHostExecutionConfig(
 }
 import { convertInjectedMessages } from '@/messages/injected';
 import { stampSyntheticProviderMessage } from '@/messages/provenance';
-import { createToolCallsDispatchedEvent, safeDispatchCustomEvent } from '@/utils/events';
+import {
+  createToolCallsDispatchedEvent,
+  safeDispatchCustomEvent,
+} from '@/utils/events';
 import { RunnableCallable, composeAbortSignals } from '@/utils';
 import {
   executeHooks,
@@ -1078,7 +1081,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           config,
           this.executingAgentId ?? this.agentId ?? ''
         );
-        config = getToolReplayConfig(config, replayOwner, activeReplayKey, assistantBatch?.message.id);
+        config = getToolReplayConfig(
+          config,
+          replayOwner,
+          activeReplayKey,
+          assistantBatch?.message.id
+        );
         let reviewEvidence = getToolApprovalReviewEvidence(config);
         const replayState = getToolBatchReplayState(config.configurable);
         const ownsParentBatch =
@@ -1135,18 +1143,40 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           );
         }
         const checkpointPending = getCheckpointPendingApproval(config);
-        const pendingBatch = checkpointPending != null && (
-          replayState?.records.some((record) => matchesToolReplayBatch(record.batch, activeReplayKey, assistantBatch?.message.id)) === true || ((replayState?.records.length ?? 0) === 0 &&
-            assistantBatch?.message.tool_calls?.some((call) =>
-              getReviewedToolApproval(checkpointPending.payload, call.id) != null
-            ) === true)
-        );
-        if (pendingBatch && checkpointPending.owner != null && checkpointPending.owner !== replayOwner && !isChildReplay) {
-          throw new Error('Tool approval execution owner changed before resume — failing closed');
+        const pendingBatch =
+          checkpointPending != null &&
+          (replayState?.records.some((record) =>
+            matchesToolReplayBatch(
+              record.batch,
+              activeReplayKey,
+              assistantBatch?.message.id
+            )
+          ) === true ||
+            ((replayState?.records.length ?? 0) === 0 &&
+              assistantBatch?.message.tool_calls?.some(
+                (call) =>
+                  getReviewedToolApproval(checkpointPending.payload, call.id) !=
+                  null
+              ) === true));
+        if (
+          pendingBatch &&
+          checkpointPending.owner != null &&
+          checkpointPending.owner !== replayOwner &&
+          !isChildReplay
+        ) {
+          throw new Error(
+            'Tool approval execution owner changed before resume — failing closed'
+          );
         }
-        if (pendingBatch && checkpointPending.owner === replayOwner &&
-          (replayState?.records.length ?? 0) > 0 && !ownsParentBatch) {
-          throw new Error('Tool batch proposal changed before approval replay — failing closed');
+        if (
+          pendingBatch &&
+          checkpointPending.owner === replayOwner &&
+          (replayState?.records.length ?? 0) > 0 &&
+          !ownsParentBatch
+        ) {
+          throw new Error(
+            'Tool batch proposal changed before approval replay — failing closed'
+          );
         }
         if (replayResumeStatus === 'stale') {
           const configurable = { ...config.configurable };
@@ -1155,7 +1185,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             replayOwner,
             activeReplayKey
           );
-          if (pendingBatch) configurable[TOOL_PENDING_APPROVAL_KEY] = checkpointPending;
+          if (pendingBatch)
+            configurable[TOOL_PENDING_APPROVAL_KEY] = checkpointPending;
           config = {
             ...config,
             configurable,
@@ -1728,7 +1759,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       void safeDispatchCustomEvent(
         GraphEvents.ON_TOOL_CALLS_DISPATCHED,
         createToolCallsDispatchedEvent(config, [
-          { id: call.id, name: call.name, stepId: this.toolCallStepIds?.get(call.id) },
+          {
+            id: call.id,
+            name: call.name,
+            stepId: this.toolCallStepIds?.get(call.id),
+          },
         ]),
         config
       );
@@ -2018,8 +2053,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           // they dispatch — including HITL gates on `write_file` / `edit_file`.
           hookContext: {
             registry: this.hookRegistry,
-            failClosedOnHookError:
-              isBackgroundDenyMode(this.humanInTheLoop),
+            failClosedOnHookError: isBackgroundDenyMode(this.humanInTheLoop),
             runId: (config.configurable?.run_id as string | undefined) ?? '',
             threadId: config.configurable?.thread_id as string | undefined,
             agentId: this.agentId,
@@ -2307,12 +2341,16 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     view?: ToolOutputResolveView
   ): ToolMessage | undefined {
     if (resolution.unresolved.length === 0) return undefined;
-    const missing = [...new Set(resolution.unresolved
-      .slice(0, 10)
-      .map((key) => key.slice(0, 80)))];
-    const available = [...new Set((view?.availableKeys ?? [])
-      .slice(0, 10)
-      .map((key) => key.slice(0, 80)))];
+    const missing = [
+      ...new Set(
+        resolution.unresolved.slice(0, 10).map((key) => key.slice(0, 80))
+      ),
+    ];
+    const available = [
+      ...new Set(
+        (view?.availableKeys ?? []).slice(0, 10).map((key) => key.slice(0, 80))
+      ),
+    ];
     return new ToolMessage({
       status: 'error',
       name: call.name,
@@ -2489,13 +2527,25 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           approvalReplaySessionId,
           approvalReplayKey
         );
-    const replayOwner = getToolBatchReplayOwner(config, this.executingAgentId ?? this.agentId ?? '');
-    const approvalReviewEvidence = getToolApprovalReviewEvidence(config, replayOwner);
+    const replayOwner = getToolBatchReplayOwner(
+      config,
+      this.executingAgentId ?? this.agentId ?? ''
+    );
+    const approvalReviewEvidence = getToolApprovalReviewEvidence(
+      config,
+      replayOwner
+    );
     const checkpointPending = getCheckpointPendingApproval(config);
-    if (approvalReviewEvidence == null && checkpointPending != null &&
-      (checkpointPending.owner == null || checkpointPending.owner === replayOwner) &&
-      getReviewedToolApproval(checkpointPending.payload, call.id) != null) {
-      throw new GraphInterrupt([{ id: checkpointPending.interruptId, value: checkpointPending.value }]);
+    if (
+      approvalReviewEvidence == null &&
+      checkpointPending != null &&
+      (checkpointPending.owner == null ||
+        checkpointPending.owner === replayOwner) &&
+      getReviewedToolApproval(checkpointPending.payload, call.id) != null
+    ) {
+      throw new GraphInterrupt([
+        { id: checkpointPending.interruptId, value: checkpointPending.value },
+      ]);
     }
     const reviewedApproval = getReviewedToolApproval(
       approvalReviewEvidence?.payload,
@@ -2647,14 +2697,13 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             onceReplaySessionId: approvalReplaySessionId,
           }).catch((): AggregatedHookResult | undefined =>
             approvalReviewEvidence == null &&
-            !isBackgroundDenyMode(this.humanInTheLoop)
+              !isBackgroundDenyMode(this.humanInTheLoop)
               ? undefined
               : {
                 decision: 'deny',
-                reason:
-                  isBackgroundDenyMode(this.humanInTheLoop)
-                    ? 'Approval policy could not be evaluated'
-                    : 'Approval policy could not be evaluated on resume',
+                reason: isBackgroundDenyMode(this.humanInTheLoop)
+                  ? 'Approval policy could not be evaluated'
+                  : 'Approval policy could not be evaluated on resume',
                 ...(isBackgroundDenyMode(this.humanInTheLoop)
                   ? { hasHookFailures: true }
                   : {}),
@@ -2762,13 +2811,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         if (preResult.decision === 'ask' || reviewedApproval != null) {
           if (this.humanInTheLoop?.enabled !== true) {
             // Fail closed when there is no foreground approval channel.
-            const reason =
-              isBackgroundDenyMode(this.humanInTheLoop)
-                ? this.backgroundApprovalReason(call.name, preResult.reason)
-                : this.resolveAskDecisionForDirectTool(
-                  preResult.reason,
-                  call.name
-                );
+            const reason = isBackgroundDenyMode(this.humanInTheLoop)
+              ? this.backgroundApprovalReason(call.name, preResult.reason)
+              : this.resolveAskDecisionForDirectTool(
+                preResult.reason,
+                call.name
+              );
             return persistOutput(
               this.blockDirectCall({
                 call,
@@ -2833,7 +2881,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             allowedDecisions,
           };
           const payload = buildToolApprovalInterruptPayload(
-            [askEntry], runId, this.executionContext, this.executingAgentId
+            [askEntry],
+            runId,
+            this.executionContext,
+            this.executingAgentId
           );
           const resumeValue = AsyncLocalStorageProviderSingleton.runWithConfig(
             config,
@@ -3726,13 +3777,29 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       config,
       runId
     );
-    const replayOwner = getToolBatchReplayOwner(config, this.executingAgentId ?? this.agentId ?? '');
-    const approvalReviewEvidence = getToolApprovalReviewEvidence(config, replayOwner);
+    const replayOwner = getToolBatchReplayOwner(
+      config,
+      this.executingAgentId ?? this.agentId ?? ''
+    );
+    const approvalReviewEvidence = getToolApprovalReviewEvidence(
+      config,
+      replayOwner
+    );
     const checkpointPending = getCheckpointPendingApproval(config);
-    if (approvalReviewEvidence == null && checkpointPending != null &&
-      (checkpointPending.owner == null || checkpointPending.owner === replayOwner) &&
-      preToolCalls.some((entry) => getReviewedToolApproval(checkpointPending.payload, entry.call.id) != null)) {
-      throw new GraphInterrupt([{ id: checkpointPending.interruptId, value: checkpointPending.value }]);
+    if (
+      approvalReviewEvidence == null &&
+      checkpointPending != null &&
+      (checkpointPending.owner == null ||
+        checkpointPending.owner === replayOwner) &&
+      preToolCalls.some(
+        (entry) =>
+          getReviewedToolApproval(checkpointPending.payload, entry.call.id) !=
+          null
+      )
+    ) {
+      throw new GraphInterrupt([
+        { id: checkpointPending.interruptId, value: checkpointPending.value },
+      ]);
     }
     const hasPendingApproval = preToolCalls.some(
       (entry) =>
@@ -3810,10 +3877,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
                 matchQuery: entry.call.name,
                 onceReplayKey: approvalReplayKey,
                 onceReplaySessionId: approvalReplaySessionId,
-              }).catch((): AggregatedHookResult =>
-                isBackgroundDenyMode(this.humanInTheLoop)
-                  ? { ...HOOK_FALLBACK, hasHookFailures: true }
-                  : HOOK_FALLBACK
+              }).catch(
+                (): AggregatedHookResult =>
+                  isBackgroundDenyMode(this.humanInTheLoop)
+                    ? { ...HOOK_FALLBACK, hasHookFailures: true }
+                    : HOOK_FALLBACK
               );
             })
           );
@@ -4104,7 +4172,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
        */
       if (askEntries.length > 0) {
         const payload = buildToolApprovalInterruptPayload(
-          askEntries, runId, this.executionContext, this.executingAgentId
+          askEntries,
+          runId,
+          this.executionContext,
+          this.executingAgentId
         );
 
         /**
@@ -4513,7 +4584,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         earlyCompletionDispatchedIds.add(result.toolCallId);
         receivedAtById.set(result.toolCallId, receivedAt);
         earlyCompletionDispatches.push(
-          this.dispatchEarlyToolCompletion({ ...result, received_at: receivedAt }, request, config).then(
+          this.dispatchEarlyToolCompletion(
+            { ...result, received_at: receivedAt },
+            request,
+            config
+          ).then(
             (dispatched) => {
               if (!dispatched) {
                 earlyCompletionDispatchedIds.delete(result.toolCallId);
@@ -4568,7 +4643,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
                 const receivedAt = Date.now();
                 for (const result of results) {
                   if (dispatchRequestById.has(result.toolCallId)) {
-                    receivedAtById.set(result.toolCallId, result.received_at ?? receivedAt);
+                    receivedAtById.set(
+                      result.toolCallId,
+                      result.received_at ?? receivedAt
+                    );
                   }
                 }
                 resultSettled = true;
