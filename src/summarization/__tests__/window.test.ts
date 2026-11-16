@@ -6,7 +6,11 @@ import {
   HumanMessage,
   ToolMessage,
 } from '@langchain/core/messages';
-import type {ConverseStreamCommandOutput, ConverseCommandOutput, ConverseStreamOutput} from '@aws-sdk/client-bedrock-runtime';
+import type {
+  ConverseStreamCommandOutput,
+  ConverseCommandOutput,
+  ConverseStreamOutput,
+} from '@aws-sdk/client-bedrock-runtime';
 import type { BaseMessage, UsageMetadata } from '@langchain/core/messages';
 import type * as t from '@/types';
 import { convertResponseContentToChatGenerationChunk } from '@/llm/google/utils/common';
@@ -84,16 +88,18 @@ class ReasoningOnlyModel extends SummaryModel {
     this.calls.push(messages);
     yield new ChatGenerationChunk({
       text: '',
-      message: this.reasoningResponse ?? new AIMessageChunk({
-        content: [{ type: 'thinking', thinking: 'PRIVATE_REASONING_ONLY' }],
-        additional_kwargs:
-          this.stopReason == null ? {} : { stop_reason: this.stopReason },
-        usage_metadata: {
-          input_tokens: 100,
-          output_tokens: 74,
-          total_tokens: 174,
-        },
-      }),
+      message:
+        this.reasoningResponse ??
+        new AIMessageChunk({
+          content: [{ type: 'thinking', thinking: 'PRIVATE_REASONING_ONLY' }],
+          additional_kwargs:
+            this.stopReason == null ? {} : { stop_reason: this.stopReason },
+          usage_metadata: {
+            input_tokens: 100,
+            output_tokens: 74,
+            total_tokens: 174,
+          },
+        }),
     });
   }
 }
@@ -112,6 +118,32 @@ function history(turns: number): BaseMessage[] {
     );
   }
   return result;
+}
+
+/**
+ * The text the emitted deltas leave in the summary. Deltas go out while a
+ * provider is still responding, so an abandoned attempt has published text; a
+ * delta marked `reset` discards whatever was streamed before it.
+ */
+function streamedSummary(
+  emitted: Array<{ event: string; data: t.StreamEventData }>
+): string {
+  let text = '';
+  for (const { event, data } of emitted) {
+    if (event !== GraphEvents.ON_SUMMARIZE_DELTA) {
+      continue;
+    }
+    const delta = data as t.SummarizeDeltaEvent;
+    if (delta.reset === true) {
+      text = '';
+    }
+    for (const block of delta.delta.summary.content ?? []) {
+      if ('text' in block && typeof block.text === 'string') {
+        text += block.text;
+      }
+    }
+  }
+  return text;
 }
 
 function harness({
@@ -229,21 +261,48 @@ describe('compaction request windows', () => {
     }
   );
 
-  it.each(['trigger', 'overflow'] as const)('skips %s when the entire visible window would be retained', async reason => {
-    const {node, model, agentContext} = harness();
-    const messages = history(360);
-    const windowMessages = messages.slice(-2);
-    const result = await node({messages, summarizationRequest: {agentId: 'agent', remainingContextTokens: 0, reason, allowSummarization: true, windowMessages}}, {});
-    expect(model.calls).toHaveLength(0);
-    expect(agentContext.getSummaryText()).toBeUndefined();
-    expect(result.messages).toBeUndefined();
-  });
+  it.each(['trigger', 'overflow'] as const)(
+    'skips %s when the entire visible window would be retained',
+    async (reason) => {
+      const { node, model, agentContext } = harness();
+      const messages = history(360);
+      const windowMessages = messages.slice(-2);
+      const result = await node(
+        {
+          messages,
+          summarizationRequest: {
+            agentId: 'agent',
+            remainingContextTokens: 0,
+            reason,
+            allowSummarization: true,
+            windowMessages,
+          },
+        },
+        {}
+      );
+      expect(model.calls).toHaveLength(0);
+      expect(agentContext.getSummaryText()).toBeUndefined();
+      expect(result.messages).toBeUndefined();
+    }
+  );
 
   it('reports nothing to compact rather than duplicating an entirely retained visible window', async () => {
-    const {node, model} = harness();
+    const { node, model } = harness();
     const messages = history(360);
-    await expect(node({messages, summarizationRequest: {agentId: 'agent', remainingContextTokens: 0, reason: 'manual', windowMessages: messages.slice(-2)}}, {}))
-      .rejects.toMatchObject({reason: 'nothing_to_summarize'});
+    await expect(
+      node(
+        {
+          messages,
+          summarizationRequest: {
+            agentId: 'agent',
+            remainingContextTokens: 0,
+            reason: 'manual',
+            windowMessages: messages.slice(-2),
+          },
+        },
+        {}
+      )
+    ).rejects.toMatchObject({ reason: 'nothing_to_summarize' });
     expect(model.calls).toHaveLength(0);
   });
 
@@ -310,7 +369,13 @@ describe('compaction request windows', () => {
   });
 
   it('reserves instruction and output space without splitting parallel tool calls', async () => {
-    const { node, model, agentContext } = harness({ maxContextTokens: 2_000, summarizationConfig: {maxSummaryTokens: 128, contextBudgetMode: 'window'} });
+    const { node, model, agentContext } = harness({
+      maxContextTokens: 2_000,
+      summarizationConfig: {
+        maxSummaryTokens: 128,
+        contextBudgetMode: 'window',
+      },
+    });
     const messages = history(15);
     messages.push(new HumanMessage('newest exchange'));
     messages.push(
@@ -360,19 +425,37 @@ describe('compaction request windows', () => {
   });
 
   it('preserves the visible head when context rejections cannot fit it without dropping messages', async () => {
-    const {node, model, agentContext} = harness();
+    const { node, model, agentContext } = harness();
     const messages = history(30);
     const before = JSON.stringify(messages);
-    model.failure = sent => sent.length > 24 ? new Error('maximum context length exceeded') : undefined;
-    const result = await node({messages, summarizationRequest: {agentId: 'agent', remainingContextTokens: 0, reason: 'overflow', allowSummarization: true, windowMessages: messages}}, {});
+    model.failure = (sent) =>
+      sent.length > 24
+        ? new Error('maximum context length exceeded')
+        : undefined;
+    const result = await node(
+      {
+        messages,
+        summarizationRequest: {
+          agentId: 'agent',
+          remainingContextTokens: 0,
+          reason: 'overflow',
+          allowSummarization: true,
+          windowMessages: messages,
+        },
+      },
+      {}
+    );
     expect(model.calls.length).toBeLessThanOrEqual(5);
-    for (const sent of model.calls) expect(sent.slice(1, 1 + messages.length - 4)).toEqual(messages.slice(0, -4));
+    for (const sent of model.calls)
+      expect(sent.slice(1, 1 + messages.length - 4)).toEqual(
+        messages.slice(0, -4)
+      );
     expect(result.messages).toBeUndefined();
     expect(JSON.stringify(messages)).toBe(before);
     expect(agentContext.getSummaryText()).toBeUndefined();
   });
 
-  it('discards partial output from an overloaded attempt before retrying', async () => {
+  it('replaces partial output from an overloaded attempt when the retry streams', async () => {
     jest.useFakeTimers();
     const { node, model, emitted, graph } = harness();
     model.failure = (_sent, attempt) =>
@@ -399,8 +482,10 @@ describe('compaction request windows', () => {
     const deltas = emitted.filter(
       (event) => event.event === GraphEvents.ON_SUMMARIZE_DELTA
     );
-    expect(deltas).toHaveLength(2);
-    expect(JSON.stringify(deltas)).not.toContain('FAILED_ONLY');
+    expect(
+      deltas.map(({ data }) => (data as t.SummarizeDeltaEvent).reset === true)
+    ).toEqual([false, true, false]);
+    expect(streamedSummary(emitted)).toBe('CLEAN_SUMMARY');
     expect(graph.dispatchRunStep).toHaveBeenCalledTimes(1);
     const completed = emitted.filter(
       (event) => event.event === GraphEvents.ON_SUMMARIZE_COMPLETE
@@ -438,7 +523,7 @@ describe('compaction request windows', () => {
       const { node, agentContext } = harness({
         maxContextTokens: 3_000,
         provider,
-        clientOptions: {...clientOptions, maxTokens: 1},
+        clientOptions: { ...clientOptions, maxTokens: 1 },
         summarizationConfig: {},
       });
       const messages = history(6);
@@ -570,7 +655,8 @@ describe('compaction request windows', () => {
         ],
       },
       summarizationConfig: {
-        maxSummaryTokens: 1_000, contextBudgetMode: 'window',
+        maxSummaryTokens: 1_000,
+        contextBudgetMode: 'window',
         prompt: 'Write a checkpoint.',
         retainRecent: { turns: 0 },
       },
@@ -637,7 +723,8 @@ describe('compaction request windows', () => {
         ],
       },
       summarizationConfig: {
-        maxSummaryTokens: 1_000, contextBudgetMode: 'window',
+        maxSummaryTokens: 1_000,
+        contextBudgetMode: 'window',
         prompt: 'Write a checkpoint.',
         retainRecent: { turns: 0 },
       },
@@ -672,7 +759,7 @@ describe('compaction request windows', () => {
     expect(agentContext.getSummaryText()).toBe('CLEAN_SUMMARY');
   });
 
-  it('publishes only the successful fallback’s deltas before completion', async () => {
+  it('leaves only the successful fallback’s deltas standing before completion', async () => {
     const primary = new SummaryModel();
     const failed = new SummaryModel();
     const successful = new SummaryModel();
@@ -715,10 +802,10 @@ describe('compaction request windows', () => {
     const deltas = emitted.filter(
       ({ event }) => event === GraphEvents.ON_SUMMARIZE_DELTA
     );
-    expect(deltas).toHaveLength(2);
-    expect(JSON.stringify(deltas)).not.toContain('FAILED_ONLY');
-    expect(deltas.map(({ data }) => data)).toEqual([
+    expect(streamedSummary(emitted)).toBe('CLEAN_SUMMARY');
+    expect(deltas.slice(-2).map(({ data }) => data)).toEqual([
       expect.objectContaining({
+        reset: true,
         delta: {
           summary: expect.objectContaining({
             provider: Providers.ANTHROPIC,
@@ -748,7 +835,7 @@ describe('compaction request windows', () => {
     );
   });
 
-  it('does not flush failed fallback chunks when a later non-streaming fallback succeeds', async () => {
+  it('withdraws failed fallback chunks when a later non-streaming fallback succeeds', async () => {
     const primary = new SummaryModel();
     const failed = new SummaryModel();
     primary.failure = () => new Error('Primary failed');
@@ -790,9 +877,21 @@ describe('compaction request windows', () => {
       {}
     );
     expect(agentContext.getSummaryText()).toBe('CLEAN_SUMMARY');
+    expect(streamedSummary(emitted)).toBe('');
     expect(
-      emitted.filter(({ event }) => event === GraphEvents.ON_SUMMARIZE_DELTA)
-    ).toHaveLength(0);
+      emitted
+        .filter(({ event }) => event === GraphEvents.ON_SUMMARIZE_DELTA)
+        .at(-1)?.data
+    ).toMatchObject({ reset: true, delta: { summary: { content: [] } } });
+    expect(
+      emitted.findIndex(
+        ({ event }) => event === GraphEvents.ON_SUMMARIZE_COMPLETE
+      )
+    ).toBeGreaterThan(
+      emitted
+        .map(({ event }) => event)
+        .lastIndexOf(GraphEvents.ON_SUMMARIZE_DELTA)
+    );
     expect(
       JSON.stringify(
         emitted.filter(
@@ -1190,189 +1289,440 @@ describe('compaction request windows', () => {
     }
   );
 
-  it.each(['stream', 'invoke'] as const)('preserves history without retrying a native Bedrock %s stop sequence', async mode => {
-    const model = new CustomChatBedrockConverse({model: 'anthropic.claude-sonnet-4-5',
-      region: 'us-east-1', credentials: {accessKeyId: 'offline-test', secretAccessKey: 'offline-test'},
-      _lc_stream_delay: 0,
-    });
-    let response: ConverseCommandOutput | ConverseStreamCommandOutput;
-    if (mode === 'stream') {
-      response = {$metadata: {}, stream: (async function* (): AsyncGenerator<ConverseStreamOutput> {
-        yield {messageStart: {role: 'assistant' as const}};
-        yield {contentBlockDelta: {contentBlockIndex: 0, delta: {reasoningContent: {text: 'PRIVATE_REASONING_ONLY'}}}};
-        yield {contentBlockStop: {contentBlockIndex: 0}};
-        yield {messageStop: {stopReason: 'stop_sequence' as const}};
-        yield {metadata: {usage: {inputTokens: 100, outputTokens: 10, totalTokens: 110}, metrics: {latencyMs: 0}}};
-      })()} satisfies ConverseStreamCommandOutput;
-    } else {
-      Object.defineProperty(model, 'stream', {value: undefined});
-      response = {$metadata: {}, output: {message: {role: 'assistant',
-        content: [{reasoningContent: {reasoningText: {text: 'PRIVATE_REASONING_ONLY', signature: 'offline-signature'}}}],
-      }}, stopReason: 'stop_sequence', usage: {inputTokens: 100, outputTokens: 10, totalTokens: 110},
-      metrics: {latencyMs: 0}} satisfies ConverseCommandOutput;
+  it.each(['stream', 'invoke'] as const)(
+    'preserves history without retrying a native Bedrock %s stop sequence',
+    async (mode) => {
+      const model = new CustomChatBedrockConverse({
+        model: 'anthropic.claude-sonnet-4-5',
+        region: 'us-east-1',
+        credentials: {
+          accessKeyId: 'offline-test',
+          secretAccessKey: 'offline-test',
+        },
+        _lc_stream_delay: 0,
+      });
+      let response: ConverseCommandOutput | ConverseStreamCommandOutput;
+      if (mode === 'stream') {
+        response = {
+          $metadata: {},
+          stream: (async function* (): AsyncGenerator<ConverseStreamOutput> {
+            yield { messageStart: { role: 'assistant' as const } };
+            yield {
+              contentBlockDelta: {
+                contentBlockIndex: 0,
+                delta: { reasoningContent: { text: 'PRIVATE_REASONING_ONLY' } },
+              },
+            };
+            yield { contentBlockStop: { contentBlockIndex: 0 } };
+            yield { messageStop: { stopReason: 'stop_sequence' as const } };
+            yield {
+              metadata: {
+                usage: { inputTokens: 100, outputTokens: 10, totalTokens: 110 },
+                metrics: { latencyMs: 0 },
+              },
+            };
+          })(),
+        } satisfies ConverseStreamCommandOutput;
+      } else {
+        Object.defineProperty(model, 'stream', { value: undefined });
+        response = {
+          $metadata: {},
+          output: {
+            message: {
+              role: 'assistant',
+              content: [
+                {
+                  reasoningContent: {
+                    reasoningText: {
+                      text: 'PRIVATE_REASONING_ONLY',
+                      signature: 'offline-signature',
+                    },
+                  },
+                },
+              ],
+            },
+          },
+          stopReason: 'stop_sequence',
+          usage: { inputTokens: 100, outputTokens: 10, totalTokens: 110 },
+          metrics: { latencyMs: 0 },
+        } satisfies ConverseCommandOutput;
+      }
+      const send = jest.fn(async () => response);
+      Object.defineProperty(model.client, 'send', { value: send });
+      const { node, emitted, agentContext, graph } = harness({
+        provider: Providers.BEDROCK,
+      });
+      graph.streamLimits = resolveStreamLimits({ maxDeltaEventsPerTurn: 10 });
+      jest.spyOn(init, 'initializeModel').mockReturnValue(model);
+      const messages = history(6);
+      const before = JSON.stringify(messages);
+      const result = await node(
+        {
+          messages,
+          summarizationRequest: {
+            agentId: 'agent',
+            remainingContextTokens: 0,
+            windowMessages: messages,
+          },
+        },
+        {}
+      );
+      expect(send).toHaveBeenCalledTimes(1);
+      expect(result.messages).toBeUndefined();
+      expect(JSON.stringify(messages)).toBe(before);
+      expect(agentContext.getSummaryText()).toBeUndefined();
+      expect(agentContext.summarizationFailures).toBe(1);
+      expect(
+        emitted.filter(({ event }) => event === GraphEvents.ON_SUMMARIZE_DELTA)
+      ).toHaveLength(0);
+      const completed = emitted.filter(
+        ({ event }) => event === GraphEvents.ON_SUMMARIZE_COMPLETE
+      );
+      expect(completed).toHaveLength(1);
+      expect(completed[0].data).toMatchObject({ errorCode: 'unknown' });
+      expect(JSON.stringify(completed)).not.toContain('PRIVATE_REASONING_ONLY');
     }
-    const send = jest.fn(async () => response);
-    Object.defineProperty(model.client, 'send', {value: send});
-    const {node, emitted, agentContext, graph} = harness({provider: Providers.BEDROCK});
-    graph.streamLimits = resolveStreamLimits({maxDeltaEventsPerTurn: 10});
-    jest.spyOn(init, 'initializeModel').mockReturnValue(model);
-    const messages = history(6);
-    const before = JSON.stringify(messages);
-    const result = await node({messages, summarizationRequest: {agentId: 'agent', remainingContextTokens: 0, windowMessages: messages}}, {});
-    expect(send).toHaveBeenCalledTimes(1);
-    expect(result.messages).toBeUndefined();
-    expect(JSON.stringify(messages)).toBe(before);
-    expect(agentContext.getSummaryText()).toBeUndefined();
-    expect(agentContext.summarizationFailures).toBe(1);
-    expect(emitted.filter(({event}) => event === GraphEvents.ON_SUMMARIZE_DELTA)).toHaveLength(0);
-    const completed = emitted.filter(({event}) => event === GraphEvents.ON_SUMMARIZE_COMPLETE);
-    expect(completed).toHaveLength(1);
-    expect(completed[0].data).toMatchObject({errorCode: 'unknown'});
-    expect(JSON.stringify(completed)).not.toContain('PRIVATE_REASONING_ONLY');
-  });
+  );
 
   const reasoningKwargs = [
-    {reasoning_content: 'PRIVATE_REASONING_ONLY'},
-    {reasoning: 'PRIVATE_REASONING_ONLY'},
-    {reasoning: {summary: [{text: 'PRIVATE_REASONING_ONLY'}]}},
-    {reasoning_details: [{type: 'reasoning.text', text: 'PRIVATE_REASONING_ONLY'}]},
-    {reasoning_details: [{type: 'reasoning.encrypted', data: 'PRIVATE_REASONING_ONLY'}]},
-    {reasoning_details: [{type: 'reasoning.summary', summary: 'PRIVATE_REASONING_ONLY'}]},
+    { reasoning_content: 'PRIVATE_REASONING_ONLY' },
+    { reasoning: 'PRIVATE_REASONING_ONLY' },
+    { reasoning: { summary: [{ text: 'PRIVATE_REASONING_ONLY' }] } },
+    {
+      reasoning_details: [
+        { type: 'reasoning.text', text: 'PRIVATE_REASONING_ONLY' },
+      ],
+    },
+    {
+      reasoning_details: [
+        { type: 'reasoning.encrypted', data: 'PRIVATE_REASONING_ONLY' },
+      ],
+    },
+    {
+      reasoning_details: [
+        { type: 'reasoning.summary', summary: 'PRIVATE_REASONING_ONLY' },
+      ],
+    },
   ];
-  it.each(reasoningKwargs.flatMap(kwargs => ['stream', 'invoke'].map(mode => ({kwargs, mode}))))(
-    'recovers kwargs-borne reasoning without exposing it: %j', async ({kwargs, mode}) => {
+  it.each(
+    reasoningKwargs.flatMap((kwargs) =>
+      ['stream', 'invoke'].map((mode) => ({ kwargs, mode }))
+    )
+  )(
+    'recovers kwargs-borne reasoning without exposing it: %j',
+    async ({ kwargs, mode }) => {
       jest.useFakeTimers();
-      const response = new AIMessageChunk({content: '', additional_kwargs: kwargs, response_metadata: {finish_reason: 'stop'}});
+      const response = new AIMessageChunk({
+        content: '',
+        additional_kwargs: kwargs,
+        response_metadata: { finish_reason: 'stop' },
+      });
       const model = new ReasoningOnlyModel(1, undefined, response);
       if (mode === 'invoke') {
-        Object.defineProperty(model, 'stream', {value: undefined});
-        jest.spyOn(model, 'invoke').mockImplementation(async messages => {
+        Object.defineProperty(model, 'stream', { value: undefined });
+        jest.spyOn(model, 'invoke').mockImplementation(async (messages) => {
           model.calls.push(messages as BaseMessage[]);
-          return model.calls.length === 1 ? response : new AIMessageChunk('CLEAN_SUMMARY');
+          return model.calls.length === 1
+            ? response
+            : new AIMessageChunk('CLEAN_SUMMARY');
         });
       }
-      const {node, emitted, agentContext} = harness({model});
+      const { node, emitted, agentContext } = harness({ model });
       const messages = history(6);
-      const pending = node({messages, summarizationRequest: {agentId: 'agent', remainingContextTokens: 0, reason: 'manual', windowMessages: messages}}, {});
+      const pending = node(
+        {
+          messages,
+          summarizationRequest: {
+            agentId: 'agent',
+            remainingContextTokens: 0,
+            reason: 'manual',
+            windowMessages: messages,
+          },
+        },
+        {}
+      );
       await jest.runAllTimersAsync();
       await pending;
       expect(model.calls).toHaveLength(2);
       expect(model.calls[1]).toEqual(model.calls[0]);
       expect(agentContext.getSummaryText()).toBe('CLEAN_SUMMARY');
-      const output = emitted.filter(({event}) => event === GraphEvents.ON_SUMMARIZE_DELTA || event === GraphEvents.ON_SUMMARIZE_COMPLETE);
+      const output = emitted.filter(
+        ({ event }) =>
+          event === GraphEvents.ON_SUMMARIZE_DELTA ||
+          event === GraphEvents.ON_SUMMARIZE_COMPLETE
+      );
       expect(JSON.stringify(output)).not.toContain('PRIVATE_REASONING_ONLY');
-      expect(output.filter(({event}) => event === GraphEvents.ON_SUMMARIZE_COMPLETE)).toHaveLength(1);
+      expect(
+        output.filter(
+          ({ event }) => event === GraphEvents.ON_SUMMARIZE_COMPLETE
+        )
+      ).toHaveLength(1);
     }
   );
 
   it.each([
-    {content: '', additional_kwargs: {reasoning_content: 'PRIVATE_REASONING_ONLY'}, response_metadata: {finish_reason: 'length'}},
-    {content: '', additional_kwargs: {reasoning_content: 'PRIVATE_REASONING_ONLY'}, response_metadata: {finish_reason: 'content_filter'}},
-    {content: '', additional_kwargs: {reasoning_content: '', reasoning_details: []}},
-    {content: 'CLEAN_SUMMARY', additional_kwargs: {reasoning_content: 'PRIVATE_REASONING_ONLY'}},
-  ])('does not retry terminal, empty, or visible responses with kwargs: %j', async fields => {
-    jest.useFakeTimers();
-    const model = new ReasoningOnlyModel(3, undefined, new AIMessageChunk(fields));
-    const {node, emitted, agentContext} = harness({model});
-    const messages = history(6);
-    const pending = node({messages, summarizationRequest: {agentId: 'agent', remainingContextTokens: 0, windowMessages: messages}}, {});
-    await jest.runAllTimersAsync();
-    const result = await pending;
-    expect(model.calls).toHaveLength(1);
-    if (fields.content === '') {
-      expect(result.messages).toBeUndefined();
-      expect(agentContext.getSummaryText()).toBeUndefined();
-    } else expect(agentContext.getSummaryText()).toBe('CLEAN_SUMMARY');
-    expect(JSON.stringify(emitted.filter(({event}) => event === GraphEvents.ON_SUMMARIZE_COMPLETE))).not.toContain('PRIVATE_REASONING_ONLY');
-  });
+    {
+      content: '',
+      additional_kwargs: { reasoning_content: 'PRIVATE_REASONING_ONLY' },
+      response_metadata: { finish_reason: 'length' },
+    },
+    {
+      content: '',
+      additional_kwargs: { reasoning_content: 'PRIVATE_REASONING_ONLY' },
+      response_metadata: { finish_reason: 'content_filter' },
+    },
+    {
+      content: '',
+      additional_kwargs: { reasoning_content: '', reasoning_details: [] },
+    },
+    {
+      content: 'CLEAN_SUMMARY',
+      additional_kwargs: { reasoning_content: 'PRIVATE_REASONING_ONLY' },
+    },
+  ])(
+    'does not retry terminal, empty, or visible responses with kwargs: %j',
+    async (fields) => {
+      jest.useFakeTimers();
+      const model = new ReasoningOnlyModel(
+        3,
+        undefined,
+        new AIMessageChunk(fields)
+      );
+      const { node, emitted, agentContext } = harness({ model });
+      const messages = history(6);
+      const pending = node(
+        {
+          messages,
+          summarizationRequest: {
+            agentId: 'agent',
+            remainingContextTokens: 0,
+            windowMessages: messages,
+          },
+        },
+        {}
+      );
+      await jest.runAllTimersAsync();
+      const result = await pending;
+      expect(model.calls).toHaveLength(1);
+      if (fields.content === '') {
+        expect(result.messages).toBeUndefined();
+        expect(agentContext.getSummaryText()).toBeUndefined();
+      } else expect(agentContext.getSummaryText()).toBe('CLEAN_SUMMARY');
+      expect(
+        JSON.stringify(
+          emitted.filter(
+            ({ event }) => event === GraphEvents.ON_SUMMARIZE_COMPLETE
+          )
+        )
+      ).not.toContain('PRIVATE_REASONING_ONLY');
+    }
+  );
 
-  it.each(['stream', 'invoke'] as const)('recovers reasoning-only replies through the actual OpenAI %s adapter', async mode => {
-    const bodies: string[] = [];
-    const fetch = jest.fn<ReturnType<typeof globalThis.fetch>, Parameters<typeof globalThis.fetch>>(async (_input, init) => {
-      if (typeof init?.body !== 'string') throw new Error('Expected a JSON request body');
-      bodies.push(init.body);
-      const first = bodies.length === 1;
-      const reply = first ? {content: '', reasoning_content: 'PRIVATE_REASONING_ONLY'} : {content: 'CLEAN_SUMMARY'};
-      const base = {id: `offline-${bodies.length}`, created: 0, model: 'gpt-4.1-mini'};
-      if (mode === 'invoke') return Response.json({...base, object: 'chat.completion',
-        choices: [{index: 0, message: {role: 'assistant', ...reply}, finish_reason: 'stop', logprobs: null}],
-        usage: {prompt_tokens: 100, completion_tokens: 10, total_tokens: 110},
+  it.each(['stream', 'invoke'] as const)(
+    'recovers reasoning-only replies through the actual OpenAI %s adapter',
+    async (mode) => {
+      const bodies: string[] = [];
+      const fetch = jest.fn<
+        ReturnType<typeof globalThis.fetch>,
+        Parameters<typeof globalThis.fetch>
+      >(async (_input, init) => {
+        if (typeof init?.body !== 'string')
+          throw new Error('Expected a JSON request body');
+        bodies.push(init.body);
+        const first = bodies.length === 1;
+        const reply = first
+          ? { content: '', reasoning_content: 'PRIVATE_REASONING_ONLY' }
+          : { content: 'CLEAN_SUMMARY' };
+        const base = {
+          id: `offline-${bodies.length}`,
+          created: 0,
+          model: 'gpt-4.1-mini',
+        };
+        if (mode === 'invoke')
+          return Response.json({
+            ...base,
+            object: 'chat.completion',
+            choices: [
+              {
+                index: 0,
+                message: { role: 'assistant', ...reply },
+                finish_reason: 'stop',
+                logprobs: null,
+              },
+            ],
+            usage: {
+              prompt_tokens: 100,
+              completion_tokens: 10,
+              total_tokens: 110,
+            },
+          });
+        const chunks = [
+          {
+            ...base,
+            object: 'chat.completion.chunk',
+            choices: [
+              {
+                index: 0,
+                delta: { role: 'assistant', ...reply },
+                finish_reason: null,
+                logprobs: null,
+              },
+            ],
+          },
+          {
+            ...base,
+            object: 'chat.completion.chunk',
+            choices: [
+              { index: 0, delta: {}, finish_reason: 'stop', logprobs: null },
+            ],
+          },
+        ];
+        return new Response(
+          chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join('') +
+            'data: [DONE]\n\n',
+          {
+            headers: { 'Content-Type': 'text/event-stream' },
+          }
+        );
       });
-      const chunks = [
-        {...base, object: 'chat.completion.chunk', choices: [{index: 0, delta: {role: 'assistant', ...reply}, finish_reason: null, logprobs: null}]},
-        {...base, object: 'chat.completion.chunk', choices: [{index: 0, delta: {}, finish_reason: 'stop', logprobs: null}]},
-      ];
-      return new Response(chunks.map(chunk => `data: ${JSON.stringify(chunk)}\n\n`).join('') + 'data: [DONE]\n\n', {
-        headers: {'Content-Type': 'text/event-stream'},
+      const model = new ChatOpenAI({
+        apiKey: 'offline-test',
+        model: 'gpt-4.1-mini',
+        useResponsesApi: false,
+        streaming: mode === 'stream',
+        maxRetries: 0,
+        _lc_stream_delay: 0,
+        configuration: { fetch },
       });
-    });
-    const model = new ChatOpenAI({apiKey: 'offline-test', model: 'gpt-4.1-mini',
-      useResponsesApi: false, streaming: mode === 'stream', maxRetries: 0, _lc_stream_delay: 0,
-      configuration: {fetch},
-    });
-    if (mode === 'invoke') Object.defineProperty(model, 'stream', {value: undefined});
-    const {node, emitted, agentContext} = harness();
-    jest.spyOn(init, 'initializeModel').mockReturnValue(model);
-    const messages = history(6);
-    await node({messages, summarizationRequest: {agentId: 'agent', remainingContextTokens: 0, reason: 'manual', windowMessages: messages}}, {});
-    expect(fetch).toHaveBeenCalledTimes(2);
-    expect(bodies[1]).toBe(bodies[0]);
-    expect(agentContext.getSummaryText()).toBe('CLEAN_SUMMARY');
-    const output = emitted.filter(({event}) => event === GraphEvents.ON_SUMMARIZE_DELTA || event === GraphEvents.ON_SUMMARIZE_COMPLETE);
-    expect(JSON.stringify(output)).not.toContain('PRIVATE_REASONING_ONLY');
-    expect(output.filter(({event}) => event === GraphEvents.ON_SUMMARIZE_COMPLETE)).toHaveLength(1);
-  });
+      if (mode === 'invoke')
+        Object.defineProperty(model, 'stream', { value: undefined });
+      const { node, emitted, agentContext } = harness();
+      jest.spyOn(init, 'initializeModel').mockReturnValue(model);
+      const messages = history(6);
+      await node(
+        {
+          messages,
+          summarizationRequest: {
+            agentId: 'agent',
+            remainingContextTokens: 0,
+            reason: 'manual',
+            windowMessages: messages,
+          },
+        },
+        {}
+      );
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(bodies[1]).toBe(bodies[0]);
+      expect(agentContext.getSummaryText()).toBe('CLEAN_SUMMARY');
+      const output = emitted.filter(
+        ({ event }) =>
+          event === GraphEvents.ON_SUMMARIZE_DELTA ||
+          event === GraphEvents.ON_SUMMARIZE_COMPLETE
+      );
+      expect(JSON.stringify(output)).not.toContain('PRIVATE_REASONING_ONLY');
+      expect(
+        output.filter(
+          ({ event }) => event === GraphEvents.ON_SUMMARIZE_COMPLETE
+        )
+      ).toHaveLength(1);
+    }
+  );
 
-  it.each([1, 3])('continues fallback recovery after %i reasoning-only responses', async reasoningAttempts => {
-    jest.useFakeTimers();
-    const primary = new SummaryModel();
-    const first = new ReasoningOnlyModel(reasoningAttempts);
-    const last = new SummaryModel();
-    primary.failure = () => new Error('Primary failed');
-    const {node, emitted, agentContext} = harness({model: primary,
-      clientOptions: {fallbacks: [
-        {provider: Providers.OPENAI, clientOptions: {model: 'first'}},
-        {provider: Providers.ANTHROPIC, clientOptions: {model: 'last'}},
-      ]},
-    });
-    jest.spyOn(init, 'initializeModel').mockImplementation(({clientOptions}) => {
-      const model = resolveClientOptionsModel(clientOptions);
-      if (model === 'first') return first;
-      return model === 'last' ? last : primary;
-    });
-    const messages = history(6);
-    const pending = node({messages, summarizationRequest: {agentId: 'agent', remainingContextTokens: 0, windowMessages: messages}}, {});
-    await jest.runAllTimersAsync();
-    await pending;
-    expect(primary.calls).toHaveLength(1);
-    expect(first.calls).toHaveLength(reasoningAttempts === 1 ? 2 : 3);
-    expect(last.calls).toHaveLength(reasoningAttempts === 3 ? 1 : 0);
-    expect(agentContext.getSummaryText()).toBe('CLEAN_SUMMARY');
-    const output = emitted.filter(({event}) => event === GraphEvents.ON_SUMMARIZE_DELTA || event === GraphEvents.ON_SUMMARIZE_COMPLETE);
-    expect(JSON.stringify(output)).not.toContain('PRIVATE_REASONING_ONLY');
-    expect(output.filter(({event}) => event === GraphEvents.ON_SUMMARIZE_DELTA)).toHaveLength(2);
-    expect(output.find(({event}) => event === GraphEvents.ON_SUMMARIZE_COMPLETE)?.data).toMatchObject({summary: {
-      provider: reasoningAttempts === 3 ? Providers.ANTHROPIC : Providers.OPENAI,
-      model: reasoningAttempts === 3 ? 'last' : 'first',
-    }});
-  });
+  it.each([1, 3])(
+    'continues fallback recovery after %i reasoning-only responses',
+    async (reasoningAttempts) => {
+      jest.useFakeTimers();
+      const primary = new SummaryModel();
+      const first = new ReasoningOnlyModel(reasoningAttempts);
+      const last = new SummaryModel();
+      primary.failure = () => new Error('Primary failed');
+      const { node, emitted, agentContext } = harness({
+        model: primary,
+        clientOptions: {
+          fallbacks: [
+            { provider: Providers.OPENAI, clientOptions: { model: 'first' } },
+            { provider: Providers.ANTHROPIC, clientOptions: { model: 'last' } },
+          ],
+        },
+      });
+      jest
+        .spyOn(init, 'initializeModel')
+        .mockImplementation(({ clientOptions }) => {
+          const model = resolveClientOptionsModel(clientOptions);
+          if (model === 'first') return first;
+          return model === 'last' ? last : primary;
+        });
+      const messages = history(6);
+      const pending = node(
+        {
+          messages,
+          summarizationRequest: {
+            agentId: 'agent',
+            remainingContextTokens: 0,
+            windowMessages: messages,
+          },
+        },
+        {}
+      );
+      await jest.runAllTimersAsync();
+      await pending;
+      expect(primary.calls).toHaveLength(1);
+      expect(first.calls).toHaveLength(reasoningAttempts === 1 ? 2 : 3);
+      expect(last.calls).toHaveLength(reasoningAttempts === 3 ? 1 : 0);
+      expect(agentContext.getSummaryText()).toBe('CLEAN_SUMMARY');
+      const output = emitted.filter(
+        ({ event }) =>
+          event === GraphEvents.ON_SUMMARIZE_DELTA ||
+          event === GraphEvents.ON_SUMMARIZE_COMPLETE
+      );
+      expect(JSON.stringify(output)).not.toContain('PRIVATE_REASONING_ONLY');
+      expect(streamedSummary(emitted)).toBe('CLEAN_SUMMARY');
+      expect(
+        output.find(({ event }) => event === GraphEvents.ON_SUMMARIZE_COMPLETE)
+          ?.data
+      ).toMatchObject({
+        summary: {
+          provider:
+            reasoningAttempts === 3 ? Providers.ANTHROPIC : Providers.OPENAI,
+          model: reasoningAttempts === 3 ? 'last' : 'first',
+        },
+      });
+    }
+  );
 
   it('does not advance the fallback chain after a terminal reasoning-only response', async () => {
     const primary = new SummaryModel();
     const terminal = new ReasoningOnlyModel(3, 'stop_sequence');
     const unused = new SummaryModel();
     primary.failure = () => new Error('Primary failed');
-    const {node, agentContext} = harness({model: primary, clientOptions: {fallbacks: [
-      {provider: Providers.OPENAI, clientOptions: {model: 'terminal'}},
-      {provider: Providers.ANTHROPIC, clientOptions: {model: 'unused'}},
-    ]}});
-    jest.spyOn(init, 'initializeModel').mockImplementation(({clientOptions}) => {
-      const name = resolveClientOptionsModel(clientOptions);
-      if (name === 'terminal') return terminal;
-      return name === 'unused' ? unused : primary;
+    const { node, agentContext } = harness({
+      model: primary,
+      clientOptions: {
+        fallbacks: [
+          { provider: Providers.OPENAI, clientOptions: { model: 'terminal' } },
+          { provider: Providers.ANTHROPIC, clientOptions: { model: 'unused' } },
+        ],
+      },
     });
+    jest
+      .spyOn(init, 'initializeModel')
+      .mockImplementation(({ clientOptions }) => {
+        const name = resolveClientOptionsModel(clientOptions);
+        if (name === 'terminal') return terminal;
+        return name === 'unused' ? unused : primary;
+      });
     const messages = history(6);
-    const result = await node({messages, summarizationRequest: {agentId: 'agent', remainingContextTokens: 0, windowMessages: messages}}, {});
+    const result = await node(
+      {
+        messages,
+        summarizationRequest: {
+          agentId: 'agent',
+          remainingContextTokens: 0,
+          windowMessages: messages,
+        },
+      },
+      {}
+    );
     expect(terminal.calls).toHaveLength(1);
     expect(unused.calls).toHaveLength(0);
     expect(result.messages).toBeUndefined();
@@ -1383,13 +1733,39 @@ describe('compaction request windows', () => {
     jest.useFakeTimers();
     const primary = new SummaryModel();
     const fallback = new SummaryModel();
-    primary.failure = () => new DOMException('The operation was aborted due to timeout', 'TimeoutError');
-    const {node, agentContext} = harness({model: primary, clientOptions: {fallbacks: [
-      {provider: Providers.ANTHROPIC, clientOptions: {model: 'fallback'}},
-    ]}});
-    jest.spyOn(init, 'initializeModel').mockImplementation(({provider}) => provider === Providers.ANTHROPIC ? fallback : primary);
+    primary.failure = () =>
+      new DOMException(
+        'The operation was aborted due to timeout',
+        'TimeoutError'
+      );
+    const { node, agentContext } = harness({
+      model: primary,
+      clientOptions: {
+        fallbacks: [
+          {
+            provider: Providers.ANTHROPIC,
+            clientOptions: { model: 'fallback' },
+          },
+        ],
+      },
+    });
+    jest
+      .spyOn(init, 'initializeModel')
+      .mockImplementation(({ provider }) =>
+        provider === Providers.ANTHROPIC ? fallback : primary
+      );
     const messages = history(6);
-    const pending = node({messages, summarizationRequest: {agentId: 'agent', remainingContextTokens: 0, windowMessages: messages}}, {});
+    const pending = node(
+      {
+        messages,
+        summarizationRequest: {
+          agentId: 'agent',
+          remainingContextTokens: 0,
+          windowMessages: messages,
+        },
+      },
+      {}
+    );
     await jest.runAllTimersAsync();
     await pending;
     expect(primary.calls).toHaveLength(3);
@@ -1397,348 +1773,921 @@ describe('compaction request windows', () => {
     expect(agentContext.getSummaryText()).toBe('CLEAN_SUMMARY');
   });
 
-  it.each([1, 3])('reports all billed usage after %i reasoning-only attempts', async reasoningAttempts => {
-    jest.useFakeTimers();
-    const model = new ReasoningOnlyModel(reasoningAttempts);
-    model.summaryUsage = {input_tokens: 200, output_tokens: 20, total_tokens: 220,
-      input_token_details: {cache_read: 150}, output_token_details: {reasoning: 5}};
-    const {node, graph, emitted, agentContext} = harness({model, clientOptions: {model: 'reasoner'}});
-    const messages = history(6);
-    const before = JSON.stringify(messages);
-    const pending = node({messages, summarizationRequest: {agentId: 'agent', remainingContextTokens: 0, windowMessages: messages}}, {});
-    await jest.runAllTimersAsync();
-    const result = await pending;
-    const completed = emitted.find(({event}) => event === GraphEvents.ON_SUMMARIZE_COMPLETE)?.data as t.SummarizeCompleteEvent;
-    expect(completed.attemptUsage).toHaveLength(reasoningAttempts === 1 ? 2 : 3);
-    expect(completed.attemptUsage?.every(entry => entry.provider === Providers.OPENAI && entry.model === 'reasoner')).toBe(true);
-    const step = graph.dispatchRunStep.mock.calls[0][0];
-    expect(step.usage).toMatchObject(reasoningAttempts === 1 ? {
-      prompt_tokens: 300, completion_tokens: 94, total_tokens: 394,
-    } : {prompt_tokens: 300, completion_tokens: 222, total_tokens: 522});
-    if (reasoningAttempts === 1) {
-      expect(completed.attemptUsage?.[1].usage).toEqual(model.summaryUsage);
-      expect(agentContext.getSummaryText()).toBe('CLEAN_SUMMARY');
-    } else {
-      expect(result.messages).toBeUndefined();
-      expect(JSON.stringify(messages)).toBe(before);
-      expect(agentContext.getSummaryText()).toBeUndefined();
-      expect(completed.errorCode).toBe('unknown');
-      expect(graph.closeRunStep).toHaveBeenCalledWith('summary-step', 'failed', expect.anything());
+  it.each([1, 3])(
+    'reports all billed usage after %i reasoning-only attempts',
+    async (reasoningAttempts) => {
+      jest.useFakeTimers();
+      const model = new ReasoningOnlyModel(reasoningAttempts);
+      model.summaryUsage = {
+        input_tokens: 200,
+        output_tokens: 20,
+        total_tokens: 220,
+        input_token_details: { cache_read: 150 },
+        output_token_details: { reasoning: 5 },
+      };
+      const { node, graph, emitted, agentContext } = harness({
+        model,
+        clientOptions: { model: 'reasoner' },
+      });
+      const messages = history(6);
+      const before = JSON.stringify(messages);
+      const pending = node(
+        {
+          messages,
+          summarizationRequest: {
+            agentId: 'agent',
+            remainingContextTokens: 0,
+            windowMessages: messages,
+          },
+        },
+        {}
+      );
+      await jest.runAllTimersAsync();
+      const result = await pending;
+      const completed = emitted.find(
+        ({ event }) => event === GraphEvents.ON_SUMMARIZE_COMPLETE
+      )?.data as t.SummarizeCompleteEvent;
+      expect(completed.attemptUsage).toHaveLength(
+        reasoningAttempts === 1 ? 2 : 3
+      );
+      expect(
+        completed.attemptUsage?.every(
+          (entry) =>
+            entry.provider === Providers.OPENAI && entry.model === 'reasoner'
+        )
+      ).toBe(true);
+      const step = graph.dispatchRunStep.mock.calls[0][0];
+      expect(step.usage).toMatchObject(
+        reasoningAttempts === 1
+          ? {
+            prompt_tokens: 300,
+            completion_tokens: 94,
+            total_tokens: 394,
+          }
+          : { prompt_tokens: 300, completion_tokens: 222, total_tokens: 522 }
+      );
+      if (reasoningAttempts === 1) {
+        expect(completed.attemptUsage?.[1].usage).toEqual(model.summaryUsage);
+        expect(agentContext.getSummaryText()).toBe('CLEAN_SUMMARY');
+      } else {
+        expect(result.messages).toBeUndefined();
+        expect(JSON.stringify(messages)).toBe(before);
+        expect(agentContext.getSummaryText()).toBeUndefined();
+        expect(completed.errorCode).toBe('unknown');
+        expect(graph.closeRunStep).toHaveBeenCalledWith(
+          'summary-step',
+          'failed',
+          expect.anything()
+        );
+      }
     }
-  });
+  );
 
   it('separates attempt usage across providers and models when multiple fallback retries are billed', async () => {
     jest.useFakeTimers();
     const primary = new ReasoningOnlyModel(3);
     const first = new ReasoningOnlyModel(3);
     const last = new SummaryModel();
-    last.summaryUsage = {input_tokens: 321, output_tokens: 45, total_tokens: 366};
-    const {node, emitted, graph} = harness({model: primary, clientOptions: {model: 'reasoner', fallbacks: [
-      {provider: Providers.ANTHROPIC, clientOptions: {model: 'reasoner'}},
-      {provider: Providers.OPENROUTER, clientOptions: {model: 'success'}},
-    ]}});
-    jest.spyOn(init, 'initializeModel').mockImplementation(({provider}) => {
+    last.summaryUsage = {
+      input_tokens: 321,
+      output_tokens: 45,
+      total_tokens: 366,
+    };
+    const { node, emitted, graph } = harness({
+      model: primary,
+      clientOptions: {
+        model: 'reasoner',
+        fallbacks: [
+          {
+            provider: Providers.ANTHROPIC,
+            clientOptions: { model: 'reasoner' },
+          },
+          {
+            provider: Providers.OPENROUTER,
+            clientOptions: { model: 'success' },
+          },
+        ],
+      },
+    });
+    jest.spyOn(init, 'initializeModel').mockImplementation(({ provider }) => {
       if (provider === Providers.ANTHROPIC) return first;
       return provider === Providers.OPENROUTER ? last : primary;
     });
     const messages = history(6);
-    const pending = node({messages, summarizationRequest: {agentId: 'agent', remainingContextTokens: 0, windowMessages: messages}}, {});
+    const pending = node(
+      {
+        messages,
+        summarizationRequest: {
+          agentId: 'agent',
+          remainingContextTokens: 0,
+          windowMessages: messages,
+        },
+      },
+      {}
+    );
     await jest.runAllTimersAsync();
     await pending;
-    const completed = emitted.find(({event}) => event === GraphEvents.ON_SUMMARIZE_COMPLETE)?.data as t.SummarizeCompleteEvent;
+    const completed = emitted.find(
+      ({ event }) => event === GraphEvents.ON_SUMMARIZE_COMPLETE
+    )?.data as t.SummarizeCompleteEvent;
     expect(completed.attemptUsage).toHaveLength(7);
-    expect(completed.attemptUsage?.map(entry => [entry.provider, entry.model])).toEqual([
-      ...Array.from({length: 3}, () => [Providers.OPENAI, 'reasoner']),
-      ...Array.from({length: 3}, () => [Providers.ANTHROPIC, 'reasoner']),
+    expect(
+      completed.attemptUsage?.map((entry) => [entry.provider, entry.model])
+    ).toEqual([
+      ...Array.from({ length: 3 }, () => [Providers.OPENAI, 'reasoner']),
+      ...Array.from({ length: 3 }, () => [Providers.ANTHROPIC, 'reasoner']),
       [Providers.OPENROUTER, 'success'],
     ]);
-    expect(completed.summary).toMatchObject({provider: Providers.OPENROUTER, model: 'success'});
+    expect(completed.summary).toMatchObject({
+      provider: Providers.OPENROUTER,
+      model: 'success',
+    });
     expect(graph.dispatchRunStep.mock.calls[0][0].usage).toMatchObject({
-      prompt_tokens: 921, completion_tokens: 489, total_tokens: 1410,
+      prompt_tokens: 921,
+      completion_tokens: 489,
+      total_tokens: 1410,
       attemptUsage: completed.attemptUsage,
     });
   });
 
   it('does not duplicate model-end callbacks while recording completed-attempt usage', async () => {
     const model = new ReasoningOnlyModel(1);
-    model.summaryUsage = {input_tokens: 200, output_tokens: 20, total_tokens: 220};
+    model.summaryUsage = {
+      input_tokens: 200,
+      output_tokens: 20,
+      total_tokens: 220,
+    };
     jest.spyOn(init, 'initializeModel').mockReturnValue(model);
     const modelEnds: UsageMetadata[] = [];
     const completions: t.SummarizeCompleteEvent[] = [];
-    const run = await Run.create<t.IState>({runId: 'summary-attempt-accounting', tokenCounter: count, returnContent: true, skipCleanup: true,
-      graphConfig: {type: 'standard', llmConfig: {provider: Providers.OPENAI, model: 'reasoner'},
-        maxContextTokens: 32_000, instructions: 'Checkpoint.', summarizeOnly: true, summarizationEnabled: true,
-        summarizationConfig: {maxSummaryTokens: 128, retainRecent: {turns: 0}},
-      }, customHandlers: {
-        [GraphEvents.CHAT_MODEL_END]: {handle: (_event, data, metadata): void => {
-          if (metadata?.summarization === true) {
-            const usage = (data as t.ModelEndData)?.output?.usage_metadata;
-            if (usage != null) modelEnds.push(usage);
-          }
-        }},
-        [GraphEvents.ON_SUMMARIZE_COMPLETE]: {handle: (_event, data): void => {completions.push(data as t.SummarizeCompleteEvent);}},
+    const run = await Run.create<t.IState>({
+      runId: 'summary-attempt-accounting',
+      tokenCounter: count,
+      returnContent: true,
+      skipCleanup: true,
+      graphConfig: {
+        type: 'standard',
+        llmConfig: { provider: Providers.OPENAI, model: 'reasoner' },
+        maxContextTokens: 32_000,
+        instructions: 'Checkpoint.',
+        summarizeOnly: true,
+        summarizationEnabled: true,
+        summarizationConfig: {
+          maxSummaryTokens: 128,
+          retainRecent: { turns: 0 },
+        },
+      },
+      customHandlers: {
+        [GraphEvents.CHAT_MODEL_END]: {
+          handle: (_event, data, metadata): void => {
+            if (metadata?.summarization === true) {
+              const usage = (data as t.ModelEndData)?.output?.usage_metadata;
+              if (usage != null) modelEnds.push(usage);
+            }
+          },
+        },
+        [GraphEvents.ON_SUMMARIZE_COMPLETE]: {
+          handle: (_event, data): void => {
+            completions.push(data as t.SummarizeCompleteEvent);
+          },
+        },
       },
     });
-    await run.processStream({messages: history(6)}, {configurable: {thread_id: 'summary-attempt-accounting'}, version: 'v2'});
+    await run.processStream(
+      { messages: history(6) },
+      {
+        configurable: { thread_id: 'summary-attempt-accounting' },
+        version: 'v2',
+      }
+    );
     expect(model.calls).toHaveLength(2);
     expect(modelEnds).toHaveLength(2);
     expect(completions).toHaveLength(1);
-    expect(completions[0].attemptUsage?.map(entry => entry.usage)).toEqual(modelEnds);
+    expect(completions[0].attemptUsage?.map((entry) => entry.usage)).toEqual(
+      modelEnds
+    );
   });
 
-  it.each(['', ' \n\t'])('preserves empty Google thought output without retrying: %j', async text => {
-    const thoughtPart = {thought: true, text};
-    const response: Parameters<typeof convertResponseContentToChatGenerationChunk>[0] = {
-      text: () => '', functionCall: () => undefined, functionCalls: () => undefined,
-      candidates: [{index: 0, content: {role: 'model', parts: [thoughtPart]},
-        finishReason: FinishReason.STOP, safetyRatings: [],
-      }],
-    };
-    const chunk = convertResponseContentToChatGenerationChunk(response, {index: 0});
-    if (!(chunk?.message instanceof AIMessageChunk)) throw new Error('Expected a Google message chunk');
-    expect(chunk.message.content).toBe('');
-    expect(chunk.message.additional_kwargs.reasoning).toBe(text);
-    const model = new ReasoningOnlyModel(3, undefined, chunk.message);
-    const {node, agentContext, emitted} = harness({model, provider: Providers.GOOGLE});
-    const messages = history(6);
-    const before = JSON.stringify(messages);
-    const result = await node({messages, summarizationRequest: {agentId: 'agent', remainingContextTokens: 0, windowMessages: messages}}, {});
-    expect(model.calls).toHaveLength(1);
-    expect(result.messages).toBeUndefined();
-    expect(JSON.stringify(messages)).toBe(before);
-    expect(agentContext.getSummaryText()).toBeUndefined();
-    expect(emitted.filter(({event}) => event === GraphEvents.ON_SUMMARIZE_DELTA)).toHaveLength(0);
-    expect(emitted.filter(({event}) => event === GraphEvents.ON_SUMMARIZE_COMPLETE)).toHaveLength(1);
-  });
+  it.each(['', ' \n\t'])(
+    'preserves empty Google thought output without retrying: %j',
+    async (text) => {
+      const thoughtPart = { thought: true, text };
+      const response: Parameters<
+        typeof convertResponseContentToChatGenerationChunk
+      >[0] = {
+        text: () => '',
+        functionCall: () => undefined,
+        functionCalls: () => undefined,
+        candidates: [
+          {
+            index: 0,
+            content: { role: 'model', parts: [thoughtPart] },
+            finishReason: FinishReason.STOP,
+            safetyRatings: [],
+          },
+        ],
+      };
+      const chunk = convertResponseContentToChatGenerationChunk(response, {
+        index: 0,
+      });
+      if (!(chunk?.message instanceof AIMessageChunk))
+        throw new Error('Expected a Google message chunk');
+      expect(chunk.message.content).toBe('');
+      expect(chunk.message.additional_kwargs.reasoning).toBe(text);
+      const model = new ReasoningOnlyModel(3, undefined, chunk.message);
+      const { node, agentContext, emitted } = harness({
+        model,
+        provider: Providers.GOOGLE,
+      });
+      const messages = history(6);
+      const before = JSON.stringify(messages);
+      const result = await node(
+        {
+          messages,
+          summarizationRequest: {
+            agentId: 'agent',
+            remainingContextTokens: 0,
+            windowMessages: messages,
+          },
+        },
+        {}
+      );
+      expect(model.calls).toHaveLength(1);
+      expect(result.messages).toBeUndefined();
+      expect(JSON.stringify(messages)).toBe(before);
+      expect(agentContext.getSummaryText()).toBeUndefined();
+      expect(
+        emitted.filter(({ event }) => event === GraphEvents.ON_SUMMARIZE_DELTA)
+      ).toHaveLength(0);
+      expect(
+        emitted.filter(
+          ({ event }) => event === GraphEvents.ON_SUMMARIZE_COMPLETE
+        )
+      ).toHaveLength(1);
+    }
+  );
 
   it.each([
-    {provider: Providers.GOOGLE, options: {thinkingConfig: {thinkingBudget: 8192}}, expected: undefined},
-    {provider: Providers.VERTEXAI, options: {thinkingBudget: 8192}, expected: undefined},
-    {provider: Providers.VERTEXAI, options: {thinkingConfig: {thinkingBudget: 8192}}, expected: undefined},
-    {provider: Providers.GOOGLE, options: {thinkingConfig: {thinkingBudget: -1}}, expected: undefined},
-    {provider: Providers.VERTEXAI, options: {thinkingConfig: {thinkingBudget: 8192, thinkingLevel: 'HIGH' as const}}, expected: undefined},
-    {provider: Providers.GOOGLE, options: {thinkingConfig: {thinkingBudget: 8192}, maxOutputTokens: 1024}, expected: 12288},
-  ])('preserves uncapped Google reasoning unless an inherited allowance exists: %j', async ({provider, options, expected}) => {
-    const {node, model} = harness({provider, maxContextTokens: 100_000, clientOptions: options, summarizationConfig: {}});
-    const messages = history(6);
-    await node({messages, summarizationRequest: {agentId: 'agent', remainingContextTokens: 0, windowMessages: messages}}, {});
-    const sentOptions = jest.mocked(init.initializeModel).mock.calls[0][0].clientOptions;
-    if (expected == null) expect(sentOptions).not.toHaveProperty('maxOutputTokens');
-    else expect(sentOptions).toMatchObject({maxOutputTokens: expected});
-    expect(model.calls).toHaveLength(1);
-  });
+    {
+      provider: Providers.GOOGLE,
+      options: { thinkingConfig: { thinkingBudget: 8192 } },
+      expected: undefined,
+    },
+    {
+      provider: Providers.VERTEXAI,
+      options: { thinkingBudget: 8192 },
+      expected: undefined,
+    },
+    {
+      provider: Providers.VERTEXAI,
+      options: { thinkingConfig: { thinkingBudget: 8192 } },
+      expected: undefined,
+    },
+    {
+      provider: Providers.GOOGLE,
+      options: { thinkingConfig: { thinkingBudget: -1 } },
+      expected: undefined,
+    },
+    {
+      provider: Providers.VERTEXAI,
+      options: {
+        thinkingConfig: {
+          thinkingBudget: 8192,
+          thinkingLevel: 'HIGH' as const,
+        },
+      },
+      expected: undefined,
+    },
+    {
+      provider: Providers.GOOGLE,
+      options: {
+        thinkingConfig: { thinkingBudget: 8192 },
+        maxOutputTokens: 1024,
+      },
+      expected: 12288,
+    },
+  ])(
+    'preserves uncapped Google reasoning unless an inherited allowance exists: %j',
+    async ({ provider, options, expected }) => {
+      const { node, model } = harness({
+        provider,
+        maxContextTokens: 100_000,
+        clientOptions: options,
+        summarizationConfig: {},
+      });
+      const messages = history(6);
+      await node(
+        {
+          messages,
+          summarizationRequest: {
+            agentId: 'agent',
+            remainingContextTokens: 0,
+            windowMessages: messages,
+          },
+        },
+        {}
+      );
+      const sentOptions = jest.mocked(init.initializeModel).mock.calls[0][0]
+        .clientOptions;
+      if (expected == null)
+        expect(sentOptions).not.toHaveProperty('maxOutputTokens');
+      else expect(sentOptions).toMatchObject({ maxOutputTokens: expected });
+      expect(model.calls).toHaveLength(1);
+    }
+  );
 
   const emptyReasoningBlocks = [
-    {type: 'thinking', thinking: ''}, {type: 'thinking', thinking: ' \n\t'},
-    {type: 'reasoning_content', reasoningText: {text: ''}},
-    {type: 'reasoning_content', reasoningText: {text: ' \n\t'}},
-    {type: 'redacted_thinking', data: ''},
-    {type: 'reasoning_content', redactedContent: ''},
+    { type: 'thinking', thinking: '' },
+    { type: 'thinking', thinking: ' \n\t' },
+    { type: 'reasoning_content', reasoningText: { text: '' } },
+    { type: 'reasoning_content', reasoningText: { text: ' \n\t' } },
+    { type: 'redacted_thinking', data: '' },
+    { type: 'reasoning_content', redactedContent: '' },
   ];
-  it.each(emptyReasoningBlocks)('does not retry an empty native reasoning block: %j', async block => {
-    const model = new ReasoningOnlyModel(3, undefined, new AIMessageChunk({content: [block], response_metadata: {stopReason: 'end_turn'}}));
-    const {node, emitted, agentContext} = harness({model});
-    const messages = history(6);
-    const result = await node({messages, summarizationRequest: {agentId: 'agent', remainingContextTokens: 0, windowMessages: messages}}, {});
-    expect(model.calls).toHaveLength(1);
-    expect(result.messages).toBeUndefined();
-    expect(agentContext.getSummaryText()).toBeUndefined();
-    expect(emitted.filter(({event}) => event === GraphEvents.ON_SUMMARIZE_DELTA)).toHaveLength(0);
-  });
+  it.each(emptyReasoningBlocks)(
+    'does not retry an empty native reasoning block: %j',
+    async (block) => {
+      const model = new ReasoningOnlyModel(
+        3,
+        undefined,
+        new AIMessageChunk({
+          content: [block],
+          response_metadata: { stopReason: 'end_turn' },
+        })
+      );
+      const { node, emitted, agentContext } = harness({ model });
+      const messages = history(6);
+      const result = await node(
+        {
+          messages,
+          summarizationRequest: {
+            agentId: 'agent',
+            remainingContextTokens: 0,
+            windowMessages: messages,
+          },
+        },
+        {}
+      );
+      expect(model.calls).toHaveLength(1);
+      expect(result.messages).toBeUndefined();
+      expect(agentContext.getSummaryText()).toBeUndefined();
+      expect(
+        emitted.filter(({ event }) => event === GraphEvents.ON_SUMMARIZE_DELTA)
+      ).toHaveLength(0);
+    }
+  );
 
   it.each([
-    {type: 'redacted_thinking', data: 'OPAQUE_REASONING'},
-    {type: 'reasoning_content', redactedContent: 'OPAQUE_REASONING'},
-    {type: 'reasoning_content', reasoningText: {signature: 'OPAQUE_REASONING'}},
-    {type: 'reasoning', encrypted_content: 'OPAQUE_REASONING', summary: []},
-  ])('retains recovery for genuine opaque reasoning: %j', async block => {
+    { type: 'redacted_thinking', data: 'OPAQUE_REASONING' },
+    { type: 'reasoning_content', redactedContent: 'OPAQUE_REASONING' },
+    {
+      type: 'reasoning_content',
+      reasoningText: { signature: 'OPAQUE_REASONING' },
+    },
+    { type: 'reasoning', encrypted_content: 'OPAQUE_REASONING', summary: [] },
+  ])('retains recovery for genuine opaque reasoning: %j', async (block) => {
     jest.useFakeTimers();
-    const model = new ReasoningOnlyModel(1, undefined, new AIMessageChunk({content: [block]}));
-    const {node, emitted, agentContext} = harness({model});
+    const model = new ReasoningOnlyModel(
+      1,
+      undefined,
+      new AIMessageChunk({ content: [block] })
+    );
+    const { node, emitted, agentContext } = harness({ model });
     const messages = history(6);
-    const pending = node({messages, summarizationRequest: {agentId: 'agent', remainingContextTokens: 0, windowMessages: messages}}, {});
-    await jest.runAllTimersAsync(); await pending;
+    const pending = node(
+      {
+        messages,
+        summarizationRequest: {
+          agentId: 'agent',
+          remainingContextTokens: 0,
+          windowMessages: messages,
+        },
+      },
+      {}
+    );
+    await jest.runAllTimersAsync();
+    await pending;
     expect(model.calls).toHaveLength(2);
     expect(agentContext.getSummaryText()).toBe('CLEAN_SUMMARY');
-    expect(JSON.stringify(emitted.filter(({event}) => event === GraphEvents.ON_SUMMARIZE_DELTA || event === GraphEvents.ON_SUMMARIZE_COMPLETE))).not.toContain('OPAQUE_REASONING');
+    expect(
+      JSON.stringify(
+        emitted.filter(
+          ({ event }) =>
+            event === GraphEvents.ON_SUMMARIZE_DELTA ||
+            event === GraphEvents.ON_SUMMARIZE_COMPLETE
+        )
+      )
+    ).not.toContain('OPAQUE_REASONING');
   });
 
-  it.each(['stream', 'invoke'] as const)('accounts completed %s usage even when terminal tool validation rejects the response', async mode => {
-    const model = new SummaryModel();
-    const response = new AIMessageChunk({content: '', tool_calls: [{id: 'truncated', name: 'search', args: {}}],
-      response_metadata: {stopReason: 'max_tokens'}, usage_metadata: {input_tokens: 100, output_tokens: 50, total_tokens: 150},
-    });
-    let calls = 0;
-    if (mode === 'invoke') {
-      Object.defineProperty(model, 'stream', {value: undefined});
-      jest.spyOn(model, 'invoke').mockImplementation(async () => {calls++; return response;});
-    } else {
-      jest.spyOn(model, '_streamResponseChunks').mockImplementation(async function* () {
-        calls++; yield new ChatGenerationChunk({text: '', message: response});
+  it.each(['stream', 'invoke'] as const)(
+    'accounts completed %s usage even when terminal tool validation rejects the response',
+    async (mode) => {
+      const model = new SummaryModel();
+      const response = new AIMessageChunk({
+        content: '',
+        tool_calls: [{ id: 'truncated', name: 'search', args: {} }],
+        response_metadata: { stopReason: 'max_tokens' },
+        usage_metadata: {
+          input_tokens: 100,
+          output_tokens: 50,
+          total_tokens: 150,
+        },
       });
+      let calls = 0;
+      if (mode === 'invoke') {
+        Object.defineProperty(model, 'stream', { value: undefined });
+        jest.spyOn(model, 'invoke').mockImplementation(async () => {
+          calls++;
+          return response;
+        });
+      } else {
+        jest
+          .spyOn(model, '_streamResponseChunks')
+          .mockImplementation(async function* () {
+            calls++;
+            yield new ChatGenerationChunk({ text: '', message: response });
+          });
+      }
+      const { node, emitted, graph, agentContext } = harness({
+        model,
+        provider: Providers.BEDROCK,
+        clientOptions: { model: 'bedrock-summary' },
+      });
+      const messages = history(6);
+      const before = JSON.stringify(messages);
+      const result = await node(
+        {
+          messages,
+          summarizationRequest: {
+            agentId: 'agent',
+            remainingContextTokens: 0,
+            windowMessages: messages,
+          },
+        },
+        {}
+      );
+      expect(calls).toBe(1);
+      expect(result.messages).toBeUndefined();
+      expect(JSON.stringify(messages)).toBe(before);
+      expect(agentContext.getSummaryText()).toBeUndefined();
+      expect(graph.dispatchRunStep.mock.calls[0][0].usage).toEqual({
+        prompt_tokens: 100,
+        completion_tokens: 50,
+        total_tokens: 150,
+      });
+      const completed = emitted.find(
+        ({ event }) => event === GraphEvents.ON_SUMMARIZE_COMPLETE
+      )?.data as t.SummarizeCompleteEvent;
+      expect(completed.attemptUsage).toEqual([
+        {
+          provider: Providers.BEDROCK,
+          model: 'bedrock-summary',
+          usage: response.usage_metadata,
+        },
+      ]);
+      expect(
+        emitted.filter(({ event }) => event === GraphEvents.ON_SUMMARIZE_DELTA)
+      ).toHaveLength(0);
     }
-    const {node, emitted, graph, agentContext} = harness({model, provider: Providers.BEDROCK, clientOptions: {model: 'bedrock-summary'}});
-    const messages = history(6);
-    const before = JSON.stringify(messages);
-    const result = await node({messages, summarizationRequest: {agentId: 'agent', remainingContextTokens: 0, windowMessages: messages}}, {});
-    expect(calls).toBe(1);
-    expect(result.messages).toBeUndefined(); expect(JSON.stringify(messages)).toBe(before);
-    expect(agentContext.getSummaryText()).toBeUndefined();
-    expect(graph.dispatchRunStep.mock.calls[0][0].usage).toEqual({prompt_tokens: 100, completion_tokens: 50, total_tokens: 150});
-    const completed = emitted.find(({event}) => event === GraphEvents.ON_SUMMARIZE_COMPLETE)?.data as t.SummarizeCompleteEvent;
-    expect(completed.attemptUsage).toEqual([{provider: Providers.BEDROCK, model: 'bedrock-summary', usage: response.usage_metadata}]);
-    expect(emitted.filter(({event}) => event === GraphEvents.ON_SUMMARIZE_DELTA)).toHaveLength(0);
-  });
+  );
 
   it('reserves the configured Google thinking allowance in the request input budget', async () => {
-    const {node, model} = harness({provider: Providers.GOOGLE, maxContextTokens: 20_000,
-      clientOptions: {maxOutputTokens: 10192, thinkingConfig: {thinkingBudget: 8192}}, summarizationConfig: {contextBudgetMode: 'window', retainRecent: {turns: 0}},
+    const { node, model } = harness({
+      provider: Providers.GOOGLE,
+      maxContextTokens: 20_000,
+      clientOptions: {
+        maxOutputTokens: 10192,
+        thinkingConfig: { thinkingBudget: 8192 },
+      },
+      summarizationConfig: {
+        contextBudgetMode: 'window',
+        retainRecent: { turns: 0 },
+      },
     });
     const messages = history(100);
-    await node({messages, summarizationRequest: {agentId: 'agent', remainingContextTokens: 0, windowMessages: messages}}, {});
+    await node(
+      {
+        messages,
+        summarizationRequest: {
+          agentId: 'agent',
+          remainingContextTokens: 0,
+          windowMessages: messages,
+        },
+      },
+      {}
+    );
     expect(model.calls).toHaveLength(1);
     expect(model.calls[0]).toHaveLength(messages.length + 2);
-    expect(model.calls[0].reduce((total, message) => total + count(message), 10192)).toBeLessThanOrEqual(20_000);
-    expect(init.initializeModel).toHaveBeenCalledWith(expect.objectContaining({clientOptions: expect.objectContaining({maxOutputTokens: 10192})}));
+    expect(
+      model.calls[0].reduce((total, message) => total + count(message), 10192)
+    ).toBeLessThanOrEqual(20_000);
+    expect(init.initializeModel).toHaveBeenCalledWith(
+      expect.objectContaining({
+        clientOptions: expect.objectContaining({ maxOutputTokens: 10192 }),
+      })
+    );
   });
 
   it('preserves rejected fallback usage before a later provider succeeds', async () => {
-    const primary = new SummaryModel(); primary.failure = () => new Error('Primary failed');
+    const primary = new SummaryModel();
+    primary.failure = () => new Error('Primary failed');
     const truncated = new SummaryModel();
-    Object.defineProperty(truncated, 'stream', {value: undefined});
-    jest.spyOn(truncated, 'invoke').mockResolvedValue(new AIMessageChunk({content: '',
-      tool_calls: [{id: 'truncated', name: 'search', args: {}}], response_metadata: {stopReason: 'max_tokens'},
-      usage_metadata: {input_tokens: 100, output_tokens: 50, total_tokens: 150},
-    }));
-    const successful = new SummaryModel(); successful.summaryUsage = {input_tokens: 321, output_tokens: 45, total_tokens: 366};
-    const {node, emitted, graph} = harness({model: primary, clientOptions: {fallbacks: [
-      {provider: Providers.BEDROCK, clientOptions: {model: 'truncated'}},
-      {provider: Providers.ANTHROPIC, clientOptions: {model: 'successful'}},
-    ]}});
-    jest.spyOn(init, 'initializeModel').mockImplementation(({provider}) => {
+    Object.defineProperty(truncated, 'stream', { value: undefined });
+    jest
+      .spyOn(truncated, 'invoke')
+      .mockResolvedValue(
+        new AIMessageChunk({
+          content: '',
+          tool_calls: [{ id: 'truncated', name: 'search', args: {} }],
+          response_metadata: { stopReason: 'max_tokens' },
+          usage_metadata: {
+            input_tokens: 100,
+            output_tokens: 50,
+            total_tokens: 150,
+          },
+        })
+      );
+    const successful = new SummaryModel();
+    successful.summaryUsage = {
+      input_tokens: 321,
+      output_tokens: 45,
+      total_tokens: 366,
+    };
+    const { node, emitted, graph } = harness({
+      model: primary,
+      clientOptions: {
+        fallbacks: [
+          {
+            provider: Providers.BEDROCK,
+            clientOptions: { model: 'truncated' },
+          },
+          {
+            provider: Providers.ANTHROPIC,
+            clientOptions: { model: 'successful' },
+          },
+        ],
+      },
+    });
+    jest.spyOn(init, 'initializeModel').mockImplementation(({ provider }) => {
       if (provider === Providers.BEDROCK) return truncated;
       return provider === Providers.ANTHROPIC ? successful : primary;
     });
     const messages = history(6);
-    await node({messages, summarizationRequest: {agentId: 'agent', remainingContextTokens: 0, windowMessages: messages}}, {});
-    const completed = emitted.find(({event}) => event === GraphEvents.ON_SUMMARIZE_COMPLETE)?.data as t.SummarizeCompleteEvent;
-    expect(completed.summary).toMatchObject({provider: Providers.ANTHROPIC, model: 'successful'});
-    expect(completed.attemptUsage?.map(entry => [entry.provider, entry.model, entry.usage.total_tokens])).toEqual([
-      [Providers.BEDROCK, 'truncated', 150], [Providers.ANTHROPIC, 'successful', 366],
+    await node(
+      {
+        messages,
+        summarizationRequest: {
+          agentId: 'agent',
+          remainingContextTokens: 0,
+          windowMessages: messages,
+        },
+      },
+      {}
+    );
+    const completed = emitted.find(
+      ({ event }) => event === GraphEvents.ON_SUMMARIZE_COMPLETE
+    )?.data as t.SummarizeCompleteEvent;
+    expect(completed.summary).toMatchObject({
+      provider: Providers.ANTHROPIC,
+      model: 'successful',
+    });
+    expect(
+      completed.attemptUsage?.map((entry) => [
+        entry.provider,
+        entry.model,
+        entry.usage.total_tokens,
+      ])
+    ).toEqual([
+      [Providers.BEDROCK, 'truncated', 150],
+      [Providers.ANTHROPIC, 'successful', 366],
     ]);
-    expect(graph.dispatchRunStep.mock.calls[0][0].usage).toMatchObject({prompt_tokens: 421, completion_tokens: 95, total_tokens: 516});
+    expect(graph.dispatchRunStep.mock.calls[0][0].usage).toMatchObject({
+      prompt_tokens: 421,
+      completion_tokens: 95,
+      total_tokens: 516,
+    });
   });
 
   it.each([
-    [Providers.OPENAI, 'initial'], [Providers.OPENAI, 'mid-run'],
-    [Providers.ANTHROPIC, 'initial'], [Providers.ANTHROPIC, 'mid-run'],
-    [Providers.OPENROUTER, 'initial'], [Providers.OPENROUTER, 'mid-run'],
-    [Providers.BEDROCK, 'initial'], [Providers.BEDROCK, 'mid-run'],
-  ] as const)('sends the prior checkpoint only once for %s %s self-compaction', async (provider, location) => {
-    const {node, model, agentContext} = harness({provider,
-      clientOptions: {promptCache: true, model: 'claude-sonnet-4-5'},
-      summarizationConfig: {maxSummaryTokens: 128},
-    });
-    const prior = 'UNIQUE_PREVIOUS_CHECKPOINT ' + 'verified context '.repeat(150);
-    if (location === 'initial') agentContext.setInitialSummary(prior, count(new HumanMessage(prior)));
-    else agentContext.setSummary(prior, count(new HumanMessage(prior)), {precedesMessages: true});
-    const messages = history(6);
-    const cachedWindow = provider === Providers.BEDROCK ? addBedrockTailCacheControl(messages, '1h') : messages;
-    const prefix = await agentContext.systemRunnable!.invoke(cachedWindow);
-    const projectedPrior = JSON.stringify(prefix);
-    expect(projectedPrior).toContain('UNIQUE_PREVIOUS_CHECKPOINT');
-    await node({messages, summarizationRequest: {agentId: 'agent', remainingContextTokens: 0, windowMessages: messages}}, {});
-    expect(model.calls).toHaveLength(1);
-    expect(model.calls[0].slice(0, -1)).toEqual(prepareProviderRequest({model, messages: prefix, provider}).messages);
-    expect(JSON.stringify(model.calls[0]).split('UNIQUE_PREVIOUS_CHECKPOINT')).toHaveLength(2);
-    expect(model.calls[0].at(-1)?.content).toContain('Hold on again, update your checkpoint');
-    expect(model.calls[0].at(-1)?.content).toContain('already present in the request prefix');
-  });
+    [Providers.OPENAI, 'initial'],
+    [Providers.OPENAI, 'mid-run'],
+    [Providers.ANTHROPIC, 'initial'],
+    [Providers.ANTHROPIC, 'mid-run'],
+    [Providers.OPENROUTER, 'initial'],
+    [Providers.OPENROUTER, 'mid-run'],
+    [Providers.BEDROCK, 'initial'],
+    [Providers.BEDROCK, 'mid-run'],
+  ] as const)(
+    'sends the prior checkpoint only once for %s %s self-compaction',
+    async (provider, location) => {
+      const { node, model, agentContext } = harness({
+        provider,
+        clientOptions: { promptCache: true, model: 'claude-sonnet-4-5' },
+        summarizationConfig: { maxSummaryTokens: 128 },
+      });
+      const prior =
+        'UNIQUE_PREVIOUS_CHECKPOINT ' + 'verified context '.repeat(150);
+      if (location === 'initial')
+        agentContext.setInitialSummary(prior, count(new HumanMessage(prior)));
+      else
+        agentContext.setSummary(prior, count(new HumanMessage(prior)), {
+          precedesMessages: true,
+        });
+      const messages = history(6);
+      const cachedWindow =
+        provider === Providers.BEDROCK
+          ? addBedrockTailCacheControl(messages, '1h')
+          : messages;
+      const prefix = await agentContext.systemRunnable!.invoke(cachedWindow);
+      const projectedPrior = JSON.stringify(prefix);
+      expect(projectedPrior).toContain('UNIQUE_PREVIOUS_CHECKPOINT');
+      await node(
+        {
+          messages,
+          summarizationRequest: {
+            agentId: 'agent',
+            remainingContextTokens: 0,
+            windowMessages: messages,
+          },
+        },
+        {}
+      );
+      expect(model.calls).toHaveLength(1);
+      expect(model.calls[0].slice(0, -1)).toEqual(
+        prepareProviderRequest({ model, messages: prefix, provider }).messages
+      );
+      expect(
+        JSON.stringify(model.calls[0]).split('UNIQUE_PREVIOUS_CHECKPOINT')
+      ).toHaveLength(2);
+      expect(model.calls[0].at(-1)?.content).toContain(
+        'Hold on again, update your checkpoint'
+      );
+      expect(model.calls[0].at(-1)?.content).toContain(
+        'already present in the request prefix'
+      );
+    }
+  );
 
-  it.each(['dedicated', 'fallback'] as const)('still supplies the prior checkpoint once when the %s omits the agent system prefix', async mode => {
-    const primary = new SummaryModel();
-    const secondary = new SummaryModel();
-    if (mode === 'fallback') primary.failure = () => new Error('Primary failed');
-    const {node, agentContext} = harness({model: primary, clientOptions: {fallbacks: mode === 'fallback' ? [
-      {provider: Providers.ANTHROPIC, clientOptions: {model: 'secondary'}},
-    ] : []}, summarizationConfig: {provider: mode === 'dedicated' ? Providers.ANTHROPIC : undefined, maxSummaryTokens: 128}});
-    agentContext.setInitialSummary('UNIQUE_PREVIOUS_CHECKPOINT', 20);
-    jest.spyOn(init, 'initializeModel').mockImplementation(({provider}) => provider === Providers.ANTHROPIC ? secondary : primary);
-    const messages = history(6);
-    await node({messages, summarizationRequest: {agentId: 'agent', remainingContextTokens: 0, windowMessages: messages}}, {});
-    expect(secondary.calls).toHaveLength(1);
-    expect(secondary.calls[0].some(message => message.getType() === 'system')).toBe(false);
-    expect(JSON.stringify(secondary.calls[0]).split('UNIQUE_PREVIOUS_CHECKPOINT')).toHaveLength(2);
-    expect(secondary.calls[0].at(-1)?.content).toContain('<previous-summary>\nUNIQUE_PREVIOUS_CHECKPOINT');
-  });
+  it.each(['dedicated', 'fallback'] as const)(
+    'still supplies the prior checkpoint once when the %s omits the agent system prefix',
+    async (mode) => {
+      const primary = new SummaryModel();
+      const secondary = new SummaryModel();
+      if (mode === 'fallback')
+        primary.failure = () => new Error('Primary failed');
+      const { node, agentContext } = harness({
+        model: primary,
+        clientOptions: {
+          fallbacks:
+            mode === 'fallback'
+              ? [
+                {
+                  provider: Providers.ANTHROPIC,
+                  clientOptions: { model: 'secondary' },
+                },
+              ]
+              : [],
+        },
+        summarizationConfig: {
+          provider: mode === 'dedicated' ? Providers.ANTHROPIC : undefined,
+          maxSummaryTokens: 128,
+        },
+      });
+      agentContext.setInitialSummary('UNIQUE_PREVIOUS_CHECKPOINT', 20);
+      jest
+        .spyOn(init, 'initializeModel')
+        .mockImplementation(({ provider }) =>
+          provider === Providers.ANTHROPIC ? secondary : primary
+        );
+      const messages = history(6);
+      await node(
+        {
+          messages,
+          summarizationRequest: {
+            agentId: 'agent',
+            remainingContextTokens: 0,
+            windowMessages: messages,
+          },
+        },
+        {}
+      );
+      expect(secondary.calls).toHaveLength(1);
+      expect(
+        secondary.calls[0].some((message) => message.getType() === 'system')
+      ).toBe(false);
+      expect(
+        JSON.stringify(secondary.calls[0]).split('UNIQUE_PREVIOUS_CHECKPOINT')
+      ).toHaveLength(2);
+      expect(secondary.calls[0].at(-1)?.content).toContain(
+        '<previous-summary>\nUNIQUE_PREVIOUS_CHECKPOINT'
+      );
+    }
+  );
 
-  it.each(['one-user-turn', 'retained-recent-turns'] as const)('skips overflow compaction with no removable history: %s', async scenario => {
-    const {node, model, agentContext, emitted, graph} = harness();
-    const prior = 'EXISTING_CHECKPOINT';
-    agentContext.setInitialSummary(prior, 20);
-    const version = agentContext.summaryVersion;
-    const messages = scenario === 'one-user-turn' ? [new HumanMessage('large payload '.repeat(100))] : history(2);
-    const before = JSON.stringify(messages);
-    const result = await node({messages, summarizationRequest: {agentId: 'agent', remainingContextTokens: 0, reason: 'overflow', allowSummarization: true, windowMessages: messages}}, {});
-    expect(model.calls).toHaveLength(0);
-    expect(graph.dispatchRunStep).not.toHaveBeenCalled();
-    expect(result.messages).toBeUndefined();
-    expect(JSON.stringify(messages)).toBe(before);
-    expect(agentContext.getSummaryText()).toBe(prior);
-    expect(agentContext.summaryVersion).toBe(version);
-    expect(emitted.filter(({event}) => event === GraphEvents.ON_SUMMARIZE_COMPLETE)).toHaveLength(0);
-  });
+  it.each(['one-user-turn', 'retained-recent-turns'] as const)(
+    'skips overflow compaction with no removable history: %s',
+    async (scenario) => {
+      const { node, model, agentContext, emitted, graph } = harness();
+      const prior = 'EXISTING_CHECKPOINT';
+      agentContext.setInitialSummary(prior, 20);
+      const version = agentContext.summaryVersion;
+      const messages =
+        scenario === 'one-user-turn'
+          ? [new HumanMessage('large payload '.repeat(100))]
+          : history(2);
+      const before = JSON.stringify(messages);
+      const result = await node(
+        {
+          messages,
+          summarizationRequest: {
+            agentId: 'agent',
+            remainingContextTokens: 0,
+            reason: 'overflow',
+            allowSummarization: true,
+            windowMessages: messages,
+          },
+        },
+        {}
+      );
+      expect(model.calls).toHaveLength(0);
+      expect(graph.dispatchRunStep).not.toHaveBeenCalled();
+      expect(result.messages).toBeUndefined();
+      expect(JSON.stringify(messages)).toBe(before);
+      expect(agentContext.getSummaryText()).toBe(prior);
+      expect(agentContext.summaryVersion).toBe(version);
+      expect(
+        emitted.filter(
+          ({ event }) => event === GraphEvents.ON_SUMMARIZE_COMPLETE
+        )
+      ).toHaveLength(0);
+    }
+  );
 
-  it.each(['dedicated', 'fallback'] as const)('measures the actual bound inventory with the %s serving tokenizer', async mode => {
-    const countOpenAI = await createTokenCounter('o200k_base');
-    const countClaude = await createTokenCounter('claude');
-    const tools: t.GraphTools = Array.from({length: 6}, (_, i) => ({type: 'function', function: {
-      name: `inspect_${i}`, description: '사용자가 인증 미들웨어를 리팩터링하여 토큰 검증을 요청했습니다. '.repeat(12),
-      parameters: {type: 'object', properties: {query: {type: 'string', description: '조회할 사용자 인증 정보와 필요한 검증 결과를 자세히 기록합니다.'.repeat(8)}}},
-    }}));
-    const toolTokens = countSummarizationToolTokens({tools, provider: Providers.ANTHROPIC, clientOptions: {model: 'production'}, count: countClaude});
-    expect(toolTokens).toBeGreaterThan(countSummarizationToolTokens({tools, provider: Providers.OPENAI, clientOptions: {model: 'gpt-4o'}, count: countOpenAI}));
-    const maxContextTokens = toolTokens + 1_000;
-    const primary = new SummaryModel();
-    const secondary = new SummaryModel();
-    if (mode === 'fallback') primary.failure = () => new Error('Primary failed');
-    secondary.failure = sent => sent.reduce((total, message) => total + countClaude(message), toolTokens + 128) > maxContextTokens
-      ? new Error('maximum context length exceeded') : undefined;
-    const {node, agentContext} = harness({model: primary, tools, tokenCounter: countOpenAI, maxContextTokens,
-      clientOptions: {model: 'gpt-4o', fallbacks: mode === 'fallback' ? [{provider: Providers.ANTHROPIC,
-        maxContextTokens, clientOptions: {model: 'production', maxTokens: 128},
-      }] : []},
-      summarizationConfig: {provider: mode === 'dedicated' ? Providers.ANTHROPIC : undefined,
-        prompt: 'Checkpoint.', maxSummaryTokens: 128, contextBudgetMode: 'window', retainRecent: {turns: 0}},
-    });
-    await agentContext.tokenCalculationPromise;
-    jest.spyOn(init, 'initializeModel').mockImplementation(({provider}) => provider === Providers.ANTHROPIC ? secondary : primary);
-    const messages = history(3);
-    await node({messages, summarizationRequest: {agentId: 'agent', remainingContextTokens: 0, windowMessages: messages}}, {});
-    expect(secondary.calls).toHaveLength(1);
-    expect(secondary.calls[0].length).toBe(messages.length + 1);
-    expect(secondary.calls[0].reduce((total, message) => total + countClaude(message), toolTokens + 128)).toBeLessThanOrEqual(maxContextTokens);
-    expect(init.initializeModel).toHaveBeenCalledWith(expect.objectContaining({provider: Providers.ANTHROPIC, tools}));
-    expect(agentContext.getSummaryText()).toBe('CLEAN_SUMMARY');
-  });
+  it.each(['dedicated', 'fallback'] as const)(
+    'measures the actual bound inventory with the %s serving tokenizer',
+    async (mode) => {
+      const countOpenAI = await createTokenCounter('o200k_base');
+      const countClaude = await createTokenCounter('claude');
+      const tools: t.GraphTools = Array.from({ length: 6 }, (_, i) => ({
+        type: 'function',
+        function: {
+          name: `inspect_${i}`,
+          description:
+            '사용자가 인증 미들웨어를 리팩터링하여 토큰 검증을 요청했습니다. '.repeat(
+              12
+            ),
+          parameters: {
+            type: 'object',
+            properties: {
+              query: {
+                type: 'string',
+                description:
+                  '조회할 사용자 인증 정보와 필요한 검증 결과를 자세히 기록합니다.'.repeat(
+                    8
+                  ),
+              },
+            },
+          },
+        },
+      }));
+      const toolTokens = countSummarizationToolTokens({
+        tools,
+        provider: Providers.ANTHROPIC,
+        clientOptions: { model: 'production' },
+        count: countClaude,
+      });
+      expect(toolTokens).toBeGreaterThan(
+        countSummarizationToolTokens({
+          tools,
+          provider: Providers.OPENAI,
+          clientOptions: { model: 'gpt-4o' },
+          count: countOpenAI,
+        })
+      );
+      const maxContextTokens = toolTokens + 1_000;
+      const primary = new SummaryModel();
+      const secondary = new SummaryModel();
+      if (mode === 'fallback')
+        primary.failure = () => new Error('Primary failed');
+      secondary.failure = (sent) =>
+        sent.reduce(
+          (total, message) => total + countClaude(message),
+          toolTokens + 128
+        ) > maxContextTokens
+          ? new Error('maximum context length exceeded')
+          : undefined;
+      const { node, agentContext } = harness({
+        model: primary,
+        tools,
+        tokenCounter: countOpenAI,
+        maxContextTokens,
+        clientOptions: {
+          model: 'gpt-4o',
+          fallbacks:
+            mode === 'fallback'
+              ? [
+                {
+                  provider: Providers.ANTHROPIC,
+                  maxContextTokens,
+                  clientOptions: { model: 'production', maxTokens: 128 },
+                },
+              ]
+              : [],
+        },
+        summarizationConfig: {
+          provider: mode === 'dedicated' ? Providers.ANTHROPIC : undefined,
+          prompt: 'Checkpoint.',
+          maxSummaryTokens: 128,
+          contextBudgetMode: 'window',
+          retainRecent: { turns: 0 },
+        },
+      });
+      await agentContext.tokenCalculationPromise;
+      jest
+        .spyOn(init, 'initializeModel')
+        .mockImplementation(({ provider }) =>
+          provider === Providers.ANTHROPIC ? secondary : primary
+        );
+      const messages = history(3);
+      await node(
+        {
+          messages,
+          summarizationRequest: {
+            agentId: 'agent',
+            remainingContextTokens: 0,
+            windowMessages: messages,
+          },
+        },
+        {}
+      );
+      expect(secondary.calls).toHaveLength(1);
+      expect(secondary.calls[0].length).toBe(messages.length + 1);
+      expect(
+        secondary.calls[0].reduce(
+          (total, message) => total + countClaude(message),
+          toolTokens + 128
+        )
+      ).toBeLessThanOrEqual(maxContextTokens);
+      expect(init.initializeModel).toHaveBeenCalledWith(
+        expect.objectContaining({ provider: Providers.ANTHROPIC, tools })
+      );
+      expect(agentContext.getSummaryText()).toBe('CLEAN_SUMMARY');
+    }
+  );
 
   it('retries an Anthropic tool-only summary without executing the tool or changing request options', async () => {
     jest.useFakeTimers();
     const model = new SummaryModel();
-    Object.defineProperty(model, 'stream', {value: undefined});
-    const invoke = jest.spyOn(model, 'invoke').mockResolvedValueOnce(new AIMessageChunk({content: '',
-      tool_calls: [{id: 'calculator', name: 'calculator', args: {expression: '2+2'}}],
-      response_metadata: {stop_reason: 'tool_use'},
-    })).mockResolvedValue(new AIMessageChunk('CLEAN_SUMMARY'));
-    const {node, emitted, agentContext} = harness({provider: Providers.ANTHROPIC, model});
+    Object.defineProperty(model, 'stream', { value: undefined });
+    const invoke = jest
+      .spyOn(model, 'invoke')
+      .mockResolvedValueOnce(
+        new AIMessageChunk({
+          content: '',
+          tool_calls: [
+            {
+              id: 'calculator',
+              name: 'calculator',
+              args: { expression: '2+2' },
+            },
+          ],
+          response_metadata: { stop_reason: 'tool_use' },
+        })
+      )
+      .mockResolvedValue(new AIMessageChunk('CLEAN_SUMMARY'));
+    const { node, emitted, agentContext } = harness({
+      provider: Providers.ANTHROPIC,
+      model,
+    });
     const messages = history(6);
-    const pending = node({messages, summarizationRequest: {agentId: 'agent', remainingContextTokens: 0, reason: 'manual', windowMessages: messages}}, {});
-    await jest.runAllTimersAsync(); await pending;
+    const pending = node(
+      {
+        messages,
+        summarizationRequest: {
+          agentId: 'agent',
+          remainingContextTokens: 0,
+          reason: 'manual',
+          windowMessages: messages,
+        },
+      },
+      {}
+    );
+    await jest.runAllTimersAsync();
+    await pending;
     expect(invoke).toHaveBeenCalledTimes(2);
     expect(invoke.mock.calls[1][0]).toEqual(invoke.mock.calls[0][0]);
     expect(agentContext.getSummaryText()).toBe('CLEAN_SUMMARY');
-    expect(emitted.filter(({event}) => event === GraphEvents.ON_SUMMARIZE_COMPLETE)).toHaveLength(1);
-    expect(JSON.stringify(emitted.filter(({event}) => event === GraphEvents.ON_SUMMARIZE_COMPLETE))).not.toContain('calculator');
+    expect(
+      emitted.filter(({ event }) => event === GraphEvents.ON_SUMMARIZE_COMPLETE)
+    ).toHaveLength(1);
+    expect(
+      JSON.stringify(
+        emitted.filter(
+          ({ event }) => event === GraphEvents.ON_SUMMARIZE_COMPLETE
+        )
+      )
+    ).not.toContain('calculator');
   });
 
   const cancellations = [
@@ -1806,16 +2755,15 @@ describe('compaction request windows', () => {
       expect(agentContext.getSummaryText()).toBeUndefined();
       expect(
         emitted.filter(
-          ({ event }) =>
-            event === GraphEvents.ON_SUMMARIZE_COMPLETE ||
-            event === GraphEvents.ON_SUMMARIZE_DELTA
+          ({ event }) => event === GraphEvents.ON_SUMMARIZE_COMPLETE
         )
       ).toHaveLength(0);
+      expect(streamedSummary(emitted)).toBe('');
     }
   );
 
   it.each(['failure', 'empty'] as const)(
-    'discards all fallback deltas after %s',
+    'withdraws all fallback deltas after %s',
     async (outcome) => {
       const primary = new SummaryModel();
       const failed = new SummaryModel();
@@ -1863,9 +2811,7 @@ describe('compaction request windows', () => {
       expect(result.messages).toBeUndefined();
       expect(JSON.stringify(messages)).toBe(before);
       expect(agentContext.getSummaryText()).toBeUndefined();
-      expect(
-        emitted.filter(({ event }) => event === GraphEvents.ON_SUMMARIZE_DELTA)
-      ).toHaveLength(0);
+      expect(streamedSummary(emitted)).toBe('');
       expect(
         JSON.stringify(
           emitted.filter(
@@ -1917,8 +2863,54 @@ describe('compaction request windows', () => {
       errorCode: 'provider_overloaded',
     });
     expect(JSON.stringify(completed)).not.toContain('private-provider-detail');
+    expect(streamedSummary(emitted)).toBe('');
     expect(
-      emitted.filter((event) => event.event === GraphEvents.ON_SUMMARIZE_DELTA)
-    ).toHaveLength(0);
+      emitted.findIndex(
+        ({ event }) => event === GraphEvents.ON_SUMMARIZE_COMPLETE
+      )
+    ).toBeGreaterThan(
+      emitted
+        .map(({ event }) => event)
+        .lastIndexOf(GraphEvents.ON_SUMMARIZE_DELTA)
+    );
+  });
+
+  it('publishes each delta while the provider is still responding', async () => {
+    const model = new SummaryModel();
+    const { node, emitted } = harness({ model });
+    const seenAtChunk: number[] = [];
+    const stream = model._streamResponseChunks.bind(model);
+    jest
+      .spyOn(model, '_streamResponseChunks')
+      .mockImplementation(async function* (messages) {
+        for await (const chunk of stream(messages)) {
+          seenAtChunk.push(
+            emitted.filter(
+              ({ event }) => event === GraphEvents.ON_SUMMARIZE_DELTA
+            ).length
+          );
+          yield chunk;
+        }
+      });
+    const messages = history(6);
+    await node(
+      {
+        messages,
+        summarizationRequest: {
+          agentId: 'agent',
+          remainingContextTokens: 0,
+          windowMessages: messages,
+        },
+      },
+      {}
+    );
+    /** The first chunk's delta is out before the provider yields the second. */
+    expect(seenAtChunk).toEqual([0, 1]);
+    expect(streamedSummary(emitted)).toBe('CLEAN_SUMMARY');
+    expect(
+      emitted
+        .filter(({ event }) => event === GraphEvents.ON_SUMMARIZE_DELTA)
+        .some(({ data }) => (data as t.SummarizeDeltaEvent).reset === true)
+    ).toBe(false);
   });
 });

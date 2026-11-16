@@ -55,7 +55,10 @@ import {
   calculateMaxToolResultChars,
   truncateToolResultContent,
 } from '@/utils/truncation';
-import { createToolCallsDispatchedEvent, safeDispatchCustomEvent } from '@/utils/events';
+import {
+  createToolCallsDispatchedEvent,
+  safeDispatchCustomEvent,
+} from '@/utils/events';
 import { resolveToolOutcome, outcomeFieldsFromResult } from '@/tools/intentArg';
 import { snapshotValidatedModelChunk } from '@/graphs/acceptedModelResponse';
 import { ProviderTextProtectionError } from '@/protection/providerText';
@@ -1366,7 +1369,8 @@ function startPreparedSubagents(
   if ((graph.clientDelegatedToolNames?.size ?? 0) > 0) return;
   // A parsed string call is not executable even if the same event carries
   // sealed raw fragments. Wait for a separately validated complete call.
-  if (chunk.tool_calls?.some((call) => typeof call.args === 'string') === true) return;
+  if (chunk.tool_calls?.some((call) => typeof call.args === 'string') === true)
+    return;
   if (
     (graph as Partial<StandardGraph>).canPrestartSubagents?.(agentContext) !==
       true ||
@@ -1688,7 +1692,11 @@ export class ChatModelStreamHandler implements t.EventHandler {
       graph.breakerAbort instanceof AbortController
         ? graph.breakerAbort
         : undefined;
-    const entrySignals = [eventBreaker?.signal, graph.signal, graph.config.signal];
+    const entrySignals = [
+      eventBreaker?.signal,
+      graph.signal,
+      graph.config.signal,
+    ];
     /** Immutable scope captured at handler entry. A reset while this
      * handler is suspended in an await replaces the object, so ONE
      * reference comparison proves the event still belongs to the live run
@@ -1698,10 +1706,12 @@ export class ChatModelStreamHandler implements t.EventHandler {
       entryRunScope != null && graph.runScope !== entryRunScope;
     const throwIfRunBreakerTripped = (): void => {
       for (const signal of entrySignals) {
-        if (signal?.aborted === true &&
-            (signal.reason instanceof StreamLimitExceededError ||
-              signal.reason instanceof PreparedSubagentError ||
-              signal.reason instanceof ProviderTextProtectionError)) {
+        if (
+          signal?.aborted === true &&
+          (signal.reason instanceof StreamLimitExceededError ||
+            signal.reason instanceof PreparedSubagentError ||
+            signal.reason instanceof ProviderTextProtectionError)
+        ) {
           throw signal.reason;
         }
         if (signal?.aborted === true && graph.providerTextProtection != null) {
@@ -1924,7 +1934,8 @@ export class ChatModelStreamHandler implements t.EventHandler {
           chunk.response_metadata as Record<string, unknown> | undefined
         );
       const canStreamEager =
-        chunk.tool_calls?.some((call) => typeof call.args === 'string') !== true &&
+        chunk.tool_calls?.some((call) => typeof call.args === 'string') !==
+          true &&
         (allowSequentialSeal || hasExplicitStreamedToolCallSeals(chunk)) &&
         !hasPotentialDirectToolInStreamContext({ graph, agentContext }) &&
         isEagerToolExecutionEnabledForBatch({ graph, metadata, agentContext });
@@ -2670,6 +2681,9 @@ export function createContentAggregator(): t.ContentAggregatorResult {
       if (!runStep) {
         console.warn('No run step found for summarize delta event');
         return;
+      }
+      if (deltaData.reset === true) {
+        contentParts[runStep.index] = { type: ContentTypes.SUMMARY };
       }
       updateContent(runStep.index, deltaData.delta.summary);
       return;

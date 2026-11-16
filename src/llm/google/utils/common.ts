@@ -41,6 +41,12 @@ import {
   GOOGLE_STREAMED_TOOL_CALL_ADAPTER,
 } from '@/tools/streamedToolCallSeals';
 import {
+  GEMINI_PARTS,
+  GEMINI_REPLAY_UNSUPPORTED,
+  captureGeminiReplayParts,
+  restoreGeminiReplayParts,
+} from './signatures';
+import {
   jsonSchemaToGeminiParameters,
   schemaToGenerativeAIParameters,
 } from './zod_to_genai_parameters';
@@ -519,6 +525,9 @@ export function convertMessageContentToParts(
     ];
   }
 
+  const replayParts = restoreGeminiReplayParts(message);
+  if (replayParts != null) return replayParts as Part[];
+
   let functionCalls: FunctionCallPart[] = [];
   const messageParts: Part[] = [];
 
@@ -534,11 +543,9 @@ export function convertMessageContentToParts(
     );
   }
 
-  const functionThoughtSignatures = (
-    message.additional_kwargs as BaseMessage['additional_kwargs'] | undefined
-  )?.[_FUNCTION_CALL_THOUGHT_SIGNATURES_MAP_KEY] as
-    | Record<string, string>
-    | undefined;
+  const storedSignatures = message.additional_kwargs[_FUNCTION_CALL_THOUGHT_SIGNATURES_MAP_KEY] as Record<string, string> | undefined;
+  let functionThoughtSignatures = storedSignatures != null && Object.keys(storedSignatures).length > 0 ? storedSignatures : undefined;
+  if (Object.hasOwn(message.additional_kwargs, GEMINI_PARTS) && message.additional_kwargs[GEMINI_REPLAY_UNSUPPORTED] !== true) functionThoughtSignatures = {};
 
   if (isAIMessage(message) && (message.tool_calls?.length ?? 0) > 0) {
     functionCalls = (message.tool_calls ?? []).map((tc) => {
@@ -549,7 +556,7 @@ export function convertMessageContentToParts(
             return signature;
           }
         }
-        if (isGemini3PlusModel(model)) {
+        if (isGemini3PlusModel(model) && functionThoughtSignatures == null) {
           return DUMMY_SIGNATURE;
         }
         return '';
@@ -700,6 +707,7 @@ const GEMINI_FLASH_VERSION_PATTERN = /^gemini-(\d+)(?:\.(\d+))?-flash(?:$|-)/;
 const NO_PREFILL_GEMINI_MODELS = [
   'gemini-3.5-flash-lite',
   'gemini-4-argon',
+  'gemini-4-hydrogen',
 ] as const;
 
 export function rejectsModelTurnPrefill(model?: string): boolean {
@@ -732,10 +740,10 @@ export function rejectsModelTurnPrefill(model?: string): boolean {
  * HTTP 400 for it, so we drop it and let the model generate fresh from the
  * preceding user turn. No-op for every other model, preserving working prefill.
  */
-export function dropUnsupportedModelTurnPrefill(
-  contents: Content[] | undefined,
+export function dropUnsupportedModelTurnPrefill<T extends { role: string }>(
+  contents: T[] | undefined,
   model?: string
-): Content[] | undefined {
+): T[] | undefined {
   if (
     contents == null ||
     contents.length === 0 ||
@@ -755,6 +763,7 @@ export function convertResponseContentToChatGenerationChunk(
   extra: {
     usageMetadata?: UsageMetadata | undefined;
     index: number;
+    model?: string;
   }
 ): ChatGenerationChunk | null {
   if (!response.candidates || response.candidates.length === 0) {
@@ -906,7 +915,7 @@ export function convertResponseContentToChatGenerationChunk(
       }
       : undefined;
 
-  return new ChatGenerationChunk({
+  const chunk = new ChatGenerationChunk({
     text,
     message: new AIMessageChunk({
       content: content,
@@ -920,6 +929,8 @@ export function convertResponseContentToChatGenerationChunk(
     }),
     generationInfo,
   });
+  captureGeminiReplayParts(chunk.message, candidateContent?.parts ?? [], extra.model);
+  return chunk;
 }
 
 /**
@@ -929,6 +940,7 @@ export function mapGenerateContentResultToChatResult(
   response: EnhancedGenerateContentResponse,
   extra?: {
     usageMetadata: UsageMetadata | undefined;
+    model?: string;
   }
 ): ChatResult {
   if (!response.candidates || response.candidates.length === 0) {
@@ -1060,6 +1072,7 @@ export function mapGenerateContentResultToChatResult(
     }),
     generationInfo,
   };
+  captureGeminiReplayParts(generation.message, candidateContent?.parts ?? [], extra?.model);
   return {
     generations: [generation],
     llmOutput: {

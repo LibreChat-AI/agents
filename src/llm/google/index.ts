@@ -15,7 +15,7 @@ import type {
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
 import type { BaseMessage, UsageMetadata } from '@langchain/core/messages';
 import type { GeminiApiUsageMetadata, InputTokenDetails } from './types';
-import type { GoogleClientOptions, GoogleThinkingConfig } from '@/types';
+import type { GoogleClientOptions } from '@/types';
 import {
   convertResponseContentToChatGenerationChunk,
   convertBaseMessagesToContent,
@@ -40,7 +40,7 @@ type GoogleToolConfigWithServerSideInvocations = ToolConfig & {
 
 export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
   _lc_stream_delay: number;
-  thinkingConfig?: GoogleThinkingConfig;
+  thinkingConfig?: ChatGoogleGenerativeAI['thinkingConfig'];
   includeServerSideToolInvocations?: boolean;
 
   /**
@@ -58,7 +58,10 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
   }
 
   constructor(fields: GoogleClientOptions) {
-    super(fields);
+    // The upstream type omits Hydrogen's XHIGH level; the API accepts it unchanged.
+    const thinkingConfig =
+      fields.thinkingConfig as ChatGoogleGenerativeAI['thinkingConfig'];
+    super({ ...fields, thinkingConfig });
 
     this._lc_stream_delay = resolveStreamDelay(fields._lc_stream_delay);
     this.model = fields.model.replace(/^models\//, '');
@@ -115,7 +118,7 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
       }
     }
 
-    this.thinkingConfig = fields.thinkingConfig ?? this.thinkingConfig;
+    this.thinkingConfig = thinkingConfig ?? this.thinkingConfig;
     this.includeServerSideToolInvocations =
       fields.includeServerSideToolInvocations ??
       this.includeServerSideToolInvocations;
@@ -172,7 +175,7 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
       total_tokens: usageMetadata.totalTokenCount ?? 0,
     };
 
-    if (usageMetadata.cachedContentTokenCount) {
+    if ((usageMetadata.cachedContentTokenCount ?? 0) > 0) {
       output.input_token_details ??= {};
       output.input_token_details.cache_read =
         usageMetadata.cachedContentTokenCount;
@@ -188,7 +191,7 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
         0,
         (usageMetadata.cachedContentTokenCount ?? 0) - 200000
       );
-      if (over200k) {
+      if (over200k > 0) {
         output.input_token_details = {
           ...output.input_token_details,
           over_200k: over200k,
@@ -285,6 +288,7 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
     /** @ts-ignore */
     const generationResult = mapGenerateContentResultToChatResult(response, {
       usageMetadata,
+      model: this.model,
     });
 
     await runManager?.handleLLMNewToken(
@@ -359,6 +363,7 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
 
       const chunk = convertResponseContentToChatGenerationChunk(response, {
         usageMetadata: undefined,
+        model: this.model,
         index,
       });
       index += 1;
@@ -380,3 +385,12 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
     }
   }
 }
+
+export {
+  GEMINI_PARTS,
+  GEMINI_REPLAY_UNSUPPORTED,
+  captureGeminiReplayParts,
+  restoreGeminiReplayParts,
+  isGeminiReplayParts,
+} from './utils/signatures';
+export type { GeminiReplayPart } from './utils/signatures';
