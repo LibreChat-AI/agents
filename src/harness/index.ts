@@ -224,3 +224,13 @@ export function createHostToolBindings(options: {
     },
   };
 }
+
+export {
+  createHostProviderTextService,
+  createHostProviderTextProtection,
+} from './providerText';
+export type {
+  HostProviderTextDescriptor,
+  HostProviderTextRequest,
+  HostProviderTextService,
+} from './providerText';

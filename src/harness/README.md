@@ -64,3 +64,50 @@ Local services that update their request also retain that state; the harness rec
 SDK session fields, including when execution fails. Remote adapters must deliver session updates
 before settling either a successful or failed invocation. This preserves lazy input provisioning
 and sandbox refresh semantics without copying request credentials or arbitrary configuration.
+
+## Host provider-text protection
+
+`createHostProviderTextService` and `createHostProviderTextProtection` connect the existing SDK
+provider-text release boundary to a host-owned policy. The host keeps classification, inspection,
+credentials, deadlines and aggregate raw-text budgets. The worker receives a versioned limits
+descriptor and an authenticated service implementation. The SDK's normal protected model path
+buffers each complete attempt and releases only the canonical text returned by the host; it does
+not issue an RPC per token.
+
+```typescript
+// Authenticated host: retain this service for the bound execution.
+const { descriptor, service } = createHostProviderTextService({
+  identity: authenticatedIdentity,
+  policy: hostProviderTextProtection,
+});
+
+// Worker: the transport forwards cancellation and maps typed policy errors.
+const providerTextProtection = createHostProviderTextProtection({
+  identity: authenticatedIdentity,
+  descriptor,
+  service: authenticatedPolicyTransport,
+});
+const run = await Run.create({ ...config, providerTextProtection });
+```
+
+Transport endpoints must validate the request shape, authenticate the connection, select its
+pre-bound service, enforce frame/queue limits, propagate invocation cancellation, and negotiate
+capability support before graph execution. Identity data is not authentication. Service calls
+reject a mismatch in any execution identity field before calling the host policy. Serialize only
+the policy error code (`ProviderTextProtectionError.code`); reconstruct that typed error on the
+caller, and sanitize all other failures. This SDK layer does not choose endpoints, authenticate
+connections, retry calls, or journal raw candidates. A transport must explicitly account for
+candidate retention in its own memory, persistence and tracing policy.
+
+Host limits are enforced even if a worker enlarges its local descriptor or calls the service
+directly. Bindings sharing one policy object share its host byte budget, including outstanding
+inspection that ignores cancellation. Timeout/cancellation can reject a request before an inspector
+settles; its budget remains charged until the inspector actually drains. Inspection statistics
+remain host-owned; the worker adapter records no additional replacements/categories.
+
+This protects the SDK provider-text output boundary only. Builder model selection, input/model
+callbacks, provider credentials, accounting, tracing/export policy and non-SDK model calls require
+their own adapters. A trusted custom graph must install the supplied policy on every applicable SDK
+Run; this service does not sandbox or attest arbitrary worker code. LibreChat's remote runtime does
+not automatically enable this service until its transport adapter and required policy negotiation
+are implemented. Existing unsupported-policy rejection must remain in place for those deployments.
