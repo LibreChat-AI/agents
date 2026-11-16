@@ -10,9 +10,12 @@
  * Subsequent tool calls can pipe a previous output into their args by
  * embedding `{{tool<idx>turn<turn>}}` inside any string argument;
  * {@link ToolOutputReferenceRegistry.resolve} walks the args and
- * substitutes the placeholders immediately before invocation. A backslash
- * before a placeholder escapes it: the backslash is removed and the literal
- * placeholder is passed through without a registry lookup.
+ * substitutes the placeholders immediately before invocation. Backslashes
+ * directly before a placeholder follow the usual escape rule: each pair
+ * collapses to one literal backslash, and a remaining single backslash is
+ * removed and escapes the placeholder, which then passes through as literal
+ * text without a registry lookup. So `\{{tool0turn0}}` is the literal
+ * placeholder and `\\{{tool0turn0}}` is a backslash followed by the output.
  *
  * The registry stores the *raw, untruncated* tool output so a later
  * `{{…}}` substitution pipes the full payload into the next tool —
@@ -157,6 +160,8 @@ export type ResolvedArgsByCallId = Map<string, Record<string, unknown>>;
 
 const EMPTY_ENTRIES: ReadonlyMap<string, string> = new Map<string, string>();
 
+const BACKSLASH = 0x5c;
+
 /** Keys a snapshot offers as a correction hint for an unknown reference. */
 const AVAILABLE_KEY_HINT_LIMIT = 10;
 
@@ -204,11 +209,13 @@ export class ToolOutputReferenceRegistry {
   private readonly maxTotalSize: number;
   private readonly maxActiveRuns: number;
   /**
-   * Local stateful matcher used only by `replaceInString`. Kept
-   * off-module so callers of the exported `TOOL_OUTPUT_REF_PATTERN`
-   * never see a stale `lastIndex`.
+   * Global matcher used only by `replaceInString`. Kept off-module so
+   * callers of the exported `TOOL_OUTPUT_REF_PATTERN` never see a stale
+   * `lastIndex`. Leading backslashes are counted by hand rather than
+   * matched: a `\\*` prefix would backtrack quadratically over a long
+   * backslash run that no placeholder follows.
    */
-  private static readonly PLACEHOLDER_MATCHER = /\\?\{\{(tool\d+turn\d+)\}\}/g;
+  private static readonly PLACEHOLDER_MATCHER = /\{\{(tool\d+turn\d+)\}\}/g;
 
   constructor(options: ToolOutputReferenceRegistryOptions = {}) {
     /**
@@ -567,20 +574,31 @@ export class ToolOutputReferenceRegistry {
     if (input.indexOf('{{tool') === -1) {
       return input;
     }
-    return input.replace(
-      ToolOutputReferenceRegistry.PLACEHOLDER_MATCHER,
-      (match, key: string) => {
-        if (match.startsWith('\\')) {
-          return match.slice(1);
-        }
-        const stored = entries.get(key);
-        if (stored == null) {
-          unresolved.add(key);
-          return match;
-        }
-        return stored;
+    let output = '';
+    let cursor = 0;
+    for (const match of input.matchAll(
+      ToolOutputReferenceRegistry.PLACEHOLDER_MATCHER
+    )) {
+      const [placeholder, key] = match;
+      let start = match.index;
+      while (start > cursor && input.charCodeAt(start - 1) === BACKSLASH) {
+        start--;
       }
-    );
+      const backslashes = match.index - start;
+      const replacement =
+        backslashes % 2 === 1 ? placeholder : entries.get(key);
+      if (replacement == null) {
+        /** Left verbatim: the caller rejects the call on any unresolved key. */
+        unresolved.add(key);
+        continue;
+      }
+      output +=
+        input.slice(cursor, start) +
+        '\\'.repeat(backslashes >> 1) +
+        replacement;
+      cursor = match.index + placeholder.length;
+    }
+    return cursor === 0 ? input : output + input.slice(cursor);
   }
 
   private evictWithinBucket(bucket: RunStateBucket): void {
