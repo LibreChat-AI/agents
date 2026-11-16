@@ -93,9 +93,9 @@ const run = await Run.create({ ...config, providerTextProtection });
 Transport endpoints must validate the request shape, authenticate the connection, select its
 pre-bound service, enforce frame/queue limits, propagate invocation cancellation, and negotiate
 capability support before graph execution. Identity data is not authentication. Service calls
-reject a mismatch in any execution identity field before calling the host policy. Serialize only
-the policy error code (`ProviderTextProtectionError.code`); reconstruct that typed error on the
-caller, and sanitize all other failures. This SDK layer does not choose endpoints, authenticate
+reject a mismatch in any execution identity field before calling the host policy. Use the versioned error
+helpers described below to reconstruct typed policy failures on the caller and sanitize all other
+failures. This SDK layer does not choose endpoints, authenticate
 connections, retry calls, or journal raw candidates. A transport must explicitly account for
 candidate retention in its own memory, persistence and tracing policy.
 
@@ -116,14 +116,18 @@ Absent `tenantId` and `conversationId` fields must be omitted (or `undefined` fo
 `null` is invalid and is never normalized to another identity. Tool and provider-text bindings use
 the same exported `snapshotExecutionIdentity` helper for identity validation and immutable snapshots.
 
-The policy-wide byte budget has no per-binding cap. Until per-binding admission is implemented,
-transports must limit concurrent inspections per binding and must not expose a shared policy to
-multiple tenants without that isolation. `timeoutMs` covers the whole model attempt on the worker,
-but starts a fresh inspection window on the host; it does not provide a separate, shorter host
-inspection deadline. Transports must supply that deadline before multi-tenant rollout.
+Hosts can now supply a reusable `ProviderTextAdmission` scope and a shorter
+`inspectionTimeoutMs` to `createHostProviderTextService`. Admission caps concurrent inspections
+and charged bytes across all bindings sharing that scope, including cancelled work that has not
+settled. `snapshot()` reports total and retained ownership without exposing content. The original
+policy-wide budget remains shared; neither a timeout nor a disconnect releases retained capacity.
+Reuse the scope across reconnects and binding reconstruction. Omitted options preserve the previous
+behavior, so shared-host transports must configure both explicitly before rollout.
 
-Before enabling a shared multi-tenant transport, add per-binding admission and an independent host
-inspection deadline. Further work includes visibility into cancelled inspections retaining budget,
-validation of transport-provided signals before attempt construction, and an explicitly versioned
-policy request/error contract for execution subjects, new targets and multiple SDK module copies.
-Do not free a cancelled inspector's budget solely because time elapsed while it still owns raw text.
+Use `serializeProviderTextProtectionError` and `deserializeProviderTextProtectionError` for the
+versioned failure envelope. These preserve allowlisted codes across separate CJS/ESM copies without
+serializing messages or stacks. The v1 target remains model-produced message text; other targets and
+child execution subjects need explicit future contracts.
+
+See [host provider-text protection](../../docs/host-provider-text.md) for setup, the identity and
+wire contract, process-local limits, retention monitoring, and recovery without freeing live work.

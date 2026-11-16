@@ -1,10 +1,12 @@
 import { z } from 'zod';
+import type { ProviderTextAdmission } from '@/protection/providerTextAdmission';
 import type { ProviderTextProtection } from '@/protection/providerText';
 import type { ExecutionIdentity } from './identity';
 import {
   ProviderTextAttempt,
   ProviderTextProtectionError,
   validateProviderTextProtection,
+  validateProviderTextTimeout,
 } from '@/protection/providerText';
 import {
   executionIdentitySchema,
@@ -53,6 +55,10 @@ function boundIdentity(
 export function createHostProviderTextService(options: {
   identity: Readonly<ExecutionIdentity>;
   policy: ProviderTextProtection;
+  /** Reuse a host-owned scope for all bindings sharing a tenant or runtime quota. */
+  admission?: ProviderTextAdmission;
+  /** Host inspection deadline; cannot extend the policy's model-attempt timeout. */
+  inspectionTimeoutMs?: number;
 }): {
   descriptor: HostProviderTextDescriptor;
   service: HostProviderTextService;
@@ -60,6 +66,9 @@ export function createHostProviderTextService(options: {
   const identity = boundIdentity(options.identity);
   const policy = options.policy;
   validateProviderTextProtection(policy);
+  const { admission, inspectionTimeoutMs } = options;
+  if (inspectionTimeoutMs !== undefined)
+    validateProviderTextTimeout(inspectionTimeoutMs);
   return {
     descriptor: Object.freeze({
       version: 1,
@@ -76,7 +85,10 @@ export function createHostProviderTextService(options: {
           !matchesExecutionIdentity(parsed.data.identity, identity)
         )
           throw new ProviderTextProtectionError('incompatible');
-        const attempt = new ProviderTextAttempt(policy, signal);
+        const attempt = new ProviderTextAttempt(policy, signal, {
+          admission,
+          timeoutMs: inspectionTimeoutMs,
+        });
         try {
           attempt.append(parsed.data.content);
           return await attempt.release();
