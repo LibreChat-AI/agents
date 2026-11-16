@@ -14,11 +14,6 @@ import type {
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type {
-  OrderedToolHistoryProjection,
-  ToolHistoryPreparation,
-  ToolHistoryCallMirrors,
-} from './toolHistoryProjection';
-import type {
   BedrockReasoningContentText,
   ExtendedMessageContent,
   GoogleReasoningContentText,
@@ -37,6 +32,11 @@ import type {
   CompactionSemanticIndexEntry,
   CompactionSemanticIndexSnapshot,
 } from '@/types';
+import type {
+  OrderedToolHistoryProjection,
+  ToolHistoryPreparation,
+  ToolHistoryCallMirrors,
+} from './toolHistoryProjection';
 import type {
   ProviderMessageAttribution,
   ProviderMessageProvenancePart,
@@ -71,6 +71,11 @@ import {
   serializeStructuredValueBounded,
 } from '@/utils/toolContent';
 import {
+  createToolHistoryPreparation,
+  isToolHistoryCallMirror,
+  recordToolHistoryCallMirror,
+} from './toolHistoryProjection';
+import {
   Providers,
   ContentTypes,
   Constants,
@@ -82,15 +87,10 @@ import {
   restoreResponsesToolRound,
   alignProviderItemsWithCall,
 } from './responsesToolRounds';
-import { isReasoningContentBlock } from './reasoningTypes';
 import { flattenLegacyContent, isLegacyConvertible } from './content';
 import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
+import { isReasoningContentBlock } from './reasoningTypes';
 import { emitAgentLog } from '@/utils/events';
-import {
-  createToolHistoryPreparation,
-  isToolHistoryCallMirror,
-  recordToolHistoryCallMirror,
-} from './toolHistoryProjection';
 
 interface MediaMessageParams {
   message: {
@@ -400,6 +400,7 @@ interface FormatAssistantMessageOptions {
   intentToolNames?: ReadonlySet<string>;
   preserveUnpairedServerToolUses?: boolean;
   preserveReasoningContent?: boolean;
+  preserveTextContent?: boolean;
   provider?: ProviderName;
   retainedSourceContentEnd?: number;
   sourceMessageId?: string;
@@ -422,6 +423,8 @@ export interface FormatAgentMessagesOptions {
    *  tool-call messages. Explicit opt-in for OpenAI-compatible endpoints that
    *  replay reasoning across turns; defaults to on for DeepSeek thinking-mode. */
   preserveReasoningContent?: boolean;
+  /** Preserve exact assistant text bytes for provider signature replay. */
+  preserveTextContent?: boolean;
   /** Skill names already primed fresh this turn (manual/always-apply). Their
    *  historical `skill` tool_calls are not reconstructed into a HumanMessage,
    *  so the same SKILL.md body is not injected twice in one request. */
@@ -1645,6 +1648,7 @@ function formatAssistantMessage(
       sourceContentPartIndices: SourceContentPartIndices;
     }
   >();
+  const preserveTextContent = options?.preserveTextContent === true;
   const shouldPreserveReasoningContent =
     options?.preserveReasoningContent === true;
   const compactionSemanticIndex = options?.compactionSemanticIndex;
@@ -1864,13 +1868,17 @@ function formatAssistantMessage(
             currentContentProvenance = createProviderMessageProvenanceBuilder();
             continue;
           }
-          let content = currentContent.reduce((acc, curr) => {
-            if (curr.type === ContentTypes.TEXT) {
-              return `${acc}${getTextContent(curr)}\n`;
-            }
-            return acc;
-          }, '');
-          content = `${content}\n${getTextContent(part)}`.trim();
+          let content = preserveTextContent
+            ? currentContent.map(getTextContent).join('')
+            : currentContent.reduce((acc, curr) => {
+              if (curr.type === ContentTypes.TEXT) {
+                return `${acc}${getTextContent(curr)}\n`;
+              }
+              return acc;
+            }, '');
+          content = preserveTextContent
+            ? content + getTextContent(part)
+            : `${content}\n${getTextContent(part)}`.trim();
           appendCurrentContentProvenance(sourcePartIndices, 'model', true);
           lastAIMessage = appendAIMessage(content, currentContentProvenance);
           currentContent = [];
@@ -1967,9 +1975,13 @@ function formatAssistantMessage(
               lastRound.roundId !== roundId);
         if (startsRound && currentContent.length > 0) {
           appendCurrentContentProvenance(sourcePartIndices, 'model');
+          let roundText = currentContent
+            .map(getTextContent)
+            .join(preserveTextContent ? '' : '\n');
+          if (!preserveTextContent) roundText = roundText.trim();
           lastAIMessage = appendAIMessage(
             currentContent.every((item) => item.type === ContentTypes.TEXT)
-              ? currentContent.map(getTextContent).join('\n').trim()
+              ? roundText
               : toLangChainContent(currentContent),
             currentContentProvenance
           );
@@ -2108,9 +2120,11 @@ function formatAssistantMessage(
               currentContentProvenance
             );
           } else {
-            const flushed = currentContent
-              .reduce((acc, curr) => `${acc}${getTextContent(curr)}\n`, '')
-              .trim();
+            const flushed = preserveTextContent
+              ? currentContent.map(getTextContent).join('')
+              : currentContent
+                .reduce((acc, curr) => `${acc}${getTextContent(curr)}\n`, '')
+                .trim();
             if (flushed.length > 0) {
               appendAIMessage(flushed, currentContentProvenance);
             }
@@ -2160,7 +2174,7 @@ function formatAssistantMessage(
       ) {
         continue;
       } else {
-        if (part.type === ContentTypes.TEXT && !getTextContent(part).trim()) {
+        if (part.type === ContentTypes.TEXT && !preserveTextContent && !getTextContent(part).trim()) {
           continue;
         }
         currentContent.push(part);
@@ -2187,18 +2201,20 @@ function formatAssistantMessage(
         );
         return finalizeFormattedMessages();
       }
-      content += `${getTextContent(part)}\n`;
+      content += getTextContent(part) + (preserveTextContent ? '' : '\n');
     }
-    content = content.trim();
+    if (!preserveTextContent) content = content.trim();
 
-    if (content) {
+    if (content !== '' || preserveTextContent) {
       appendAIMessage(content, currentContentProvenance);
     }
   } else if (currentContent.length > 0) {
-    appendAIMessage(
-      toLangChainContent(currentContent),
-      currentContentProvenance
-    );
+    const content = preserveTextContent && currentContent.every((part) => part.type === ContentTypes.TEXT)
+      ? currentContent.map(getTextContent).join('')
+      : toLangChainContent(currentContent);
+    appendAIMessage(content, currentContentProvenance);
+  } else if (preserveTextContent && shouldPreserveReasoningContent && pendingReasoningContent !== '') {
+    appendAIMessage('', currentContentProvenance);
   }
 
   return finalizeFormattedMessages();
@@ -3182,6 +3198,7 @@ export const formatAgentMessages = (
       compactionSemanticIndex: compactionSemanticIndexCollector,
       intentToolNames: options?.compactionSemanticIndex?.intentToolNames,
       preserveUnpairedServerToolUses: i === payload.length - 1,
+      preserveTextContent: options?.preserveTextContent,
       preserveReasoningContent:
         options?.preserveReasoningContent ??
         options?.provider === Providers.DEEPSEEK,
