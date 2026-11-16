@@ -1655,7 +1655,7 @@ async function* delayStreamChunks(
 ): AsyncGenerator<ChatGenerationChunk> {
   const source = (async function* (): AsyncGenerator<
     SmoothItem<ChatGenerationChunk>
-    > {
+  > {
     for await (const chunk of chunks) {
       yield toSmoothItem(chunk);
     }
@@ -2450,10 +2450,10 @@ class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
     const cacheControl =
       promptCache === true
         ? buildAnthropicCacheControl(
-          resolvePromptCacheTtl(
-            cacheOptions?.promptCacheTtl ?? this.responsesPromptCacheTtl
+            resolvePromptCacheTtl(
+              cacheOptions?.promptCacheTtl ?? this.responsesPromptCacheTtl
+            )
           )
-        )
         : undefined;
     const baseParams = applyManagedRequestParams(
       super.invocationParams(options),
@@ -2638,6 +2638,9 @@ class LibreChatAzureOpenAICompletions extends OriginalAzureChatOpenAICompletions
       rawResponse,
       defaultRole
     );
+    if ('usage' in message.response_metadata) {
+      delete message.response_metadata.usage;
+    }
     if (
       isFirstPartyAzureEndpoint({
         baseURL: this.clientConfig.baseURL,
