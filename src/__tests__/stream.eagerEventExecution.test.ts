@@ -2637,6 +2637,118 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
     expect(graph.eagerEventToolCallChunks.size).toBe(0);
   });
 
+  it('never prestarts Anthropic server tool calls that the provider already executed', async () => {
+    const graph = createGraph();
+    const toolExecuteCalls: t.ToolExecuteBatchRequest[] = [];
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data): Promise<void> => {
+        if (event !== GraphEvents.ON_TOOL_EXECUTE) {
+          return;
+        }
+        const batch = data as t.ToolExecuteBatchRequest;
+        toolExecuteCalls.push(batch);
+        batch.resolve(
+          batch.toolCalls.map((call) => ({
+            toolCallId: call.id,
+            status: 'success',
+            content: `ok ${call.name}`,
+          }))
+        );
+      });
+
+    const handler = new ChatModelStreamHandler();
+    const metadata = { langgraph_node: 'agent' };
+    const streamChunk = async (
+      toolCallChunk: Array<{
+        id: string;
+        name: string;
+        args: string;
+        index: number;
+      }>
+    ): Promise<void> =>
+      handler.handle(
+        GraphEvents.CHAT_MODEL_STREAM,
+        {
+          chunk: {
+            content: '',
+            tool_call_chunks: toolCallChunk,
+          } as unknown as t.StreamChunk,
+        },
+        metadata,
+        graph
+      );
+
+    await streamChunk([
+      {
+        id: `${Constants.ANTHROPIC_SERVER_TOOL_PREFIX}01first`,
+        name: 'web_search',
+        args: '{"query":"first"}',
+        index: 0,
+      },
+    ]);
+    await streamChunk([
+      {
+        id: `${Constants.ANTHROPIC_SERVER_TOOL_PREFIX}02second`,
+        name: 'web_search',
+        args: '{"query":"second"}',
+        index: 1,
+      },
+    ]);
+    await streamChunk([
+      {
+        id: 'toolu_weather',
+        name: 'weather',
+        args: '{"city":"NYC"}',
+        index: 2,
+      },
+    ]);
+
+    expect(toolExecuteCalls).toHaveLength(0);
+    expect(graph.eagerEventToolExecutions.size).toBe(0);
+
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_calls: [
+            {
+              id: `${Constants.ANTHROPIC_SERVER_TOOL_PREFIX}01first`,
+              name: 'web_search',
+              args: { query: 'first' },
+            },
+            {
+              id: `${Constants.ANTHROPIC_SERVER_TOOL_PREFIX}02second`,
+              name: 'web_search',
+              args: { query: 'second' },
+            },
+            {
+              id: 'toolu_weather',
+              name: 'weather',
+              args: { city: 'NYC' },
+            },
+          ],
+          response_metadata: finalToolCallResponseMetadata,
+        } as unknown as t.StreamChunk,
+      },
+      metadata,
+      graph
+    );
+
+    expect(toolExecuteCalls).toHaveLength(1);
+    expect(toolExecuteCalls[0].toolCalls).toEqual([
+      expect.objectContaining({
+        id: 'toolu_weather',
+        name: 'weather',
+        args: { city: 'NYC' },
+      }),
+    ]);
+    expect([...graph.eagerEventToolExecutions.keys()]).toEqual([
+      'toolu_weather',
+    ]);
+  });
+
   it('emits a completed event when an eager streamed tool result settles', async () => {
     const graph = createGraph({
       getAgentContext: jest.fn(
