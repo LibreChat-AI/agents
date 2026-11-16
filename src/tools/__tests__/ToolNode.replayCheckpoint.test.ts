@@ -127,6 +127,136 @@ describe('ToolNode checkpoint authority', () => {
     }
   );
 
+  describe('frozen reference inputs on resume', () => {
+    /** Pauses a `work` batch, lets a sibling batch register an output on the
+     * shared registry, then resumes in a runtime restored from the live state. */
+    async function pauseAroundSibling(options: {
+      registry: ToolOutputReferenceRegistry;
+      restored: ToolOutputReferenceRegistry;
+      value: string;
+      siblingOutput: string;
+      hooks?: HookRegistry;
+    }): Promise<{ result: ToolMessage; resumedRuns: string[] }> {
+      const { registry, restored, hooks } = options;
+      let release: () => void = () => {
+        throw new Error('not initialized');
+      };
+      const barrier = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let paused = false;
+      const resumedRuns: string[] = [];
+      const work = tool(
+        async ({ value }) => {
+          if (!paused) {
+            await barrier;
+            throw new GraphInterrupt([{ id: 'pause', value: 'confirm' }]);
+          }
+          resumedRuns.push(value);
+          return value;
+        },
+        {
+          name: 'work',
+          description: 'work',
+          schema: z.object({ value: z.string() }),
+        }
+      );
+      const sibling = tool(async () => options.siblingOutput, {
+        name: 'sibling',
+        description: 'sibling',
+        schema: z.object({}),
+      });
+      const config = {
+        configurable: { thread_id: 'checkpoint-replay', run_id: 'shared' },
+      };
+      const input = {
+        messages: [
+          new AIMessage({
+            id: 'batch',
+            content: '',
+            tool_calls: [
+              { id: 'work', name: 'work', args: { value: options.value } },
+            ],
+          }),
+        ],
+      };
+      const pause = capturePause(
+        new ToolNode({ tools: [work], toolOutputRegistry: registry }),
+        input,
+        config
+      );
+      await new ToolNode({
+        tools: [sibling],
+        toolOutputRegistry: registry,
+      }).invoke(
+        {
+          messages: [
+            new AIMessage({
+              content: '',
+              tool_calls: [{ id: 'sibling', name: 'sibling', args: {} }],
+            }),
+          ],
+        },
+        config
+      );
+      release();
+      const checkpoint = await pause;
+      restored.restoreState('shared', registry.snapshotState('shared'));
+      const resume = replayConfig(checkpoint);
+      resume.configurable = { ...resume.configurable, run_id: 'shared' };
+      paused = true;
+      const output = (await new ToolNode({
+        tools: [work],
+        toolOutputRegistry: restored,
+        hookRegistry: hooks,
+      }).invoke(input, resume)) as { messages: ToolMessage[] };
+      return { result: output.messages[0], resumedRuns };
+    }
+
+    it('rejects a resumed hook edit naming an output registered after the batch started', async () => {
+      const restored = new ToolOutputReferenceRegistry();
+      const hooks = new HookRegistry();
+      hooks.register('PreToolUse', {
+        hooks: [async () => ({ updatedInput: { value: '{{tool0turn1}}' } })],
+      });
+      const { result, resumedRuns } = await pauseAroundSibling({
+        registry: new ToolOutputReferenceRegistry(),
+        restored,
+        value: 'initial',
+        siblingOutput: 'sibling-result',
+        hooks,
+      });
+      expect(restored.get('shared', 'tool0turn1')).toBe('sibling-result');
+      expect(resumedRuns).toEqual([]);
+      expect(result.status).toBe('error');
+      expect(result.content).toContain('nothing was run');
+      expect(String(result.content).split('Available keys')[1]).not.toContain(
+        'tool0turn1'
+      );
+    });
+
+    it('resolves a resumed reference the live registry has since evicted', async () => {
+      const limits = { maxTotalSize: 64 };
+      const registry = new ToolOutputReferenceRegistry(limits);
+      registry.restoreState('shared', {
+        entries: [{ key: 'tool0turn0', value: 'old-value' }],
+        turnCounter: 1,
+        warnedNonStringTools: [],
+      });
+      const restored = new ToolOutputReferenceRegistry(limits);
+      const { result, resumedRuns } = await pauseAroundSibling({
+        registry,
+        restored,
+        value: '{{tool0turn0}}',
+        siblingOutput: 'x'.repeat(60),
+      });
+      expect(restored.get('shared', 'tool0turn0')).toBeUndefined();
+      expect(result.status).not.toBe('error');
+      expect(result.content).toBe('old-value');
+      expect(resumedRuns).toEqual(['old-value']);
+    });
+  });
+
   it.each([undefined, ''])(
     'restores an ID-less completed sibling (%j) without repeating it',
     async (id) => {
