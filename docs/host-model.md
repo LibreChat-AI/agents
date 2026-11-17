@@ -98,8 +98,16 @@ family traits. For an unregistered generic model, forced reserved names (`auto`,
 `none`, `any`, `required`) fail closed instead of being interpreted as a different
 choice. An empty selection explicitly
 binds an empty tool list when the descriptor contains tools. Native messages are
-snapshotted through LangChain's stored-message representation before asynchronous
-provider dispatch. Host-local V8 serialization preserves binary data, dates,
+snapshotted through the SDK's `toStoredMessage` representation before asynchronous
+provider dispatch. The same helper is exported for transport/checkpoint adapters:
+it reads current native message fields without LangChain's JSON-oriented escaping,
+so binary data, dates, maps, sets, tool artifacts and caller tag fields reach the
+adapter's codec intact. It returns field references, not a deep copy or a wire
+encoding; the adapter must apply its own bounded snapshot/encoding immediately.
+Custom messages declaring `lc_secrets` fail closed and require an explicit codec;
+this helper does not silently bypass their secret-redaction contract.
+A chunk-aware codec must preserve chunk kind separately, because the standard
+LangChain stored-message decoder constructs full messages. Host-local V8 serialization preserves binary data, dates,
 BigInts, maps and sets instead of coercing them through JSON. Functions and other
 uncloneable values fail closed. The returned descriptor is a separate copy.
 

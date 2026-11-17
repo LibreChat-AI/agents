@@ -7,9 +7,6 @@ import {
 import {
   isAIMessage,
   isAIMessageChunk,
-  isToolMessage,
-  isChatMessage,
-  isBaseMessageChunk,
   isBaseMessage,
   mapStoredMessagesToChatMessages,
 } from '@langchain/core/messages';
@@ -40,6 +37,7 @@ import {
 } from './model';
 import { modelStreamCallbacks } from './modelStreamCallbacks';
 import { getProviderFamily } from '@/llm/providers';
+import { toStoredMessage } from '@/messages/stored';
 
 interface ModelLease {
   charge(bytes: number): void;
@@ -144,39 +142,6 @@ const requestSchema = z.object({
     .optional(),
 });
 
-/** Preserve current native fields; BaseMessage.toDict() JSON-coerces structured metadata. */
-function storedMessage(message: BaseMessage): StoredMessage {
-  const data = {
-    ...message.lc_kwargs,
-    content: message.content,
-    additional_kwargs: message.additional_kwargs,
-    response_metadata: message.response_metadata,
-    id: message.id,
-    name: message.name,
-    role: isChatMessage(message) ? message.role : undefined,
-    tool_call_id: undefined,
-    ...(isAIMessage(message)
-      ? {
-        tool_calls: message.tool_calls,
-        invalid_tool_calls: message.invalid_tool_calls,
-        usage_metadata: message.usage_metadata,
-      }
-      : {}),
-    ...(isBaseMessageChunk(message) && isAIMessageChunk(message)
-      ? { tool_call_chunks: message.tool_call_chunks }
-      : {}),
-    ...(isToolMessage(message)
-      ? {
-        tool_call_id: message.tool_call_id,
-        artifact: message.artifact,
-        status: message.status,
-      }
-      : {}),
-  };
-  // LangChain's StoredMessageData types content as string, but its codec supports native blocks.
-  return { type: message.getType(), data } as StoredMessage;
-}
-
 function messageBytes(
   messages: readonly BaseMessage[],
   maxBytes: number
@@ -184,7 +149,7 @@ function messageBytes(
   let bytes = 2;
   try {
     for (const message of messages) {
-      bytes += serializeNativeValue(storedMessage(message)).byteLength + 1;
+      bytes += serializeNativeValue(toStoredMessage(message)).byteLength + 1;
       if (bytes > maxBytes) throw new HostModelServiceError('overflow');
     }
     return bytes;
@@ -355,7 +320,7 @@ export function createHostModelService(options: {
       if (bytes > limits.maxRequestBytes)
         throw new HostModelServiceError('overflow');
       for (const message of value.messages) {
-        const serialized = serializeNativeValue(storedMessage(message));
+        const serialized = serializeNativeValue(toStoredMessage(message));
         const added = serialized.byteLength + 1;
         bytes += added;
         if (bytes > limits.maxRequestBytes)
