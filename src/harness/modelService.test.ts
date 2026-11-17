@@ -735,7 +735,14 @@ function callbackLog(waitForEnd?: Promise<void>) {
     tags?: string[];
   }[] = [];
   const handler = BaseCallbackHandler.fromMethods({
-    handleChatModelStart: (_model, _messages, runId, parentRunId, _extra, tags): void => {
+    handleChatModelStart: (
+      _model,
+      _messages,
+      runId,
+      parentRunId,
+      _extra,
+      tags
+    ): void => {
       events.push({ type: 'start', runId, parentRunId, tags });
     },
     handleLLMEnd: async (output, runId, parentRunId, tags): Promise<void> => {
@@ -962,3 +969,71 @@ it('closes the native run even when partial chunks cannot be concatenated', asyn
   expect(log.events[1].runId).toBe(log.events[0].runId);
   expect(admission.snapshot().calls).toBe(0);
 });
+
+it.each(['cumulative', 'single', 'split-usage'] as const)(
+  'preserves a usage-only tail rejected by the %s response limit',
+  async (mode) => {
+    class TailUsageModel extends Model {
+      override async *_streamResponseChunks(): AsyncGenerator<ChatGenerationChunk> {
+        yield new ChatGenerationChunk({
+          text: 'a'.repeat(200),
+          message: new AIMessageChunk({
+            content: 'a'.repeat(200),
+            ...(mode === 'split-usage'
+              ? {
+                usage_metadata: {
+                  input_tokens: 7,
+                  output_tokens: 0,
+                  total_tokens: 7,
+                },
+              }
+              : {}),
+          }),
+        });
+        yield new ChatGenerationChunk({
+          text: '',
+          message: new AIMessageChunk({
+            content: '',
+            usage_metadata: {
+              input_tokens: mode === 'split-usage' ? 0 : 7,
+              output_tokens: 3,
+              total_tokens: mode === 'split-usage' ? 3 : 10,
+              input_token_details: { cache_read: 2 },
+              output_token_details: { reasoning: 1 },
+            },
+            response_metadata: {
+              padding: mode === 'single' ? 'x'.repeat(2000) : '',
+            },
+          }),
+        });
+      }
+    }
+    const log = callbackLog();
+    const model = new TailUsageModel();
+    model.callbacks = [log.handler];
+    const { service, admission } = fixture({ model, maxResponseBytes: 600 });
+    const stream = service.stream(request())[Symbol.asyncIterator]();
+    expect((await stream.next()).value?.text).toBe('a'.repeat(200));
+    await expect(stream.next()).rejects.toMatchObject({ code: 'overflow' });
+    await flush();
+    expect(log.events.map((event) => event.type)).toEqual(['start', 'end']);
+    expect(log.events[1].output?.generations[0][0]).toMatchObject({
+      text: 'a'.repeat(200),
+      message: {
+        usage_metadata: {
+          input_tokens: 7,
+          output_tokens: 3,
+          total_tokens: 10,
+          input_token_details: { cache_read: 2 },
+          output_token_details: { reasoning: 1 },
+        },
+      },
+    });
+    expect(log.events[1].output?.llmOutput).toMatchObject({
+      reason: 'overflow',
+      usage_incomplete: false,
+      tokenUsage: { promptTokens: 7, completionTokens: 3, totalTokens: 10 },
+    });
+    expect(admission.snapshot().calls).toBe(0);
+  }
+);

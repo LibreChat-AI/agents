@@ -130,6 +130,9 @@ An early iterator return can bypass LangChain's terminal callback. The binding
 closes that native run once, after provider cleanup, using the SDK's shared callback
 composition helper. It preserves the observed run ID, parent and tags, records
 partial output as `HostModelTerminated` control flow, and preserves reported usage.
+Usage is accumulated separately from released content, including a usage-bearing
+chunk rejected by the response-byte limit; it appears in native message metadata
+and `llmOutput.tokenUsage` without releasing that rejected content.
 Missing usage is marked `usage_incomplete`; no token counts are invented. Normal
 native success/error callbacks are not duplicated. Provider billing reconciliation
 for cancelled requests remains a host integration responsibility.

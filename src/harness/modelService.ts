@@ -534,6 +534,7 @@ export function createHostModelService(options: {
             }
             if (!isAIMessageChunk(next.value))
               throw new HostModelServiceError('incompatible');
+            callbacks?.observeUsage(next.value.usage_metadata);
             responseBytes += messageBytes(
               [next.value],
               limits.maxResponseBytes

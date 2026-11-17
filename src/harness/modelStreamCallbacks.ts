@@ -1,4 +1,5 @@
-import { AIMessageChunk } from '@langchain/core/messages';
+import { AIMessageChunk, mergeUsageMetadata } from '@langchain/core/messages';
+import type { UsageMetadata } from '@langchain/core/messages';
 import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { ChatGeneration } from '@langchain/core/outputs';
@@ -15,6 +16,7 @@ export function modelStreamCallbacks(
 ): {
   config: RunnableConfig;
   observe(chunk: AIMessageChunk): void;
+  observeUsage(usage: UsageMetadata | undefined): void;
   finish(reason: HostModelErrorCode): Promise<void>;
 } {
   let runId: string | undefined;
@@ -22,23 +24,38 @@ export function modelStreamCallbacks(
   let terminal = false;
   const isTerminal = (): boolean => terminal;
   let finishing: Promise<void> | undefined;
+  let usage: UsageMetadata | undefined;
   const chunks: AIMessageChunk[] = [];
   const capture = BaseCallbackHandler.fromMethods({
-    handleChatModelStart: (_model, _messages, id, parentRunId, _extra, tags, metadata): void => {
+    handleChatModelStart: (
+      _model,
+      _messages,
+      id,
+      parentRunId,
+      _extra,
+      tags,
+      metadata
+    ): void => {
       if (runId !== undefined) return;
       runId = id;
-      observed = { parentRunId, tags: tags?.slice(), metadata: { ...metadata } };
+      observed = {
+        parentRunId,
+        tags: tags?.slice(),
+        metadata: { ...metadata },
+      };
     },
     handleLLMEnd: (_output, id): void => {
       if (id === runId) {
         terminal = true;
         chunks.length = 0;
+        usage = undefined;
       }
     },
     handleLLMError: (_error, id): void => {
       if (id === runId) {
         terminal = true;
         chunks.length = 0;
+        usage = undefined;
       }
     },
   });
@@ -50,6 +67,11 @@ export function modelStreamCallbacks(
   };
   return {
     config: callConfig,
+    observeUsage: (reported): void => {
+      if (!terminal && reported !== undefined) {
+        usage = mergeUsageMetadata(usage, reported);
+      }
+    },
     observe: (chunk): void => {
       if (!terminal) chunks.push(chunk);
     },
@@ -70,12 +92,16 @@ export function modelStreamCallbacks(
             new AIMessageChunk('')
           );
         } catch {
-          await manager.handleLLMError(new HostModelServiceError('incompatible'));
+          await manager.handleLLMError(
+            new HostModelServiceError('incompatible')
+          );
           return;
         } finally {
           chunks.length = 0;
         }
-        const incomplete = aggregate.usage_metadata === undefined;
+        aggregate.usage_metadata = usage;
+        aggregate.lc_kwargs.usage_metadata = usage;
+        const incomplete = usage === undefined;
         aggregate.response_metadata = {
           ...aggregate.response_metadata,
           host_model_terminated: reason,
@@ -93,6 +119,15 @@ export function modelStreamCallbacks(
             controlFlow: 'HostModelTerminated',
             reason,
             usage_incomplete: incomplete,
+            ...(usage
+              ? {
+                tokenUsage: {
+                  promptTokens: usage.input_tokens,
+                  completionTokens: usage.output_tokens,
+                  totalTokens: usage.total_tokens,
+                },
+              }
+              : {}),
           },
         });
       })();
