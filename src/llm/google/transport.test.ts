@@ -130,9 +130,14 @@ describe('Google HTTP transport', () => {
     );
   });
 
-  test.each(['abort', 'return'] as const)(
-    'closes an idle upstream connection on %s @scenario:google-stream-cleanup',
-    async (mode) => {
+  test.each([
+    ['abort', 0],
+    ['return', 0],
+    ['abort', 25],
+    ['return', 25],
+  ] as const)(
+    'closes an idle upstream connection on %s with smoothing=%s @scenario:google-stream-cleanup',
+    async (mode, delay) => {
       const closed = Promise.withResolvers<void>();
       await withServer(
         (request, response) => {
@@ -143,7 +148,9 @@ describe('Google HTTP transport', () => {
         },
         async (baseUrl) => {
           const controller = new AbortController();
-          const stream = model(baseUrl)._streamResponseChunks(question, {
+          const stream = model(baseUrl, {
+            _lc_stream_delay: delay,
+          })._streamResponseChunks(question, {
             signal: controller.signal,
           });
           expect((await stream.next()).value?.text).toBe('First');
