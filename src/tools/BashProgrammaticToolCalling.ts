@@ -22,18 +22,21 @@ import {
   type ProgrammaticInvocationParams,
 } from './ProgrammaticCallerPolicy';
 import {
+  makeRequest,
+  executeTools,
+  requireContinuationFiles,
+  programmaticWireResults,
+  retainProgrammaticAttachments,
+  runPlainExecution,
+  formatCompletedResponse,
+} from './ProgrammaticToolCalling';
+import {
   clampCodeApiRunTimeoutMs,
   createCodeApiRunTimeoutSchema,
   resolveCodeApiRunTimeoutMs,
 } from './ptcTimeout';
-import {
-  makeRequest,
-  executeTools,
-  runPlainExecution,
-  formatCompletedResponse,
-} from './ProgrammaticToolCalling';
-import { logCodeApiDiagnostic } from '@/tools/diagnostics';
 import { resolveAttachedWorkspaceInstanceId } from '@/tools/workspaceIdentity';
+import { logCodeApiDiagnostic } from '@/tools/diagnostics';
 import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { Constants } from '@/common';
 
@@ -388,7 +391,8 @@ export function createBashProgrammaticToolCallingTool(
     )
       .replace(CORE_RULES, ATTACHED_CORE_RULES)
       .replace(EXAMPLES, ATTACHED_EXAMPLES)
-    : BashProgrammaticToolCallingDescription;
+    : BashProgrammaticToolCallingDescription +
+      '\nMCP downloads return registered filenames in interpreter_files. Open those names under /mnt/data after the tool returns; do not decode base64 from the response.';
   const schema = createBashProgrammaticToolCallingSchema(maxRunTimeoutMs);
   if (hasWorkspace) {
     schema.properties.code.description = CODE_PARAM_DESCRIPTION.replace(
@@ -474,6 +478,7 @@ export function createBashProgrammaticToolCallingTool(
       );
 
       let roundTrip = 0;
+      const attachmentResults: t.PTCToolResult[] = [];
 
       try {
         // ====================================================================
@@ -583,15 +588,18 @@ export function createBashProgrammaticToolCallingTool(
             await executeTools(
               response.tool_calls ?? [],
               effectiveToolMap,
-              Constants.BASH_PROGRAMMATIC_TOOL_CALLING
+              Constants.BASH_PROGRAMMATIC_TOOL_CALLING,
+              config
             )
           );
 
+          attachmentResults.push(...toolResults);
+          requireContinuationFiles(toolResults, response);
           response = await makeRequest(
             EXEC_ENDPOINT,
             {
               continuation_token: response.continuation_token,
-              tool_results: toolResults,
+              tool_results: programmaticWireResults(toolResults),
             },
             proxy,
             requestAuthHeaders,
@@ -605,10 +613,13 @@ export function createBashProgrammaticToolCallingTool(
         // ====================================================================
 
         if (response.status === 'completed') {
-          return formatCompletedResponse(
-            response,
-            code,
-            hasWorkspace ? 'execution' : 'session'
+          return retainProgrammaticAttachments(
+            formatCompletedResponse(
+              response,
+              code,
+              hasWorkspace ? 'execution' : 'session'
+            ),
+            attachmentResults
           );
         }
 
