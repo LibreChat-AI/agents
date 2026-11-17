@@ -5,6 +5,8 @@ on:
     branches:
       - dev
       - main
+      # Validate stacked PRs before their parent reaches main.
+      - danny-avila/**
     paths-ignore:
       - '**.md'
 
