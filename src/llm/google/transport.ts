@@ -1,5 +1,6 @@
 import { GoogleGenAI } from '@google/genai';
 import type {
+  Content,
   GenerateContentRequest,
   GenerateContentResponse,
   ModelParams,
@@ -7,6 +8,22 @@ import type {
   SingleRequestOptions,
 } from '@google/generative-ai';
 import type { GenerateContentParameters } from '@google/genai';
+
+function formatSystemInstruction(
+  input: GenerateContentRequest['systemInstruction']
+): Content | undefined {
+  if (input == null) return undefined;
+  if (typeof input === 'string') {
+    return { role: 'system', parts: [{ text: input }] };
+  }
+  if ('text' in input && input.text != null && input.text !== '') {
+    return { role: 'system', parts: [input] };
+  }
+  if ('parts' in input) {
+    return { ...input, role: input.role || 'system' };
+  }
+  return undefined;
+}
 
 /** Retains LangChain's wire contract without using its archived SDK transport. */
 export class GoogleTransport {
@@ -56,10 +73,13 @@ export class GoogleTransport {
           // Raw fields bypass SDK conversion; this also replaces the placeholder contents.
           extraBody: {
             ...defaults,
-            ...request,
             ...(this.cachedContent != null && this.cachedContent !== ''
               ? { cachedContent: this.cachedContent }
               : {}),
+            ...request,
+            systemInstruction: formatSystemInstruction(
+              request.systemInstruction ?? defaults.systemInstruction
+            ),
           },
         },
       },

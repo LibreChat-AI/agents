@@ -371,57 +371,63 @@ describe('Google HTTP transport', () => {
   );
 });
 
-test('keeps cached-content requests on the maintained transport @scenario:google-cached-transport', async () => {
-  const bodies: GenerateContentRequest[] = [];
-  const systemInstruction = {
-    role: 'system',
-    parts: [{ text: 'Cached system.' }],
-  };
-  const tools = [{ functionDeclarations: [{ name: 'lookup' }] }];
-  await withServer(
-    (request, response) => {
-      let body = '';
-      request.setEncoding('utf8');
-      request.on('data', (chunk: string) => {
-        body += chunk;
-      });
-      request.on('end', () => {
-        bodies.push(JSON.parse(body) as GenerateContentRequest);
-        if (request.url?.includes(':streamGenerateContent') === true) {
-          startStream(response);
-          response.end(': cached heartbeat\n\n' + frame('Cached answer.'));
-        } else {
-          response.writeHead(200, { 'content-type': 'application/json' });
-          response.end(frame('Cached answer.').slice(6).trim());
-        }
-      });
-    },
-    async (baseUrl) => {
-      const client = model(baseUrl);
-      client.useCachedContent(
-        {
-          name: 'cachedContents/test',
-          model: 'models/gemini-4-carbon',
-          contents: [],
-          tools,
-          systemInstruction,
-        },
-        { model: 'gemini-4-carbon' },
-        { baseUrl, customHeaders: new Headers({ 'x-cache': 'yes' }) }
-      );
-      expect(await text(client)).toBe('Cached answer.');
-      await client._generate(question, {});
-      expect(bodies).toHaveLength(2);
-      for (const body of bodies) {
-        expect(body).toMatchObject({
-          cachedContent: 'cachedContents/test',
-          systemInstruction,
-          tools,
+test.each([
+  'Cached system.',
+  { text: 'Cached system.' },
+  { role: 'system', parts: [{ text: 'Cached system.' }] },
+])(
+  'keeps cached instructions %j on the maintained transport @scenario:google-cached-transport',
+  async (systemInstruction) => {
+    const bodies: GenerateContentRequest[] = [];
+    const tools = [{ functionDeclarations: [{ name: 'lookup' }] }];
+    await withServer(
+      (request, response) => {
+        let body = '';
+        request.setEncoding('utf8');
+        request.on('data', (chunk: string) => {
+          body += chunk;
         });
+        request.on('end', () => {
+          bodies.push(JSON.parse(body) as GenerateContentRequest);
+          if (request.url?.includes(':streamGenerateContent') === true) {
+            startStream(response);
+            response.end(': cached heartbeat\n\n' + frame('Cached answer.'));
+          } else {
+            response.writeHead(200, { 'content-type': 'application/json' });
+            response.end(frame('Cached answer.').slice(6).trim());
+          }
+        });
+      },
+      async (baseUrl) => {
+        const client = model(baseUrl);
+        client.useCachedContent(
+          {
+            name: 'cachedContents/test',
+            model: 'models/gemini-4-carbon',
+            contents: [],
+            tools,
+            systemInstruction,
+          },
+          { model: 'gemini-4-carbon' },
+          { baseUrl, customHeaders: new Headers({ 'x-cache': 'yes' }) }
+        );
+        expect(await text(client)).toBe('Cached answer.');
+        await client._generate(question, {});
+        expect(bodies).toHaveLength(2);
+        for (const body of bodies) {
+          expect(body).toMatchObject({
+            cachedContent: 'cachedContents/test',
+            systemInstruction: {
+              role: 'system',
+              parts: [{ text: 'Cached system.' }],
+            },
+            tools,
+          });
+        }
       }
-    }
-  );
-});
+    );
+  }
+);
 
 test('retains cached-content input validation', () => {
   const client = model('http://127.0.0.1');
