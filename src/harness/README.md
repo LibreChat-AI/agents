@@ -144,3 +144,11 @@ See [host model integration](../../docs/host-model.md) for the SDK contract, req
 host authorization/lifecycle checks, supported function-tool scope and remaining
 LibreChat transport work. This contract alone does not enable protected remote
 saved agents or establish full chat parity.
+
+`createHostModelService` binds an already configured native host model to one
+execution, validates identity/reference/tool selection, snapshots messages and
+enforces required deadlines and response limits. Reuse `HostModelAdmission` across
+bindings to bound concurrent calls and aggregate request bytes. Cancellation stops
+the caller's wait; capacity remains charged until native work and cleanup drain.
+Authentication, transport recovery and application policy/billing remain host
+integration responsibilities.

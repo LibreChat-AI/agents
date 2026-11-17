@@ -225,3 +225,6 @@ export type {
   HostModelToolChoice,
   HostModelErrorCode,
 } from './model';
+
+export { createHostModelService, HostModelAdmission } from './modelService';
+export type { HostModelLimits } from './modelService';
