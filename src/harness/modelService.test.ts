@@ -1,4 +1,7 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { ChatGenerationChunk } from '@langchain/core/outputs';
+import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
+import { AsyncLocalStorageProviderSingleton } from '@langchain/core/singletons';
 import {
   AIMessage,
   AIMessageChunk,
@@ -9,8 +12,9 @@ import type {
   BindToolsInput,
   BaseChatModelCallOptions,
 } from '@langchain/core/language_models/chat_models';
+import type { ChatResult, LLMResult } from '@langchain/core/outputs';
+import type { RunnableConfig } from '@langchain/core/runnables';
 import type { BaseMessage } from '@langchain/core/messages';
-import type { ChatResult } from '@langchain/core/outputs';
 import type { HostModelDescriptor, HostModelRequest } from './model';
 import { createHostModelService, HostModelAdmission } from './modelService';
 import { FakeChatModel } from '@/llm/fake';
@@ -129,6 +133,7 @@ function fixture(
     maxRequestBytes?: number;
     maxResponseBytes?: number;
     hostSignal?: AbortSignal;
+    callbacks?: RunnableConfig['callbacks'];
   } = {}
 ) {
   const model = options.model ?? new Model();
@@ -152,7 +157,11 @@ function fixture(
         ? { maxResponseBytes: options.maxResponseBytes }
         : {}),
     },
-    config: { signal: options.hostSignal, metadata: { host: true } },
+    config: {
+      signal: options.hostSignal,
+      metadata: { host: true },
+      callbacks: options.callbacks,
+    },
   });
   return { ...bound, model, admission };
 }
@@ -715,4 +724,241 @@ it('preserves tool-result artifacts and status in the native model input', async
     status: 'error',
     artifact: { data: Uint8Array.from([4, 5]) },
   });
+});
+
+function callbackLog(waitForEnd?: Promise<void>) {
+  const events: {
+    type: 'start' | 'end' | 'error';
+    runId: string;
+    output?: LLMResult;
+    parentRunId?: string;
+    tags?: string[];
+  }[] = [];
+  const handler = BaseCallbackHandler.fromMethods({
+    handleChatModelStart: (_model, _messages, runId, parentRunId, _extra, tags): void => {
+      events.push({ type: 'start', runId, parentRunId, tags });
+    },
+    handleLLMEnd: async (output, runId, parentRunId, tags): Promise<void> => {
+      events.push({ type: 'end', runId, output, parentRunId, tags });
+      await waitForEnd;
+    },
+    handleLLMError: (_error, runId): void => {
+      events.push({ type: 'error', runId });
+    },
+  });
+  handler.awaitHandlers = true;
+  return { handler, events };
+}
+
+it.each(['return', 'timeout', 'overflow'] as const)(
+  'closes model and host-config callbacks exactly once after early %s',
+  async (mode) => {
+    const modelLog = callbackLog();
+    const configLog = callbackLog();
+    const { service, model, admission } = fixture({
+      timeoutMs: mode === 'timeout' ? 20 : 5000,
+      maxResponseBytes: 1024,
+      callbacks: [configLog.handler],
+    });
+    model.callbacks = [modelLog.handler];
+    model.tags = ['host-model-tag'];
+    if (mode === 'overflow') model.chunks = ['one', 'x'.repeat(2000)];
+    const stream = service.stream(request())[Symbol.asyncIterator]();
+    expect((await stream.next()).value?.text).toBe('one');
+    if (mode === 'return') await stream.return?.();
+    if (mode === 'timeout')
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    if (mode === 'overflow')
+      await expect(stream.next()).rejects.toMatchObject({ code: 'overflow' });
+    await model.cleanup.promise;
+    await flush();
+    for (const log of [modelLog, configLog]) {
+      expect(log.events.map((event) => event.type)).toEqual(['start', 'end']);
+      expect(log.events[1].runId).toBe(log.events[0].runId);
+      expect(log.events[0].tags).toContain('host-model-tag');
+      expect(log.events[1].tags).toEqual(log.events[0].tags);
+      expect(log.events[1].parentRunId).toBe(log.events[0].parentRunId);
+      expect(log.events[1].output?.generations[0][0].text).toBe('one');
+      expect(log.events[1].output?.llmOutput).toMatchObject({
+        controlFlow: 'HostModelTerminated',
+        reason: mode === 'return' ? 'cancelled' : mode,
+        usage_incomplete: true,
+      });
+    }
+    expect(modelLog.events[0].runId).toBe(configLog.events[0].runId);
+    expect(admission.snapshot().calls).toBe(0);
+    if (mode === 'timeout')
+      await expect(stream.next()).rejects.toMatchObject({ code: 'timeout' });
+  }
+);
+
+it('does not duplicate the native terminal callback on success or provider failure', async () => {
+  for (const fail of [false, true]) {
+    const log = callbackLog();
+    const { service, model, admission } = fixture();
+    model.callbacks = [log.handler];
+    const gate = deferred<void>();
+    model.blocked = gate.promise;
+    const result = (async () => {
+      for await (const chunk of service.stream(request())) void chunk;
+    })();
+    const assertion = fail
+      ? expect(result).rejects.toMatchObject({ code: 'unavailable' })
+      : expect(result).resolves.toBeUndefined();
+    await model.streamEntered.promise;
+    if (fail) gate.reject(new Error('provider failed'));
+    else gate.resolve();
+    await assertion;
+    await flush();
+    expect(log.events.map((event) => event.type)).toEqual([
+      'start',
+      fail ? 'error' : 'end',
+    ]);
+    expect(log.events[1].runId).toBe(log.events[0].runId);
+    expect(admission.snapshot().calls).toBe(0);
+  }
+});
+
+it('does not synthesize another end after native cancellation closes the callback run', async () => {
+  const log = callbackLog();
+  const { service, model, admission } = fixture();
+  model.callbacks = [log.handler];
+  const controller = new AbortController();
+  const gate = deferred<void>();
+  model.blocked = gate.promise;
+  const iterable = service.stream(request(), controller.signal);
+  const pending = iterable[Symbol.asyncIterator]().next();
+  const assertion = expect(pending).rejects.toMatchObject({
+    code: 'cancelled',
+  });
+  await model.streamEntered.promise;
+  controller.abort();
+  await assertion;
+  gate.resolve();
+  await model.cleanup.promise;
+  await flush();
+  expect(log.events.map((event) => event.type)).toEqual(['start', 'error']);
+  expect(admission.snapshot().calls).toBe(0);
+});
+
+it('retains admission while an early-close host callback is still running', async () => {
+  const gate = deferred<void>();
+  const log = callbackLog(gate.promise);
+  const { service, model, admission } = fixture();
+  model.callbacks = [log.handler];
+  const stream = service.stream(request())[Symbol.asyncIterator]();
+  await stream.next();
+  await stream.return?.();
+  await model.cleanup.promise;
+  await flush();
+  expect(log.events.map((event) => event.type)).toEqual(['start', 'end']);
+  expect(admission.snapshot()).toMatchObject({ calls: 1, retainedCalls: 1 });
+  gate.resolve();
+  await flush();
+  expect(admission.snapshot().calls).toBe(0);
+});
+
+it.each(['invoke', 'stream'] as const)(
+  'isolates %s from the caller ambient LangChain configuration',
+  async (mode) => {
+    AsyncLocalStorageProviderSingleton.initializeGlobalInstance(
+      new AsyncLocalStorage()
+    );
+    const foreignStart = jest.fn();
+    const hostStart = jest.fn();
+    const { service, model } = fixture();
+    model.callbacks = [{ handleChatModelStart: hostStart }];
+    await AsyncLocalStorageProviderSingleton.runWithConfig(
+      {
+        metadata: { foreign: 'PRIVATE' },
+        configurable: { model: 'foreign-model' },
+        callbacks: [{ handleChatModelStart: foreignStart }],
+      },
+      async () => {
+        expect(
+          AsyncLocalStorageProviderSingleton.getRunnableConfig().metadata
+            .foreign
+        ).toBe('PRIVATE');
+        if (mode === 'invoke') await service.invoke(request());
+        else {
+          for await (const chunk of service.stream(request())) void chunk;
+        }
+      }
+    );
+    expect(foreignStart).not.toHaveBeenCalled();
+    expect(hostStart).toHaveBeenCalledTimes(1);
+    expect(hostStart.mock.calls[0][6]).toMatchObject({ host: true });
+    expect(JSON.stringify(hostStart.mock.calls[0][6])).not.toContain('PRIVATE');
+    expect(JSON.stringify(hostStart.mock.calls[0][6])).not.toContain(
+      'foreign-model'
+    );
+  }
+);
+
+it('preserves measured provider usage when synthesizing an early callback end', async () => {
+  class UsageModel extends Model {
+    override async *_streamResponseChunks(): AsyncGenerator<ChatGenerationChunk> {
+      yield new ChatGenerationChunk({
+        text: 'partial',
+        message: new AIMessageChunk({
+          content: 'partial',
+          usage_metadata: {
+            input_tokens: 7,
+            output_tokens: 3,
+            total_tokens: 10,
+          },
+        }),
+      });
+      yield new ChatGenerationChunk({
+        text: 'more',
+        message: new AIMessageChunk('more'),
+      });
+    }
+  }
+  const log = callbackLog();
+  const model = new UsageModel();
+  model.callbacks = [log.handler];
+  const { service, admission } = fixture({ model });
+  const stream = service.stream(request())[Symbol.asyncIterator]();
+  await stream.next();
+  await stream.return?.();
+  await flush();
+  expect(log.events.map((event) => event.type)).toEqual(['start', 'end']);
+  expect(log.events[1].output?.generations[0][0]).toMatchObject({
+    message: {
+      usage_metadata: { input_tokens: 7, output_tokens: 3, total_tokens: 10 },
+    },
+  });
+  expect(log.events[1].output?.llmOutput).toMatchObject({
+    usage_incomplete: false,
+  });
+  expect(admission.snapshot().calls).toBe(0);
+});
+
+it('closes the native run even when partial chunks cannot be concatenated', async () => {
+  class InvalidChunksModel extends Model {
+    override async *_streamResponseChunks(): AsyncGenerator<ChatGenerationChunk> {
+      for (const value of ['PRIVATE', 42]) {
+        yield new ChatGenerationChunk({
+          text: 'part',
+          message: new AIMessageChunk({
+            content: 'part',
+            response_metadata: { conflicting: value },
+          }),
+        });
+      }
+    }
+  }
+  const model = new InvalidChunksModel();
+  const log = callbackLog();
+  model.callbacks = [log.handler];
+  const { service, admission } = fixture({ model });
+  const stream = service.stream(request())[Symbol.asyncIterator]();
+  await stream.next();
+  await stream.next();
+  await stream.return?.();
+  await flush();
+  expect(log.events.map((event) => event.type)).toEqual(['start', 'error']);
+  expect(log.events[1].runId).toBe(log.events[0].runId);
+  expect(admission.snapshot().calls).toBe(0);
 });

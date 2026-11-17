@@ -88,7 +88,9 @@ const binding = createHostModelService({
 
 The returned service compares every identity field and model reference, validates
 selected tools again, and binds only its private snapshot of approved definitions.
-The worker cannot replace schemas or host settings. Tool-choice encoding uses the
+The worker cannot replace schemas or host settings. Each provider operation runs
+inside the explicit host configuration, isolated from a caller's ambient LangChain
+callbacks, metadata and configurable overrides. Tool-choice encoding uses the
 SDK provider registry for OpenAI, Anthropic, Bedrock and Google families. Required
 choice uses the native `any` alias; Bedrock `none` removes the tool definitions
 because Converse has no `none` choice. Register custom providers with accurate
@@ -111,7 +113,7 @@ cluster-wide quotas are outside this process-local admission scope.
 
 Cancellation/deadline expiry stops the caller's wait promptly. Admission remains
 charged while an invocation, outstanding stream read, or iterator cleanup has not
-settled. `snapshot()` exposes total and retained ownership without content. There
+settled, including awaited host terminal callbacks. `snapshot()` exposes total and retained ownership without content. There
 is no reset that can free live work. A deadline also closes a stream whose consumer
 is paused between chunks. Underlying models must faithfully expose settlement of
 their provider work; this binding cannot discover work a custom model hides after
@@ -123,6 +125,14 @@ the `ReadableStream` adapter whose cancellation can return before asynchronous
 provider cleanup finishes. Tests cover both normal tool binding and a provider
 that ignores cancellation and blocks its cleanup. The binding does not call the
 provider's raw `_generate` or `_streamResponseChunks` methods.
+
+An early iterator return can bypass LangChain's terminal callback. The binding
+closes that native run once, after provider cleanup, using the SDK's shared callback
+composition helper. It preserves the observed run ID, parent and tags, records
+partial output as `HostModelTerminated` control flow, and preserves reported usage.
+Missing usage is marked `usage_incomplete`; no token counts are invented. Normal
+native success/error callbacks are not duplicated. Provider billing reconciliation
+for cancelled requests remains a host integration responsibility.
 
 ## Host service boundary
 

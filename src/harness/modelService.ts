@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { AsyncLocalStorageProviderSingleton } from '@langchain/core/singletons';
 import {
   serialize as serializeNativeValue,
   deserialize as deserializeNativeValue,
@@ -24,6 +25,7 @@ import type {
   HostModelDescriptor,
   HostModelRequest,
   HostModelService,
+  HostModelErrorCode,
 } from './model';
 import type { ExecutionIdentity } from './identity';
 import {
@@ -36,6 +38,7 @@ import {
   HostModelServiceError,
   normalizeHostModelError,
 } from './model';
+import { modelStreamCallbacks } from './modelStreamCallbacks';
 import { getProviderFamily } from '@/llm/providers';
 
 interface ModelLease {
@@ -303,6 +306,17 @@ export function createHostModelService(options: {
   if (tools.size !== descriptor.tools.length)
     throw new HostModelServiceError('incompatible');
   const config = { ...options.config };
+  const hostStorage = AsyncLocalStorageProviderSingleton.getInstance();
+  const hostStore: unknown = hostStorage.run(undefined, () =>
+    AsyncLocalStorageProviderSingleton.runWithConfig(
+      config,
+      () => hostStorage.getStore(),
+      true
+    )
+  );
+  function runOnHost<T>(operation: () => T): T {
+    return hostStorage.run(hostStore, operation);
+  }
   const model = options.model;
   const admission = options.admission;
 
@@ -426,9 +440,11 @@ export function createHostModelService(options: {
           const operation = attempt.track(
             Promise.resolve().then(() => {
               attempt.signal.throwIfAborted();
-              return selected(prepared.request).invoke(
-                [...prepared.request.messages],
-                { signal: attempt.signal }
+              return runOnHost(() =>
+                selected(prepared.request).invoke(
+                  [...prepared.request.messages],
+                  { signal: attempt.signal }
+                )
               );
             })
           );
@@ -452,13 +468,30 @@ export function createHostModelService(options: {
         const prepared = prepare(request, signal);
         const { attempt } = prepared;
         let iterator: AsyncIterator<AIMessageChunk> | undefined;
+        let callbacks: ReturnType<typeof modelStreamCallbacks> | undefined;
+        let termination: HostModelErrorCode = 'cancelled';
         let closing = false;
         const close = (): void => {
           if (!iterator || closing) return;
           closing = true;
           const active = iterator;
           void attempt
-            .track(Promise.resolve().then(() => active.return?.()))
+            .track(
+              Promise.resolve().then(() =>
+                runOnHost(async () => {
+                  try {
+                    await active.return?.();
+                  } finally {
+                    const reason = attempt.signal.reason;
+                    await callbacks?.finish(
+                      reason instanceof HostModelServiceError
+                        ? reason.code
+                        : termination
+                    );
+                  }
+                })
+              )
+            )
             .catch(() => undefined);
         };
         attempt.setCleanup(close);
@@ -470,9 +503,15 @@ export function createHostModelService(options: {
                 attempt.signal.throwIfAborted();
                 // Use the native iterator/callback path: ReadableStream cancellation can
                 // settle before the provider generator's asynchronous cleanup drains.
-                const stream = selected(prepared.request)._streamIterator(
-                  [...prepared.request.messages],
-                  { signal: attempt.signal }
+                const boundModel = runOnHost(() => selected(prepared.request));
+                callbacks = modelStreamCallbacks(boundModel, {
+                  signal: attempt.signal,
+                });
+                const stream = runOnHost(() =>
+                  boundModel._streamIterator(
+                    [...prepared.request.messages],
+                    callbacks!.config
+                  )
                 );
                 iterator = stream[Symbol.asyncIterator]();
                 if (attempt.signal.aborted) close();
@@ -485,7 +524,7 @@ export function createHostModelService(options: {
               attempt.track(
                 Promise.resolve().then(() => {
                   attempt.signal.throwIfAborted();
-                  return iterator!.next();
+                  return runOnHost(() => iterator!.next());
                 })
               )
             );
@@ -501,10 +540,16 @@ export function createHostModelService(options: {
             );
             if (responseBytes > limits.maxResponseBytes)
               throw new HostModelServiceError('overflow');
+            callbacks?.observe(next.value);
             yield next.value;
           }
         } catch (error) {
-          throw attempt.error(error);
+          const normalized = attempt.error(error);
+          termination =
+            normalized instanceof HostModelServiceError
+              ? normalized.code
+              : 'cancelled';
+          throw normalized;
         } finally {
           attempt.finish();
         }
