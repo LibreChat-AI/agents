@@ -35,7 +35,7 @@ export interface HostModelDescriptor {
 }
 
 const nonempty = z.string().refine((value) => value.trim().length > 0);
-const descriptorSchema = z.object({
+export const hostModelDescriptorSchema = z.object({
   version: z.literal(1),
   reference: nonempty,
   provider: nonempty,
@@ -121,7 +121,7 @@ export class HostModelServiceError extends Error {
   }
 }
 
-function safeError(
+export function normalizeHostModelError(
   error: unknown,
   signal?: AbortSignal
 ): HostModelServiceError | StreamLimitExceededError | PreparedSubagentError {
@@ -181,7 +181,7 @@ function waitForService<T>(
   return new Promise<T>((resolve, reject) => {
     const abort = (): void => {
       signal?.removeEventListener('abort', abort);
-      reject(safeError(undefined, signal));
+      reject(normalizeHostModelError(undefined, signal));
     };
     signal?.addEventListener('abort', abort, { once: true });
     try {
@@ -216,7 +216,7 @@ export class HostChatModel extends BaseChatModel<HostModelCallOptions> {
     service: HostModelService;
   }) {
     super({});
-    const parsed = descriptorSchema.safeParse(options.descriptor);
+    const parsed = hostModelDescriptorSchema.safeParse(options.descriptor);
     const serviceVersion: number = options.service.version;
     if (
       !parsed.success ||
@@ -336,7 +336,7 @@ export class HostChatModel extends BaseChatModel<HostModelCallOptions> {
         throw new HostModelServiceError('incompatible');
       return { generations: [{ text: message.text, message }] };
     } catch (error) {
-      throw safeError(error, options.signal);
+      throw normalizeHostModelError(error, options.signal);
     }
   }
 
@@ -378,7 +378,7 @@ export class HostChatModel extends BaseChatModel<HostModelCallOptions> {
         );
       }
     } catch (error) {
-      throw safeError(error, options.signal);
+      throw normalizeHostModelError(error, options.signal);
     } finally {
       controller.abort();
       // The host/transport retains execution ownership until this cleanup actually settles.

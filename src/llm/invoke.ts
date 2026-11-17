@@ -2,11 +2,6 @@ import { concat } from '@langchain/core/utils/stream';
 import { AIMessageChunk } from '@langchain/core/messages';
 import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
 import { getCallbackManagerForConfig } from '@langchain/core/runnables';
-import {
-  CallbackManager,
-  CallbackManagerForLLMRun,
-  type Callbacks,
-} from '@langchain/core/callbacks/manager';
 import type { Serialized } from '@langchain/core/load/serializable';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { ChatGeneration } from '@langchain/core/outputs';
@@ -65,6 +60,7 @@ import { getContextOverflowInfo, isProviderCancellation } from '@/utils/errors';
 import { ChatModelStreamHandler, dispatchesChatModelStream } from '@/stream';
 import { Constants, ContentTypes, GraphEvents, Providers } from '@/common';
 import { withProviderTextBoundary } from '@/llm/providerTextBoundary';
+import { getModelCallbackRunManager } from '@/llm/modelCallbackRun';
 import { PreparedSubagentError } from '@/tools/preparedSubagents';
 import { assertNotTruncatedToolCall } from '@/llm/truncation';
 import { resolveClientOptionsModel } from '@/llm/request';
@@ -478,45 +474,6 @@ function getMessageText(chunk: AIMessageChunk): string {
  * Falls back to a custom-event dispatch if the id was never observed, so the
  * host still records usage even when the native close is unavailable.
  */
-/**
- * Every callbacks source the real model run would compose beyond the per-call
- * config. `model` here is whatever `createCallModel` produced — with tools
- * that is `bindTools(...)`'s `RunnableBinding`, and a system runnable pipes a
- * `RunnableSequence` on top — while `clientOptions.callbacks` lives on the
- * chat model at the BOTTOM of that stack. Walks `bound` (bindings) and
- * `last`/`steps` (sequences), collecting each wrapper's own `callbacks` and
- * any binding-config callbacks along the way, since the binding merges its
- * config into the call before the chat model composes.
- */
-function collectModelCallbackSources(model: unknown): Callbacks[] {
-  const sources: Callbacks[] = [];
-  const seen = new Set<unknown>();
-  let current: unknown = model;
-  while (current != null && typeof current === 'object' && !seen.has(current)) {
-    seen.add(current);
-    const wrapper = current as {
-      callbacks?: Callbacks;
-      config?: { callbacks?: Callbacks };
-      bound?: unknown;
-      last?: unknown;
-      steps?: unknown[];
-    };
-    if (wrapper.callbacks != null) {
-      sources.push(wrapper.callbacks);
-    }
-    if (wrapper.config?.callbacks != null) {
-      sources.push(wrapper.config.callbacks);
-    }
-    current =
-      wrapper.bound ??
-      wrapper.last ??
-      (Array.isArray(wrapper.steps)
-        ? wrapper.steps[wrapper.steps.length - 1]
-        : undefined);
-  }
-  return sources;
-}
-
 async function endSealedModelRun(
   context: InvokeContext | undefined,
   chunk: AIMessageChunk,
@@ -543,34 +500,8 @@ async function endSealedModelRun(
   synthesizeSealedUsage(context, chunk, prompt, metadata);
   if (llmRunId != null) {
     try {
-      let callbackManager = await getCallbackManagerForConfig(config);
-      /**
-       * The real model run composes the per-call config's callbacks WITH the
-       * model's own (`CallbackManager.configure(config.callbacks,
-       * this.callbacks, …)` in `@langchain/core`'s base chat model), so a
-       * handler supplied via `clientOptions.callbacks` received
-       * `handleChatModelStart` for this run. Rebuilding from the config alone
-       * would close the run for every handler EXCEPT those — leaving their
-       * span open forever. Composed the same way the real run composes:
-       * model callbacks appended non-inheritable, parent run id preserved by
-       * `copy`, tracers deduped by `configure`.
-       */
-      for (const source of collectModelCallbackSources(model)) {
-        callbackManager =
-          CallbackManager.configure(callbackManager ?? undefined, source) ??
-          callbackManager;
-      }
-      if (callbackManager != null) {
-        const runManager = new CallbackManagerForLLMRun(
-          llmRunId,
-          callbackManager.handlers,
-          callbackManager.inheritableHandlers,
-          callbackManager.tags,
-          callbackManager.inheritableTags,
-          callbackManager.metadata,
-          callbackManager.inheritableMetadata,
-          callbackManager.getParentRunId()
-        );
+      const runManager = await getModelCallbackRunManager(llmRunId, config, model);
+      if (runManager != null) {
         const generation: ChatGeneration = {
           text: getMessageText(chunk),
           message: chunk,

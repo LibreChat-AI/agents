@@ -56,6 +56,87 @@ not register a new global provider name for every run. Choose provider-family
 traits to match the host model and test provider-specific message projection.
 The SDK tests also run the normal graph/tool loop through a registered provider.
 
+## Native host binding
+
+`createHostModelService` supplies the host-side binding for an already configured
+native model. Reuse `HostModelAdmission` across all bindings sharing a process-local
+quota; do not create a new scope per request or reconnect.
+
+```typescript
+import { createHostModelService, HostModelAdmission } from '@librechat/agents';
+
+const admission = new HostModelAdmission({
+  maxConcurrentCalls: 32,
+  maxRequestBytes: 8 * 1024 * 1024,
+});
+
+// Retain for this authenticated execution. The model is created by the host
+// using builder settings, credentials and the deployment's policy configuration.
+const binding = createHostModelService({
+  identity: authenticatedExecutionIdentity,
+  descriptor: negotiatedModelDescriptor,
+  model: configuredNativeModel,
+  admission,
+  limits: {
+    timeoutMs: 120_000,
+    maxRequestBytes: 1024 * 1024,
+    maxResponseBytes: 1024 * 1024,
+  },
+  config: { signal: hostRunSignal, callbacks: hostCallbacks },
+});
+```
+
+The returned service compares every identity field and model reference, validates
+selected tools again, and binds only its private snapshot of approved definitions.
+The worker cannot replace schemas or host settings. Each provider operation runs
+inside the explicit host configuration, isolated from a caller's ambient LangChain
+callbacks, metadata and configurable overrides. Tool-choice encoding uses the
+SDK provider registry for OpenAI, Anthropic, Bedrock and Google families. Required
+choice uses the native `any` alias; Bedrock `none` removes the tool definitions
+because Converse has no `none` choice. Register custom providers with accurate
+family traits. For an unregistered generic model, forced reserved names (`auto`,
+`none`, `any`, `required`) fail closed instead of being interpreted as a different
+choice. An empty selection explicitly
+binds an empty tool list when the descriptor contains tools. Native messages are
+snapshotted through LangChain's stored-message representation before asynchronous
+provider dispatch. Host-local V8 serialization preserves binary data, dates,
+BigInts, maps and sets instead of coercing them through JSON. Functions and other
+uncloneable values fail closed. The returned descriptor is a separate copy.
+
+The host's execution signal and the invocation signal are combined. Each operation
+has a required deadline, a per-request message-byte limit, and a cumulative response
+byte limit (including rich content, metadata and tool fragments). Shared admission
+bounds concurrent calls and total charged request-message bytes. Limits count
+the host-local binary serialization of native messages, not a transport wire format: the transport still
+needs frame and queue bounds before decoding. Provider-internal caches/buffers and
+cluster-wide quotas are outside this process-local admission scope.
+
+Cancellation/deadline expiry stops the caller's wait promptly. Admission remains
+charged while an invocation, outstanding stream read, or iterator cleanup has not
+settled, including awaited host terminal callbacks. `snapshot()` exposes total and retained ownership without content. There
+is no reset that can free live work. A deadline also closes a stream whose consumer
+is paused between chunks. Underlying models must faithfully expose settlement of
+their provider work; this binding cannot discover work a custom model hides after
+its own promise/iterator has settled.
+
+The binding uses native `invoke` and `_streamIterator` with configured callbacks.
+The latter is the same model/callback path underlying LangChain streaming, without
+the `ReadableStream` adapter whose cancellation can return before asynchronous
+provider cleanup finishes. Tests cover both normal tool binding and a provider
+that ignores cancellation and blocks its cleanup. The binding does not call the
+provider's raw `_generate` or `_streamResponseChunks` methods.
+
+An early iterator return can bypass LangChain's terminal callback. The binding
+closes that native run once, after provider cleanup, using the SDK's shared callback
+composition helper. It preserves the observed run ID, parent and tags, records
+partial output as `HostModelTerminated` control flow, and preserves reported usage.
+Usage is accumulated separately from released content, including a usage-bearing
+chunk rejected by the response-byte limit; it appears in native message metadata
+and `llmOutput.tokenUsage` without releasing that rejected content.
+Missing usage is marked `usage_incomplete`; no token counts are invented. Normal
+native success/error callbacks are not duplicated. Provider billing reconciliation
+for cancelled requests remains a host integration responsibility.
+
 ## Host service boundary
 
 The service exposes `invoke(request, signal)` and a pull-based
@@ -64,7 +145,8 @@ identity, model reference, native messages, selected tool names and normalized
 tool choice. It does not carry a provider endpoint or worker-supplied model
 configuration.
 
-A production host adapter must:
+The native binding supplies identity/reference validation, tool selection, message snapshots,
+admission and deadlines. A production transport/host integration must additionally:
 
 1. Authenticate the transport, resolve its pre-bound execution, and compare every
    identity field and model reference. Identity supplied in a request is not
@@ -109,12 +191,14 @@ work retain their control-flow semantics.
 Tests exercise a real configured host model, its callbacks, native SDK graph
 and tool execution, nonstreaming models, tool-choice override, rich content/tool
 fragments/usage, backpressure, cancellation while blocked, consumer termination,
-late rejection, safe failures, and immutable identity/schema snapshots.
+late rejection, safe failures, and immutable identity/schema snapshots. Native binding tests
+add authorization checks, message snapshots, shared quotas, cumulative response limits,
+host-owned cancellation, idle-stream deadlines and retained ownership through cleanup.
 
-This slice does **not** establish complete remote-chat parity. Remaining work:
+The facade and native binding do **not** establish complete remote-chat parity. Remaining work:
 
-- LibreChat authenticated model service, bounded streaming transport and recovery,
-  capability negotiation, builder binding, host protection and billing enforcement.
+- LibreChat authenticated transport and recovery, capability negotiation, and
+  integration of the native binding with builder policy/protections and billing.
 - End-to-end protected deployments with provider-specific callbacks and message
   projections, cancellation/approvals/reconnection, and measured UI latency.
 - Native provider tools that are not function schemas, host-approved dynamic tool
