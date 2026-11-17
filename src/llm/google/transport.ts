@@ -1,13 +1,37 @@
-import { GoogleGenAI } from '@google/genai';
+import { createParser } from 'eventsource-parser';
+import { GoogleGenerativeAIFetchError } from '@google/generative-ai';
 import type {
   Content,
+  ErrorDetails,
   GenerateContentRequest,
   GenerateContentResponse,
   ModelParams,
   RequestOptions,
   SingleRequestOptions,
 } from '@google/generative-ai';
-import type { GenerateContentParameters } from '@google/genai';
+import type { EventSourceParser } from 'eventsource-parser';
+
+type GoogleError = {
+  code?: number;
+  message?: string;
+  status?: string;
+  details?: ErrorDetails[];
+};
+
+type GoogleResponse = GenerateContentResponse & { error?: GoogleError };
+
+function providerError(
+  error?: GoogleError,
+  status = 500,
+  statusText = ''
+): GoogleGenerativeAIFetchError {
+  return new GoogleGenerativeAIFetchError(
+    error?.message ?? `Google request failed: ${status} ${statusText}`,
+    status,
+    statusText,
+    error?.details
+  );
+}
 
 function formatSystemInstruction(
   input: GenerateContentRequest['systemInstruction']
@@ -25,75 +49,89 @@ function formatSystemInstruction(
   return undefined;
 }
 
-/** Retains LangChain's wire contract without using its archived SDK transport. */
+/** Follows LangChainJS's GenerateContentApiHandler fetch/SSE flow, retaining our wire contract. */
 export class GoogleTransport {
   readonly generationConfig: NonNullable<ModelParams['generationConfig']>;
-  private readonly client: GoogleGenAI;
 
   constructor(
-    apiKey: string,
+    private readonly apiKey: string,
     private readonly params: ModelParams,
     private readonly options: RequestOptions = {},
     private readonly cachedContent?: string
   ) {
     this.generationConfig = params.generationConfig ?? {};
-    this.client = new GoogleGenAI({
-      apiKey,
-      vertexai: false,
-      httpOptions: {
-        baseUrl: options.baseUrl ?? 'https://generativelanguage.googleapis.com',
-        apiVersion: options.apiVersion ?? 'v1beta',
-      },
-    });
   }
 
-  private request(
+  private async request(
     request: GenerateContentRequest,
+    streaming: boolean,
     options: SingleRequestOptions = {}
-  ): GenerateContentParameters {
-    const { model, ...defaults } = this.params;
+  ): Promise<Response> {
+    const { model, cachedContent, ...defaults } = this.params;
+    const cacheName = this.cachedContent ?? cachedContent?.name;
     const requestOptions = { ...this.options, ...options };
-    return {
-      model,
-      contents: [{ role: 'user', parts: [] }],
-      config: {
-        abortSignal: options.signal,
-        automaticContinuation: false,
-        automaticFunctionCalling: { disable: true },
-        httpOptions: {
-          baseUrl: (
-            requestOptions.baseUrl ??
-            'https://generativelanguage.googleapis.com'
-          ).replace(/\/$/, ''),
-          apiVersion: requestOptions.apiVersion ?? 'v1beta',
-          headers: Object.fromEntries(
-            new Headers(requestOptions.customHeaders)
-          ),
-          timeout: requestOptions.timeout,
-          // Raw fields bypass SDK conversion; this also replaces the placeholder contents.
-          extraBody: {
-            ...defaults,
-            ...(this.cachedContent != null && this.cachedContent !== ''
-              ? { cachedContent: this.cachedContent }
-              : {}),
-            ...request,
-            systemInstruction: formatSystemInstruction(
-              request.systemInstruction ?? defaults.systemInstruction
-            ),
-          },
-        },
-      },
+    const baseUrl = (
+      requestOptions.baseUrl ?? 'https://generativelanguage.googleapis.com'
+    ).replace(/\/$/, '');
+    const apiVersion = requestOptions.apiVersion ?? 'v1beta';
+    const method = streaming
+      ? 'streamGenerateContent?alt=sse'
+      : 'generateContent';
+    const url = `${baseUrl}/${apiVersion}/models/${model.replace(/^models\//, '')}:${method}`;
+    const headers = new Headers({
+      'content-type': 'application/json',
+      'x-goog-api-key': this.apiKey,
+    });
+    if (requestOptions.apiClient != null) {
+      headers.set('x-goog-api-client', requestOptions.apiClient);
+    }
+    new Headers(requestOptions.customHeaders).forEach((value, name) => {
+      headers.set(name, value);
+    });
+    const timeout = requestOptions.timeout;
+    const timeoutSignal =
+      timeout != null && timeout >= 0
+        ? AbortSignal.timeout(Math.trunc(timeout))
+        : undefined;
+    const signal =
+      options.signal && timeoutSignal
+        ? AbortSignal.any([options.signal, timeoutSignal])
+        : (options.signal ?? timeoutSignal);
+    const body: GenerateContentRequest = {
+      ...defaults,
+      ...(cacheName != null && cacheName !== ''
+        ? { cachedContent: cacheName }
+        : {}),
+      ...request,
+      systemInstruction: formatSystemInstruction(
+        request.systemInstruction ?? defaults.systemInstruction
+      ),
     };
+    const response = await fetch(
+      new Request(url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+        signal,
+      })
+    );
+    if (!response.ok) {
+      const payload: GoogleResponse | undefined = await response
+        .json()
+        .catch(() => undefined);
+      throw providerError(payload?.error, response.status, response.statusText);
+    }
+    return response;
   }
 
   async generateContent(
     request: GenerateContentRequest,
     options?: SingleRequestOptions
   ): Promise<{ response: GenerateContentResponse }> {
-    const response = await this.client.models.generateContent(
-      this.request(request, options)
-    );
-    return { response: response as GenerateContentResponse };
+    const response = await this.request(request, false, options);
+    const payload: GoogleResponse = await response.json();
+    if (payload.error) throw providerError(payload.error, payload.error.code);
+    return { response: payload };
   }
 
   async generateContentStream(
@@ -105,16 +143,51 @@ export class GoogleTransport {
       ? AbortSignal.any([options.signal, controller.signal])
       : controller.signal;
     try {
-      const source = await this.client.models.generateContentStream(
-        this.request(request, { ...options, signal })
-      );
+      const response = await this.request(request, true, {
+        ...options,
+        signal,
+      });
+      if (response.body == null)
+        throw new Error('Google response body is empty');
+      const decoder = new TextDecoder('utf-8', { fatal: true });
+      let parser: EventSourceParser;
+      const reader = response.body
+        .pipeThrough(
+          new TransformStream<Uint8Array, GenerateContentResponse>({
+            start(output): void {
+              parser = createParser({
+                onEvent(event): void {
+                  const payload: GoogleResponse = JSON.parse(event.data);
+                  if (payload.error)
+                    throw providerError(payload.error, payload.error.code);
+                  output.enqueue(payload);
+                },
+                onError(error): void {
+                  throw error;
+                },
+              });
+            },
+            transform(chunk): void {
+              parser.feed(decoder.decode(chunk, { stream: true }));
+            },
+            flush(): void {
+              parser.feed(decoder.decode());
+              parser.feed('\n\n');
+            },
+          })
+        )
+        .getReader();
       async function* stream(): AsyncGenerator<GenerateContentResponse> {
         try {
-          for await (const response of source) {
-            yield response as GenerateContentResponse;
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) return;
+            yield value;
           }
         } finally {
           controller.abort();
+          await reader.cancel().catch(() => undefined);
+          reader.releaseLock();
         }
       }
       return { stream: stream() };

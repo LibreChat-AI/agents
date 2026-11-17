@@ -356,14 +356,17 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
     const controller = new AbortController();
-    const signal = options.signal
+    const upstreamSignal = options.signal
       ? AbortSignal.any([options.signal, controller.signal])
       : controller.signal;
     try {
       yield* smoothGenerationChunks({
-        chunks: this._streamProviderChunks(messages, { ...options, signal }),
+        chunks: this._streamProviderChunks(messages, {
+          ...options,
+          signal: upstreamSignal,
+        }),
         delayMs: this._lc_stream_delay,
-        signal,
+        signal: options.signal,
         runManager,
         abortUpstream: () => controller.abort(),
       });

@@ -1,35 +1,16 @@
 import { once } from 'node:events';
 import { createServer } from 'node:http';
-import { runInThisContext } from 'node:vm';
 import { setImmediate } from 'node:timers/promises';
+import { describe, expect, test } from '@jest/globals';
 import { HumanMessage, SystemMessage } from '@langchain/core/messages';
-import { afterAll, beforeAll, describe, expect, test } from '@jest/globals';
 import type { ChatModelStreamEvent } from '@langchain/core/language_models/event';
 import type { GenerateContentRequest } from '@google/generative-ai';
 import type { RequestListener, ServerResponse } from 'node:http';
 import type { GoogleClientOptions } from '@/types';
 import { CustomChatGoogleGenerativeAI } from './index';
 import { GEMINI_PARTS } from './utils/signatures';
-
-const dispatcherSymbol = Symbol.for('undici.globalDispatcher.1');
-
-beforeAll(() => {
-  // The SDK looks up Node's dispatcher on Jest's isolated global.
-  new Headers();
-  const descriptor = Object.getOwnPropertyDescriptor(
-    runInThisContext('globalThis'),
-    dispatcherSymbol
-  );
-  if (!descriptor) throw new Error('Missing native fetch dispatcher');
-  Object.defineProperty(globalThis, dispatcherSymbol, {
-    ...descriptor,
-    configurable: true,
-  });
-});
-
-afterAll(() => {
-  Reflect.deleteProperty(globalThis, dispatcherSymbol);
-});
+import { attemptInvoke } from '@/llm/invoke';
+import { Providers } from '@/common';
 
 const question = [new HumanMessage('Question.')];
 
@@ -261,7 +242,15 @@ describe('Google HTTP transport', () => {
       ];
       const payload = {
         candidates: [
-          { index: 0, content: { role: 'model', parts }, finishReason: 'STOP' },
+          {
+            index: 0,
+            content: { role: 'model', parts },
+            finishReason: 'STOP',
+            finishMessage: 'Complete.',
+            citationMetadata: {
+              citationSources: [{ uri: 'https://example.com/source' }],
+            },
+          },
         ],
         usageMetadata: {
           promptTokenCount: 3,
@@ -319,16 +308,20 @@ describe('Google HTTP transport', () => {
             ],
           };
           let output;
+          const metadata = [];
           if (streaming) {
             for await (const chunk of client._streamResponseChunks(
               messages,
               options
             )) {
+              if (chunk.generationInfo != null)
+                metadata.push(chunk.generationInfo);
               output = output ? output.concat(chunk.message) : chunk.message;
             }
           } else {
-            output = (await client._generate(messages, options)).generations[0]
-              .message;
+            const result = await client._generate(messages, options);
+            output = result.generations[0].message;
+            metadata.push(result.generations[0].generationInfo);
           }
           expect(output).toMatchObject({
             additional_kwargs: { reasoning: 'Reasoning' },
@@ -343,6 +336,14 @@ describe('Google HTTP transport', () => {
             },
           });
           expect(output?.additional_kwargs[GEMINI_PARTS]).toBeDefined();
+          expect(metadata).toContainEqual(
+            expect.objectContaining({
+              finishMessage: 'Complete.',
+              citationMetadata: {
+                citationSources: [{ uri: 'https://example.com/source' }],
+              },
+            })
+          );
           if (!output) throw new Error('Missing model response');
           await client._generate(
             [...question, output, new HumanMessage('Follow up.')],
@@ -481,6 +482,82 @@ test('uses the maintained transport for inherited stream events @scenario:google
           delta: { type: 'text-delta', text: 'Event answer.' },
         })
       );
+    }
+  );
+});
+
+test('preserves protected lazy streaming and the attempt byte budget @scenario:google-protected-stream', async () => {
+  const content = 'word '.repeat(80);
+  await withServer(
+    (request, response) => {
+      request.resume();
+      startStream(response);
+      response.end(frame(content));
+    },
+    async (baseUrl) => {
+      const result = await attemptInvoke({
+        model: model(baseUrl, { _lc_stream_delay: 25 }),
+        messages: question,
+        provider: Providers.GOOGLE,
+        onChunk: () => {},
+        providerTextProtection: {
+          version: 1,
+          timeoutMs: 10000,
+          maxAttemptBytes: 3500,
+          maxBufferedBytes: 7000,
+          classify: () => 'prose',
+          inspect: ({ content }) => ({
+            version: 1,
+            ok: true,
+            value: { content, replacements: 0, categories: [] },
+          }),
+        },
+      });
+      expect(result.messages?.[0].content).toBe(content);
+    }
+  );
+});
+
+test('closes the upstream request when the protection budget rejects a frame @scenario:google-protected-abort', async () => {
+  const closed = Promise.withResolvers<void>();
+  let inspections = 0;
+  let publications = 0;
+  await withServer(
+    (request, response) => {
+      request.resume();
+      response.once('close', () => closed.resolve());
+      startStream(response);
+      response.write(frame('word '.repeat(80)));
+    },
+    async (baseUrl) => {
+      await expect(
+        attemptInvoke({
+          model: model(baseUrl, { _lc_stream_delay: 25 }),
+          messages: question,
+          provider: Providers.GOOGLE,
+          onChunk: () => {
+            publications++;
+          },
+          providerTextProtection: {
+            version: 1,
+            timeoutMs: 10000,
+            maxAttemptBytes: 1500,
+            maxBufferedBytes: 7000,
+            classify: () => 'prose',
+            inspect: ({ content }) => {
+              inspections++;
+              return {
+                version: 1,
+                ok: true,
+                value: { content, replacements: 0, categories: [] },
+              };
+            },
+          },
+        })
+      ).rejects.toMatchObject({ code: 'overflow' });
+      await within(closed.promise);
+      expect(inspections).toBe(0);
+      expect(publications).toBe(0);
     }
   );
 });
