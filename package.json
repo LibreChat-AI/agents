@@ -327,6 +327,7 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.115.0",
     "@aws-sdk/client-bedrock-runtime": "^3.1075.0",
+    "@google/genai": "^3.4.0",
     "@langchain/anthropic": "1.5.2",
     "@langchain/aws": "^1.4.2",
     "@langchain/core": "1.2.8",
