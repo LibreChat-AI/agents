@@ -12,7 +12,9 @@ on:
       - '**.md'
 
 concurrency:
-  group: ci-${{ github.head_ref || github.ref }}
+  # Ignored edits must never cancel or replace pending validation runs.
+  group: >-
+    ci-${{ github.head_ref || github.ref }}-${{ github.event.action == 'edited' && github.event.changes.base == null && github.run_id || 'validation' }}
   cancel-in-progress: true
 
 permissions:
