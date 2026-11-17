@@ -79,10 +79,11 @@ export function selectProgrammaticTools(args: {
   allowedToolDefs?: t.LCTool[];
   disallowedToolDefs?: t.LCTool[];
   programmaticToolName: string;
+  getManifestAlias?: (name: string) => string | undefined;
 }): t.LCTool[] {
   const allowedToolDefs = args.allowedToolDefs ?? [];
   const disallowedToolDefs = args.disallowedToolDefs ?? [];
-  const requestedToolNames = args.requestedToolNames;
+  let requestedToolNames = args.requestedToolNames;
 
   if (requestedToolNames == null) {
     if (disallowedToolDefs.length > 0) {
@@ -97,6 +98,34 @@ export function selectProgrammaticTools(args: {
   const disallowedNames = new Set(
     disallowedToolDefs.map((toolDef) => toolDef.name)
   );
+  const allowedByName = new Map(
+    allowedToolDefs.map((toolDef) => [toolDef.name, toolDef])
+  );
+  const getManifestAlias = args.getManifestAlias;
+  if (getManifestAlias != null) {
+    const aliases = new Map<string, string | null>();
+    for (const name of [...allowedByName.keys(), ...disallowedNames]) {
+      const alias = getManifestAlias(name);
+      if (alias == null || alias === name) {
+        continue;
+      }
+      const prior = aliases.get(alias);
+      aliases.set(alias, prior === undefined || prior === name ? name : null);
+    }
+    requestedToolNames = requestedToolNames.map((name) => {
+      if (allowedByName.has(name) || disallowedNames.has(name)) {
+        return name;
+      }
+      const registeredName = aliases.get(name);
+      if (registeredName === null) {
+        throw new Error(
+          `Tool identifier "${name}" is ambiguous in "${args.programmaticToolName}". ` +
+            'Use an exact registered tool name in the tool_manifest field.'
+        );
+      }
+      return registeredName ?? name;
+    });
+  }
   const requestedDisallowedNames = new Set(
     requestedToolNames.filter((name) => disallowedNames.has(name))
   );
@@ -105,9 +134,6 @@ export function selectProgrammaticTools(args: {
     args.programmaticToolName
   );
 
-  const allowedByName = new Map(
-    allowedToolDefs.map((toolDef) => [toolDef.name, toolDef])
-  );
   const unknownNames = new Set(
     requestedToolNames.filter((name) => !allowedByName.has(name))
   );

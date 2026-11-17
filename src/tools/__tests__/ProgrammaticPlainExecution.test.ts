@@ -150,6 +150,78 @@ const invokePython = (
     context
   );
 
+describe('Bash tool manifest aliases', () => {
+  const registered = 'echo_mcp_my-server';
+  const identifier = 'echo_mcp_my_server';
+  const code = `result=$(${identifier} '{}'); echo "$result"`;
+  const tools = new Map([[registered, createGetWeatherTool()]]);
+
+  beforeEach(() => {
+    requests.length = 0;
+  });
+
+  it.each([
+    { tool_manifest: [identifier] },
+    { tool_manifest: [registered] },
+    { tool_manifest: [identifier, registered] },
+  ])(
+    'sends the registered tool when selecting with %j',
+    async ({ tool_manifest }) => {
+      await invokeBash(
+        { code, tool_manifest },
+        {
+          toolMap: tools,
+          toolDefs: [{ name: registered }],
+          disallowedToolDefs: [{ name: 'direct_only' }],
+        }
+      );
+
+      expect(requests).toHaveLength(1);
+      expect(requests[0].url).toBe(`${BASE_URL}/exec/programmatic`);
+      expect(requests[0].body.tools).toEqual([{ name: registered }]);
+      expect(requests[0].body.code).toContain(code);
+    }
+  );
+
+  it('rejects aliases for direct-only tools', async () => {
+    await expect(
+      invokeBash(
+        { code, tool_manifest: [identifier] },
+        { toolDefs: [], disallowedToolDefs: [{ name: registered }] }
+      )
+    ).rejects.toThrow('not marked for code_execution');
+    expect(requests).toHaveLength(0);
+  });
+
+  it('rejects ambiguous aliases across the two caller policies', async () => {
+    await expect(
+      invokeBash(
+        { code, tool_manifest: [identifier] },
+        {
+          toolMap: tools,
+          toolDefs: [{ name: registered }],
+          disallowedToolDefs: [{ name: 'echo_mcp-my_server' }],
+        }
+      )
+    ).rejects.toThrow('is ambiguous');
+    expect(requests).toHaveLength(0);
+  });
+
+  it('preserves exact direct-only names that match an allowed alias', async () => {
+    await expect(
+      invokeBash(
+        { code, tool_manifest: [identifier] },
+        {
+          toolMap: tools,
+          toolDefs: [{ name: registered }],
+          disallowedToolDefs: [{ name: identifier }],
+        }
+      )
+    ).rejects.toThrow('not marked for code_execution');
+    expect(requests).toHaveLength(0);
+  });
+});
+
 describe('an empty tool manifest runs instead of being rejected', () => {
   beforeEach(() => {
     requests.length = 0;

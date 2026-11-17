@@ -149,13 +149,16 @@ ${STATELESS_WARNING}
 
 Each tool function accepts a JSON string as its argument.
 Example: tool_name '{"key": "value"}'
+${ADDITIONAL_RULES}
 
 ${EXAMPLES}
 
 ${CORE_RULES}`;
 
 const TOOL_MANIFEST_DESCRIPTION =
-  'Exact registered tool names used by the code. Required when direct-only tools are configured; ' +
+  'Registered tool names used by the code. For hyphenated names, you can also use the unambiguous ' +
+  'underscore function name from the script (e.g., echo_mcp_my_server for echo_mcp_my-server). ' +
+  'Required when direct-only tools are configured; ' +
   'validated before execution starts. Pass [] when the code calls no tools at all.';
 
 // ============================================================================
@@ -433,6 +436,13 @@ export function createBashProgrammaticToolCallingTool(
         allowedToolDefs: toolDefs,
         disallowedToolDefs,
         programmaticToolName,
+        getManifestAlias: (name) => {
+          if (!name.includes('-')) {
+            return undefined;
+          }
+          const identifier = normalizeToBashIdentifier(name);
+          return /^_ptc_/i.test(identifier) ? `${identifier}_tool` : identifier;
+        },
       });
 
       /* These guard the replay path only. A call that selected no tools never
