@@ -16,10 +16,12 @@ import type { BaseLanguageModelInput } from '@langchain/core/language_models/bas
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
 import type { Runnable } from '@langchain/core/runnables';
 import type { ChatResult } from '@langchain/core/outputs';
+import type { ModelInvocationContext } from '@/llm/invocation';
 import type { ExecutionIdentity } from './identity';
 import { PreparedSubagentError } from '@/tools/preparedSubagents';
 import { stableStringify } from '@/tools/eagerEventExecution';
 import { StreamLimitExceededError } from '@/llm/streamLimits';
+import { getModelInvocationContext } from '@/llm/invocation';
 import { snapshotExecutionIdentity } from './identity';
 
 type FunctionTool = ReturnType<typeof convertToOpenAITool>;
@@ -87,10 +89,15 @@ export interface HostModelRequest {
  */
 export interface HostModelService {
   readonly version: 1;
-  invoke(request: HostModelRequest, signal?: AbortSignal): Promise<AIMessage>;
+  invoke(
+    request: HostModelRequest,
+    signal?: AbortSignal,
+    context?: Readonly<ModelInvocationContext>
+  ): Promise<AIMessage>;
   stream(
     request: HostModelRequest,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    context?: Readonly<ModelInvocationContext>
   ): AsyncIterable<AIMessageChunk>;
 }
 
@@ -205,6 +212,7 @@ function waitForService<T>(
 
 /** Native LangChain model facade; no provider/model options or credentials cross to the host. */
 export class HostChatModel extends BaseChatModel<HostModelCallOptions> {
+  static readonly invocationContextVersion = 1;
   private readonly identity: Readonly<ExecutionIdentity>;
   private readonly descriptor: HostModelDescriptor;
   private readonly service: HostModelService;
@@ -322,13 +330,19 @@ export class HostChatModel extends BaseChatModel<HostModelCallOptions> {
 
   async _generate(
     messages: BaseMessage[],
-    options: this['ParsedCallOptions']
+    options: this['ParsedCallOptions'],
+    runManager?: CallbackManagerForLLMRun
   ): Promise<ChatResult> {
     const request = this.request(messages, options);
     try {
       options.signal?.throwIfAborted();
       const message = await waitForService(
-        () => this.service.invoke(request, options.signal),
+        () =>
+          this.service.invoke(
+            request,
+            options.signal,
+            getModelInvocationContext(options, runManager)
+          ),
         options.signal
       );
       options.signal?.throwIfAborted();
@@ -353,7 +367,8 @@ export class HostChatModel extends BaseChatModel<HostModelCallOptions> {
     let iterator: AsyncIterator<AIMessageChunk> | undefined;
     try {
       signal.throwIfAborted();
-      iterator = this.service.stream(request, signal)[Symbol.asyncIterator]();
+      const context = getModelInvocationContext(options, runManager);
+      iterator = this.service.stream(request, signal, context)[Symbol.asyncIterator]();
       for (;;) {
         const next = await waitForService(() => iterator!.next(), signal);
         signal.throwIfAborted();

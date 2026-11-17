@@ -219,3 +219,25 @@ The facade and native binding do **not** establish complete remote-chat parity. 
 Arbitrary trusted worker code can still call another model directly. This facade
 is an integration boundary, not a sandbox or proof that a custom graph uses the
 host model for every generation.
+
+## Invocation correlation through output protection
+
+Host model services may accept a third argument on `invoke` and `stream`:
+`context?: Readonly<ModelInvocationContext>`, containing only `{ version: 1, runId }`.
+The ID matches the native model callback run ID, including when provider-text
+protection suppresses the underlying callback manager. `HostChatModel.invocationContextVersion`
+advertises support as `1`; older two-argument service implementations remain compatible.
+
+The provider-text boundary carries context in an internal weak map keyed by the
+specific invocation options object. It does not add provider parameters, callbacks,
+message content, or ambient async context. Concurrent and nested protected calls
+retain their own IDs, and context is not serialized automatically. Direct low-level
+calls without a native callback manager or a protected invocation have no context;
+transports requiring correlation must reject those calls rather than invent identity.
+
+This ID is correlation, not authorization. Transport adapters must still authenticate
+the execution identity, correlate it with their own root graph callbacks, validate
+it before accepting lifecycle events, and negotiate support before running a graph.
+The raw callback manager remains suppressed: only approved provider output reaches
+public callbacks, events, and persistence. This contract does not itself implement
+remote admission, tracing, or billing.

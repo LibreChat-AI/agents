@@ -218,6 +218,7 @@ export type {
 } from './providerText';
 
 export { HostChatModel, HostModelServiceError } from './model';
+export type { ModelInvocationContext } from '@/llm/invocation';
 export type {
   HostModelDescriptor,
   HostModelRequest,
