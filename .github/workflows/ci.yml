@@ -2,6 +2,7 @@ name: CI
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, edited]
     branches:
       - dev
       - main
@@ -19,5 +20,7 @@ permissions:
 
 jobs:
   validate:
+    # Retargeting a stack must validate the new merge result; body edits need no rerun.
+    if: github.event.action != 'edited' || github.event.changes.base != null
     uses: ./.github/workflows/validate.yml
     secrets: inherit
