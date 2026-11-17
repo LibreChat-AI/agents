@@ -8,6 +8,7 @@ import {
   ProviderTextAttempt,
   ProviderTextProtectionError,
 } from '@/protection/providerText';
+import { ProviderTextAdmission } from '@/protection/providerTextAdmission';
 import { Run, Providers, FakeChatModel, GraphEvents } from '../index';
 
 const identity = {
@@ -40,9 +41,15 @@ const policy = (
 
 it('uses host classification and only releases canonical text through a real SDK Run', async () => {
   const classify = jest.fn(() => 'prose' as const);
+  const admission = new ProviderTextAdmission({
+    maxConcurrentInspections: 1,
+    maxBufferedBytes: 16384,
+  });
   const bound = createHostProviderTextService({
     identity,
     policy: policy({ classify }),
+    admission,
+    inspectionTimeoutMs: 500,
   });
   const inspect = jest.fn(bound.service.inspect);
   const protection = createHostProviderTextProtection({
@@ -88,6 +95,10 @@ it('uses host classification and only releases canonical text through a real SDK
   expect(visible.join('')).not.toContain('PRIVATE');
   expect(classify).toHaveBeenCalledWith('PRIVATE prose');
   expect(inspect).toHaveBeenCalledTimes(1);
+  expect(admission.snapshot()).toMatchObject({
+    inspections: 0,
+    bufferedBytes: 0,
+  });
 });
 
 it.each([
