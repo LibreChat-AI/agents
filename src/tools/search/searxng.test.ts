@@ -155,6 +155,20 @@ describe('SearXNG search options', () => {
     });
   });
 
+  it('merges configured headers into the request', async () => {
+    const searchAPI = createSearchAPI({
+      searchProvider: 'searxng',
+      searxngInstanceUrl: INSTANCE_URL,
+      searxngSearchOptions: { headers: { 'x-end-user': 'user@example.com' } },
+    });
+    await searchAPI.getSources({ query: 'typescript' });
+
+    expect(lastRequestConfig()?.headers).toEqual({
+      'Content-Type': 'application/json',
+      'x-end-user': 'user@example.com',
+    });
+  });
+
   it('still threads http agents supplied alongside the options block', async () => {
     const httpAgent = new HttpAgent();
     const httpsAgent = new HttpsAgent();

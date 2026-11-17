@@ -147,6 +147,33 @@ describe('JinaReranker', () => {
       );
     });
 
+    it('should send configured headers through createReranker', async () => {
+      const reranker = createReranker({
+        rerankerType: 'jina',
+        jinaApiKey: 'test-key',
+        rerankerHeaders: { 'x-end-user': 'user@example.com' },
+        logger: mockLogger,
+      });
+      jest.spyOn(mockLogger, 'debug').mockImplementation(() => mockLogger);
+      jest.spyOn(mockLogger, 'error').mockImplementation(() => mockLogger);
+      const postSpy = jest
+        .spyOn(axios, 'post')
+        .mockRejectedValueOnce(new Error('Network error'));
+
+      await reranker?.rerank('test query', ['document1'], 1);
+
+      expect(postSpy).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.anything(),
+        expect.objectContaining({
+          headers: expect.objectContaining({
+            Authorization: 'Bearer test-key',
+            'x-end-user': 'user@example.com',
+          }),
+        })
+      );
+    });
+
     it('should keep a ranking when the response omits the usage telemetry', async () => {
       const reranker = new JinaReranker({
         apiKey: 'test-key',
