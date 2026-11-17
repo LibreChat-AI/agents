@@ -2,6 +2,8 @@ import { createParser } from 'eventsource-parser';
 import { GoogleGenerativeAIFetchError } from '@google/generative-ai';
 import type {
   Content,
+  Part,
+  GenerateContentResult,
   ErrorDetails,
   GenerateContentRequest,
   GenerateContentResponse,
@@ -10,6 +12,7 @@ import type {
   SingleRequestOptions,
 } from '@google/generative-ai';
 import type { EventSourceParser } from 'eventsource-parser';
+import { enhanceResponse, formatRequest } from './completion';
 
 type GoogleError = {
   code?: number;
@@ -125,13 +128,13 @@ export class GoogleTransport {
   }
 
   async generateContent(
-    request: GenerateContentRequest,
+    request: GenerateContentRequest | string | (string | Part)[],
     options?: SingleRequestOptions
-  ): Promise<{ response: GenerateContentResponse }> {
-    const response = await this.request(request, false, options);
+  ): Promise<GenerateContentResult> {
+    const response = await this.request(formatRequest(request), false, options);
     const payload: GoogleResponse = await response.json();
     if (payload.error) throw providerError(payload.error, payload.error.code);
-    return { response: payload };
+    return { response: enhanceResponse(payload) };
   }
 
   async generateContentStream(

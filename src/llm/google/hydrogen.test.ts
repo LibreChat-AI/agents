@@ -129,8 +129,8 @@ describe('Google Hydrogen request configuration', () => {
     expect(generate.mock.calls[0][0]).toMatchObject({
       contents: [{ role: 'user', parts: [{ text: 'Question.' }] }],
     });
-    expect(generate.mock.calls[0][0].generationConfig).toMatchObject({
-      thinkingConfig: { thinkingLevel: 'XHIGH' },
+    expect(generate.mock.calls[0][0]).toMatchObject({
+      generationConfig: { thinkingConfig: { thinkingLevel: 'XHIGH' } },
     });
   });
 

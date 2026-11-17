@@ -2,9 +2,10 @@ import { once } from 'node:events';
 import { createServer } from 'node:http';
 import { setImmediate } from 'node:timers/promises';
 import { describe, expect, test } from '@jest/globals';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 import { HumanMessage, SystemMessage } from '@langchain/core/messages';
 import type { ChatModelStreamEvent } from '@langchain/core/language_models/event';
-import type { GenerateContentRequest } from '@google/generative-ai';
+import type { GenerateContentRequest, Part } from '@google/generative-ai';
 import type { RequestListener, ServerResponse } from 'node:http';
 import type { GoogleClientOptions } from '@/types';
 import { CustomChatGoogleGenerativeAI } from './index';
@@ -558,6 +559,203 @@ test('closes the upstream request when the protection budget rejects a frame @sc
       await within(closed.promise);
       expect(inspections).toBe(0);
       expect(publications).toBe(0);
+    }
+  );
+});
+
+describe('inherited completionWithRetry contract', () => {
+  test.each([
+    ['string', 'Question.', { role: 'user', parts: [{ text: 'Question.' }] }],
+    [
+      'parts',
+      ['Describe.', { inlineData: { mimeType: 'image/png', data: 'AA==' } }],
+      {
+        role: 'user',
+        parts: [
+          { text: 'Describe.' },
+          { inlineData: { mimeType: 'image/png', data: 'AA==' } },
+        ],
+      },
+    ],
+    [
+      'function response',
+      [{ functionResponse: { name: 'lookup', response: { value: 42 } } }],
+      {
+        role: 'function',
+        parts: [
+          { functionResponse: { name: 'lookup', response: { value: 42 } } },
+        ],
+      },
+    ],
+    [
+      'request',
+      { contents: [{ role: 'user', parts: [{ text: 'Question.' }] }] },
+      { role: 'user', parts: [{ text: 'Question.' }] },
+    ],
+  ] as const)(
+    'accepts %s shorthand and returns response helpers @scenario:google-public-completion',
+    async (_name, request, expected) => {
+      let body: GenerateContentRequest | undefined;
+      await withServer(
+        (incoming, response) => {
+          let raw = '';
+          incoming.setEncoding('utf8');
+          incoming.on('data', (chunk: string) => {
+            raw += chunk;
+          });
+          incoming.on('end', () => {
+            body = JSON.parse(raw) as GenerateContentRequest;
+            response.writeHead(200, { 'content-type': 'application/json' });
+            response.end(
+              JSON.stringify({
+                candidates: [
+                  {
+                    index: 0,
+                    content: {
+                      role: 'model',
+                      parts: [
+                        { text: 'Answer.' },
+                        {
+                          executableCode: {
+                            language: 'python',
+                            code: 'print(42)',
+                          },
+                        },
+                        {
+                          codeExecutionResult: {
+                            outcome: 'OUTCOME_OK',
+                            output: '42',
+                          },
+                        },
+                        {
+                          functionCall: { name: 'lookup', args: { value: 42 } },
+                          thoughtSignature: 'signature',
+                        },
+                      ],
+                    },
+                  },
+                ],
+              })
+            );
+          });
+        },
+        async (baseUrl) => {
+          const input = request as
+            | string
+            | GenerateContentRequest
+            | (string | Part)[];
+          const { response } = await model(baseUrl, {
+            temperature: 0.7,
+          }).completionWithRetry(input);
+          expect(body?.contents).toEqual([expected]);
+          expect(body?.generationConfig).toMatchObject({ temperature: 0.7 });
+          const legacy = new GoogleGenerativeAI('test-key').getGenerativeModel(
+            { model: 'gemini-4-carbon' },
+            { baseUrl }
+          );
+          const old = await legacy.generateContent(input);
+          expect(response.text()).toBe(old.response.text());
+          expect(response.functionCalls()).toEqual(
+            old.response.functionCalls()
+          );
+          expect(response.text()).toBe(
+            'Answer.\n```python\nprint(42)\n```\n\n```\n42\n```\n'
+          );
+          expect(response.functionCalls()).toEqual([
+            { name: 'lookup', args: { value: 42 } },
+          ]);
+          expect(response.functionCall()).toEqual({
+            name: 'lookup',
+            args: { value: 42 },
+          });
+          expect(response.candidates?.[0].content.parts[3]).toHaveProperty(
+            'thoughtSignature',
+            'signature'
+          );
+        }
+      );
+    }
+  );
+
+  test.each([
+    { candidates: [] },
+    { promptFeedback: { blockReason: 'SAFETY' } },
+    ...['SAFETY', 'RECITATION', 'LANGUAGE'].map((finishReason) => ({
+      candidates: [
+        {
+          index: 0,
+          finishReason,
+          content: { role: 'model', parts: [{ text: 'Blocked.' }] },
+        },
+      ],
+    })),
+  ])(
+    'keeps response helper refusal semantics for %j @scenario:google-public-response-helpers',
+    async (payload) => {
+      await withServer(
+        (request, response) => {
+          request.resume();
+          response.writeHead(200, { 'content-type': 'application/json' });
+          response.end(JSON.stringify(payload));
+        },
+        async (baseUrl) => {
+          const { response } = await model(baseUrl).completionWithRetry({
+            contents: [],
+          });
+          if ('candidates' in payload && payload.candidates.length === 0) {
+            expect(response.text()).toBe('');
+            expect(response.functionCalls()).toBeUndefined();
+            expect(response.functionCall()).toBeUndefined();
+            return;
+          }
+          for (const helper of [
+            response.text,
+            response.functionCalls,
+            response.functionCall,
+          ]) {
+            expect(helper).toThrow(/blocked/);
+            try {
+              helper();
+            } catch (error) {
+              expect(error).toMatchObject({ response });
+            }
+          }
+        }
+      );
+    }
+  );
+
+  test('rejects empty or mixed shorthand before HTTP @scenario:google-public-request-validation', async () => {
+    const client = model('http://127.0.0.1:1');
+    await expect(client.completionWithRetry([])).rejects.toThrow(/No content/);
+    await expect(
+      client.completionWithRetry([
+        'Question.',
+        { functionResponse: { name: 'lookup', response: {} } },
+      ])
+    ).rejects.toThrow(/cannot be mixed/);
+  });
+});
+
+test('completionWithRetry aborts its HTTP request @scenario:google-public-completion-abort', async () => {
+  const received = Promise.withResolvers<void>();
+  const closed = Promise.withResolvers<void>();
+  await withServer(
+    (request, response) => {
+      request.resume();
+      response.once('close', () => closed.resolve());
+      received.resolve();
+    },
+    async (baseUrl) => {
+      const controller = new AbortController();
+      const pending = model(baseUrl).completionWithRetry('Question.', {
+        signal: controller.signal,
+      });
+      const rejected = expect(pending).rejects.toThrow(/abort/i);
+      await within(received.promise);
+      controller.abort();
+      await rejected;
+      await within(closed.promise);
     }
   );
 });
