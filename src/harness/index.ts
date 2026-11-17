@@ -216,3 +216,12 @@ export type {
   HostProviderTextRequest,
   HostProviderTextService,
 } from './providerText';
+
+export { HostChatModel, HostModelServiceError } from './model';
+export type {
+  HostModelDescriptor,
+  HostModelRequest,
+  HostModelService,
+  HostModelToolChoice,
+  HostModelErrorCode,
+} from './model';
