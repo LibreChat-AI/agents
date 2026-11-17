@@ -8,17 +8,12 @@ import type {
   HostModelRequest,
   HostModelService,
 } from './model';
+import type { RuntimeProviderName } from '@/types';
 import { Run, Providers, FakeChatModel, GraphEvents } from '../index';
 import { PreparedSubagentError } from '@/tools/preparedSubagents';
 import { HostChatModel, HostModelServiceError } from './model';
 import { registerProvider } from '../provider-registration';
 import { createHostToolBindings } from './index';
-
-declare module '../provider-registration' {
-  interface CustomProviderOptionsMap {
-    'host-model-tools-test': { binding: string };
-  }
-}
 
 const identity = {
   runtimeId: 'runtime',
@@ -534,7 +529,7 @@ it('uses host-approved tools through the native SDK tool lifecycle', async () =>
       customHandlers: bindings.customHandlers,
       graphConfig: {
         type: 'standard',
-        llmConfig: { provider: 'host-model-tools-test', binding: 'fixture' },
+        llmConfig: { provider: 'host-model-tools-test' as RuntimeProviderName },
         toolDefinitions: bindings.toolDefinitions,
       },
     });
