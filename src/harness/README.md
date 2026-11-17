@@ -131,3 +131,16 @@ child execution subjects need explicit future contracts.
 
 See [host provider-text protection](../../docs/host-provider-text.md) for setup, the identity and
 wire contract, process-local limits, retention monitoring, and recovery without freeing live work.
+
+## Host-owned model execution
+
+`HostChatModel` consumes the versioned `HostModelService` through native LangChain
+invoke/stream and tool-binding interfaces. A custom graph can keep the actual
+provider model, builder settings, credentials and model callbacks on its host
+while receiving native messages and chunks. The facade restricts worker tool
+selection to approved schemas and preserves usage, rich content and cancellation.
+
+See [host model integration](../../docs/host-model.md) for the SDK contract, required
+host authorization/lifecycle checks, supported function-tool scope and remaining
+LibreChat transport work. This contract alone does not enable protected remote
+saved agents or establish full chat parity.
