@@ -97,13 +97,15 @@ family traits. For an unregistered generic model, forced reserved names (`auto`,
 choice. An empty selection explicitly
 binds an empty tool list when the descriptor contains tools. Native messages are
 snapshotted through LangChain's stored-message representation before asynchronous
-provider dispatch. The returned descriptor is a separate copy.
+provider dispatch. Host-local V8 serialization preserves binary data, dates,
+BigInts, maps and sets instead of coercing them through JSON. Functions and other
+uncloneable values fail closed. The returned descriptor is a separate copy.
 
 The host's execution signal and the invocation signal are combined. Each operation
 has a required deadline, a per-request message-byte limit, and a cumulative response
 byte limit (including rich content, metadata and tool fragments). Shared admission
 bounds concurrent calls and total charged request-message bytes. Limits count
-serialized native messages, not the entire transport envelope: the transport still
+the host-local binary serialization of native messages, not a transport wire format: the transport still
 needs frame and queue bounds before decoding. Provider-internal caches/buffers and
 cluster-wide quotas are outside this process-local admission scope.
 

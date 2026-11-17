@@ -1,7 +1,14 @@
 import { z } from 'zod';
 import {
+  serialize as serializeNativeValue,
+  deserialize as deserializeNativeValue,
+} from 'node:v8';
+import {
   isAIMessage,
   isAIMessageChunk,
+  isToolMessage,
+  isChatMessage,
+  isBaseMessageChunk,
   isBaseMessage,
   mapStoredMessagesToChatMessages,
 } from '@langchain/core/messages';
@@ -134,6 +141,39 @@ const requestSchema = z.object({
     .optional(),
 });
 
+/** Preserve current native fields; BaseMessage.toDict() JSON-coerces structured metadata. */
+function storedMessage(message: BaseMessage): StoredMessage {
+  const data = {
+    ...message.lc_kwargs,
+    content: message.content,
+    additional_kwargs: message.additional_kwargs,
+    response_metadata: message.response_metadata,
+    id: message.id,
+    name: message.name,
+    role: isChatMessage(message) ? message.role : undefined,
+    tool_call_id: undefined,
+    ...(isAIMessage(message)
+      ? {
+        tool_calls: message.tool_calls,
+        invalid_tool_calls: message.invalid_tool_calls,
+        usage_metadata: message.usage_metadata,
+      }
+      : {}),
+    ...(isBaseMessageChunk(message) && isAIMessageChunk(message)
+      ? { tool_call_chunks: message.tool_call_chunks }
+      : {}),
+    ...(isToolMessage(message)
+      ? {
+        tool_call_id: message.tool_call_id,
+        artifact: message.artifact,
+        status: message.status,
+      }
+      : {}),
+  };
+  // LangChain's StoredMessageData types content as string, but its codec supports native blocks.
+  return { type: message.getType(), data } as StoredMessage;
+}
+
 function messageBytes(
   messages: readonly BaseMessage[],
   maxBytes: number
@@ -141,7 +181,7 @@ function messageBytes(
   let bytes = 2;
   try {
     for (const message of messages) {
-      bytes += Buffer.byteLength(JSON.stringify(message.toDict()), 'utf8') + 1;
+      bytes += serializeNativeValue(storedMessage(message)).byteLength + 1;
       if (bytes > maxBytes) throw new HostModelServiceError('overflow');
     }
     return bytes;
@@ -301,13 +341,13 @@ export function createHostModelService(options: {
       if (bytes > limits.maxRequestBytes)
         throw new HostModelServiceError('overflow');
       for (const message of value.messages) {
-        const serialized = JSON.stringify(message.toDict());
-        const added = Buffer.byteLength(serialized, 'utf8') + 1;
+        const serialized = serializeNativeValue(storedMessage(message));
+        const added = serialized.byteLength + 1;
         bytes += added;
         if (bytes > limits.maxRequestBytes)
           throw new HostModelServiceError('overflow');
         lease.charge(added);
-        stored.push(JSON.parse(serialized) as StoredMessage);
+        stored.push(deserializeNativeValue(serialized) as StoredMessage);
       }
       value.messages = mapStoredMessagesToChatMessages(stored);
       return {

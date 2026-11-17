@@ -3,6 +3,7 @@ import {
   AIMessage,
   AIMessageChunk,
   HumanMessage,
+  ToolMessage,
 } from '@langchain/core/messages';
 import type {
   BindToolsInput,
@@ -547,7 +548,7 @@ it('rejects full capacity before serializing another request', async () => {
   const pending = service.invoke(request());
   await model.entered.promise;
   const message = new HumanMessage('second');
-  const serialize = jest.spyOn(message, 'toDict');
+  const serialize = jest.spyOn(message, 'getType');
   await expect(
     service.invoke({ ...request(), messages: [message] })
   ).rejects.toMatchObject({ code: 'overflow' });
@@ -559,7 +560,7 @@ it('rejects full capacity before serializing another request', async () => {
 it('rolls back capacity after malformed message serialization', async () => {
   const { service, admission } = fixture();
   const message = new HumanMessage('hello');
-  message.additional_kwargs.invalid = 1n;
+  message.additional_kwargs.invalid = () => 'not data';
   await expect(
     service.invoke({ ...request(), messages: [message] })
   ).rejects.toMatchObject({ code: 'incompatible' });
@@ -672,4 +673,46 @@ it('runs the authenticated native binding through a real SDK graph', async () =>
   expect(JSON.stringify(result)).toContain('onetwo');
   expect(model.inputs).toHaveLength(1);
   expect(admission.snapshot().calls).toBe(0);
+});
+
+it('preserves binary and structured message metadata without JSON coercion', async () => {
+  const { service, model } = fixture();
+  const bytes = Uint8Array.from([1, 2, 3]);
+  const date = new Date('2026-01-01T00:00:00.000Z');
+  const message = new HumanMessage({
+    content: 'hello',
+    additional_kwargs: {
+      bytes,
+      date,
+      large: 123n,
+      values: new Map([['a', 1]]),
+      flags: new Set(['a']),
+    },
+  });
+  const result = service.invoke({ ...request(), messages: [message] });
+  bytes[0] = 9;
+  await result;
+  expect(model.inputs[0][0].additional_kwargs).toEqual({
+    bytes: Uint8Array.from([1, 2, 3]),
+    date,
+    large: 123n,
+    values: new Map([['a', 1]]),
+    flags: new Set(['a']),
+  });
+});
+
+it('preserves tool-result artifacts and status in the native model input', async () => {
+  const { service, model } = fixture();
+  const message = new ToolMessage({
+    content: 'tool output',
+    tool_call_id: 'call',
+    status: 'error',
+    artifact: { data: Uint8Array.from([4, 5]) },
+  });
+  await service.invoke({ ...request(), messages: [message] });
+  expect(model.inputs[0][0]).toMatchObject({
+    tool_call_id: 'call',
+    status: 'error',
+    artifact: { data: Uint8Array.from([4, 5]) },
+  });
 });
