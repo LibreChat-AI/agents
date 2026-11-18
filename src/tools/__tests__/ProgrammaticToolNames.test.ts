@@ -57,7 +57,9 @@ it.each([
       { toolCall }
     );
 
-    expect(String(result)).toContain('hello from hyphenated server');
+    expect(result).toMatchObject({
+      content: expect.stringContaining('hello from hyphenated server'),
+    });
     expect(invokeSpy).toHaveBeenCalledTimes(1);
     expect(echo.name).toBe(registeredName);
     expect(invokeSpy.mock.calls[0][0]).toEqual({
