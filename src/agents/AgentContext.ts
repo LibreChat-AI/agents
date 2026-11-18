@@ -688,31 +688,68 @@ export class AgentContext {
     const runtimes = new Set(
       programmaticTools.flatMap((tool) => tool.runtimes)
     );
-    const sandboxNames = capabilities.codeExecutionTools.flatMap((toolDef) => {
+    const identifierOwners = new Map<string, string | null>();
+    for (const runtime of runtimes) {
+      const normalizeIdentifier =
+        runtime === 'Bash'
+          ? normalizeToBashIdentifier
+          : normalizeToPythonIdentifier;
+      for (const toolDefs of [
+        capabilities.codeExecutionTools,
+        capabilities.directOnlyTools,
+      ]) {
+        for (const toolDef of toolDefs) {
+          const key = `${runtime}:${normalizeIdentifier(toolDef.name)}`;
+          const owner = identifierOwners.get(key);
+          identifierOwners.set(
+            key,
+            owner === undefined || owner === toolDef.name ? toolDef.name : null
+          );
+        }
+      }
+    }
+    const sandboxNames: string[] = [];
+    const collidingNames: string[] = [];
+    for (const toolDef of capabilities.codeExecutionTools) {
       const names: string[] = [];
+      const collisions: string[] = [];
       for (const runtime of runtimes) {
         const identifier =
           runtime === 'Bash'
             ? normalizeToBashIdentifier(toolDef.name)
             : normalizeToPythonIdentifier(toolDef.name);
-        if (identifier !== toolDef.name) {
+        if (identifier === toolDef.name) {
+          continue;
+        }
+        if (identifierOwners.get(`${runtime}:${identifier}`) !== toolDef.name) {
+          collisions.push(`${runtime} code \`${identifier}\``);
+        } else {
           names.push(`${runtime} \`${identifier}\``);
         }
       }
-      return names.length === 0
-        ? []
-        : [`- \`${toolDef.name}\`: ${names.join('; ')}`];
-    });
+      if (names.length > 0) {
+        sandboxNames.push(`- \`${toolDef.name}\`: ${names.join('; ')}`);
+      }
+      if (collisions.length > 0) {
+        collidingNames.push(`- \`${toolDef.name}\`: ${collisions.join('; ')}`);
+      }
+    }
     const sandboxNameGuidance =
       sandboxNames.length === 0
         ? ''
-        : '\n\nUse sandbox names in both code and `tool_manifest`; registered names are also accepted in `tool_manifest`:\n' +
+        : '\n\nUse sandbox names in both code and `tool_manifest` for the tools below; registered names are also accepted in `tool_manifest`:\n' +
           sandboxNames.join('\n');
+    const collidingNameGuidance =
+      collidingNames.length === 0
+        ? ''
+        : '\n\nFor colliding sandbox names, use registered names in `tool_manifest` and sandbox names in code. Select only one tool per sandbox name:\n' +
+          collidingNames.join('\n');
     const boundary =
       '\n\n' +
       `Only these tools may be invoked inside ${programmaticRunnerNames}: ${quotedProgrammaticNames}.` +
       directOnlyBoundary +
-      sandboxNameGuidance;
+      sandboxNameGuidance +
+      collidingNameGuidance;
 
     if (programmaticOnlyTools.length === 0) {
       return boundary;

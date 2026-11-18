@@ -156,7 +156,8 @@ ${CORE_RULES}`;
 
 const TOOL_MANIFEST_DESCRIPTION =
   'Registered tool names or their normalized sandbox function names used by the code. ' +
-  'Use normalized names in both code and tool_manifest. Required when direct-only tools are configured; ' +
+  'Use sandbox names in code, but registered names in tool_manifest when sandbox names collide. ' +
+  'Required when direct-only tools are configured; ' +
   'validated before execution starts. Pass [] when the code calls no tools at all.';
 
 // ============================================================================

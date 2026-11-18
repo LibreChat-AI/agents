@@ -1238,6 +1238,56 @@ describe('AgentContext', () => {
       );
     });
 
+    it.each([
+      [Constants.BASH_PROGRAMMATIC_TOOL_CALLING, 'Bash', 'code_execution'],
+      [Constants.PROGRAMMATIC_TOOL_CALLING, 'Python', 'code_execution'],
+      [Constants.BASH_PROGRAMMATIC_TOOL_CALLING, 'Bash', 'direct'],
+      [Constants.PROGRAMMATIC_TOOL_CALLING, 'Python', 'direct'],
+    ] as const)(
+      'uses registered manifests for %s (%s, other caller: %s)',
+      async (runnerName, runtime, otherCaller) => {
+        const registeredName = 'delete_record_mcp_prod-server';
+        const sandboxName = 'delete_record_mcp_prod_server';
+        const ctx = createBasicContext({
+          agentConfig: {
+            toolDefinitions: [{ name: runnerName }],
+            toolRegistry: new Map([
+              [
+                registeredName,
+                {
+                  name: registeredName,
+                  allowed_callers: ['code_execution'],
+                },
+              ],
+              [
+                sandboxName,
+                {
+                  name: sandboxName,
+                  allowed_callers: [otherCaller],
+                },
+              ],
+            ]),
+          },
+        });
+
+        const content = String(
+          (await ctx.systemRunnable!.invoke([]))[0].content
+        );
+        expect(content).toContain(
+          'For colliding sandbox names, use registered names in `tool_manifest` and sandbox names in code. Select only one tool per sandbox name'
+        );
+        expect(content).toContain(
+          `- \`${registeredName}\`: ${runtime} code \`${sandboxName}\``
+        );
+        expect(content).not.toContain(
+          `- \`${registeredName}\`: ${runtime} \`${sandboxName}\``
+        );
+        expect(content).not.toContain(
+          'Use sandbox names in both code and `tool_manifest`'
+        );
+      }
+    );
+
     it('makes mixed direct and programmatic caller boundaries explicit', async () => {
       const toolRegistry: t.LCToolRegistry = new Map([
         [
