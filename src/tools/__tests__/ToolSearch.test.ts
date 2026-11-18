@@ -1622,3 +1622,116 @@ describe('tool_search mcp_server filtering', () => {
     expect(output).not.toContain('The tool registry is empty');
   });
 });
+
+describe('tool_search exact match against the full registry', () => {
+  beforeAll(() => {
+    if ((globalThis as { crypto?: Crypto }).crypto === undefined) {
+      Object.defineProperty(globalThis, 'crypto', {
+        value: nodeWebcrypto,
+        configurable: true,
+      });
+    }
+  });
+
+  const registry = new Map(
+    [
+      {
+        name: 'create_proposal_mcp_dolibarr',
+        description: 'Create a proposal',
+        defer_loading: false,
+      },
+      {
+        name: 'delete_proposal_mcp_dolibarr',
+        description: 'Delete a proposal',
+        defer_loading: true,
+      },
+      {
+        name: 'validate_proposal_mcp_dolibarr',
+        description: 'Validate a proposal',
+        defer_loading: true,
+      },
+    ].map((tool) => [
+      tool.name,
+      {
+        ...tool,
+        parameters: { type: 'object', properties: {} },
+      },
+    ])
+  );
+
+  const search = () =>
+    createToolSearch({ mode: 'local', toolRegistry: registry as never });
+
+  it('reports a bound tool as already available instead of ranking deferred siblings', async () => {
+    const raw = await search().invoke({
+      query: 'create_proposal_mcp_dolibarr',
+    });
+    const output = JSON.parse(String(raw)) as {
+      tools: Array<{ name: string }>;
+      already_available?: boolean;
+      hint?: string;
+    };
+
+    expect(output.tools.map((tool) => tool.name)).toEqual([
+      'create_proposal_mcp_dolibarr',
+    ]);
+    expect(output.already_available).toBe(true);
+    expect(output.hint).toContain('already bound');
+  });
+
+  it('loads a deferred tool by exact base name', async () => {
+    const raw = await search().invoke({ query: 'validate_proposal' });
+    const output = JSON.parse(String(raw)) as {
+      tools: Array<{ name: string }>;
+      already_available?: boolean;
+    };
+
+    expect(output.tools.map((tool) => tool.name)).toEqual([
+      'validate_proposal_mcp_dolibarr',
+    ]);
+    expect(output.already_available).toBeUndefined();
+  });
+
+  it('loads a tool via the select: prefix', async () => {
+    const raw = await search().invoke({
+      query: 'select:validate_proposal_mcp_dolibarr',
+    });
+    const output = JSON.parse(String(raw)) as {
+      tools: Array<{ name: string }>;
+      query: string;
+    };
+
+    expect(output.tools.map((tool) => tool.name)).toEqual([
+      'validate_proposal_mcp_dolibarr',
+    ]);
+    expect(output.query).toBe('validate_proposal_mcp_dolibarr');
+  });
+
+  it('does not treat a single English word as an exact base-name match', async () => {
+    const raw = await search().invoke({ query: 'proposal' });
+    const output = JSON.parse(String(raw)) as {
+      tools: Array<{ name: string }>;
+      hidden?: number;
+    };
+
+    expect(output.tools.map((tool) => tool.name)).not.toEqual([
+      'create_proposal_mcp_dolibarr',
+    ]);
+  });
+
+  it('does not claim hidden misses for an empty listing query', () => {
+    const result = performLocalSearch(
+      [
+        {
+          name: 'create_proposal_mcp_dolibarr',
+          description: 'Create a proposal',
+        },
+      ],
+      '',
+      ['name'],
+      5
+    );
+
+    expect(result.total_matches).toBe(1);
+  });
+});

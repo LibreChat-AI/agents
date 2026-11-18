@@ -73,6 +73,36 @@ describe('Tool Discovery Functions', () => {
   };
 
   describe('extractToolDiscoveries', () => {
+    it('extracts tool names from a skill artifact in the current turn', () => {
+      const messages: BaseMessage[] = [
+        new HumanMessage('Load the proposal skill'),
+        createAIMessage('Loading skill...', [
+          {
+            id: 'skill_call',
+            name: Constants.SKILL_TOOL,
+            args: { skill: 'dolibarr-proposal' },
+          },
+        ]),
+        new ToolMessage({
+          content: 'Loaded skill',
+          tool_call_id: 'skill_call',
+          name: Constants.SKILL_TOOL,
+          artifact: {
+            tool_references: [
+              { tool_name: 'create_proposal_mcp_dolibarr' },
+              { tool_name: 'add_proposal_lines_mcp_dolibarr' },
+            ],
+          },
+        }),
+      ];
+
+      expect(extractToolDiscoveries(messages)).toEqual([
+        'create_proposal_mcp_dolibarr',
+        'add_proposal_lines_mcp_dolibarr',
+      ]);
+      expect(hasToolSearchInCurrentTurn(messages)).toBe(true);
+    });
+
     it('extracts tool names from a single tool search result', () => {
       const messages: BaseMessage[] = [
         new HumanMessage('Search for database tools'),

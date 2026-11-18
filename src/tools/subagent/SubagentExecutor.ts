@@ -1,6 +1,7 @@
 import { nanoid } from 'nanoid';
 import { createHash } from 'crypto';
 import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
+import { ROOT_CONTEXT, context as otelContext } from '@opentelemetry/api';
 import { AsyncLocalStorageProviderSingleton } from '@langchain/core/singletons';
 import {
   AIMessage,
@@ -142,6 +143,12 @@ import {
   getSubagentHostArgsDigest,
 } from './hostArgs';
 import {
+  createLangfuseHandler,
+  createLangfuseTraceMetadata,
+  disposeLangfuseHandler,
+  withLangfuseAttributes,
+} from '@/langfuse';
+import {
   executeHooks,
   HookRegistry,
   TOOL_APPROVAL_EXECUTION_SCOPE_CONFIG_KEY,
@@ -167,10 +174,13 @@ import {
 } from './childGraphConfig';
 import { cloneToolApprovalInterruptPayload } from '@/hitl/approvalReview';
 import { ProviderTextProtectionError } from '@/protection/providerText';
+import { withLangfuseRuntimeScope } from '@/langfuseRuntimeScope';
 import { stripRunStepResumeState } from '@/tools/runStepResume';
 import { seedAgentInitialSessions } from '@/utils/toolSessions';
 import { stableStringify } from '@/tools/eagerEventExecution';
 import { convertInjectedMessages } from '@/messages/injected';
+import { initializeLangfuseTracing } from '@/instrumentation';
+import { traceIdFromSeed } from '@/langfuseRuntimeContext';
 import { resolveClientOptionsModel } from '@/llm/request';
 import { isBackgroundDenyMode } from '@/types/hitl';
 import { composeAbortSignals } from '@/utils/misc';
@@ -195,6 +205,49 @@ const SUBAGENT_CONFIG_CHANGED_MESSAGE =
   'Subagent error: Subagent configuration changed since this execution was paused.';
 const SUBAGENT_INVOCATION_CHANGED_MESSAGE =
   'Subagent error: Subagent invocation changed for this execution.';
+
+type SubagentContentPart = {
+  type: string;
+  [key: string]: unknown;
+};
+
+function readNonEmptyString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() !== '' ? value : undefined;
+}
+
+function isSubagentTimeout(value: unknown): boolean {
+  if (value == null || typeof value !== 'object') {
+    return false;
+  }
+  const name = (value as { name?: string }).name;
+  return name === 'TimeoutError' || name === 'SubagentTimeoutError';
+}
+
+function childHumanMessage(
+  description: string,
+  additionalKwargs?: Record<string, unknown>,
+  getAdditionalContentParts?: () => SubagentContentPart[] | undefined
+): HumanMessage {
+  const parts = getAdditionalContentParts?.();
+  if (!Array.isArray(parts) || parts.length === 0) {
+    if (additionalKwargs == null) {
+      return new HumanMessage(description);
+    }
+    return new HumanMessage({
+      content: description,
+      additional_kwargs: additionalKwargs,
+    });
+  }
+  if (additionalKwargs == null) {
+    return new HumanMessage({
+      content: [{ type: 'text', text: description }, ...parts],
+    });
+  }
+  return new HumanMessage({
+    content: [{ type: 'text', text: description }, ...parts],
+    additional_kwargs: additionalKwargs,
+  });
+}
 
 function isSubagentResolutionControlFlow(error: unknown): boolean {
   try {
@@ -1081,6 +1134,18 @@ export type SubagentExecuteParams = {
    * rather than sharing parent's host context.
    */
   parentConfigurable?: Record<string, unknown>;
+  /**
+   * Optional host timeout for this spawn. Composed with `signal` and the
+   * parent/breaker abort. Timed-out children return a tool error instead of
+   * hanging the parent turn.
+   */
+  timeoutMs?: number;
+  /**
+   * Extra multimodal content parts appended to the child HumanMessage, for
+   * example chat-file images or PDFs. Hosts should pass a callback rather
+   * than writing a process-global hook.
+   */
+  getAdditionalContentParts?: () => SubagentContentPart[] | undefined;
   /** Dedicated hook session used by a detached task. @internal */
   hookSessionId?: string;
   /** Process-local task controls consumed by the child graph. @internal */
@@ -2980,7 +3045,20 @@ export class SubagentExecutor {
      * new run's breaker from an old child's stream-limit breach. Signal and
      * trip target both bind to this capture. */
     const childBreaker = params.breaker ?? this.resolveBreakerController();
-    const childSignal = this.composeChildSignal(childBreaker, params.signal);
+    const timeoutMs =
+      typeof params.timeoutMs === 'number' &&
+      Number.isFinite(params.timeoutMs) &&
+      params.timeoutMs > 0
+        ? params.timeoutMs
+        : undefined;
+    const timeoutSignal =
+      timeoutMs == null ? undefined : AbortSignal.timeout(timeoutMs);
+    const childSignal = this.composeChildSignal(
+      childBreaker,
+      timeoutSignal == null
+        ? params.signal
+        : (composeAbortSignals(params.signal, timeoutSignal) ?? timeoutSignal)
+    );
 
     const { parentToolCallId: executionSuffix } = execution.address;
     const { resumeExecution } = execution;
@@ -3270,6 +3348,7 @@ export class SubagentExecutor {
     let result: MultiAgentGraphState | undefined;
     let recoveredComplete = false;
     let recoveredInProgress = false;
+    let langfuseHandler: ReturnType<typeof createLangfuseHandler>;
     try {
       const workflow = (cachedChildRun?.workflow ??
         childGraph.createWorkflow()) as StatefulCompiledWorkflow;
@@ -3368,11 +3447,58 @@ export class SubagentExecutor {
         isBackgroundDenyMode(this.humanInTheLoop)
           ? childThreadId
           : (inheritedConfigurable.thread_id ?? childRunId);
+      /**
+       * Langfuse: emit a linked child AgentRun (own deterministic trace id)
+       * instead of nesting under the parent `subagent` TOOL span. Detach
+       * OTEL via ROOT_CONTEXT + child traceIdSeed so LLM/MCP observations
+       * do not leak into the parent trace as orphans. Keep parent UI
+       * callbacks out of this list (forwarder + usage only, plus child
+       * Langfuse handler).
+       */
+      const parentThreadId = readNonEmptyString(
+        inheritedConfigurable.thread_id
+      );
+      const parentUserId = readNonEmptyString(inheritedConfigurable.user_id);
+      const childTraceSeed =
+        this.langfuse?.deterministicTraceId === true ? childRunId : undefined;
+      const parentTraceId =
+        this.langfuse?.deterministicTraceId === true
+          ? traceIdFromSeed(this.parentRunId)
+          : undefined;
+      const childAgentName = readNonEmptyString(config.name) ?? subagentType;
+      const linkedParentToolCallId = readNonEmptyString(parentToolCallId);
+      const childTraceMetadata: Record<string, string> = {
+        ...createLangfuseTraceMetadata({
+          messageId: childRunId,
+          parentMessageId: this.parentRunId,
+          agentId: childAgentId,
+          agentName: childAgentName,
+        }),
+        subagentType,
+        ...(parentTraceId != null ? { parentTraceId } : {}),
+        ...(linkedParentToolCallId != null
+          ? { parentToolCallId: linkedParentToolCallId }
+          : {}),
+      };
+      initializeLangfuseTracing(this.langfuse);
+      langfuseHandler = createLangfuseHandler({
+        langfuse: this.langfuse,
+        userId: parentUserId,
+        sessionId: parentThreadId,
+        traceMetadata: childTraceMetadata,
+        tags: ['librechat', 'agent', 'subagent'],
+        traceIdSeed: childTraceSeed,
+        traceName: 'AgentRun',
+      });
+      if (langfuseHandler != null) {
+        callbackHandlers.push(langfuseHandler);
+      }
       const childInvokeConfig = {
         recursionLimit,
         signal: childSignal,
         callbacks,
-        runName: `subagent:${subagentType}`,
+        runName: 'AgentRun',
+        metadata: childTraceMetadata,
         configurable: childConfigurable,
       };
       activeChildRun.invokeConfig = childInvokeConfig;
@@ -3461,13 +3587,14 @@ export class SubagentExecutor {
           childInput = {
             messages: [
               ...(params.initialMessages ?? []),
-              new HumanMessage({
-                content: description,
-                additional_kwargs: {
+              childHumanMessage(
+                description,
+                {
                   [SUBAGENT_HOOK_SESSION_KEY]: currentHookSessionId,
                   [SUBAGENT_RUN_ID_KEY]: childRunId,
                 },
-              }),
+                params.getAdditionalContentParts
+              ),
               ...(preparedContext?.messages ?? []),
             ],
           };
@@ -3490,7 +3617,13 @@ export class SubagentExecutor {
               parentAgentId: this.parentAgentId,
               agentId: childAgentId,
               agentType: subagentType,
-              inputs: [new HumanMessage(description)],
+              inputs: [
+                childHumanMessage(
+                  description,
+                  undefined,
+                  params.getAdditionalContentParts
+                ),
+              ],
             },
             sessionId: currentHookSessionId,
             matchQuery: subagentType,
@@ -3537,6 +3670,31 @@ export class SubagentExecutor {
           });
         }
 
+        const invokeChild = (
+          input: BaseGraphState | Command | null
+        ): Promise<MultiAgentGraphState> =>
+          otelContext.with(ROOT_CONTEXT, () =>
+            withLangfuseRuntimeScope(
+              {
+                langfuse: this.langfuse,
+                ...(childTraceSeed != null
+                  ? { traceIdSeed: childTraceSeed }
+                  : {}),
+              },
+              () =>
+                withLangfuseAttributes(
+                  {
+                    langfuse: this.langfuse,
+                    userId: parentUserId,
+                    sessionId: parentThreadId,
+                    traceMetadata: childTraceMetadata,
+                    traceName: 'AgentRun',
+                    tags: ['librechat', 'agent', 'subagent'],
+                  },
+                  () => workflow.invoke(input, childInvokeConfig)
+                )
+            )
+          );
         for (;;) {
           let childResult: MultiAgentGraphState;
           if (
@@ -3550,11 +3708,10 @@ export class SubagentExecutor {
             childResult =
               await AsyncLocalStorageProviderSingleton.runWithConfig(
                 childInvokeConfig,
-                (): Promise<MultiAgentGraphState> =>
-                  workflow.invoke(childInput, childInvokeConfig)
+                (): Promise<MultiAgentGraphState> => invokeChild(childInput)
               );
           } else {
-            childResult = await workflow.invoke(childInput, childInvokeConfig);
+            childResult = await invokeChild(childInput);
           }
           const childInterrupts = isInterrupted(childResult)
             ? childResult[INTERRUPT]
@@ -3682,10 +3839,16 @@ export class SubagentExecutor {
       ) {
         throw error;
       }
+      const timedOut =
+        isSubagentTimeout(error) || isSubagentTimeout(childSignal.reason);
       return createSubagentFailure(
-        `Subagent error: ${errorMessage}`,
+        timedOut
+          ? `Error processing tool: ${errorMessage}`
+          : `Subagent error: ${errorMessage}`,
         errorMessage
       );
+    } finally {
+      await disposeLangfuseHandler(langfuseHandler);
     }
 
     /**

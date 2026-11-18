@@ -36,10 +36,10 @@ const MAX_PATTERN_LENGTH = 200;
 export const ToolSearchToolName = Constants.TOOL_SEARCH;
 
 export const ToolSearchToolDescription =
-  'Searches deferred tools using BM25 ranking. Multi-word queries supported. Use mcp_server param to filter by server.';
+  'Searches deferred tools using BM25 ranking. Multi-word queries rank better than a single word. If you know the exact tool name, query that full name or base name (or select:full_name) to load it directly. Use mcp_server param to filter by server.';
 
 const QUERY_DESCRIPTION_LOCAL =
-  'Search term to find in tool names and descriptions. Case-insensitive substring matching. Optional if mcp_server is provided.';
+  'BM25 ranking over tool names and descriptions. Multi-word queries rank better than one word. If you know the exact tool name, pass the full name or base name (optionally prefixed with select:) to load it directly without ranking. Optional if mcp_server is provided.';
 const QUERY_DESCRIPTION_REGEX =
   'Regex pattern to search tool names and descriptions. Optional if mcp_server is provided.';
 const FIELDS_DESCRIPTION =
@@ -597,9 +597,84 @@ function findMatchedField(
   return { field: 'unknown', snippet: fallbackSnippet };
 }
 
+const SELECT_QUERY_PREFIX = /^select:/i;
+
+/**
+ * Strips an optional `select:` prefix used to load a tool by exact name.
+ */
+function normalizeToolSearchQuery(query: string): string {
+  const trimmed = query.trim();
+  return (
+    SELECT_QUERY_PREFIX.test(trimmed)
+      ? trimmed.replace(SELECT_QUERY_PREFIX, '')
+      : trimmed
+  ).trim();
+}
+
+/**
+ * Base-name exact match is gated so a single English word does not skip BM25.
+ * Full names, underscored base names, and `select:` queries still qualify.
+ */
+function allowsBaseNameExactMatch(rawQuery: string): boolean {
+  const trimmed = rawQuery.trim();
+  if (SELECT_QUERY_PREFIX.test(trimmed)) {
+    return true;
+  }
+  return normalizeToolSearchQuery(rawQuery).includes('_');
+}
+
+/**
+ * Finds tools whose full name or MCP base name equals the query.
+ * Full-name matches win over base-name matches. All same-base tools are returned.
+ */
+function findExactToolMatches(
+  tools: t.ToolMetadata[],
+  query: string,
+  allowBaseName = true
+): t.ToolMetadata[] {
+  const queryLower = query.toLowerCase();
+  if (queryLower === '') {
+    return [];
+  }
+  const full = tools.filter((tool) => tool.name.toLowerCase() === queryLower);
+  if (full.length > 0) {
+    return full;
+  }
+  if (allowBaseName !== true) {
+    return [];
+  }
+  return tools.filter(
+    (tool) => getBaseToolName(tool.name).toLowerCase() === queryLower
+  );
+}
+
+function toExactSearchResponse(
+  matches: t.ToolMetadata[],
+  query: string,
+  totalSearched: number
+): t.ToolSearchResponse {
+  return {
+    tool_references: matches.map((tool) => ({
+      tool_name: tool.name,
+      match_score: 1,
+      matched_field: 'name',
+      snippet: tool.description
+        ? tool.description.substring(0, 100)
+        : tool.name,
+    })),
+    total_tools_searched: totalSearched,
+    total_matches: matches.length,
+    pattern_used: query,
+    already_available:
+      matches.length > 0 &&
+      matches.every((tool) => tool.defer_loading === false),
+  };
+}
+
 /**
  * Performs BM25-based search for better relevance ranking.
  * Uses Okapi BM25 algorithm for term frequency and document length normalization.
+ * Exact full-name or base-name queries (optionally `select:`-prefixed) return that tool only.
  * If query is empty, returns all tools (up to maxResults) sorted alphabetically.
  * @param tools - Array of tool metadata to search
  * @param query - The search query (empty returns all tools)
@@ -617,11 +692,24 @@ function performLocalSearch(
     return {
       tool_references: [],
       total_tools_searched: 0,
+      total_matches: 0,
       pattern_used: query,
     };
   }
 
-  const queryTokens = tokenize(query);
+  const normalizedQuery = normalizeToolSearchQuery(query);
+  if (fields.includes('name')) {
+    const exactMatches = findExactToolMatches(
+      tools,
+      normalizedQuery,
+      allowsBaseNameExactMatch(query)
+    );
+    if (exactMatches.length > 0) {
+      return toExactSearchResponse(exactMatches, normalizedQuery, tools.length);
+    }
+  }
+
+  const queryTokens = tokenize(normalizedQuery);
 
   if (queryTokens.length === 0) {
     const allTools = tools
@@ -638,7 +726,8 @@ function performLocalSearch(
     return {
       tool_references: allTools,
       total_tools_searched: tools.length,
-      pattern_used: query,
+      total_matches: tools.length,
+      pattern_used: normalizedQuery,
     };
   }
 
@@ -646,7 +735,7 @@ function performLocalSearch(
   const scores = BM25(documents, queryTokens, { k1: 1.5, b: 0.75 }) as number[];
 
   const maxScore = Math.max(...scores.filter((s) => s > 0), 1);
-  const queryLower = query.toLowerCase().trim();
+  const queryLower = normalizedQuery.toLowerCase().trim();
   const queryIdentifier = queryTokens.join('');
   const matchesIdentifiers = fields.includes('name');
 
@@ -708,7 +797,8 @@ function performLocalSearch(
   return {
     tool_references: topResults,
     total_tools_searched: tools.length,
-    pattern_used: query,
+    total_matches: results.length,
+    pattern_used: normalizedQuery,
   };
 }
 
@@ -834,11 +924,22 @@ function formatSearchResults(
   nameFormat: t.McpNameFormat = 'full',
   notes: string[] = []
 ): string {
-  const { tool_references, total_tools_searched, pattern_used } =
-    searchResponse;
+  const {
+    tool_references,
+    total_tools_searched,
+    pattern_used,
+    total_matches,
+    already_available,
+  } = searchResponse;
   const useFullName = nameFormat === 'full';
+  const matchCount = total_matches ?? tool_references.length;
+  const hasQuery =
+    typeof pattern_used === 'string' && pattern_used.trim() !== '';
+  const hidden = hasQuery
+    ? Math.max(0, matchCount - tool_references.length)
+    : 0;
 
-  const output = {
+  const output: Record<string, unknown> = {
     found: tool_references.length,
     tools: tool_references.map((ref) => ({
       name: useFullName ? ref.tool_name : getBaseToolName(ref.tool_name),
@@ -846,10 +947,19 @@ function formatSearchResults(
       matched_in: ref.matched_field,
       snippet: ref.snippet,
     })),
+    total_matches: matchCount,
+    hidden,
     total_searched: total_tools_searched,
     query: pattern_used,
     ...(notes.length > 0 ? { notes } : {}),
   };
+
+  if (already_available === true) {
+    output.already_available = true;
+    output.hint = 'This tool is already bound; call it directly.';
+  } else if (hidden > 0) {
+    output.hint = `${hidden} more matches not shown. Use a more specific query (full tool name or base name) to load a known tool.`;
+  }
 
   return JSON.stringify(output, null, 2);
 }
@@ -1065,7 +1175,8 @@ ${deferredToolsListing}`
   const description =
     mode === 'local'
       ? `
-Searches deferred tools using BM25 ranking. Multi-word queries supported.
+Searches deferred tools using BM25 ranking. Multi-word queries rank better than a single word.
+If you know the exact tool name, query that full name or base name (or select:full_name) to load it directly.
 ${mcpNote}${toolsListSection}
 `.trim()
       : `
@@ -1127,6 +1238,7 @@ ${mcpNote}${toolsListSection}
         name: lcTool.name,
         description: lcTool.description ?? '',
         parameters: simplifyParametersForSearch(lcTool.parameters),
+        defer_loading: lcTool.defer_loading === true,
       });
 
       for (const lcTool of toolRegistry.values()) {
@@ -1205,6 +1317,58 @@ ${mcpNote}${toolsListSection}
         for (const lcTool of staged) {
           if (isFromAnyMcpServer(lcTool.name, activeServers)) {
             deferredTools.push(describeTool(lcTool));
+          }
+        }
+      }
+
+      if (mode === 'local') {
+        let catalogFilter: string[] = [];
+        if (hasServerFilter) {
+          catalogFilter =
+            activeServers.length > 0 ? activeServers : matchedServers;
+        }
+        const catalogTools: t.ToolMetadata[] = [];
+        for (const lcTool of toolRegistry.values()) {
+          if (
+            hasServerFilter &&
+            !isFromAnyMcpServer(lcTool.name, catalogFilter)
+          ) {
+            continue;
+          }
+          catalogTools.push(describeTool(lcTool));
+        }
+        const normalizedQuery = normalizeToolSearchQuery(query);
+        if (normalizedQuery !== '') {
+          const exactMatches = findExactToolMatches(
+            catalogTools,
+            normalizedQuery,
+            allowsBaseNameExactMatch(query)
+          );
+          if (exactMatches.length > 0) {
+            const searchResponse = toExactSearchResponse(
+              exactMatches,
+              normalizedQuery,
+              catalogTools.length
+            );
+            const formattedOutput = formatSearchResults(
+              searchResponse,
+              mcpNameFormat,
+              filterNotes
+            );
+            return [
+              formattedOutput,
+              {
+                tool_references: searchResponse.tool_references,
+                metadata: {
+                  total_searched: searchResponse.total_tools_searched,
+                  pattern: searchResponse.pattern_used,
+                  already_available: searchResponse.already_available,
+                  mcp_server:
+                    serverFilters.length > 0 ? serverFilters : undefined,
+                  ...filterMetadata,
+                },
+              },
+            ];
           }
         }
       }
@@ -1311,6 +1475,7 @@ ${mcpNote}${toolsListSection}
             metadata: {
               total_searched: searchResponse.total_tools_searched,
               pattern: searchResponse.pattern_used,
+              already_available: searchResponse.already_available,
               mcp_server: serverFilters.length > 0 ? serverFilters : undefined,
               ...filterMetadata,
             },
@@ -1423,6 +1588,7 @@ ${mcpNote}${toolsListSection}
 
 export {
   createToolSearch,
+  formatSearchResults,
   performLocalSearch,
   extractMcpServerName,
   isFromMcpServer,

@@ -1174,7 +1174,10 @@ export abstract class Graph<
     }
     const savedStateKeys = new Set<string>();
     const toolNodeStatesByKey = new Map<string, SubagentToolNodeResumeState>();
-    const legacyNodeStatesByKey = new Map<string, SubagentToolNodeResumeState>();
+    const legacyNodeStatesByKey = new Map<
+      string,
+      SubagentToolNodeResumeState
+    >();
     for (const nodeState of state.toolNodes) {
       const identity = parseSubagentToolNodeStateKey(nodeState.stateKey);
       if (identity == null) {
@@ -4378,7 +4381,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       );
       const traceMetadata = createLangfuseTraceMetadata({
         messageId: this.runId,
-        parentMessageId: config.configurable?.requestBody?.parentMessageId,
+        parentMessageId:
+          typeof config.metadata?.parentMessageId === 'string'
+            ? config.metadata.parentMessageId
+            : config.configurable?.requestBody?.parentMessageId,
         agentId,
         agentName: agentContext.name,
         rootAgentId: this.defaultAgentId,
@@ -4462,6 +4468,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             traceAnchor: this.langfuseTraceAnchor,
             runId: this.langfuseScopeRunId,
             agentId,
+            traceIdSeed:
+              langfuse?.deterministicTraceId === true ? this.runId : undefined,
           }),
           () =>
             attemptInvoke(
@@ -4672,6 +4680,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               langfuseOverlay: agentContext.langfuse,
               runId: this.langfuseScopeRunId,
               agentId,
+              traceIdSeed:
+                langfuse?.deterministicTraceId === true
+                  ? this.runId
+                  : undefined,
             }),
             () =>
               tryFallbackProviders({

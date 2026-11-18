@@ -43,7 +43,12 @@ export function extractToolDiscoveries(messages: BaseMessage[]): string[] {
   for (let i = latestAIParentIndex + 1; i < messages.length; i++) {
     const msg = messages[i];
     if (!(msg instanceof ToolMessage)) continue;
-    if (msg.name !== Constants.TOOL_SEARCH) continue;
+    if (
+      msg.name !== Constants.TOOL_SEARCH &&
+      msg.name !== Constants.SKILL_TOOL
+    ) {
+      continue;
+    }
     if (!toolCallIds.has(msg.tool_call_id)) continue;
 
     // This is a tool search result from the current turn
@@ -88,7 +93,8 @@ export function hasToolSearchInCurrentTurn(messages: BaseMessage[]): boolean {
     const msg = messages[i];
     if (
       msg instanceof ToolMessage &&
-      msg.name === Constants.TOOL_SEARCH &&
+      (msg.name === Constants.TOOL_SEARCH ||
+        msg.name === Constants.SKILL_TOOL) &&
       toolCallIds.has(msg.tool_call_id)
     ) {
       return true;

@@ -1312,6 +1312,7 @@ export type ToolMetadata = {
   name: string;
   description: string;
   parameters?: JsonSchemaType;
+  defer_loading?: boolean;
 };
 
 /** Individual search result for a matching tool */
@@ -1327,6 +1328,8 @@ export type ToolSearchResponse = {
   tool_references: ToolSearchResult[];
   total_tools_searched: number;
   pattern_used: string;
+  total_matches?: number;
+  already_available?: boolean;
 };
 
 /** Artifact returned alongside the formatted search results */
@@ -1335,6 +1338,7 @@ export type ToolSearchArtifact = {
   metadata: {
     total_searched: number;
     pattern: string;
+    already_available?: boolean;
     error?: string;
     /** Servers that had tools to search, emitted when a server filter matched
      * nothing so the caller can see what it could have asked for. */
