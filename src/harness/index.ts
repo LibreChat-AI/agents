@@ -229,3 +229,27 @@ export type {
 
 export { createHostModelService, HostModelAdmission } from './modelService';
 export type { HostModelLimits } from './modelService';
+
+export { createHostFileService, HostFileAdmission } from './fileService';
+export type { HostFileStore } from './fileService';
+export { createHostFileBindings } from './fileBindings';
+export type { HostFileBindings } from './fileBindings';
+export {
+  HostFileServiceError,
+  hostFileDescriptorSchema,
+  hostFileServiceDescriptorSchema,
+  hostFileReadRequestSchema,
+  hostFileStageRequestSchema,
+  hostFilePublishRequestSchema,
+} from './files';
+export type {
+  HostFileDescriptor,
+  HostFileServiceDescriptor,
+  HostFileService,
+  HostFileReadRequest,
+  HostFileStageRequest,
+  HostFilePublishRequest,
+  HostFileChunk,
+  HostFilePublication,
+  HostFileErrorCode,
+} from './files';
