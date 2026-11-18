@@ -2935,6 +2935,26 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
   static lc_name(): string {
     return 'LibreChatOpenAI';
   }
+
+  override withConfig(
+    config: Partial<t.ChatOpenAICallOptions>
+  ): ReturnType<OriginalChatOpenAI<t.ChatOpenAICallOptions>['withConfig']> {
+    const Ctor = this.constructor as new (
+      fields?: LibreChatOpenAIFields & t.OpenAIChatInput['modelKwargs']
+    ) => this;
+    const newModel = new Ctor(
+      this.fields as LibreChatOpenAIFields & t.OpenAIChatInput['modelKwargs']
+    );
+    newModel.defaultOptions = {
+      ...this.defaultOptions,
+      ...config,
+    };
+    newModel._lc_stream_delay = this._lc_stream_delay;
+    newModel.firstPartyEndpoint = this.firstPartyEndpoint;
+    return newModel as unknown as ReturnType<
+      OriginalChatOpenAI<t.ChatOpenAICallOptions>['withConfig']
+    >;
+  }
   _getClientOptions(
     options?: OpenAICoreRequestOptions
   ): OpenAICoreRequestOptions {

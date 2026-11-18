@@ -171,6 +171,19 @@ export class ChatOpenRouter extends ChatOpenAI {
     return 'LibreChatOpenRouter';
   }
 
+  override withConfig(
+    config: Partial<ChatOpenRouterCallOptions>
+  ): ReturnType<ChatOpenAI['withConfig']> {
+    const newModel = super.withConfig(config) as unknown as this;
+    if (this.openRouterReasoning != null) {
+      newModel.openRouterReasoning = { ...this.openRouterReasoning };
+    }
+    if (this.includeReasoning !== undefined) {
+      newModel.includeReasoning = this.includeReasoning;
+    }
+    return newModel as unknown as ReturnType<ChatOpenAI['withConfig']>;
+  }
+
   // OpenRouter widens OpenAI reasoning with extra effort levels ('xhigh' | 'none' | 'minimal').
   override invocationParams(
     options?: this['ParsedCallOptions'],
