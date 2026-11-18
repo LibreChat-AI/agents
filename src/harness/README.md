@@ -1,5 +1,8 @@
 # Host tool bindings
 
+For authorized attachment reads and private artifact staging/publication, see
+[Host files and artifacts](./files.md).
+
 `createHostToolBindings` connects the SDK's existing tool/approval lifecycle to a host service.
 A descriptor combines the model-visible `LCTool` schema with an opaque authorized host reference.
 The same service interface supports direct calls and remote RPC; the SDK never selects URLs,
