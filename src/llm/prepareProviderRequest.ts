@@ -1,4 +1,5 @@
 import { Buffer } from 'node:buffer';
+import { isIDContentBlock } from '@langchain/core/messages';
 import type {
   BaseMessage,
   Data,
@@ -112,7 +113,12 @@ type PreparedProviderRequestData = Omit<
 export interface ProviderRequestContext {
   getOrCreateToolOutputRegistry?(): ToolOutputReferenceRegistry | undefined;
   isRunProducedMessage?(message: BaseMessage): boolean;
+  resolveAttachment?: t.AttachmentResolver;
 }
+
+type ResolveReference = (
+  reference: t.AttachmentReference
+) => MessageContentComplex | null | undefined;
 
 export interface PrepareProviderRequestParams {
   model: t.ChatModel;
@@ -209,6 +215,7 @@ interface ProjectMessagesForProviderParams {
   maxToolResultChars?: number;
   callOptions?: unknown;
   toolHistory?: ToolHistoryPreparation;
+  resolve?: ResolveReference;
 }
 
 function isSerializedBuffer(value: object): value is SerializedBuffer {
@@ -344,15 +351,18 @@ function copyUsableContentPrefix(
   return content;
 }
 
-/** Reprojects persisted provider-native attachments without changing history. */
+/**
+ * Resolves referenced attachments and reprojects persisted provider-native
+ * ones, in one pass and without changing history.
+ */
 function projectAttachmentsForProvider(
   messages: BaseMessage[],
-  provider: t.ProviderName
+  provider: t.ProviderName,
+  resolve?: ResolveReference
 ): BaseMessage[] {
-  if (
-    provider === Providers.BEDROCK ||
-    getProviderFamily(provider) === 'bedrock'
-  ) {
+  const native =
+    provider === Providers.BEDROCK || getProviderFamily(provider) === 'bedrock';
+  if (native && resolve == null) {
     return messages;
   }
   let projected: BaseMessage[] | undefined;
@@ -365,6 +375,21 @@ function projectAttachmentsForProvider(
     let content: ProviderContentBlock[] | undefined;
     for (let blockIndex = 0; blockIndex < sourceContent.length; blockIndex++) {
       const block = sourceContent[blockIndex];
+      const resolved =
+        resolve != null && isIDContentBlock(block) ? resolve(block) : undefined;
+      if (resolved !== undefined) {
+        content ??= copyUsableContentPrefix(sourceContent, blockIndex);
+        if (resolved !== null) {
+          content.push(resolved);
+        }
+        continue;
+      }
+      if (native) {
+        if (content != null && !isBlankTextBlock(block)) {
+          content.push(block);
+        }
+        continue;
+      }
       if (isStandardFileBlock(block)) {
         if (shouldRetainStandardFile(provider, block.mime_type)) {
           content?.push(block);
@@ -411,6 +436,7 @@ function projectMessagesForProviderMode(
     provider,
     maxToolResultChars,
     toolHistory,
+    resolve,
   }: ProjectMessagesForProviderParams,
   projectionMode: ProviderMessageProjectionMode
 ): BaseMessage[] {
@@ -423,7 +449,8 @@ function projectMessagesForProviderMode(
       maxToolResultChars,
       toolHistory
     ),
-    provider
+    provider,
+    resolve
   );
   if (nativeOpenAIResponses) {
     return projectOpenAIResponsesToolMessageContent(
@@ -540,6 +567,8 @@ export function prepareProviderRequest({
     provider,
     config
   );
+  const modelId = resolveServingModelId(model);
+  const resolveAttachment = context?.resolveAttachment;
   const projected = projectMessagesForProviderMode(
     {
       model,
@@ -548,6 +577,15 @@ export function prepareProviderRequest({
       maxToolResultChars,
       callOptions: config,
       toolHistory,
+      resolve:
+        resolveAttachment == null
+          ? undefined
+          : (reference): MessageContentComplex | null | undefined =>
+            resolveAttachment(reference, {
+              provider,
+              modelId,
+              projectionMode,
+            }),
     },
     projectionMode
   );
@@ -555,7 +593,6 @@ export function prepareProviderRequest({
   const runId = config?.configurable?.run_id as string | undefined;
   const annotated = annotateMessagesForLLM(projected, registry, runId);
   const isRunProduced = context?.isRunProducedMessage;
-  const modelId = resolveServingModelId(model);
   const handoffGrounded = appendInstructionlessHandoffCue(annotated, config);
   const cued = isAnthropicLike(provider, {
     model: modelId,

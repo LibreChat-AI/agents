@@ -68,6 +68,10 @@ export async function createRemoteSdkRun({
     throw new Error(
       'Remote SDK provider protection requires a supported policy adapter'
     );
+  if (config.resolveAttachment)
+    throw new Error(
+      'Remote SDK attachment references require a supported file adapter'
+    );
   identity = Object.freeze({ ...identity });
   const limits = remoteSdkLimits(remote);
   const url = new URL(remote.url);

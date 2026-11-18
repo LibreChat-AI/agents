@@ -1174,6 +1174,8 @@ export type SubagentExecutorOptions = {
    * revert to the defaults.
    */
   providerTextProtection?: StandardGraphInput['providerTextProtection'];
+  /** The parent's attachment resolver, so a child resolves the references it inherits. */
+  resolveAttachment?: StandardGraphInput['resolveAttachment'];
   streamLimits?: StandardGraphInput['streamLimits'];
   humanInTheLoop?: HumanInTheLoopConfig;
   /** Shared durable saver used to recover outer tool lifecycle results before
@@ -1252,6 +1254,7 @@ export class SubagentExecutor {
   private readonly langfuse?: StandardGraphInput['langfuse'];
   private readonly tokenCounter?: TokenCounter;
   private readonly providerTextProtection?: StandardGraphInput['providerTextProtection'];
+  private readonly resolveAttachment?: StandardGraphInput['resolveAttachment'];
   private readonly streamLimits?: StandardGraphInput['streamLimits'];
   private readonly humanInTheLoop?: HumanInTheLoopConfig;
   private readonly checkpointer?: BaseCheckpointSaver;
@@ -1293,6 +1296,7 @@ export class SubagentExecutor {
     this.tokenCounter = options.tokenCounter;
     this.streamLimits = options.streamLimits;
     this.providerTextProtection = options.providerTextProtection;
+    this.resolveAttachment = options.resolveAttachment;
     this.humanInTheLoop = options.humanInTheLoop;
     this.checkpointer = isCheckpointSaver(options.checkpointer)
       ? options.checkpointer
@@ -1578,6 +1582,7 @@ export class SubagentExecutor {
       onResolutionFailure: this.onResolutionFailure,
       streamLimits: this.streamLimits,
       providerTextProtection: this.providerTextProtection,
+      resolveAttachment: this.resolveAttachment,
       humanInTheLoop:
         this.humanInTheLoop?.enabled === true ||
         this.humanInTheLoop?.backgroundPausePolicy === 'deny'
@@ -3187,6 +3192,7 @@ export class SubagentExecutor {
       tokenCounter: this.tokenCounter,
       streamLimits: this.streamLimits,
       providerTextProtection: this.providerTextProtection,
+      resolveAttachment: this.resolveAttachment,
       subagentScope: true,
       subagentExecutionContext: childExecutionContext,
       subagentContext: this.subagentContext,
