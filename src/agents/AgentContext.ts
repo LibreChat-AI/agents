@@ -57,7 +57,9 @@ import {
   Providers,
 } from '@/common';
 import { isTokenCounterCacheCompatible } from '@/llm/tokenCounterCacheCompatibility';
+import { normalizeToBashIdentifier } from '@/tools/BashProgrammaticToolCalling';
 import { snapshotCompactionSemanticIndex } from '@/summarization/semanticIndex';
+import { normalizeToPythonIdentifier } from '@/tools/ProgrammaticToolCalling';
 import { createExactTokenCountCache } from '@/llm/contextPressureMeter';
 import { markProviderTextInput } from '@/protection/providerTextInput';
 import { buildSummaryCarrierText } from '@/summarization/shared';
@@ -81,6 +83,7 @@ type PromptCacheProvider = Providers.ANTHROPIC | Providers.OPENROUTER;
 type ProgrammaticToolInstructionTarget = {
   name: string;
   codeGuidance: string;
+  runtimes: Array<'Bash' | 'Python'>;
   executesDirectly: boolean;
 };
 
@@ -680,12 +683,36 @@ export class AgentContext {
           .map((name) => `\`${name}\``)
           .join(
             ', '
-          )}. Every ${programmaticRunnerNames} call must include a \`tool_manifest\` containing the exact registered names used by its code; the manifest is validated before execution starts.`
+          )}. Every ${programmaticRunnerNames} call must include a \`tool_manifest\` containing the registered names or sandbox names used by its code; the manifest is validated before execution starts.`
         : '';
+    const runtimes = new Set(
+      programmaticTools.flatMap((tool) => tool.runtimes)
+    );
+    const sandboxNames = capabilities.codeExecutionTools.flatMap((toolDef) => {
+      const names: string[] = [];
+      for (const runtime of runtimes) {
+        const identifier =
+          runtime === 'Bash'
+            ? normalizeToBashIdentifier(toolDef.name)
+            : normalizeToPythonIdentifier(toolDef.name);
+        if (identifier !== toolDef.name) {
+          names.push(`${runtime} \`${identifier}\``);
+        }
+      }
+      return names.length === 0
+        ? []
+        : [`- \`${toolDef.name}\`: ${names.join('; ')}`];
+    });
+    const sandboxNameGuidance =
+      sandboxNames.length === 0
+        ? ''
+        : '\n\nUse sandbox names in both code and `tool_manifest`; registered names are also accepted in `tool_manifest`:\n' +
+          sandboxNames.join('\n');
     const boundary =
       '\n\n' +
       `Only these tools may be invoked inside ${programmaticRunnerNames}: ${quotedProgrammaticNames}.` +
-      directOnlyBoundary;
+      directOnlyBoundary +
+      sandboxNameGuidance;
 
     if (programmaticOnlyTools.length === 0) {
       return boundary;
@@ -730,6 +757,7 @@ export class AgentContext {
       targets.push({
         name: Constants.BASH_PROGRAMMATIC_TOOL_CALLING,
         codeGuidance: 'Bash code',
+        runtimes: ['Bash'],
         executesDirectly: this.isProgrammaticRunnerDirectlyBound(
           Constants.BASH_PROGRAMMATIC_TOOL_CALLING
         ),
@@ -751,6 +779,7 @@ export class AgentContext {
         codeGuidance: localDefault
           ? 'Bash code by default, or set `lang: "py"` to use Python code'
           : 'Python code',
+        runtimes: localDefault ? ['Bash', 'Python'] : ['Python'],
         executesDirectly: this.isProgrammaticRunnerDirectlyBound(
           Constants.PROGRAMMATIC_TOOL_CALLING
         ),

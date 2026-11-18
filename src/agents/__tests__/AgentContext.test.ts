@@ -1194,6 +1194,50 @@ describe('AgentContext', () => {
       expect(result[0].content).not.toContain('run_tools_with_bash');
     });
 
+    it.each([
+      [Constants.BASH_PROGRAMMATIC_TOOL_CALLING, 'Bash'],
+      [Constants.PROGRAMMATIC_TOOL_CALLING, 'Python'],
+    ])('shows sandbox names for %s', async (runnerName, runtime) => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          instructions: 'Base',
+          toolDefinitions: [{ name: runnerName }],
+          toolRegistry: new Map([
+            [
+              'stub_echo_mcp_hypen-server',
+              {
+                name: 'stub_echo_mcp_hypen-server',
+                allowed_callers: ['code_execution'],
+              },
+            ],
+            [
+              'both_mcp_my-server',
+              {
+                name: 'both_mcp_my-server',
+                allowed_callers: ['direct', 'code_execution'],
+              },
+            ],
+            ['direct_only', { name: 'direct_only' }],
+          ]),
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([]);
+      const content = String(result[0].content);
+      expect(content).toContain(
+        'Use sandbox names in both code and `tool_manifest`'
+      );
+      expect(content).toContain(
+        `\`stub_echo_mcp_hypen-server\`: ${runtime} \`stub_echo_mcp_hypen_server\``
+      );
+      expect(content).toContain(
+        `\`both_mcp_my-server\`: ${runtime} \`both_mcp_my_server\``
+      );
+      expect(content).toContain(
+        'registered names are also accepted in `tool_manifest`'
+      );
+    });
+
     it('makes mixed direct and programmatic caller boundaries explicit', async () => {
       const toolRegistry: t.LCToolRegistry = new Map([
         [
