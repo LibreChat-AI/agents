@@ -42,18 +42,20 @@ function withCallIds(
   let index = 0;
   return parts.map((part) => {
     if (!('functionCall' in part)) return part;
+    const call = message.tool_calls?.[index++];
+    if (call?.id == null) throw new Error('Missing tool-call ID');
     return {
       ...part,
       functionCall: {
         ...part.functionCall,
-        id: message.tool_calls[index++].id,
+        id: call.id,
       },
     };
   });
 }
 
 function toolResults(message: AIMessageChunk): ToolMessage[] {
-  return message.tool_calls.map(
+  return (message.tool_calls ?? []).map(
     (call) =>
       new ToolMessage({
         tool_call_id: call.id ?? '',
@@ -63,7 +65,9 @@ function toolResults(message: AIMessageChunk): ToolMessage[] {
   );
 }
 
-afterEach(() => jest.restoreAllMocks());
+afterEach(() => {
+  jest.restoreAllMocks();
+});
 
 for (const modelName of ['gemini-3.8-flash', 'gemini-4-hydrogen']) {
   describe(`${modelName} reasoning replay`, () => {
