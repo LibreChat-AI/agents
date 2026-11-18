@@ -559,3 +559,53 @@ it('closes an opened upload source even if storage never pulls it', async () => 
   expect(next).not.toHaveBeenCalled();
   expect(close).toHaveBeenCalledTimes(1);
 });
+
+it('retains host admission when storage rejects an unstarted binding upload', async () => {
+  const closing = deferred<void>();
+  const finish = deferred<void>();
+  const close = jest.fn(async () => {
+    closing.resolve();
+    await finish.promise;
+    return { done: true as const, value: undefined };
+  });
+  const next = jest.fn(async () => ({
+    done: false as const,
+    value: Buffer.from('abcd'),
+  }));
+  const content = { [Symbol.asyncIterator]: () => ({ next, return: close }) };
+  const { bindings, admission } = fixture(
+    {
+      stage: async () => {
+        throw new HostFileServiceError('overflow');
+      },
+    },
+    20
+  );
+  const pending = bindings.stage(stage, content);
+  await closing.promise;
+  await expect(pending).rejects.toMatchObject({ code: 'timeout' });
+  expect(next).not.toHaveBeenCalled();
+  expect(admission.snapshot()).toEqual({ operations: 1, reservedBytes: 8 });
+  finish.resolve();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  expect(close).toHaveBeenCalledTimes(1);
+  expect(admission.snapshot()).toEqual({ operations: 0, reservedBytes: 0 });
+});
+
+it('validates publication receipts again on the transport consumer', async () => {
+  const { service } = fixture();
+  const bindings = createHostFileBindings({
+    identity,
+    descriptor,
+    service: {
+      ...service,
+      publish: async (request) => ({
+        operationId: request.operationId,
+        file: { ...file, bytes: descriptor.maxFileBytes + 1 },
+      }),
+    },
+  });
+  await expect(bindings.publish(file, 'p')).rejects.toMatchObject({
+    code: 'overflow',
+  });
+});

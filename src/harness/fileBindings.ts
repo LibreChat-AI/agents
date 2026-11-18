@@ -144,7 +144,10 @@ export function createHostFileBindings(options: {
         allow('publish', signal);
         if (result.operationId !== operationId)
           throw new HostFileServiceError('incompatible');
-        return { operationId, file: checkedHostFile(result.file) };
+        const published = checkedHostFile(result.file);
+        if (published.bytes > descriptor.maxFileBytes)
+          throw new HostFileServiceError('overflow');
+        return { operationId, file: published };
       } catch (error) {
         throw normalizeHostFileError(error, signal);
       }
