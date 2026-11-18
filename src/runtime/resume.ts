@@ -1,5 +1,7 @@
-import type { EventHandler, RunStep } from '@/index';
-import { GraphEvents } from '@/index';
+import type { EventHandler, MessageContentComplex, RunStep } from '@/index';
+import type { RemoteSdkSnapshot } from './types';
+import { ContentTypes, GraphEvents, convertMessagesToContent } from '@/index';
+import { AIMessage, isAIMessage, isToolMessage } from '@/langchain/messages';
 
 type ResumableRunStep = {
   id: string;
@@ -208,4 +210,59 @@ export function createContentIndexOffsetHandlers(
   }
 
   return wrapped;
+}
+
+/** Merge a worker continuation with the host’s already rendered prefix. */
+export function reconcileRemoteResumeContent(
+  seededProjection: readonly (MessageContentComplex | undefined)[],
+  snapshot: RemoteSdkSnapshot
+): MessageContentComplex[] {
+  const content = seededProjection.filter((part) => part != null);
+  const toolSlots = new Map<string, number>();
+  for (const [index, part] of content.entries()) {
+    if (part.type !== ContentTypes.TOOL_CALL) continue;
+    const id = part.tool_call?.id;
+    if (id != null && id !== '') toolSlots.set(id, index);
+  }
+  if (toolSlots.size === 0 || snapshot.messages == null)
+    return content.concat(snapshot.content ?? []);
+
+  let replayed = false;
+  const messages: NonNullable<RemoteSdkSnapshot['messages']> = [];
+  for (const message of snapshot.messages) {
+    if (isAIMessage(message) && message.tool_calls != null) {
+      const calls = message.tool_calls.filter(
+        (call) => call.id == null || !toolSlots.has(call.id)
+      );
+      if (calls.length !== message.tool_calls.length) {
+        replayed = true;
+        // Retain declarations for calls in the replayed batch without a seeded card.
+        if (calls.length > 0)
+          messages.push(new AIMessage({ content: '', tool_calls: calls }));
+        continue;
+      }
+    }
+    if (!isToolMessage(message)) {
+      messages.push(message);
+      continue;
+    }
+    const index = toolSlots.get(message.tool_call_id);
+    const part = index === undefined ? undefined : content[index];
+    if (
+      index === undefined ||
+      part?.type !== ContentTypes.TOOL_CALL ||
+      part.tool_call == null
+    ) {
+      messages.push(message);
+      continue;
+    }
+    replayed = true;
+    content[index] = {
+      ...part,
+      tool_call: { ...part.tool_call, output: message.content },
+    };
+  }
+  return content.concat(
+    replayed ? convertMessagesToContent(messages) : (snapshot.content ?? [])
+  );
 }

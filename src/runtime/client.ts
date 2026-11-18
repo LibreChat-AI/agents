@@ -34,10 +34,7 @@ import {
   BaseCheckpointSaver,
   TOOL_APPROVAL_EXECUTION_SCOPE_CONFIG_KEY,
 } from '@/index';
-import {
-  hydrateResumeRunSteps,
-  createContentIndexOffsetHandlers,
-} from './resume';
+import { hydrateResumeRunSteps, reconcileRemoteResumeContent } from './resume';
 import { connectRecoveringSdkSocket } from './recovery/client';
 import { remoteSdkLimits, isRemoteSdkSecret } from './types';
 import { createHostToolService } from './hostTools';
@@ -100,59 +97,37 @@ export async function createRemoteSdkRun({
       graph,
       resumeState.content
     );
-    for (const step of projection.stepMap.values()) {
-      if (!step) continue;
+    for (const step of resumeState.steps) {
+      if (step.id.length === 0) continue;
       graph.contentIndexMap.set(step.id, graph.contentData.length);
-      graph.contentData.push(step);
+      graph.contentData.push({ ...step });
     }
   }
-  const projectionHandlers = createContentIndexOffsetHandlers(
-    Object.fromEntries(
-      Object.values(GraphEvents).map(
-        (
-          event
-        ): [
-          GraphEvents,
-          { handle: (_event: string, data: SdkEventData) => void },
-        ] => [
-          event,
-          {
-            handle: (_event: string, data: SdkEventData): void => {
-              projection.aggregateContent({
-                event,
-                data: data as Parameters<
-                  typeof projection.aggregateContent
-                >[0]['data'],
-              });
-              if (event === GraphEvents.ON_RUN_STEP) {
-                const step = projection.stepMap.get((data as RunStep).id);
-                if (step) {
-                  const position = graph.contentIndexMap.get(step.id);
-                  if (position === undefined) {
-                    graph.contentIndexMap.set(
-                      step.id,
-                      graph.contentData.length
-                    );
-                    graph.contentData.push(step);
-                  } else graph.contentData[position] = step;
-                  hydrateResumeRunSteps([step], undefined, graph);
-                }
-              } else if (event === GraphEvents.ON_RUN_STEP_CLOSED) {
-                const closed = data as RunStepClosedEvent;
-                const step = graph.getRunStep(closed.id);
-                if (step)
-                  Object.assign(step, {
-                    status: closed.status,
-                    closed_at: closed.closed_at,
-                  });
-              }
-            },
-          },
-        ]
-      )
-    ),
-    resumeState?.content
-  );
+  const projectEvent = (event: GraphEvents, data: SdkEventData): void => {
+    // The aggregator maps worker indices to physical slots after seeded content.
+    projection.aggregateContent({
+      event,
+      data: data as Parameters<typeof projection.aggregateContent>[0]['data'],
+    });
+    if (event === GraphEvents.ON_RUN_STEP) {
+      const step = data as RunStep;
+      const position = graph.contentIndexMap.get(step.id);
+      if (position === undefined) {
+        graph.contentIndexMap.set(step.id, graph.contentData.length);
+        graph.contentData.push(step);
+      } else graph.contentData[position] = step;
+      hydrateResumeRunSteps([step], undefined, graph);
+    } else if (event === GraphEvents.ON_RUN_STEP_CLOSED) {
+      const closed = data as RunStepClosedEvent;
+      const step = graph.getRunStep(closed.id);
+      if (step) {
+        Object.assign(step, {
+          status: closed.status,
+          closed_at: closed.closed_at,
+        });
+      }
+    }
+  };
   const createResumeState = graph.createRunStepResumeState.bind(graph);
   graph.createRunStepResumeState = (): RunStepResumeState =>
     snapshot?.runSteps ?? createResumeState();
@@ -304,6 +279,9 @@ export async function createRemoteSdkRun({
     snapshot = undefined;
     let settled = false;
     const hostInvocations = new Set<Promise<unknown>>();
+    const advertisedHooks = HOOK_EVENTS.filter(
+      (event) => config.hooks?.hasHookFor(event, identity.runId) === true
+    );
     let hostFileChannel: ReturnType<typeof createHostFileChannel> | undefined;
     let hostModelChannel: ReturnType<typeof createHostModelChannel> | undefined;
     const result = new Promise<RemoteSdkSnapshot>((resolve, reject) => {
@@ -353,12 +331,7 @@ export async function createRemoteSdkRun({
             const event = z.nativeEnum(GraphEvents).parse(frame.name);
             if (event === GraphEvents.ON_TOOL_EXECUTE)
               throw new Error('Remote events cannot invoke host tools');
-            await projectionHandlers?.[event]?.handle(
-              event,
-              frame.data as SdkEventData,
-              frame.metadata,
-              graph
-            );
+            projectEvent(event, frame.data as SdkEventData);
             await config.customHandlers?.[event]?.handle(
               event,
               frame.data as SdkEventData,
@@ -448,11 +421,7 @@ export async function createRemoteSdkRun({
             };
             if (
               args.input == null ||
-              !HOOK_EVENTS.includes(args.input.hook_event_name) ||
-              !config.hooks.hasHookFor(
-                args.input.hook_event_name,
-                identity.runId
-              )
+              !advertisedHooks.includes(args.input.hook_event_name)
             )
               throw new Error('Host hook is not enabled');
             return executeHooks({
@@ -593,9 +562,7 @@ export async function createRemoteSdkRun({
             GraphEvents.ON_REASONING_DELTA,
           ]),
         ].filter((name) => name !== GraphEvents.ON_TOOL_EXECUTE),
-        hooks: HOOK_EVENTS.filter(
-          (event) => config.hooks?.hasHookFor(event, identity.runId) === true
-        ),
+        hooks: advertisedHooks,
         checkpoint: Boolean(saver),
         humanInTheLoop: config.humanInTheLoop,
         streamLimits: config.streamLimits,
@@ -649,6 +616,16 @@ export async function createRemoteSdkRun({
     });
     try {
       snapshot = await result;
+      if (
+        operation === 'resume' &&
+        resumeState != null &&
+        resumeState.content.length > 0
+      ) {
+        snapshot.content = reconcileRemoteResumeContent(
+          projection.contentParts.slice(0, resumeState.content.length),
+          snapshot
+        );
+      }
       if (snapshot.runSteps) graph.restoreRunStepResumeState(snapshot.runSteps);
       return snapshot.content?.filter(Boolean);
     } finally {

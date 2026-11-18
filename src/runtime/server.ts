@@ -398,7 +398,7 @@ export function createRemoteSdkServer(options: RemoteSdkServerOptions): {
               for (const event of request.hooks)
                 hooks.register(event, {
                   internal: true,
-                  ...(recovered ? { timeout: limits.rpcTimeoutMs } : {}),
+                  timeout: limits.rpcTimeoutMs,
                   hooks: [
                     async (input, hookSignal): Promise<HookOutput> => {
                       const abort = (): void => controller.abort();
@@ -406,6 +406,14 @@ export function createRemoteSdkServer(options: RemoteSdkServerOptions): {
                         once: true,
                       });
                       try {
+                        let matchQuery =
+                          'toolName' in input ? input.toolName : undefined;
+                        if (
+                          input.hook_event_name === 'SubagentStart' ||
+                          input.hook_event_name === 'SubagentStop'
+                        ) {
+                          matchQuery = input.agentType;
+                        }
                         const {
                           errors,
                           hasHookFailures,
@@ -414,8 +422,7 @@ export function createRemoteSdkServer(options: RemoteSdkServerOptions): {
                           ...result
                         } = (await peer.call('hook', {
                           input,
-                          matchQuery:
-                            'toolName' in input ? input.toolName : undefined,
+                          matchQuery,
                         })) as AggregatedHookResult;
                         if (errors.length || hasHookFailures)
                           throw new Error('Host hook failed');

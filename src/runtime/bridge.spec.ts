@@ -8,7 +8,7 @@ import type { AddressInfo } from 'node:net';
 import type { ToolExecuteBatchRequest } from '@/index';
 import type { RemoteSdkServerOptions } from './server';
 import type { RemoteSdkFactoryInput } from './types';
-import type { RunConfig } from '@/index';
+import type { RunConfig, RunStep } from '@/index';
 import {
   Run,
   Providers,
@@ -16,6 +16,9 @@ import {
   FakeChatModel,
   MemorySaver,
   HookRegistry,
+  Constants,
+  ContentTypes,
+  createContentAggregator,
 } from '@/index';
 import { HumanMessage, AIMessageChunk } from '@/langchain/messages';
 import { createRemoteSdkServer } from './server';
@@ -428,6 +431,202 @@ describe('remote SDK runtime bridge', () => {
       await runtime.close();
     }
   });
+  it('returns an empty result for an advertised hook after its only matcher fires once', async () => {
+    const inspected = jest.fn(async () => 'inspected');
+    const inspect = tool(inspected, {
+      name: 'inspect',
+      description: 'Inspect an item',
+      schema: z.object({}),
+    });
+    const runtime = await fixture(async (input) => {
+      const run = await Run.create({
+        ...input.config,
+        tokenCounter: () => 1,
+        graphConfig: {
+          type: 'standard',
+          agents: [
+            {
+              agentId: input.identity.agentId,
+              provider: Providers.OPENAI,
+              tools: [inspect],
+              clientOptions: { streaming: false },
+            },
+          ],
+        },
+      });
+      const model = new TestModel({});
+      model._generate = async (messages) => ({
+        generations: [
+          {
+            text: '',
+            message: new AIMessageChunk(
+              messages.some((message) => message.getType() === 'tool')
+                ? { content: 'Both items inspected' }
+                : {
+                    content: '',
+                    tool_calls: ['one', 'two'].map((id) => ({
+                      id,
+                      name: 'inspect',
+                      args: {},
+                    })),
+                  }
+            ),
+          },
+        ],
+      });
+      run.Graph!.overrideModel = model;
+      return run;
+    });
+    try {
+      const config = hostConfig();
+      const once = jest.fn(async () => ({}));
+      config.hooks = new HookRegistry();
+      config.hooks.register('PreToolUse', { once: true, hooks: [once] });
+      const run = await createRemoteSdkRun({
+        config,
+        identity,
+        remote: runtime.remote,
+      });
+      const result = await run.processStream(
+        { messages: [new HumanMessage('Inspect both items')] },
+        invocation()
+      );
+      expect(once).toHaveBeenCalledTimes(1);
+      expect(inspected).toHaveBeenCalledTimes(2);
+      expect(result).toContainEqual(
+        expect.objectContaining({ text: 'Both items inspected' })
+      );
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it('matches host subagent start and stop hooks by agent type', async () => {
+    const runtime = await fixture(async (input) => {
+      const childTypes = ['researcher', 'writer'];
+      const run = await Run.create({
+        ...input.config,
+        tokenCounter: () => 1,
+        graphConfig: {
+          type: 'standard',
+          agents: [
+            {
+              agentId: input.identity.agentId,
+              provider: Providers.OPENAI,
+              clientOptions: { streaming: false },
+              subagentConfigs: childTypes.map((type) => ({
+                type,
+                name: type,
+                description: 'Complete a delegated task',
+                agentInputs: {
+                  agentId: type,
+                  provider: Providers.OPENAI,
+                  clientOptions: { apiKey: 'fixture', modelName: 'gpt-4.1' },
+                },
+              })),
+            },
+          ],
+        },
+      });
+      const model = new TestModel({});
+      model._generate = async (messages) => ({
+        generations: [
+          {
+            text: '',
+            message: new AIMessageChunk(
+              messages.some((message) => message.getType() === 'tool')
+                ? { content: 'Delegation finished' }
+                : {
+                    content: '',
+                    tool_calls: childTypes.map((id) => ({
+                      id,
+                      name: Constants.SUBAGENT,
+                      args: {
+                        description: 'Report the result',
+                        subagent_type: id,
+                      },
+                    })),
+                  }
+            ),
+          },
+        ],
+      });
+      run.Graph!.overrideModel = model;
+      run.Graph!.setSubagentModelOverride(
+        new FakeChatModel({ responses: ['Child result'] })
+      );
+      return run;
+    });
+    try {
+      const config = hostConfig();
+      const deny = jest.fn(async () => ({
+        decision: 'deny' as const,
+        reason: 'Research is blocked',
+      }));
+      const observeStop = jest.fn(async () => ({}));
+      config.hooks = new HookRegistry();
+      config.hooks.register('SubagentStart', {
+        pattern: 'researcher',
+        hooks: [deny],
+      });
+      config.hooks.register('SubagentStop', {
+        pattern: 'writer',
+        hooks: [observeStop],
+      });
+      const run = await createRemoteSdkRun({
+        config,
+        identity,
+        remote: runtime.remote,
+      });
+      const result = await run.processStream(
+        { messages: [new HumanMessage('Delegate both tasks')] },
+        invocation()
+      );
+      expect(deny).toHaveBeenCalledTimes(1);
+      expect(observeStop).toHaveBeenCalledTimes(1);
+      expect(JSON.stringify(result)).toContain('Blocked: Research is blocked');
+      expect(JSON.stringify(result)).toContain('Child result');
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it('uses the RPC deadline for hook forwarding without recovery', async () => {
+    const runtime = await fixture(factory, { rpcTimeoutMs: 45_000 });
+    const originalTimeout = AbortSignal.timeout.bind(AbortSignal);
+    const deadline = jest
+      .spyOn(AbortSignal, 'timeout')
+      .mockImplementation((ms) => originalTimeout(ms === 30_000 ? 1 : ms));
+    try {
+      const config = hostConfig();
+      const hook = jest.fn(async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 20));
+        return {};
+      });
+      config.hooks = new HookRegistry();
+      config.hooks.register('RunStart', { timeout: 40_000, hooks: [hook] });
+      const run = await createRemoteSdkRun({
+        config,
+        identity,
+        remote: runtime.remote,
+      });
+      await expect(
+        run.processStream(
+          { messages: [new HumanMessage('hello')] },
+          invocation()
+        )
+      ).resolves.toContainEqual(
+        expect.objectContaining({ text: 'A separately hosted SDK reply' })
+      );
+      expect(hook).toHaveBeenCalledTimes(1);
+      expect(deadline).toHaveBeenCalledWith(45_000);
+      expect(deadline).toHaveBeenCalledWith(40_000);
+    } finally {
+      deadline.mockRestore();
+      await runtime.close();
+    }
+  });
+
   it('rejects approval configuration without a host checkpointer', async () => {
     const config = hostConfig();
     config.humanInTheLoop = { enabled: true };
@@ -468,29 +667,36 @@ describe('remote SDK runtime bridge', () => {
               agentId: input.identity.agentId,
               provider: Providers.OPENAI,
               tools: [reviewed],
-              clientOptions: { streaming: false },
+              clientOptions: { streaming: true },
             },
           ],
         },
       });
       const model = new TestModel({});
-      model._generate = async (messages) => ({
-        generations: [
-          {
-            text: '',
-            message: new AIMessageChunk(
-              messages.some((message) => message.getType() === 'tool')
-                ? { content: 'Reviewed operation completed' }
-                : {
-                    content: '',
-                    tool_calls: [
-                      { id: 'review-1', name: 'reviewed', args: {} },
-                    ],
-                  }
-            ),
-          },
-        ],
-      });
+      model._streamResponseChunks = async function* (messages) {
+        if (messages.some((message) => message.getType() === 'tool')) {
+          const text = 'Reviewed operation completed';
+          yield new ChatGenerationChunk({
+            text,
+            message: new AIMessageChunk(text),
+          });
+          return;
+        }
+        const text = 'Pre-approval explanation';
+        yield new ChatGenerationChunk({
+          text,
+          message: new AIMessageChunk(text),
+        });
+        yield new ChatGenerationChunk({
+          text: '',
+          message: new AIMessageChunk({
+            content: '',
+            tool_call_chunks: [
+              { id: 'review-1', name: 'reviewed', args: '{}', index: 0 },
+            ],
+          }),
+        });
+      };
       if (!run.Graph) throw new Error('Missing SDK graph');
       run.Graph.overrideModel = model;
       return run;
@@ -504,6 +710,23 @@ describe('remote SDK runtime bridge', () => {
       config.hooks = hooks;
       config.humanInTheLoop = { enabled: true };
       config.graphConfig.compileOptions = { checkpointer: new MemorySaver() };
+      const projection = createContentAggregator();
+      config.customHandlers = Object.fromEntries(
+        [
+          GraphEvents.ON_RUN_STEP,
+          GraphEvents.ON_MESSAGE_DELTA,
+          GraphEvents.ON_RUN_STEP_DELTA,
+          GraphEvents.ON_RUN_STEP_COMPLETED,
+        ].map((event) => [
+          event,
+          {
+            handle: (
+              _event: string,
+              data: Parameters<typeof projection.aggregateContent>[0]['data']
+            ): void => projection.aggregateContent({ event, data }),
+          },
+        ])
+      );
       const run = await createRemoteSdkRun({
         config,
         identity,
@@ -515,12 +738,37 @@ describe('remote SDK runtime bridge', () => {
       );
       expect(run.getInterrupt()?.payload.type).toBe('tool_approval');
       expect(executions).toBe(0);
+      const seed = projection.contentParts.filter((part) => part != null);
+      expect(seed).toEqual([
+        expect.objectContaining({
+          type: ContentTypes.TEXT,
+          text: 'Pre-approval explanation',
+        }),
+        expect.objectContaining({
+          type: ContentTypes.TOOL_CALL,
+          tool_call: expect.objectContaining({ id: 'review-1' }),
+        }),
+      ]);
+      const observed: Array<{ event: number; graph: number | undefined }> = [];
       const restored = await createRemoteSdkRun({
-        config,
+        config: {
+          ...config,
+          customHandlers: {
+            [GraphEvents.ON_RUN_STEP]: {
+              handle: (_event, data, _metadata, graph): void => {
+                const step = data as RunStep;
+                observed.push({
+                  event: step.index,
+                  graph: graph?.getRunStep(step.id)?.index,
+                });
+              },
+            },
+          },
+        },
         identity,
         remote: runtime.remote,
         resumeState: {
-          content: run.Graph!.getContentParts() ?? [],
+          content: seed,
           steps: run
             .Graph!.createRunStepResumeState()
             .steps.map((entry) => entry.step),
@@ -533,7 +781,26 @@ describe('remote SDK runtime bridge', () => {
       expect(restored.getInterrupt()).toBeUndefined();
       expect(executions).toBe(1);
       expect(factories).toBe(2);
-      expect(JSON.stringify(result)).toContain('Reviewed operation completed');
+      expect(observed.length).toBeGreaterThan(0);
+      for (const step of observed) expect(step.graph).toBe(step.event);
+      expect(result).toEqual([
+        expect.objectContaining({
+          type: ContentTypes.TEXT,
+          text: 'Pre-approval explanation',
+        }),
+        expect.objectContaining({
+          type: ContentTypes.TOOL_CALL,
+          tool_call: expect.objectContaining({
+            id: 'review-1',
+            output: 'approved result',
+          }),
+        }),
+        expect.objectContaining({
+          type: ContentTypes.TEXT,
+          text: 'Reviewed operation completed',
+        }),
+      ]);
+      expect(restored.Graph!.getContentParts()).toEqual(result);
     } finally {
       await runtime.close();
     }
