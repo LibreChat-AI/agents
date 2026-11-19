@@ -5,17 +5,20 @@ import { ChatGoogleGenerativeAI } from '@langchain/google-genai';
 import { getEnvironmentVariable } from '@langchain/core/utils/env';
 import {
   FunctionCallingMode,
-  GoogleGenerativeAI as GenerativeAI,
+  GoogleGenerativeAIRequestInputError,
 } from '@google/generative-ai';
 import type {
   GenerateContentRequest,
+  CachedContent,
+  ModelParams,
+  RequestOptions,
   SafetySetting,
   ToolConfig,
 } from '@google/generative-ai';
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
 import type { BaseMessage, UsageMetadata } from '@langchain/core/messages';
 import type { GeminiApiUsageMetadata, InputTokenDetails } from './types';
-import type { GoogleClientOptions, GoogleThinkingConfig } from '@/types';
+import type { GoogleClientOptions } from '@/types';
 import {
   convertResponseContentToChatGenerationChunk,
   convertBaseMessagesToContent,
@@ -25,6 +28,7 @@ import {
 } from './utils/common';
 import { smoothGenerationChunks } from '@/llm/stream/chunkAdapters';
 import { resolveStreamDelay } from '@/llm/stream/smoother';
+import { GoogleTransport } from './transport';
 
 type GoogleToolConfigWithServerSideInvocations = ToolConfig & {
   includeServerSideToolInvocations?: boolean;
@@ -40,7 +44,8 @@ type GoogleToolConfigWithServerSideInvocations = ToolConfig & {
 
 export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
   _lc_stream_delay: number;
-  thinkingConfig?: GoogleThinkingConfig;
+  private transport: GoogleTransport;
+  thinkingConfig?: ChatGoogleGenerativeAI['thinkingConfig'];
   includeServerSideToolInvocations?: boolean;
 
   /**
@@ -58,7 +63,10 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
   }
 
   constructor(fields: GoogleClientOptions) {
-    super(fields);
+    // The upstream type omits Hydrogen's XHIGH level; the API accepts it unchanged.
+    const thinkingConfig =
+      fields.thinkingConfig as ChatGoogleGenerativeAI['thinkingConfig'];
+    super({ ...fields, thinkingConfig });
 
     this._lc_stream_delay = resolveStreamDelay(fields._lc_stream_delay);
     this.model = fields.model.replace(/^models\//, '');
@@ -115,7 +123,7 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
       }
     }
 
-    this.thinkingConfig = fields.thinkingConfig ?? this.thinkingConfig;
+    this.thinkingConfig = thinkingConfig ?? this.thinkingConfig;
     this.includeServerSideToolInvocations =
       fields.includeServerSideToolInvocations ??
       this.includeServerSideToolInvocations;
@@ -123,8 +131,8 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
     this.streaming = fields.streaming ?? this.streaming;
     this.json = fields.json;
 
-    // @ts-ignore - Accessing private property from parent class
-    this.client = new GenerativeAI(this.apiKey).getGenerativeModel(
+    this.transport = new GoogleTransport(
+      this.apiKey,
       {
         model: this.model,
         safetySettings: this.safetySettings as SafetySetting[],
@@ -145,7 +153,62 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
         customHeaders: fields.customHeaders,
       }
     );
+    // @ts-ignore - The parent keeps its transport private.
+    this.client = this.transport;
     this.streamUsage = fields.streamUsage ?? this.streamUsage;
+  }
+
+  useCachedContent(
+    cachedContent: CachedContent,
+    modelParams?: ModelParams,
+    requestOptions?: RequestOptions
+  ): void {
+    if (this.apiKey == null || this.apiKey === '') return;
+    if (
+      cachedContent.name == null ||
+      cachedContent.name === '' ||
+      cachedContent.model == null ||
+      cachedContent.model === ''
+    ) {
+      throw new GoogleGenerativeAIRequestInputError(
+        'Cached content must contain `name` and `model` fields.'
+      );
+    }
+    if (
+      modelParams?.model != null &&
+      modelParams.model !== '' &&
+      modelParams.model.replace(/^models\//, '') !==
+        cachedContent.model.replace(/^models\//, '')
+    ) {
+      throw new GoogleGenerativeAIRequestInputError(
+        'Different model specified in modelParams and cachedContent.'
+      );
+    }
+    if (
+      modelParams?.systemInstruction != null &&
+      modelParams.systemInstruction !== '' &&
+      cachedContent.systemInstruction != null &&
+      cachedContent.systemInstruction !== '' &&
+      modelParams.systemInstruction !== cachedContent.systemInstruction
+    ) {
+      throw new GoogleGenerativeAIRequestInputError(
+        'Different systemInstruction specified in modelParams and cachedContent.'
+      );
+    }
+    this.transport = new GoogleTransport(
+      this.apiKey,
+      {
+        ...modelParams,
+        model: cachedContent.model,
+        systemInstruction: cachedContent.systemInstruction,
+        tools: cachedContent.tools,
+        toolConfig: cachedContent.toolConfig,
+      },
+      requestOptions,
+      cachedContent.name
+    );
+    // @ts-ignore - The parent keeps its transport private.
+    this.client = this.transport;
   }
 
   static lc_name(): 'LibreChatGoogleGenerativeAI' {
@@ -172,7 +235,7 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
       total_tokens: usageMetadata.totalTokenCount ?? 0,
     };
 
-    if (usageMetadata.cachedContentTokenCount) {
+    if ((usageMetadata.cachedContentTokenCount ?? 0) > 0) {
       output.input_token_details ??= {};
       output.input_token_details.cache_read =
         usageMetadata.cachedContentTokenCount;
@@ -188,7 +251,7 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
         0,
         (usageMetadata.cachedContentTokenCount ?? 0) - 200000
       );
-      if (over200k) {
+      if (over200k > 0) {
         output.input_token_details = {
           ...output.input_token_details,
           over_200k: over200k,
@@ -209,15 +272,6 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
     options?: this['ParsedCallOptions']
   ): Omit<GenerateContentRequest, 'contents'> {
     const params = super.invocationParams(options);
-    if (this.thinkingConfig) {
-      /** @ts-ignore */
-      this.client.generationConfig = {
-        /** @ts-ignore */
-        ...this.client.generationConfig,
-        /** @ts-ignore */
-        thinkingConfig: this.thinkingConfig,
-      };
-    }
     if (
       this.includeServerSideToolInvocations === true &&
       Array.isArray(params.tools) &&
@@ -255,40 +309,38 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
       this.model
     );
     let actualPrompt = prompt;
+    let systemInstruction: GenerateContentRequest['systemInstruction'];
     if (prompt?.[0].role === 'system') {
-      const [systemInstruction] = prompt;
-      /** @ts-ignore */
-      this.client.systemInstruction = systemInstruction;
+      [systemInstruction] = prompt;
       actualPrompt = prompt.slice(1);
     }
     actualPrompt = dropUnsupportedModelTurnPrefill(actualPrompt, this.model);
     const parameters = this.invocationParams(options);
     const request = {
       ...parameters,
-      contents: actualPrompt,
+      ...(systemInstruction != null ? { systemInstruction } : {}),
+      contents: actualPrompt ?? [],
     };
 
     const res = await this.caller.callWithOptions(
       { signal: options.signal },
       async () =>
-        /** @ts-ignore */
-        this.client.generateContent(request)
+        this.transport.generateContent(request, { signal: options.signal })
     );
 
     const response = res.response;
     const usageMetadata = this._convertToUsageMetadata(
-      /** @ts-ignore */
-      response.usageMetadata,
+      response.usageMetadata as GeminiApiUsageMetadata | undefined,
       this.model
     );
 
-    /** @ts-ignore */
     const generationResult = mapGenerateContentResultToChatResult(response, {
       usageMetadata,
+      model: this.model,
     });
 
     await runManager?.handleLLMNewToken(
-      generationResult.generations[0].text || '',
+      generationResult.generations[0]?.text || '',
       undefined,
       undefined,
       undefined,
@@ -303,12 +355,24 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
     options: this['ParsedCallOptions'],
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
-    yield* smoothGenerationChunks({
-      chunks: this._streamProviderChunks(messages, options),
-      delayMs: this._lc_stream_delay,
-      signal: options.signal,
-      runManager,
-    });
+    const controller = new AbortController();
+    const upstreamSignal = options.signal
+      ? AbortSignal.any([options.signal, controller.signal])
+      : controller.signal;
+    try {
+      yield* smoothGenerationChunks({
+        chunks: this._streamProviderChunks(messages, {
+          ...options,
+          signal: upstreamSignal,
+        }),
+        delayMs: this._lc_stream_delay,
+        signal: options.signal,
+        runManager,
+        abortUpstream: () => controller.abort(),
+      });
+    } finally {
+      controller.abort();
+    }
   }
 
   private async *_streamProviderChunks(
@@ -322,23 +386,24 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
       this.model
     );
     let actualPrompt = prompt;
+    let systemInstruction: GenerateContentRequest['systemInstruction'];
     if (prompt?.[0].role === 'system') {
-      const [systemInstruction] = prompt;
-      /** @ts-ignore */
-      this.client.systemInstruction = systemInstruction;
+      [systemInstruction] = prompt;
       actualPrompt = prompt.slice(1);
     }
     actualPrompt = dropUnsupportedModelTurnPrefill(actualPrompt, this.model);
     const parameters = this.invocationParams(options);
     const request = {
       ...parameters,
-      contents: actualPrompt,
+      ...(systemInstruction != null ? { systemInstruction } : {}),
+      contents: actualPrompt ?? [],
     };
     const stream = await this.caller.callWithOptions(
       { signal: options.signal },
       async () => {
-        /** @ts-ignore */
-        const { stream } = await this.client.generateContentStream(request);
+        const { stream } = await this.transport.generateContentStream(request, {
+          signal: options.signal,
+        });
         return stream;
       }
     );
@@ -359,6 +424,7 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
 
       const chunk = convertResponseContentToChatGenerationChunk(response, {
         usageMetadata: undefined,
+        model: this.model,
         index,
       });
       index += 1;
@@ -380,3 +446,12 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
     }
   }
 }
+
+export {
+  GEMINI_PARTS,
+  GEMINI_REPLAY_UNSUPPORTED,
+  captureGeminiReplayParts,
+  restoreGeminiReplayParts,
+  isGeminiReplayParts,
+} from './utils/signatures';
+export type { GeminiReplayPart } from './utils/signatures';

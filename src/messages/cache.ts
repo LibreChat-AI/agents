@@ -3,8 +3,8 @@ import { BaseMessage, MessageContentComplex } from '@langchain/core/messages';
 import type Anthropic from '@anthropic-ai/sdk';
 import type { AnthropicMessage } from '@/types/messages';
 import { hasComputerCallOutputMarker } from '@/utils/toolContent';
-import { toLangChainContent } from './langchain';
 import { isReasoningContentBlock } from './reasoningTypes';
+import { toLangChainContent } from './langchain';
 import { ContentTypes } from '@/common/enum';
 
 type MessageWithContent = {
@@ -412,9 +412,7 @@ function isCachePoint(block: unknown): boolean {
  * Anchoring the only breakpoint on a block that is about to disappear silently
  * loses tail caching, so all of these are excluded.
  */
-const NON_ANCHORABLE_BLOCK_TYPES = new Set([
-  'input_json_delta',
-]);
+const NON_ANCHORABLE_BLOCK_TYPES = new Set(['input_json_delta']);
 
 /**
  * A block can anchor the tail cache breakpoint when it is a real content block
@@ -422,7 +420,7 @@ const NON_ANCHORABLE_BLOCK_TYPES = new Set([
  * conversion. Reasoning and dropped-delta blocks are excluded, and empty text
  * blocks are not cacheable, so all are skipped.
  */
-function isTailCacheableBlock(block: MessageContentComplex): boolean {
+export function isTailCacheableBlock(block: MessageContentComplex): boolean {
   if (isCachePoint(block)) {
     return false;
   }
@@ -439,6 +437,28 @@ function isTailCacheableBlock(block: MessageContentComplex): boolean {
     return text != null && text.trim() !== '';
   }
   return true;
+}
+
+type CacheControl = NonNullable<Anthropic.TextBlockParam['cache_control']>;
+
+/** The Anthropic cache breakpoint a block carries, if any. */
+export function getCacheControl(
+  block: MessageContentComplex
+): CacheControl | undefined {
+  if (!('cache_control' in block) || block.cache_control == null) {
+    return undefined;
+  }
+  return block.cache_control as CacheControl;
+}
+
+/** `block` carrying `marker`, unless it already has a breakpoint of its own. */
+export function withCacheControl<T extends MessageContentComplex>(
+  block: T,
+  marker: CacheControl
+): T {
+  return getCacheControl(block) == null
+    ? { ...block, cache_control: marker }
+    : block;
 }
 
 /**

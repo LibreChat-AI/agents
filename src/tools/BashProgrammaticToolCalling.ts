@@ -32,8 +32,8 @@ import {
   runPlainExecution,
   formatCompletedResponse,
 } from './ProgrammaticToolCalling';
-import { logCodeApiDiagnostic } from '@/tools/diagnostics';
 import { resolveAttachedWorkspaceInstanceId } from '@/tools/workspaceIdentity';
+import { logCodeApiDiagnostic } from '@/tools/diagnostics';
 import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { Constants } from '@/common';
 
@@ -155,7 +155,9 @@ ${EXAMPLES}
 ${CORE_RULES}`;
 
 const TOOL_MANIFEST_DESCRIPTION =
-  'Exact registered tool names used by the code. Required when direct-only tools are configured; ' +
+  'Registered tool names or their normalized sandbox function names used by the code. ' +
+  'Use sandbox names in code, but registered names in tool_manifest when sandbox names collide. ' +
+  'Required when direct-only tools are configured; ' +
   'validated before execution starts. Pass [] when the code calls no tools at all.';
 
 // ============================================================================
@@ -433,6 +435,7 @@ export function createBashProgrammaticToolCallingTool(
         allowedToolDefs: toolDefs,
         disallowedToolDefs,
         programmaticToolName,
+        normalizeIdentifier: normalizeToBashIdentifier,
       });
 
       /* These guard the replay path only. A call that selected no tools never

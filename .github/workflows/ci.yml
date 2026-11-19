@@ -2,14 +2,19 @@ name: CI
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, edited]
     branches:
       - dev
       - main
+      # Validate stacked PRs before their parent reaches main.
+      - danny-avila/**
     paths-ignore:
       - '**.md'
 
 concurrency:
-  group: ci-${{ github.head_ref || github.ref }}
+  # Ignored edits must never cancel or replace pending validation runs.
+  group: >-
+    ci-${{ github.head_ref || github.ref }}-${{ github.event.action == 'edited' && github.event.changes.base == null && github.run_id || 'validation' }}
   cancel-in-progress: true
 
 permissions:
@@ -17,5 +22,7 @@ permissions:
 
 jobs:
   validate:
+    # Retargeting a stack must validate the new merge result; body edits need no rerun.
+    if: github.event.action != 'edited' || github.event.changes.base != null
     uses: ./.github/workflows/validate.yml
     secrets: inherit

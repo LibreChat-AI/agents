@@ -126,12 +126,30 @@ export * from './rerank';
 export {
   PROVIDER_TEXT_PROTECTION_VERSION,
   ProviderTextProtectionError,
+  serializeProviderTextProtectionError,
+  deserializeProviderTextProtectionError,
 } from './protection/providerText';
 export type {
   ProviderTextProtection,
   ProviderTextProtectionResult,
   ProviderTextProtectionErrorCode,
+  ProviderTextProtectionFailure,
 } from './protection/providerText';
+
+export {
+  GEMINI_PARTS,
+  GEMINI_REPLAY_UNSUPPORTED,
+  captureGeminiReplayParts,
+  restoreGeminiReplayParts,
+  isGeminiReplayParts,
+} from './llm/google/utils/signatures';
+export type { GeminiReplayPart } from './llm/google/utils/signatures';
 
 /* Host execution harness */
 export * from './harness';
+
+export { ProviderTextAdmission } from './protection/providerTextAdmission';
+export type {
+  ProviderTextAdmissionLimits,
+  ProviderTextAdmissionSnapshot,
+} from './protection/providerTextAdmission';

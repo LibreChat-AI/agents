@@ -428,6 +428,201 @@ describe('prepareProviderRequest', () => {
     expect(request.messages[0].content[0]).toBe(document);
   });
 
+  describe('attachments carried by reference', () => {
+    const reference = {
+      type: 'file' as const,
+      source_type: 'id' as const,
+      id: 'file-1',
+      mime_type: 'application/pdf',
+      metadata: { name: 'report.pdf' },
+    };
+    const bedrockDocument = {
+      type: 'document',
+      document: {
+        name: 'report',
+        format: 'pdf',
+        source: { bytes: new Uint8Array([37, 80, 68, 70]) },
+      },
+    };
+    const text = { type: 'text', text: 'Summarize the report' };
+
+    it('puts the host content into the request and leaves the reference in the source', () => {
+      const { model } = createCapturingModel();
+      const source = new HumanMessage({ content: [text, reference] });
+      const resolveAttachment = jest.fn<t.AttachmentResolver>(
+        () => bedrockDocument
+      );
+      const measure = jest.fn((messages: BaseMessage[]) => ({
+        fits: true,
+        projectedMessageTokens: messages.length,
+      }));
+
+      const request = prepareProviderRequest({
+        model: model as t.ChatModel,
+        messages: [source],
+        provider: Providers.BEDROCK,
+        context: { resolveAttachment },
+        measure,
+      });
+
+      expect(request.messages[0]).not.toBe(source);
+      expect(request.messages[0].content).toEqual([text, bedrockDocument]);
+      expect(request.messages[0].content[1]).toBe(bedrockDocument);
+      expect(source.content).toEqual([text, reference]);
+      expect(JSON.stringify(source)).not.toContain('"bytes"');
+      expect(resolveAttachment).toHaveBeenCalledTimes(1);
+      expect(resolveAttachment).toHaveBeenCalledWith(reference, {
+        provider: Providers.BEDROCK,
+        modelId: 'prepared-model',
+        projectionMode: 'chat-messages',
+      });
+      expect(measure).toHaveBeenCalledWith(request.messages);
+    });
+
+    it('resolves for the provider that is being served and sends the result as returned', () => {
+      const { model } = createCapturingModel();
+      const source = new HumanMessage({ content: [text, reference] });
+      const spreadsheet = {
+        type: 'file',
+        source_type: 'base64',
+        mime_type: 'text/csv',
+        data: 'Y29sMQ==',
+        metadata: { name: 'sales.csv' },
+      };
+      const resolveAttachment: t.AttachmentResolver = (_reference, target) =>
+        target.provider === Providers.BEDROCK ? bedrockDocument : spreadsheet;
+
+      const request = prepareProviderRequest({
+        model: model as t.ChatModel,
+        messages: [source],
+        provider: Providers.OPENAI,
+        context: { resolveAttachment },
+      });
+
+      expect(request.messages[0].content).toEqual([text, spreadsheet]);
+    });
+
+    it('leaves a reference the host does not own, and the message, as they are', () => {
+      const { model } = createCapturingModel();
+      const source = new HumanMessage({ content: [text, reference] });
+
+      for (const provider of [Providers.BEDROCK, Providers.OPENAI]) {
+        const request = prepareProviderRequest({
+          model: model as t.ChatModel,
+          messages: [source],
+          provider,
+          context: { resolveAttachment: () => undefined },
+        });
+        expect(request.messages[0]).toBe(source);
+      }
+      expect(
+        prepareProviderRequest({
+          model: model as t.ChatModel,
+          messages: [source],
+          provider: Providers.BEDROCK,
+        }).messages[0]
+      ).toBe(source);
+    });
+
+    it('drops a reference with nothing to send and keeps an attachment-only turn valid', () => {
+      const { model } = createCapturingModel();
+      const context = { resolveAttachment: (): null => null };
+
+      const withText = prepareProviderRequest({
+        model: model as t.ChatModel,
+        messages: [new HumanMessage({ content: [text, reference] })],
+        provider: Providers.BEDROCK,
+        context,
+      });
+      const alone = prepareProviderRequest({
+        model: model as t.ChatModel,
+        messages: [new HumanMessage({ content: [reference] })],
+        provider: Providers.ANTHROPIC,
+        context,
+      });
+
+      expect(withText.messages[0].content).toEqual([text]);
+      expect(alone.messages[0].content).toEqual([
+        {
+          type: 'text',
+          text: '[Attachment omitted because its binary format is unsupported by this provider.]',
+        },
+      ]);
+    });
+
+    it('keeps the prompt cache breakpoint a reference was carrying', () => {
+      const { model } = createCapturingModel();
+      const marker = { type: 'ephemeral' as const };
+      const marked = { ...reference, cache_control: marker };
+      const anthropicDocument = {
+        type: 'document',
+        source: {
+          type: 'base64',
+          media_type: 'application/pdf',
+          data: 'JVBERg==',
+        },
+      };
+      const prepare = (
+        content: Array<typeof text | typeof marked>,
+        resolveAttachment: t.AttachmentResolver
+      ): BaseMessage['content'] =>
+        prepareProviderRequest({
+          model: model as t.ChatModel,
+          messages: [new HumanMessage({ content })],
+          provider: Providers.ANTHROPIC,
+          context: { resolveAttachment },
+        }).messages[0].content;
+      const own = { type: 'ephemeral' as const, ttl: '1h' as const };
+
+      expect(prepare([text, marked], () => anthropicDocument)).toEqual([
+        text,
+        { ...anthropicDocument, cache_control: marker },
+      ]);
+      expect(
+        prepare([text, marked], () => ({
+          ...anthropicDocument,
+          cache_control: own,
+        }))
+      ).toEqual([text, { ...anthropicDocument, cache_control: own }]);
+      expect(prepare([text, marked], () => null)).toEqual([
+        { ...text, cache_control: marker },
+      ]);
+      expect(prepare([marked], () => null)).toEqual([
+        {
+          type: 'text',
+          text: '[Attachment omitted because its binary format is unsupported by this provider.]',
+          cache_control: marker,
+        },
+      ]);
+    });
+
+    it('still reprojects a provider-native document beside a resolved reference', () => {
+      const { model } = createCapturingModel();
+      const resolved = {
+        type: 'file',
+        source_type: 'base64',
+        mime_type: 'application/pdf',
+        data: 'JVBERg==',
+        metadata: { name: 'report.pdf' },
+      };
+      const source = new HumanMessage({
+        content: [reference, bedrockDocument],
+      });
+
+      const request = prepareProviderRequest({
+        model: model as t.ChatModel,
+        messages: [source],
+        provider: Providers.OPENAI,
+        context: { resolveAttachment: () => resolved },
+      });
+
+      expect(request.messages[0].content).toEqual([
+        resolved,
+        { ...resolved, metadata: { name: 'report' } },
+      ]);
+    });
+  });
+
   it('keeps an attachment-only turn valid when its binary block is unsupported', () => {
     const { model } = createCapturingModel();
     const source = new HumanMessage({
