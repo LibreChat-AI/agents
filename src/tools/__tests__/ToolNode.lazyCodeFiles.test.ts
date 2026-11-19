@@ -786,7 +786,10 @@ describe.each([Constants.EXECUTE_CODE, Constants.BASH_TOOL])(
       ]) {
         await node.invoke({
           messages: [
-            new AIMessage({ content: '', tool_calls: [{ id, name, args: {} }] }),
+            new AIMessage({
+              content: '',
+              tool_calls: [{ id, name, args: {} }],
+            }),
           ],
         });
       }

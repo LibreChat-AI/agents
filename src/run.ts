@@ -397,9 +397,7 @@ async function resolveCompletedSegmentConfig(
   );
 }
 
-function getFirstPersistedInterrupt(
-  snapshot: InterruptStateSnapshot
-):
+function getFirstPersistedInterrupt(snapshot: InterruptStateSnapshot):
   | {
       id: string;
       value: unknown;
@@ -3082,7 +3080,9 @@ export class Run<_T extends t.BaseGraphState> {
       reasoningChainOptions.runName ?? REASONING_LABEL_TRACE_NAME;
     const reasoningTags = ['librechat', 'reasoning-label', 'reasoning-step'];
     const reasoningRunLangfuse = withoutSkillsAvailable(this.langfuse);
-    const reasoningLangfuseOverlay = withoutSkillsAvailable(reasoningContext?.langfuse);
+    const reasoningLangfuseOverlay = withoutSkillsAvailable(
+      reasoningContext?.langfuse
+    );
     const reasoningLangfuseConfig = resolveLangfuseConfig(
       reasoningRunLangfuse,
       reasoningLangfuseOverlay
