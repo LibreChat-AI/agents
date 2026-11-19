@@ -63,6 +63,10 @@ import { normalizeToPythonIdentifier } from '@/tools/ProgrammaticToolCalling';
 import { createExactTokenCountCache } from '@/llm/contextPressureMeter';
 import { markProviderTextInput } from '@/protection/providerTextInput';
 import { buildSummaryCarrierText } from '@/summarization/shared';
+import {
+  createToolDispatcherDefinition,
+  resolveToolDispatch,
+} from '@/tools/toolDispatch';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { apportionTokenCounts } from '@/utils/tokens';
 import { isThinkingEnabled } from '@/llm/request';
@@ -139,6 +143,7 @@ export class AgentContext {
       subagentConfigs,
       maxSubagentDepth,
       graphTools,
+      toolDispatch,
     } = agentConfig;
 
     const agentContext = new AgentContext({
@@ -181,6 +186,7 @@ export class AgentContext {
         };
     agentContext.subagentConfigs = subagentConfigs;
     agentContext.maxSubagentDepth = maxSubagentDepth;
+    agentContext.toolDispatch = resolveToolDispatch(toolDispatch);
     /**
      * Host-supplied direct tools (see `AgentInputs.graphTools`). Copied — never
      * aliased — because the SDK later pushes graph-managed tools (handoff /
@@ -377,6 +383,8 @@ export class AgentContext {
    * When provided, ToolNode operates in event-driven mode.
    */
   toolDefinitions?: t.LCTool[];
+  /** Binds the `call_tool` dispatcher (`AgentInputs.toolDispatch`). */
+  toolDispatch: false | t.ToolDispatchOptions = false;
   /** Set of tool names discovered via tool search (to be loaded) */
   discoveredToolNames: Set<string> = new Set();
   /** Original AgentInputs used to create this context — used for self-spawn subagent resolution. */
@@ -1449,8 +1457,18 @@ export class AgentContext {
      */
     return resolveCallerCapabilityProjection(
       effectiveToolDefinitions,
-      (toolDef) => isToolDefinitionActive(toolDef, this.discoveredToolNames)
+      (toolDef) => this.isToolDefinitionBound(toolDef)
     ).directTools;
+  }
+
+  /**
+   * With a dispatcher, deferred tools are reached through it and never bound,
+   * even once discovered: binding them would change `tools` mid-conversation.
+   */
+  private isToolDefinitionBound(toolDef: t.LCTool): boolean {
+    return this.toolDispatch !== false
+      ? toolDef.defer_loading !== true
+      : isToolDefinitionActive(toolDef, this.discoveredToolNames);
   }
 
   /**
@@ -1538,7 +1556,9 @@ export class AgentContext {
       }
     }
 
-    for (const def of this.getActiveToolDefinitions()) {
+    const dispatcher =
+      this.toolDispatch === false ? [] : [createToolDispatcherDefinition()];
+    for (const def of [...this.getActiveToolDefinitions(), ...dispatcher]) {
       if (countedToolNames.has(def.name)) {
         continue;
       }
@@ -2347,6 +2367,19 @@ export class AgentContext {
    * @returns Array of tools to bind to model
    */
   getToolsForBinding(): t.GraphTools | undefined {
+    const tools = this.getToolsWithoutDispatcher();
+    if (this.toolDispatch === false) {
+      return tools;
+    }
+    return [
+      ...(tools ?? []),
+      ...(createSchemaOnlyTools([
+        createToolDispatcherDefinition(),
+      ]) as t.GraphTools),
+    ];
+  }
+
+  private getToolsWithoutDispatcher(): t.GraphTools | undefined {
     if (this.toolDefinitions && this.toolDefinitions.length > 0) {
       return this.getEventDrivenToolsForBinding();
     }
@@ -2397,8 +2430,7 @@ export class AgentContext {
       }
 
       return (
-        allowsToolCaller(toolDef, 'direct') &&
-        isToolDefinitionActive(toolDef, this.discoveredToolNames)
+        allowsToolCaller(toolDef, 'direct') && this.isToolDefinitionBound(toolDef)
       );
     });
   }
