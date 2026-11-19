@@ -344,6 +344,65 @@ export interface ConvertMessagesOptions {
   preserveToolCacheControl?: boolean;
 }
 
+/** Placeholder kept in place of stripped images so a message never ends up empty. */
+const IMAGE_OMITTED_PLACEHOLDER =
+  '(Image content omitted — model does not support vision)';
+
+/**
+ * True for image content parts a non-vision model cannot accept: OpenAI-style
+ * `image_url` parts and standard `image` data content blocks. Data content blocks are
+ * converted to `image_url` further downstream, so dropping only `image_url` here would
+ * still let them reach a text-only model.
+ */
+function isImageContentPart(part: unknown): boolean {
+  if (part == null || typeof part !== 'object' || !('type' in part)) {
+    return false;
+  }
+  const { type } = part as { type?: string };
+  return type === 'image_url' || type === 'image';
+}
+
+/**
+ * Removes image content from messages bound for a model without vision support.
+ *
+ * OpenAI-compatible providers reject the whole request when an image reaches a
+ * text-only model ("model is not a multimodal model", "No endpoints found that support
+ * image input"), and callers routinely cannot control the history: a tool that returns
+ * an image, or an agent handoff from a vision model to a text-only one, both put image
+ * parts into the messages.
+ *
+ * Returns the input untouched when `visionCapable` is true, and clones only the messages
+ * that actually carry an image. A message whose content was nothing but images keeps a
+ * short text placeholder so it does not become empty.
+ */
+export function stripImagesFromMessages(
+  messages: BaseMessage[],
+  visionCapable: boolean
+): BaseMessage[] {
+  if (visionCapable) {
+    return messages;
+  }
+  return messages.map((msg) => {
+    if (!Array.isArray(msg.content)) {
+      return msg;
+    }
+    if (!msg.content.some(isImageContentPart)) {
+      return msg;
+    }
+    const kept = msg.content.filter((part) => !isImageContentPart(part));
+    const clone = Object.assign(
+      Object.create(Object.getPrototypeOf(msg)),
+      msg
+    ) as BaseMessage;
+    clone.content = (
+      kept.length > 0
+        ? kept
+        : [{ type: 'text' as const, text: IMAGE_OMITTED_PLACEHOLDER }]
+    ) as BaseMessage['content'];
+    return clone;
+  });
+}
+
 // Used in LangSmith, export is important here
 export function _convertMessagesToOpenAIParams(
   messages: BaseMessage[],
