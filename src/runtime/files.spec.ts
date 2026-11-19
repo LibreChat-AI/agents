@@ -563,6 +563,34 @@ it('feeds file bindings into a custom graph and preserves native SDK message eve
   }
 });
 
+it('refuses a remote run that is given an attachment resolver', async () => {
+  await expect(
+    createRemoteSdkRun({
+      identity,
+      config: {
+        runId: identity.runId,
+        tokenCounter: () => 1,
+        resolveAttachment: () => undefined,
+        graphConfig: {
+          type: 'standard',
+          agents: [
+            {
+              agentId: identity.agentId,
+              provider: Providers.OPENAI,
+              clientOptions: { model: 'test' },
+              tools: [],
+            },
+          ],
+        },
+      },
+      remote: {
+        url: 'ws://127.0.0.1:9/sdk',
+        secret: 'attachment-resolver-test-secret-at-least-32-characters',
+      },
+    })
+  ).rejects.toThrow('Remote SDK attachment references');
+});
+
 it('fails before execution when an older worker does not advertise file support', async () => {
   const server = new WebSocketServer({ port: 0, host: '127.0.0.1' });
   await once(server, 'listening');
