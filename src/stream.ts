@@ -894,7 +894,8 @@ function startEagerToolExecutions(args: {
     void safeDispatchCustomEvent(
       GraphEvents.ON_TOOL_EXECUTE,
       batchRequest,
-      graph.config
+      graph.config,
+      toolCalls
     )
       .then(() => {
         dispatchSettled = true;
