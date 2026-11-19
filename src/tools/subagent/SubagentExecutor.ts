@@ -108,7 +108,7 @@ import type {
 import type { RunBreakerScope } from '@/llm/streamLimits';
 import type { GraphFactory } from '@/graphs/graphFactory';
 import type { StandardGraph } from '@/graphs/Graph';
-import { protectToolApprovalResume, admitToolResultCheckpoints, getToolResultCheckpointLookup, bindToolResultCheckpoint, normalizeToolResultError, hasRequiredToolExecuteProtection, ToolResultProtectionError } from '@/protection/toolResult';
+import { snapshotToolResultMessages, protectToolApprovalResume, admitToolResultCheckpoints, getToolResultCheckpointLookup, bindToolResultCheckpoint, normalizeToolResultError, hasRequiredToolExecuteProtection, ToolResultProtectionError } from '@/protection/toolResult';
 import {
   getSubagentApprovalExecutionScope,
   SubagentDefinitionBindingError,
@@ -3726,6 +3726,7 @@ export class SubagentExecutor {
     if (result == null) {
       throw new Error('Subagent completed without producing graph state.');
     }
+    result.messages = snapshotToolResultMessages(this.toolResultProtection, result.messages);
     if (this.toolResultProtection != null && childPlan.kind === 'graph' && result.subagentResult != null) result.subagentResult = childGraph.validateToolResultSubagentResult(result.subagentResult, result.messages, childPlan.resultAgentId);
     const filteredContent =
       childPlan.kind === 'graph'
@@ -3743,6 +3744,7 @@ export class SubagentExecutor {
        * tool result, so the small extra latency is acceptable. Errors are
        * swallowed — SubagentStop is observational.
        */
+      const hookMessages = snapshotToolResultMessages(this.toolResultProtection, result.messages);
       await executeHooks({
         registry: this.hookRegistry,
         input: {
@@ -3752,13 +3754,14 @@ export class SubagentExecutor {
           threadId,
           agentId: childAgentId,
           agentType: subagentType,
-          messages: result.messages,
+          messages: hookMessages,
         },
         sessionId: currentHookSessionId,
         matchQuery: subagentType,
       }).catch(() => {
         /* SubagentStop is observational — swallow errors */
       });
+      snapshotToolResultMessages(this.toolResultProtection, hookMessages);
     }
 
     if (!childAlreadyCompleted) {

@@ -1751,7 +1751,7 @@ function buildToolOutcomeGuard(policy: ToolResultProtection, value: unknown, act
         if (envelope != null && admission != null) {
           if (!matchesToolMessageEnvelope(snapshotToolMessageEnvelope(copy as ToolMessage), envelope)) throw new ToolResultProtectionError('unsupported');
           const Message = Object.getPrototypeOf(message) === ToolMessageChunk.prototype ? ToolMessageChunk : ToolMessage;
-          return markReleasedToolMessage(policy, admission.name, admission.id, new Message(envelope), admission.referenceContent);
+          return markReleasedToolMessage(policy, admission.name, admission.id, new Message(snapshotToolMessageEnvelope(envelope)), admission.referenceContent);
         }
         return payload == null ? copy : restoreToolOutcomeMessagePayload(copy, payload(toolOutcomeMessagePayload(copy), inspection) as object);
       };
@@ -1858,6 +1858,12 @@ function buildToolOutcomeGuard(policy: ToolResultProtection, value: unknown, act
       return next;
     };
   } finally { active.delete(value); }
+}
+
+/** Detach admitted message carriers before giving observational consumers mutable views. */
+export function snapshotToolResultMessages(policy: ToolResultProtection | undefined, messages: BaseMessage[]): BaseMessage[] {
+  if (policy == null) return messages;
+  return createToolOutcomeGuard(policy, messages, toolOutcomeSourceScope.getStore()).snapshot() as BaseMessage[];
 }
 
 /** Capture release provenance before native chain observers receive the outcome. */
@@ -2299,6 +2305,23 @@ export function bindToolExecuteProtection(
       requiresToolResultProtection(policy, call.name)
     ),
   });
+  const reject = request.reject;
+  request.reject = (error): void => {
+    try { reject(protectToolExecuteFailure(request, error)); }
+    catch (failure) { reject(normalizeToolResultError(failure)); }
+  };
+}
+
+export function hasToolExecuteProtection(request: ToolExecuteBatchRequest): boolean {
+  return hostPolicies.has(request);
+}
+
+function protectToolExecuteFailure(request: ToolExecuteBatchRequest, error: Error): Error {
+  const binding = hostPolicies.get(request);
+  if (binding == null) return error;
+  validateToolExecuteProtection(request);
+  if (binding.required) return normalizeToolResultError(error);
+  return admitToolResultControl(binding.policy, error) as Error;
 }
 
 export function inheritToolExecuteProtection(
@@ -2394,14 +2417,21 @@ function toolBodyCallbacks(
   }) as CallbackManagerForToolRun;
 }
 
+const quarantineToolWriter = (): void => {};
+
 function toolBodyConfig(input?: RunnableConfig, copies = new WeakMap<object, RunnableConfig>(), depth = 0): RunnableConfig {
   if (input == null) return { callbacks: [] };
   if (depth > 64 || types.isProxy(input)) throw new ToolResultProtectionError('unsupported');
   const previous = copies.get(input);
   if (previous != null) return previous;
-  const fields = snapshotToolCheckpointRecord(input as RunnableConfig & { config?: RunnableConfig }, ['config', 'callbacks']);
+  const fields = snapshotToolCheckpointRecord(input as RunnableConfig & { config?: RunnableConfig; writer?: typeof quarantineToolWriter }, ['config', 'callbacks', 'writer', 'configurable']);
   const nested = fields.config;
   fields.callbacks = [];
+  fields.writer = quarantineToolWriter;
+  if (fields.configurable != null) {
+    fields.configurable = snapshotToolCheckpointRecord(fields.configurable, ['writer']);
+    if (Object.hasOwn(fields.configurable, 'writer')) fields.configurable.writer = quarantineToolWriter;
+  }
   copies.set(input, fields);
   if (nested != null) {
     if (typeof nested !== 'object') throw new ToolResultProtectionError('unsupported');

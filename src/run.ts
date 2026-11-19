@@ -1,5 +1,5 @@
 import type { ToolCallSources } from '@/protection/toolResult';
-import { validateToolResultStateFields, validateToolResultStateWrite, snapshotToolSubagentResult, snapshotToolHandoffWrite, snapshotToolHandoffState, snapshotToolSummarizationRequest, snapshotToolRunStepWrite, snapshotToolCallSources, snapshotToolCommand, protectToolApprovalResume, snapshotToolInputMessages, snapshotToolRunStepState, snapshotToolCheckpointRecord, admitToolResultCheckpoints, getToolResultCheckpointLookup, bindToolResultCheckpoint, snapshotToolMessageRemoval, snapshotToolResumeUpdates, snapshotToolResumeMessages, snapshotToolHistoryMessages, normalizeToolResultError, hasRequiredToolExecuteProtection, ToolResultProtectionError } from '@/protection/toolResult';
+import { snapshotToolResultMessages, validateToolResultStateFields, validateToolResultStateWrite, snapshotToolSubagentResult, snapshotToolHandoffWrite, snapshotToolHandoffState, snapshotToolSummarizationRequest, snapshotToolRunStepWrite, snapshotToolCallSources, snapshotToolCommand, protectToolApprovalResume, snapshotToolInputMessages, snapshotToolRunStepState, snapshotToolCheckpointRecord, admitToolResultCheckpoints, getToolResultCheckpointLookup, bindToolResultCheckpoint, snapshotToolMessageRemoval, snapshotToolResumeUpdates, snapshotToolResumeMessages, snapshotToolHistoryMessages, normalizeToolResultError, hasRequiredToolExecuteProtection, ToolResultProtectionError } from '@/protection/toolResult';
 import { messagesStateReducer } from '@/messages/reducer';
 // src/run.ts
 import { nanoid } from 'nanoid';
@@ -1021,7 +1021,8 @@ export class Run<_T extends t.BaseGraphState> {
         'Graph not initialized. Make sure to use Run.create() to instantiate the Run.'
       );
     }
-    return this.Graph.getRunMessages();
+    const messages = this.Graph.getRunMessages();
+    return messages == null ? messages : snapshotToolResultMessages(this.toolResultProtection, messages);
   }
 
   getChildCheckpointThreadIds(): string[] {
@@ -1731,8 +1732,7 @@ export class Run<_T extends t.BaseGraphState> {
           stopReason = OUTPUT_TRUNCATED_HALT_REASON;
         }
 
-        const stopMessages =
-          graph.getRunMessages() ?? stateInputs?.messages ?? [];
+        let stopMessages = snapshotToolResultMessages(this.toolResultProtection, graph.getRunMessages() ?? stateInputs?.messages ?? []);
         const stopContinuationCount = graph.getStopContinuationCount();
         const continuationBudgetRemaining = Math.max(
           0,
@@ -1756,6 +1756,7 @@ export class Run<_T extends t.BaseGraphState> {
             sessionId: this.id,
             signal: config.signal,
           }).catch((): undefined => undefined);
+          stopMessages = snapshotToolResultMessages(this.toolResultProtection, stopMessages);
         }
 
         /** A summarize-only run is complete once its summary exists: there
@@ -1764,7 +1765,7 @@ export class Run<_T extends t.BaseGraphState> {
         const continuationAdmissible = graph.summarizeOnlyAgentId == null;
         if (this.hookRegistry?.hasHookFor('StopFinalize', this.id) === true) {
           const stopInjected =
-            stopResult == null ? [] : materializeStopContinuation(stopResult);
+            stopResult == null ? [] : snapshotToolResultMessages(this.toolResultProtection, materializeStopContinuation(stopResult));
           const continuationPrevented =
             !continuationAdmissible ||
             stopReason != null ||
@@ -1791,6 +1792,7 @@ export class Run<_T extends t.BaseGraphState> {
             sessionId: this.id,
             signal: config.signal,
           });
+          snapshotToolResultMessages(this.toolResultProtection, stopMessages);
           assertFinalAdmissionSucceeded(finalized);
           stopResult = mergeAggregatedHookResults(stopResult, finalized);
         }
@@ -1806,7 +1808,7 @@ export class Run<_T extends t.BaseGraphState> {
           stopReason == null &&
           stopResult?.stopDecision === 'block';
         if (requestsContinuation && stopResult != null) {
-          const injected = materializeStopContinuation(stopResult);
+          const injected = snapshotToolResultMessages(this.toolResultProtection, materializeStopContinuation(stopResult));
           if (injected.length > 0) {
             if (stopContinuationCount >= this.maxStopContinuations) {
               throw new Error(
@@ -1889,7 +1891,7 @@ export class Run<_T extends t.BaseGraphState> {
       streamAborted =
         config.signal?.aborted === true || this.Graph.signal?.aborted === true;
       if (this.hookRegistry?.hasHookFor('StopFailure', this.id) === true) {
-        const runMessages = this.Graph.getRunMessages() ?? [];
+        const runMessages = snapshotToolResultMessages(this.toolResultProtection, this.Graph.getRunMessages() ?? []);
         await executeHooks({
           registry: this.hookRegistry,
           input: {
@@ -1904,6 +1906,7 @@ export class Run<_T extends t.BaseGraphState> {
         }).catch(() => {
           /* swallow hook errors — the original error must propagate */
         });
+        snapshotToolResultMessages(this.toolResultProtection, runMessages);
       }
       throw err;
     } finally {

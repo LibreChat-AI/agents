@@ -6,7 +6,7 @@ import type { ToolCall } from '@langchain/core/messages/tool';
 import type { ToolCallsDispatchedEvent } from '@/types/stream';
 import type { ToolExecuteBatchRequest } from '@/types/tools';
 import type { AgentLogEvent } from '@/types/graph';
-import { normalizeToolResultError, inheritToolExecuteProtection, validateToolExecuteProtection, hasRequiredToolExecuteProtection, protectToolExecuteBatch } from '@/protection/toolResult';
+import { hasToolExecuteProtection, normalizeToolResultError, inheritToolExecuteProtection, validateToolExecuteProtection, hasRequiredToolExecuteProtection, protectToolExecuteBatch } from '@/protection/toolResult';
 import { traceHostToolResults } from '@/langfuse';
 import { GraphEvents } from '@/common';
 
@@ -63,8 +63,8 @@ export async function safeDispatchCustomEvent(
     }
     return true;
   } catch (e) {
-    if (toolRequest != null && hasRequiredToolExecuteProtection(toolRequest)) {
-      toolRequest.reject(normalizeToolResultError(e));
+    if (toolRequest != null && hasToolExecuteProtection(toolRequest)) {
+      toolRequest.reject(e as Error);
       return false;
     }
     // Check if this is the known EventStreamCallbackHandler error
