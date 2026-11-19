@@ -1036,6 +1036,19 @@ function historyMessageType(message: BaseMessage): string {
   return type;
 }
 
+function validateAlternateToolResultRole(policy: ToolResultProtection, message: BaseMessage, sources?: ToolCallSources, embedded?: ToolCallSources): void {
+  const type = historyMessageType(message);
+  const role = type === 'generic' ? ownMessageValue(message, 'role') : type;
+  if (role !== 'function' && !(type === 'generic' && role === 'tool')) return;
+  const name = ownMessageValue(message, 'name');
+  const id = ownMessageValue(message, 'tool_call_id') ?? ownMessageValue(message, 'toolCallId');
+  if ((name != null && typeof name !== 'string') || (id != null && typeof id !== 'string')) throw new ToolResultProtectionError('unsupported');
+  const entries = typeof id === 'string' ? sources?.get(id) : undefined;
+  const nested = typeof id === 'string' ? embedded?.get(id) : undefined;
+  const selected = (typeof name === 'string' && requiresToolResultProtection(policy, name)) || entries?.some((source) => requiresToolResultProtection(policy, source.name)) === true || nested?.some((source) => requiresToolResultProtection(policy, source.name)) === true;
+  if (selected || ((name == null || name === '') && (entries?.length ?? 0) === 0 && (nested?.length ?? 0) === 0)) throw new ToolResultProtectionError('unsupported');
+}
+
 function historyIdentity(message: BaseMessage): { id?: string; tool_call_id: string; name?: string } {
   const id = ownMessageValue(message, 'id');
   const tool_call_id = ownMessageValue(message, 'tool_call_id');
@@ -1348,6 +1361,7 @@ function toolOutcomeMessagePayload(message: BaseMessage): object {
       const serialized = ownMessageValue(fields.lc_kwargs, key);
       if (serialized != null && serialized !== ownMessageValue(message, key)) throw new ToolResultProtectionError('unsupported');
     }
+    if (ownMessageValue(message, 'type') === 'generic' && Object.hasOwn(fields.lc_kwargs, 'role') && ownMessageValue(fields.lc_kwargs, 'role') !== ownMessageValue(message, 'role')) throw new ToolResultProtectionError('unsupported');
     Reflect.deleteProperty(fields.lc_kwargs, 'type');
     for (const key of argumentFields) if (Object.hasOwn(fields.lc_kwargs, key)) Object.defineProperty(fields.lc_kwargs, key, { value: toolOutcomeCallPayload(ownMessageValue(fields.lc_kwargs, key)), enumerable: true, writable: true, configurable: true });
   }
@@ -1699,6 +1713,7 @@ function buildToolOutcomeGuard(policy: ToolResultProtection, value: unknown, act
     const type = ownMessageValue(value, 'type');
     if (trustedMessageImplementations.has(Object.getPrototypeOf(value)) || (Object.hasOwn(value, 'content') && typeof type === 'string' && ['ai', 'human', 'system', 'tool', 'function', 'generic', 'remove'].includes(type))) {
       const message = snapshotToolInputMessages([value as BaseMessage])[0];
+      validateAlternateToolResultRole(policy, message, context.sources, context.embedded);
       const admission = approved.get(message);
       const envelope = admission?.policy === policy ? admission.envelope : undefined;
       if (envelope != null && !matchesToolMessageEnvelope(snapshotToolMessageEnvelope(message as ToolMessage), envelope)) throw new ToolResultProtectionError('unsupported');
@@ -1728,10 +1743,10 @@ function buildToolOutcomeGuard(policy: ToolResultProtection, value: unknown, act
         if ((envelope == null && (selected || (context.control === true && name == null))) || (selected && ((source != null && name != null && name !== source) || (owned != null && proposal != null && owned !== proposal.name)))) throw new ToolResultProtectionError('unsupported');
       }
       const payload = envelope == null ? toolOutcomeGuard(policy, toolOutcomeMessagePayload(message), active, depth + 1, context) : undefined;
-      const identity = ['type', 'id', 'name', 'tool_call_id'].map((field) => ownMessageValue(message, field));
+      const identity = ['type', 'id', 'name', 'tool_call_id', 'role'].map((field) => ownMessageValue(message, field));
       return (current, inspection) => {
         const copy = snapshotToolInputMessages([current as BaseMessage])[0];
-        if (!identity.every((field, index) => field === ownMessageValue(copy, ['type', 'id', 'name', 'tool_call_id'][index]))) throw new ToolResultProtectionError('unsupported');
+        if (!identity.every((field, index) => field === ownMessageValue(copy, ['type', 'id', 'name', 'tool_call_id', 'role'][index]))) throw new ToolResultProtectionError('unsupported');
         if (routing != null && !isDeepStrictEqual(((ownMessageValue(copy, 'tool_calls') ?? []) as Array<{ id?: string; name: string }>).map(({ id, name }) => ({ id, name })), routing)) throw new ToolResultProtectionError('unsupported');
         if (envelope != null && admission != null) {
           if (!matchesToolMessageEnvelope(snapshotToolMessageEnvelope(copy as ToolMessage), envelope)) throw new ToolResultProtectionError('unsupported');
@@ -1884,6 +1899,7 @@ export async function validateToolMessageHistory(policy: ToolResultProtection | 
   for (let index = 0; index < history.length; index++) {
     const message = history[index];
     const type = historyMessageType(message);
+    validateAlternateToolResultRole(policy, message, payloadSources);
     const messageId = ownMessageValue(message, 'id');
     if (messageId != null && typeof messageId !== 'string') throw new ToolResultProtectionError('unsupported');
     const knownRelease = messageId == null ? undefined : byMessage.get(messageId);
@@ -2378,6 +2394,22 @@ function toolBodyCallbacks(
   }) as CallbackManagerForToolRun;
 }
 
+function toolBodyConfig(input?: RunnableConfig, copies = new WeakMap<object, RunnableConfig>(), depth = 0): RunnableConfig {
+  if (input == null) return { callbacks: [] };
+  if (depth > 64 || types.isProxy(input)) throw new ToolResultProtectionError('unsupported');
+  const previous = copies.get(input);
+  if (previous != null) return previous;
+  const fields = snapshotToolCheckpointRecord(input as RunnableConfig & { config?: RunnableConfig }, ['config', 'callbacks']);
+  const nested = fields.config;
+  fields.callbacks = [];
+  copies.set(input, fields);
+  if (nested != null) {
+    if (typeof nested !== 'object') throw new ToolResultProtectionError('unsupported');
+    fields.config = toolBodyConfig(nested, copies, depth + 1);
+  }
+  return fields;
+}
+
 function isNativeToolResultShell(tool: GenericTool): tool is StructuredTool {
   return tool instanceof StructuredTool && tool.invoke === StructuredTool.prototype.invoke && [
     StructuredTool.prototype.call,
@@ -2503,7 +2535,7 @@ function withToolResultCarrierBoundary(tool: GenericTool, policy: ToolResultProt
       }
       let raw: unknown;
       try {
-        const producerConfig = { ...config, callbacks: [] };
+        const producerConfig = toolBodyConfig(config);
         raw = await AsyncLocalStorageProviderSingleton.runWithConfig(producerConfig, () => call.call(tool, input, toolBodyCallbacks(manager), producerConfig));
       }
       catch (error) { throw admitToolResultControl(policy, error, sources); }
@@ -2582,7 +2614,7 @@ export function withToolResultBoundary(
         let raw: unknown;
         let status: 'success' | 'error' = 'success';
         try {
-          const producerConfig = { ...effective, callbacks: [] };
+          const producerConfig = toolBodyConfig(effective);
           raw = await attempt.wait(
             AsyncLocalStorageProviderSingleton.runWithConfig(producerConfig, () =>
               invoke.call(tool, input, toolBodyCallbacks(manager), producerConfig)
