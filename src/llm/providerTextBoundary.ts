@@ -13,12 +13,14 @@ import {
   STREAMED_TOOL_CALL_SEAL_METADATA_KEY,
 } from '@/tools/streamedToolCallSeals';
 import { GEMINI_SIGNATURES, RESPONSES_POSITIONS, stringMap, safetyRatings, replayPositions, ResponsesTextProjection, keys } from '@/llm/providerTextControls';
+import { GEMINI_PARTS, GEMINI_REPLAY_UNSUPPORTED, isGeminiReplayParts } from '@/llm/google/utils/signatures';
 import {
   ProviderTextAttempt,
   ProviderTextProtectionError,
 } from '@/protection/providerText';
 import { isProviderTextInput } from '@/protection/providerTextInput';
 import { createProviderTextChunk } from '@/llm/providerTextChunk';
+import { preserveModelInvocationContext } from '@/llm/invocation';
 import { getChatModelClass } from '@/llm/providers';
 import { Providers } from '@/common';
 
@@ -48,6 +50,8 @@ const additionalControls: Readonly<Partial<Record<string, (value: unknown) => bo
 
 const geminiControls: Readonly<Partial<Record<string, (value: unknown) => boolean>>> = {
   [GEMINI_SIGNATURES]: stringMap,
+  [GEMINI_PARTS]: isGeminiReplayParts,
+  [GEMINI_REPLAY_UNSUPPORTED]: (value) => value === true,
   finishReason: (value) => ['STOP', 'MAX_TOKENS', 'SAFETY', 'RECITATION', 'OTHER', 'MALFORMED_FUNCTION_CALL', 'FINISH_REASON_UNSPECIFIED'].includes(String(value)),
   safetyRatings,
   avgLogprobs: (value) => typeof value === 'number' && Number.isFinite(value),
@@ -362,7 +366,11 @@ export function withProviderTextBoundary(
     try {
       source = model._streamResponseChunks(
         messages,
-        { ...options, signal: attempt.signal },
+        preserveModelInvocationContext(
+          options,
+          { ...options, signal: attempt.signal },
+          runManager
+        ),
         undefined
       );
       for (;;) {
@@ -404,14 +412,18 @@ export function withProviderTextBoundary(
   };
   protectedChat._streamChatModelEvents =
     BaseChatModel.prototype._streamChatModelEvents;
-  protectedChat._generate = async function (messages, options): Promise<ChatResult> {
+  protectedChat._generate = async function (messages, options, runManager): Promise<ChatResult> {
     if (usesInternalStreaming(model, options)) throw new ProviderTextProtectionError('unsupported');
     const attempt = new ProviderTextAttempt(policy, options.signal);
     try {
       const result = await attempt.wait(
         model._generate(
           messages,
-          { ...options, signal: attempt.signal },
+          preserveModelInvocationContext(
+            options,
+            { ...options, signal: attempt.signal },
+            runManager
+          ),
           undefined
         )
       );

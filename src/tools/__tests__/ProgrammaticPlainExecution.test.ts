@@ -320,6 +320,46 @@ describe('behavior that stays as it was', () => {
   });
 });
 
+describe.each([
+  ['Bash', invokeBash],
+  ['Python', invokePython],
+])('%s sandbox-name manifests', (_runtime, invokeTool) => {
+  beforeEach(() => {
+    requests.length = 0;
+  });
+
+  it.each(['stub_echo_mcp_hypen-server', 'stub_echo_mcp_hypen_server'])(
+    'sends the original registered definition for %s',
+    async (manifestName) => {
+      const definition: t.LCTool = {
+        name: 'stub_echo_mcp_hypen-server',
+        allowed_callers: ['code_execution'],
+      };
+      await invokeTool(
+        { code: 'stub_echo_mcp_hypen_server', tool_manifest: [manifestName] },
+        {
+          toolMap: new Map([[definition.name, createCalculatorTool()]]),
+          toolDefs: [definition],
+          disallowedToolDefs: [{ name: 'direct_only' }],
+        }
+      );
+
+      expect(requests).toHaveLength(1);
+      expect(requests[0].body.tools).toEqual([definition]);
+    }
+  );
+
+  it('rejects normalized direct-only names before sending a request', async () => {
+    await expect(
+      invokeTool(
+        { code: 'send_email', tool_manifest: ['send_email'] },
+        { ...DEFAULT_CONTEXT, disallowedToolDefs: [{ name: 'send-email' }] }
+      )
+    ).rejects.toThrow('not marked for code_execution');
+    expect(requests).toHaveLength(0);
+  });
+});
+
 describe('ambiguous runtime identifiers', () => {
   const colliding: t.LCTool[] = [
     { name: 'report-tool', allowed_callers: ['code_execution'] },

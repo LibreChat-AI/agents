@@ -14,6 +14,8 @@ const REPEATED_SCALAR_METADATA_FIELDS = [
   'finish_reason',
   'service_tier',
   'system_fingerprint',
+  'provider',
+  'usage',
 ] as const;
 
 /** Per-completion-index set of scalar fields already emitted this stream. */
@@ -29,9 +31,9 @@ function completionIndex(
 /**
  * Strip scalar `response_metadata`/`generationInfo` fields that have already
  * appeared on an earlier chunk of the same completion (tracked in `seen`),
- * keeping the first occurrence so the aggregated message still carries the
- * value once. Scoped per completion index so multi-choice (`n > 1`) responses,
- * which `_generate` aggregates separately, keep each choice's own metadata.
+ * keeping the first occurrence (first nonempty snapshot for usage) so the
+ * aggregated message still carries the value once. Scoped per completion index
+ * so multi-choice (`n > 1`) responses keep each choice's own metadata.
  *
  * Deletes from a shallow clone rather than in place: providers such as
  * `ChatDeepSeek` split one raw chunk into several synthetic pieces that share
@@ -64,6 +66,15 @@ export function dropRepeatedScalarMetadata(
       generationInfo != null && generationInfo[field] != null;
     const inResponseMetadata = responseMetadata[field] != null;
     if (!inGenerationInfo && !inResponseMetadata) {
+      continue;
+    }
+    if (
+      field === 'usage' &&
+      (!inGenerationInfo ||
+        Object.keys(generationInfo.usage ?? {}).length === 0) &&
+      (!inResponseMetadata ||
+        Object.keys(responseMetadata.usage ?? {}).length === 0)
+    ) {
       continue;
     }
     if (!seenFields.has(field)) {

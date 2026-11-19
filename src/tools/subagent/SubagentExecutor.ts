@@ -2,13 +2,16 @@ import { nanoid } from 'nanoid';
 import { createHash } from 'crypto';
 import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
 import { AsyncLocalStorageProviderSingleton } from '@langchain/core/singletons';
-import { convertToOpenAITool, isLangChainTool } from '@langchain/core/utils/function_calling';
 import {
   AIMessage,
   BaseMessage,
   HumanMessage,
   ToolMessage,
 } from '@langchain/core/messages';
+import {
+  convertToOpenAITool,
+  isLangChainTool,
+} from '@langchain/core/utils/function_calling';
 import {
   Command,
   END,
@@ -50,6 +53,7 @@ import type {
   RunStepClosedEvent,
   RunStepStatus,
   StandardGraphInput,
+  ExecutableSubagentConfig,
   ExecutableSubagentConfigEntry,
   ResolvedSubagentConfig,
   ResolvedSubagentConfigEntry,
@@ -62,6 +66,7 @@ import type {
   SubagentTaskRuntime,
   SubagentResolveConfigurable,
   SubagentHostArgs,
+  SubagentAgentInputsResolver,
   SubagentResolveRequestContext,
   SubagentResolveUserContext,
   StepCompleted,
@@ -435,9 +440,10 @@ type SubagentCheckpointMarker = {
 };
 
 /** Hash serializable options; executable or opaque inputs require a host revision. */
-function getRuntimeOptionsIdentity(
-  options: unknown
-): { digest: string; requiresRevision: boolean } {
+function getRuntimeOptionsIdentity(options: unknown): {
+  digest: string;
+  requiresRevision: boolean;
+} {
   const hash = createHash('sha256');
   const ancestors = new Set<object>();
   let requiresRevision = false;
@@ -451,7 +457,11 @@ function getRuntimeOptionsIdentity(
       return;
     }
     const kind = typeof value;
-    if (kind === 'string' || kind === 'boolean' || (kind === 'number' && Number.isFinite(value))) {
+    if (
+      kind === 'string' ||
+      kind === 'boolean' ||
+      (kind === 'number' && Number.isFinite(value))
+    ) {
       hash.update(`${kind}:${JSON.stringify(value)};`);
       return;
     }
@@ -465,8 +475,11 @@ function getRuntimeOptionsIdentity(
       return;
     }
     const prototype = Object.getPrototypeOf(object);
-    if (prototype !== Object.prototype && prototype !== null &&
-      !(Array.isArray(value) && prototype === Array.prototype)) {
+    if (
+      prototype !== Object.prototype &&
+      prototype !== null &&
+      !(Array.isArray(value) && prototype === Array.prototype)
+    ) {
       opaque();
       return;
     }
@@ -500,9 +513,19 @@ function getRuntimeOptionsIdentity(
 }
 
 const MEMBER_IDENTITY_EXCLUSIONS = new Set([
-  'tools', 'toolMap', 'graphTools', 'toolRegistry', 'toolDefinitions',
-  'codeSessionKey', 'toolEnd', 'summarizeOnly', 'discoveredTools',
-  'initialSessions', 'initialSummary', 'subagentConfigs', 'maxSubagentDepth',
+  'tools',
+  'toolMap',
+  'graphTools',
+  'toolRegistry',
+  'toolDefinitions',
+  'codeSessionKey',
+  'toolEnd',
+  'summarizeOnly',
+  'discoveredTools',
+  'initialSessions',
+  'initialSummary',
+  'subagentConfigs',
+  'maxSubagentDepth',
   'langfuse',
 ]);
 
@@ -519,9 +542,11 @@ function getMemberExecutionIdentity(
 }
 
 function hasExecutableMemberTools(agent: AgentInputs): boolean {
-  return (agent.toolMap?.size ?? 0) > 0 ||
+  return (
+    (agent.toolMap?.size ?? 0) > 0 ||
     (agent.graphTools?.length ?? 0) > 0 ||
-    agent.tools?.some(isLangChainTool) === true;
+    agent.tools?.some(isLangChainTool) === true
+  );
 }
 
 /** Declarative graph identity plus the host's revision for executable implementations. */
@@ -537,9 +562,10 @@ function getSubagentDefinitionId(
     result: config.resultAgentId,
     edges: config.edges.map((edge) => ({
       ...edge,
-      prompt: typeof edge.prompt === 'function'
-        ? { revision: config.configId }
-        : edge.prompt,
+      prompt:
+        typeof edge.prompt === 'function'
+          ? { revision: config.configId }
+          : edge.prompt,
     })),
     members: config.agents.map((agent) => ({
       id: agent.agentId,
@@ -571,8 +597,8 @@ function getSubagentDefinitionId(
           convertToOpenAITool(tool),
         ])
       ),
-      tools: agent.tools?.map(
-        (tool) => (isLangChainTool(tool) ? convertToOpenAITool(tool) : tool)
+      tools: agent.tools?.map((tool) =>
+        isLangChainTool(tool) ? convertToOpenAITool(tool) : tool
       ),
       graphTools: agent.graphTools?.map((tool) => convertToOpenAITool(tool)),
     })),
@@ -1148,6 +1174,8 @@ export type SubagentExecutorOptions = {
    * revert to the defaults.
    */
   providerTextProtection?: StandardGraphInput['providerTextProtection'];
+  /** The parent's attachment resolver, so a child resolves the references it inherits. */
+  resolveAttachment?: StandardGraphInput['resolveAttachment'];
   streamLimits?: StandardGraphInput['streamLimits'];
   humanInTheLoop?: HumanInTheLoopConfig;
   /** Shared durable saver used to recover outer tool lifecycle results before
@@ -1226,6 +1254,7 @@ export class SubagentExecutor {
   private readonly langfuse?: StandardGraphInput['langfuse'];
   private readonly tokenCounter?: TokenCounter;
   private readonly providerTextProtection?: StandardGraphInput['providerTextProtection'];
+  private readonly resolveAttachment?: StandardGraphInput['resolveAttachment'];
   private readonly streamLimits?: StandardGraphInput['streamLimits'];
   private readonly humanInTheLoop?: HumanInTheLoopConfig;
   private readonly checkpointer?: BaseCheckpointSaver;
@@ -1267,6 +1296,7 @@ export class SubagentExecutor {
     this.tokenCounter = options.tokenCounter;
     this.streamLimits = options.streamLimits;
     this.providerTextProtection = options.providerTextProtection;
+    this.resolveAttachment = options.resolveAttachment;
     this.humanInTheLoop = options.humanInTheLoop;
     this.checkpointer = isCheckpointSaver(options.checkpointer)
       ? options.checkpointer
@@ -1552,6 +1582,7 @@ export class SubagentExecutor {
       onResolutionFailure: this.onResolutionFailure,
       streamLimits: this.streamLimits,
       providerTextProtection: this.providerTextProtection,
+      resolveAttachment: this.resolveAttachment,
       humanInTheLoop:
         this.humanInTheLoop?.enabled === true ||
         this.humanInTheLoop?.backgroundPausePolicy === 'deny'
@@ -1673,11 +1704,14 @@ export class SubagentExecutor {
       hostArgs?: SubagentHostArgs;
     }
   ): Promise<ResolvedSubagentConfigEntry> {
-    if (isGraphSubagentConfig(config) || config.agentInputs != null) {
-      return Promise.resolve(config as ResolvedSubagentConfigEntry);
+    if (isGraphSubagentConfig(config)) {
+      return Promise.resolve(config);
     }
-    const resolver = config.resolveAgentInputs;
-    const configId = config.configId;
+    const lazy = getExecutionResolver(config, context.hostArgs);
+    if (lazy == null) {
+      return Promise.resolve(config as ResolvedSubagentConfig);
+    }
+    const { resolver, configId } = lazy;
     return execution.resolveConfig(
       (): Promise<ResolvedSubagentConfig> =>
         resolveAgentInputsWithSignal(
@@ -2204,14 +2238,25 @@ export class SubagentExecutor {
         ...(activeRun == null
           ? {}
           : {
-            pendingInterruptIds: [...new Set(activeRun.pendingInterrupts.flatMap(
-              (pending) => pending.id == null ? [] : [pending.id]
-            ))],
-            pendingInterrupts: activeRun.pendingInterrupts.flatMap((pending) =>
-              pending.id == null ? [] : [{
-                interruptId: pending.id,
-                payload: cloneToolApprovalInterruptPayload(getPublicToolInterruptPayload(pending.value)),
-              }]
+            pendingInterruptIds: [
+              ...new Set(
+                activeRun.pendingInterrupts.flatMap((pending) =>
+                  pending.id == null ? [] : [pending.id]
+                )
+              ),
+            ],
+            pendingInterrupts: activeRun.pendingInterrupts.flatMap(
+              (pending) =>
+                pending.id == null
+                  ? []
+                  : [
+                    {
+                      interruptId: pending.id,
+                      payload: cloneToolApprovalInterruptPayload(
+                        getPublicToolInterruptPayload(pending.value)
+                      ),
+                    },
+                  ]
             ),
           }),
         ...(descendant == null ? {} : { descendant }),
@@ -3089,8 +3134,9 @@ export class SubagentExecutor {
         member.initialSessions = sessions.initialSessions;
       }
       for (const member of childPlan.agents) {
-        const activeMember =
-          execution.activeRun?.graph.agentContexts.get(member.agentId);
+        const activeMember = execution.activeRun?.graph.agentContexts.get(
+          member.agentId
+        );
         if (
           activeMember != null &&
           (activeMember.codeSessionKey ?? Constants.EXECUTE_CODE) !==
@@ -3146,6 +3192,7 @@ export class SubagentExecutor {
       tokenCounter: this.tokenCounter,
       streamLimits: this.streamLimits,
       providerTextProtection: this.providerTextProtection,
+      resolveAttachment: this.resolveAttachment,
       subagentScope: true,
       subagentExecutionContext: childExecutionContext,
       subagentContext: this.subagentContext,
@@ -3381,7 +3428,9 @@ export class SubagentExecutor {
             const values = persistedState.values as MultiAgentGraphState;
             result = {
               messages: persistedMessages,
-              ...(childPlan.kind === 'graph' ? { subagentResult: values.subagentResult } : {}),
+              ...(childPlan.kind === 'graph'
+                ? { subagentResult: values.subagentResult }
+                : {}),
             };
             recoveredComplete = true;
             childAlreadyStarted = true;
@@ -4856,6 +4905,29 @@ function truncateErrorMessage(error: unknown): string {
     return message;
   }
   return `${message.slice(0, ERROR_MESSAGE_MAX_CHARS)}...`;
+}
+
+/**
+ * The resolver one call runs through: always a lazy config's, and a `self`
+ * config's only when the call passed host arguments. Every other call keeps
+ * the config's eager or self inputs.
+ */
+function getExecutionResolver(
+  config: ExecutableSubagentConfig,
+  hostArgs: SubagentHostArgs | undefined
+): { resolver: SubagentAgentInputsResolver; configId: string } | undefined {
+  if (config.agentInputs == null) {
+    return { resolver: config.resolveAgentInputs, configId: config.configId };
+  }
+  if (
+    config.self !== true ||
+    hostArgs == null ||
+    config.resolveAgentInputs == null ||
+    config.configId == null
+  ) {
+    return undefined;
+  }
+  return { resolver: config.resolveAgentInputs, configId: config.configId };
 }
 
 function resolveAgentInputsWithSignal(

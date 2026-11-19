@@ -313,14 +313,6 @@ describe('CustomChatGoogleGenerativeAI.streamEvents (sub-stream assertions)', ()
     expect(getTestClient(model).systemInstruction).toBeUndefined();
   });
 
-  // FORK DIVERGENCE (not a bug): upstream's `_streamChatModelEvents` request
-  // builder sets `request.systemInstruction` per call and leaves
-  // `client.systemInstruction` undefined. The fork's overridden legacy
-  // `_streamResponseChunks` (used by `.stream()`) keeps the old
-  // `@google/generative-ai` convention instead: it assigns the system message
-  // to `client.systemInstruction` and omits it from the request. The system
-  // instruction is still applied correctly, just via a different mechanism, so
-  // this case asserts the fork's actual behavior rather than upstream's.
   test('passes system instructions per stream request', async () => {
     const model = newModel();
     const generateContentStream = jest
@@ -338,13 +330,13 @@ describe('CustomChatGoogleGenerativeAI.streamEvents (sub-stream assertions)', ()
 
     const [[request]] = generateContentStream.mock.calls;
     expect(chunks.join('')).toBe('Hello world');
-    expect(request.systemInstruction).toBeUndefined();
-    expect(request.contents).toEqual([
-      { role: 'user', parts: [{ text: 'Hello' }] },
-    ]);
-    expect(getTestClient(model).systemInstruction).toEqual({
+    expect(request.systemInstruction).toEqual({
       role: 'system',
       parts: [{ text: 'Stream system instruction' }],
     });
+    expect(request.contents).toEqual([
+      { role: 'user', parts: [{ text: 'Hello' }] },
+    ]);
+    expect(getTestClient(model).systemInstruction).toBeUndefined();
   });
 });
