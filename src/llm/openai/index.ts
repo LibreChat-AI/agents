@@ -19,7 +19,6 @@ import {
   wrapOpenAIClientError,
   getHeadersWithUserAgent,
   convertMessagesToResponsesInput,
-  convertResponsesDeltaToChatGenerationChunk,
   ChatOpenAI as OriginalChatOpenAI,
   ChatOpenAIResponses as OriginalChatOpenAIResponses,
   ChatOpenAICompletions as OriginalChatOpenAICompletions,
@@ -64,6 +63,7 @@ import {
   getReasoningKwargsText,
 } from '@/llm/stream/chunkAdapters';
 import { registerProviderTextChunkConstructor } from '@/llm/providerTextChunk';
+import { createResponsesToolArgumentConverter } from './responseToolArguments';
 import { isReasoningModel, _convertMessagesToOpenAIParams } from './utils';
 import { smoothStream, resolveStreamDelay } from '@/llm/stream/smoother';
 import { INTENT_ARG, isIntentLabelProperty } from '@/tools/intentArg';
@@ -1203,6 +1203,7 @@ async function* convertLibreChatResponsesStream(
 ): AsyncGenerator<ChatGenerationChunk> {
   const seenReplayPositions = new Set<string>();
   const responsesTextBlockIndices = new Map<string, number>();
+  const convertResponseEvent = createResponsesToolArgumentConverter();
   try {
     for await (const event of stream) {
       options.signal?.throwIfAborted();
@@ -1212,7 +1213,7 @@ async function* convertLibreChatResponsesStream(
       }
       ensureResponsesOutputAnnotations(event);
       const convertedChunk =
-        convertResponsesDeltaToChatGenerationChunk(event) ??
+        convertResponseEvent(event) ??
         convertDroppedResponsesReplayOutput(event);
       if (convertedChunk == null) {
         continue;
