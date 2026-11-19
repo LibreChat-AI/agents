@@ -663,7 +663,9 @@ describe('ChatOpenRouter Responses prompt caching', () => {
       reasoning: { effort: 'high' },
     });
 
-    const configured = bound.withConfig({ stop: ['END'] }) as unknown as ChatOpenRouter;
+    const configured = bound.withConfig({
+      stop: ['END'],
+    }) as unknown as ChatOpenRouter;
     expect(configured).toBeInstanceOf(ChatOpenRouter);
     expect(configured.invocationParams({})).toMatchObject({
       reasoning: { effort: 'high' },
@@ -720,7 +722,9 @@ describe('ChatOpenRouter Responses prompt caching', () => {
     for await (const chunk of stream) {
       result = result == null ? chunk : result.concat(chunk);
     }
-    expect(result?.response_metadata.model_name).toBe('anthropic/claude-haiku-5.5');
+    expect(result?.response_metadata.model_name).toBe(
+      'anthropic/claude-haiku-5.5'
+    );
     expect(result?.response_metadata.finish_reason).toBe('stop');
   });
 });

@@ -2973,24 +2973,18 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
     return 'LibreChatOpenAI';
   }
 
-  override withConfig(
-    config: Partial<t.ChatOpenAICallOptions>
-  ): ReturnType<OriginalChatOpenAI<t.ChatOpenAICallOptions>['withConfig']> {
+  override withConfig(config: Partial<t.ChatOpenAICallOptions>): this {
     const Ctor = this.constructor as new (
       fields?: LibreChatOpenAIFields & t.OpenAIChatInput['modelKwargs']
     ) => this;
-    const newModel = new Ctor(
-      this.fields as LibreChatOpenAIFields & t.OpenAIChatInput['modelKwargs']
-    );
+    const newModel = new Ctor(this.fields);
     newModel.defaultOptions = {
       ...this.defaultOptions,
       ...config,
     };
     newModel._lc_stream_delay = this._lc_stream_delay;
     newModel.firstPartyEndpoint = this.firstPartyEndpoint;
-    return newModel as unknown as ReturnType<
-      OriginalChatOpenAI<t.ChatOpenAICallOptions>['withConfig']
-    >;
+    return newModel;
   }
   _getClientOptions(
     options?: OpenAICoreRequestOptions

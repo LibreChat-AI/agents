@@ -171,17 +171,15 @@ export class ChatOpenRouter extends ChatOpenAI {
     return 'LibreChatOpenRouter';
   }
 
-  override withConfig(
-    config: Partial<ChatOpenRouterCallOptions>
-  ): ReturnType<ChatOpenAI['withConfig']> {
-    const newModel = super.withConfig(config) as unknown as this;
+  override withConfig(config: Partial<ChatOpenRouterCallOptions>): this {
+    const newModel = super.withConfig(config);
     if (this.openRouterReasoning != null) {
       newModel.openRouterReasoning = { ...this.openRouterReasoning };
     }
     if (this.includeReasoning !== undefined) {
       newModel.includeReasoning = this.includeReasoning;
     }
-    return newModel as unknown as ReturnType<ChatOpenAI['withConfig']>;
+    return newModel;
   }
 
   // OpenRouter widens OpenAI reasoning with extra effort levels ('xhigh' | 'none' | 'minimal').
@@ -318,6 +316,8 @@ export class ChatOpenRouter extends ChatOpenAI {
         if (finalReasoningDetails.length > 0) {
           generationChunk.message.additional_kwargs.reasoning_details =
             finalReasoningDetails;
+          reasoningTextByIndex.clear();
+          reasoningEncryptedById.clear();
         } else {
           delete generationChunk.message.additional_kwargs.reasoning_details;
         }
