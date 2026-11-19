@@ -183,4 +183,51 @@ describe('SubagentTool', () => {
       expect(params.schema).toEqual(def.parameters);
     });
   });
+
+  describe('opaque subagent types', () => {
+    const configs: SubagentConfig[] = [
+      { type: 'researcher', name: 'Research Agent', description: 'Searches' },
+      {
+        type: 'agent_bqFVwJV0dwKDSyqMnrIIC',
+        name: 'Exchange',
+        description: 'Mailbox with write access',
+      },
+      {
+        type: 'agent_4LDprR3w5AG934e_vaFU9',
+        name: 'Exchange (read-only)',
+        description: 'Mailbox, read-only',
+      },
+    ];
+
+    it('advertises readable names instead of opaque ids', () => {
+      const params = buildSubagentToolParams(configs);
+      const prop = params.schema.properties!.subagent_type as {
+        enum: string[];
+        description: string;
+      };
+      expect(prop.description).toContain(
+        'Available: researcher, exchange, exchange-read-only.'
+      );
+      expect(prop.description).not.toContain('agent_bqFVwJV0dwKDSyqMnrIIC');
+      expect(params.description).toContain(
+        '- "exchange" (Exchange): Mailbox with write access'
+      );
+      expect(params.description).not.toContain('agent_bqFVwJV0dwKDSyqMnrIIC');
+      expect(params.description).not.toContain('agent_4LDprR3w5AG934e_vaFU9');
+    });
+
+    it('still accepts the configured ids', () => {
+      const params = buildSubagentToolParams(configs);
+      const prop = params.schema.properties!.subagent_type as {
+        enum: string[];
+      };
+      expect(prop.enum).toEqual([
+        'researcher',
+        'exchange',
+        'exchange-read-only',
+        'agent_bqFVwJV0dwKDSyqMnrIIC',
+        'agent_4LDprR3w5AG934e_vaFU9',
+      ]);
+    });
+  });
 });
