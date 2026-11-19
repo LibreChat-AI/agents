@@ -11,6 +11,7 @@ import type { RemoteSdkFactoryInput } from './types';
 import type { RunConfig, RunStep } from '@/index';
 import {
   Run,
+  ToolResultProtectionError,
   Providers,
   GraphEvents,
   FakeChatModel,
@@ -130,6 +131,18 @@ async function connect(url: string, token: string): Promise<WebSocket> {
   });
 }
 describe('remote SDK runtime bridge', () => {
+  it.each([false, true])('rejects tool-result protection before constructing a delegated run (recovery=%s)', async (recovery) => {
+    const createRun = jest.spyOn(Run, 'create');
+    try {
+      await expect(createRemoteSdkRun({
+        config: { ...hostConfig(), toolResultProtection: { version: 1, toolNames: ['lookup'], timeoutMs: 1000, maxAttemptBytes: 65536, maxBufferedBytes: 65536, classify: () => 'prose', inspect: () => { throw new Error('Must not inspect'); } } },
+        identity,
+        remote: { url: 'ws://127.0.0.1:1/sdk', secret, ...(recovery ? { recovery: { maxDisconnectMs: 100, retryDelayMs: 20, maxJournalBytes: 10000 } } : {}) },
+      })).rejects.toBeInstanceOf(ToolResultProtectionError);
+      expect(createRun).not.toHaveBeenCalled();
+    } finally { createRun.mockRestore(); }
+  });
+
   it('requires explicit worker recovery support without starting execution', async () => {
     const createRun = jest.fn(factory);
     const runtime = await fixture(createRun);

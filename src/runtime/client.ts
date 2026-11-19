@@ -27,6 +27,7 @@ import type { RecoveryClaim } from './recovery/server';
 import type { SdkAgentIdentity } from './identity';
 import {
   Run,
+  ToolResultProtectionError,
   executeHooks,
   GraphEvents,
   HOOK_EVENTS,
@@ -58,6 +59,8 @@ export async function createRemoteSdkRun({
   remote: RemoteSdkOptions;
   resumeState?: RemoteSdkResumeState;
 }): ReturnType<typeof Run.create> {
+  if (config.toolResultProtection != null)
+    throw new ToolResultProtectionError('unsupported');
   if (hostServices?.modelProfile && !hostServices.model)
     throw new Error('Builder model profile requires a host model');
   if ((config.clientDelegatedToolNames?.length ?? 0) > 0)
