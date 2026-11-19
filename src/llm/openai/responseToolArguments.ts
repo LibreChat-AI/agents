@@ -59,8 +59,8 @@ function reconcileArguments(
       additional_kwargs:
         missingId != null && snapshot.id != null
           ? {
-              __openai_function_call_ids__: { [missingId]: snapshot.id },
-            }
+            __openai_function_call_ids__: { [missingId]: snapshot.id },
+          }
           : {},
       response_metadata: { model_provider: 'openai' },
     }),

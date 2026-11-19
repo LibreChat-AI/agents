@@ -1,8 +1,8 @@
 import { z } from 'zod';
 import { tool } from '@langchain/core/tools';
 import { describe, expect, it } from '@jest/globals';
+import { AIMessage } from '@langchain/core/messages';
 import { concat } from '@langchain/core/utils/stream';
-import { isAIMessage } from '@langchain/core/messages';
 import type { AIMessageChunk } from '@langchain/core/messages';
 import type { LLMResult } from '@langchain/core/outputs';
 import type { OpenAIClient } from '@langchain/openai';
@@ -134,12 +134,12 @@ function fixture(
   return provider === 'openai'
     ? new ChatOpenAI(fields)
     : new AzureChatOpenAI({
-        ...fields,
-        azureOpenAIApiKey: 'offline-test',
-        azureOpenAIApiInstanceName: 'offline-instance',
-        azureOpenAIApiDeploymentName: 'offline-deployment',
-        azureOpenAIApiVersion: '2025-04-01-preview',
-      });
+      ...fields,
+      azureOpenAIApiKey: 'offline-test',
+      azureOpenAIApiInstanceName: 'offline-instance',
+      azureOpenAIApiDeploymentName: 'offline-deployment',
+      azureOpenAIApiVersion: '2025-04-01-preview',
+    });
 }
 
 async function assemble(
@@ -244,11 +244,11 @@ describe('Responses terminal argument safety', () => {
         callbacks: [
           {
             handleLLMEnd(output: LLMResult): void {
-              const generation = output.generations[0]?.[0];
+              const generation = output.generations.at(0)?.at(0);
               if (
                 generation != null &&
                 'message' in generation &&
-                isAIMessage(generation.message)
+                AIMessage.isInstance(generation.message)
               ) {
                 callbackCalls = generation.message.tool_calls;
               }
