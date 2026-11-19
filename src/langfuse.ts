@@ -25,6 +25,7 @@ import type {
 import type { PropagateAttributesParams } from '@langfuse/tracing';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { Context, SpanContext } from '@opentelemetry/api';
+import type { ToolCall } from '@langchain/core/messages/tool';
 import type { ResolvedLangfuseToolOutputTracingConfig } from '@/langfuseRuntimeContext';
 import type * as t from '@/types';
 import {
@@ -1226,15 +1227,16 @@ export function isLangfuseCallbackHandler(value: unknown): boolean {
   return value instanceof CallbackHandler;
 }
 
-/** Records each host result as a tool observation with the call's arguments,
- * which the tool-dispatch observation also records, and reserved metadata.
+/** Records host results using model-authored arguments, never substituted
+ * tool outputs, and reserved metadata.
  * Host results have passed host output filters, so rows, errors, and
  * attachments are not recorded. These completion observations do not measure
  * tool latency; execution timing belongs in the metadata. */
 export async function traceHostToolResults(
   request: t.ToolExecuteBatchRequest,
   results: t.ToolExecuteResult[],
-  config?: RunnableConfig
+  config?: RunnableConfig,
+  originalToolCalls?: readonly ToolCall[]
 ): Promise<void> {
   if (findCallback(config?.callbacks, isLangfuseCallbackHandler) == null) {
     return;
@@ -1244,6 +1246,9 @@ export async function traceHostToolResults(
     isLangfuseCallbackHandler
   );
   const callsById = new Map(request.toolCalls.map((call) => [call.id, call]));
+  const originalArgsById = new Map(
+    originalToolCalls?.map((call) => [call.id, call.args])
+  );
   for (const result of results) {
     const metadata = getToolObservationMetadata(result.artifact);
     const call = callsById.get(result.toolCallId);
@@ -1269,7 +1274,12 @@ export async function traceHostToolResults(
     );
     try {
       await observation.invoke(
-        { type: 'tool_call', id: call.id, name: call.name, args: call.args },
+        {
+          type: 'tool_call',
+          id: call.id,
+          name: call.name,
+          args: originalArgsById.get(call.id) ?? {},
+        },
         {
           callbacks,
           metadata: { ...metadata, ...request.metadata },

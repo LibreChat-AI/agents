@@ -4600,7 +4600,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             void safeDispatchCustomEvent(
               GraphEvents.ON_TOOL_EXECUTE,
               batchRequest,
-              config
+              config,
+              toolCalls
             )
               .then(() => {
                 dispatchSettled = true;

@@ -24,10 +24,10 @@ import {
   TitleMethod,
 } from '@/common';
 import { LANGFUSE_OBSERVATION_METADATA_ARTIFACT_KEY } from '@/langfuseToolOutputTracing';
+import { createLangfuseHandler, traceHostToolResults } from '@/langfuse';
 import { withLangfuseRuntimeScope } from '@/langfuseRuntimeScope';
 import { initializeLangfuseTracing } from '@/instrumentation';
 import { traceIdFromSeed } from '@/langfuseRuntimeContext';
-import { createLangfuseHandler } from '@/langfuse';
 import * as providers from '@/llm/providers';
 import { HookRegistry } from '@/hooks';
 import { Run } from '@/run';
@@ -809,6 +809,121 @@ describe('Langfuse per-run routing integration', () => {
       }
     }
   );
+
+  it.each([false, true])(
+    'traces original host arguments without substituted tool output (eager=%s)',
+    async (eager) => {
+      const tenantId = `host-input-redaction-${eager}`;
+      const runId = `routing-${tenantId}`;
+      const referenceKey = 'tool0turn99';
+      const privateOutput = 'PRIVATE_TOOL_ROWS_664';
+      const originalArgs = { command: `echo {{${referenceKey}}}` };
+      const hostArgs: t.ToolCallRequest['args'][] = [];
+      const run = await Run.create<t.IState>({
+        runId,
+        graphConfig: {
+          type: 'standard',
+          llmConfig: {
+            provider: Providers.OPENAI,
+            streaming: true,
+            streamUsage: false,
+          },
+          toolDefinitions: [
+            {
+              name: 'consume',
+              description: 'Consumes a previous tool output',
+              parameters: {
+                type: 'object',
+                properties: { command: { type: 'string' } },
+              },
+            },
+          ],
+        },
+        langfuse: {
+          ...tenantLangfuse(tenantId),
+          toolOutputTracing: { enabled: false },
+        },
+        toolOutputReferences: { enabled: true },
+        eagerEventToolExecution: { enabled: eager },
+        returnContent: true,
+        skipCleanup: true,
+        customHandlers: {
+          [GraphEvents.ON_TOOL_EXECUTE]: {
+            handle: async (_event, rawData) => {
+              const data = rawData as t.ToolExecuteBatchRequest;
+              data.resolve(
+                data.toolCalls.map((call) => {
+                  hostArgs.push(call.args);
+                  return {
+                    toolCallId: call.id,
+                    status: 'success' as const,
+                    content: 'Consumed',
+                  };
+                })
+              );
+            },
+          },
+        },
+      });
+      run.Graph?.getOrCreateToolOutputRegistry()?.set(
+        runId,
+        referenceKey,
+        privateOutput
+      );
+      run.Graph?.overrideTestModel(['Consuming', 'Done'], 1, [
+        { id: 'consume-reference', name: 'consume', args: originalArgs },
+      ]);
+      await run.processStream(
+        { messages: [new HumanMessage('Consume the previous output')] },
+        callerConfig
+      );
+
+      expect(hostArgs).toEqual([{ command: `echo ${privateOutput}` }]);
+      const starts = startsForTenant(tenantId).filter(
+        (span) => span.name === 'consume'
+      );
+      expect(starts).toHaveLength(1);
+      const span = endedSpans.find(
+        (entry) => entry.spanContext().spanId === starts[0].spanId
+      );
+      expect(
+        JSON.parse(
+          String(span?.attributes[LangfuseOtelSpanAttributes.OBSERVATION_INPUT])
+        )
+      ).toEqual(originalArgs);
+      expect(JSON.stringify(span?.attributes)).not.toContain(privateOutput);
+    }
+  );
+
+  it('omits host arguments when original calls are unavailable', async () => {
+    const tenantId = 'host-input-unavailable';
+    const langfuse = tenantLangfuse(tenantId);
+    initializeLangfuseTracing(langfuse);
+    const handler = createLangfuseHandler({ langfuse });
+    expect(handler).toBeDefined();
+    await traceHostToolResults(
+      {
+        toolCalls: [
+          { id: 'host-only', name: 'consume', args: { command: 'private rows' } },
+        ],
+        resolve: jest.fn(),
+        reject: jest.fn(),
+      },
+      [{ toolCallId: 'host-only', status: 'success', content: 'Consumed' }],
+      { callbacks: [handler!] }
+    );
+    const starts = startsForTenant(tenantId);
+    expect(starts).toHaveLength(1);
+    const span = endedSpans.find(
+      (entry) => entry.spanContext().spanId === starts[0].spanId
+    );
+    expect(
+      JSON.parse(
+        String(span?.attributes[LangfuseOtelSpanAttributes.OBSERVATION_INPUT])
+      )
+    ).toEqual({});
+    expect(JSON.stringify(span?.attributes)).not.toContain('private rows');
+  });
 
   it('reports agent skills on agent spans and the loaded skill on its tool observation', async () => {
     const tenantId = 'tenant-skills';
