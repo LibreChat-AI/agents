@@ -45,6 +45,10 @@ span) see it once.
   how provider-side file ids keep working. `null` removes it; a message left
   with no content gets the standard omission notice.
 
+- **Cache breakpoints survive.** An Anthropic `cache_control` marker on a
+  reference moves to the block that replaces it, or to the last block that can
+  hold one when the reference is dropped.
+
 The resolver reaches every graph of a run: handoff and child agents, and the
 summarization request. Remote runs (`createRemoteSdkRun`) do not carry it and
 refuse a config that sets one.

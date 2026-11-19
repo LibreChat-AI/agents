@@ -2464,7 +2464,10 @@ async function summarizeWithCacheHit({
   config?: RunnableConfig;
   stepId?: string;
   provider: t.ProviderName;
-  graph?: StreamLimitState & { getBreakerSignal?: () => AbortSignal };
+  graph?: StreamLimitState & {
+    resolveAttachment?: t.AttachmentResolver;
+    getBreakerSignal?: () => AbortSignal;
+  };
   deltas?: SummaryDeltaStream;
   usePromptCache?: boolean;
   promptCacheTtl?: PromptCacheTtl;
@@ -2544,11 +2547,17 @@ async function summarizeWithCacheHit({
     /** Each pass is a new attempt: what an earlier one streamed is not its output. */
     deltas?.abandon();
     try {
+      /** Prepared here because this attempt passes no invocation context, which is where the attachment resolver would otherwise come from. */
+      const request = prepareProviderRequest({
+        model,
+        messages: [...cachedHistory, new HumanMessage(instruction)],
+        provider,
+        context: graph,
+        config: signalConfig,
+      });
       result = await attemptInvoke(
         {
-          model,
-          messages: [...cachedHistory, new HumanMessage(instruction)],
-          provider,
+          request,
           onModelComplete: (response) => {
             const usage = readSummarizationUsage(response);
             if (usage != null) onUsage(usage);

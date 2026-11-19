@@ -20,16 +20,19 @@ import {
   projectToolStreamContentForProvider,
 } from '@/messages/core';
 import {
+  stripAnthropicCacheControl,
+  stripBedrockCacheControl,
+  isTailCacheableBlock,
+  withCacheControl,
+  getCacheControl,
+  cloneMessage,
+} from '@/messages/cache';
+import {
   coalesceAdjacentUserTurns,
   appendPredecessorHandoffCue,
   appendInstructionlessHandoffCue,
   removePredecessorHandoffCue,
 } from '@/messages';
-import {
-  stripAnthropicCacheControl,
-  stripBedrockCacheControl,
-  cloneMessage,
-} from '@/messages/cache';
 import { createToolHistoryPreparation } from '@/messages/toolHistoryProjection';
 import { isAnthropicLike, isGoogleLike, isOpenAILike } from '@/utils/llm';
 import { annotateMessagesForLLM } from '@/tools/toolOutputReferences';
@@ -351,6 +354,19 @@ function copyUsableContentPrefix(
   return content;
 }
 
+/** Puts the breakpoint a dropped reference carried on the last block that can hold one. */
+function anchorCacheControl(
+  content: MessageContentComplex[],
+  marker: NonNullable<ReturnType<typeof getCacheControl>>
+): void {
+  for (let index = content.length - 1; index >= 0; index--) {
+    if (isTailCacheableBlock(content[index])) {
+      content[index] = withCacheControl(content[index], marker);
+      return;
+    }
+  }
+}
+
 /**
  * Resolves referenced attachments and reprojects persisted provider-native
  * ones, in one pass and without changing history.
@@ -373,14 +389,20 @@ function projectAttachmentsForProvider(
     }
     const sourceContent = message.content as ProviderContentBlock[];
     let content: ProviderContentBlock[] | undefined;
+    let displaced: ReturnType<typeof getCacheControl>;
     for (let blockIndex = 0; blockIndex < sourceContent.length; blockIndex++) {
       const block = sourceContent[blockIndex];
       const resolved =
         resolve != null && isIDContentBlock(block) ? resolve(block) : undefined;
       if (resolved !== undefined) {
         content ??= copyUsableContentPrefix(sourceContent, blockIndex);
-        if (resolved !== null) {
-          content.push(resolved);
+        const marker = getCacheControl(block);
+        if (resolved === null) {
+          displaced = marker ?? displaced;
+        } else {
+          content.push(
+            marker == null ? resolved : withCacheControl(resolved, marker)
+          );
         }
         continue;
       }
@@ -420,6 +442,9 @@ function projectAttachmentsForProvider(
     }
     if (content.length === 0) {
       content.push({ type: 'text', text: OMITTED_ATTACHMENT_TEXT });
+    }
+    if (displaced != null) {
+      anchorCacheControl(content as MessageContentComplex[], displaced);
     }
     projected ??= [...messages];
     projected[messageIndex] = cloneMessage(

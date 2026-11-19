@@ -550,6 +550,52 @@ describe('prepareProviderRequest', () => {
       ]);
     });
 
+    it('keeps the prompt cache breakpoint a reference was carrying', () => {
+      const { model } = createCapturingModel();
+      const marker = { type: 'ephemeral' as const };
+      const marked = { ...reference, cache_control: marker };
+      const anthropicDocument = {
+        type: 'document',
+        source: {
+          type: 'base64',
+          media_type: 'application/pdf',
+          data: 'JVBERg==',
+        },
+      };
+      const prepare = (
+        content: Array<typeof text | typeof marked>,
+        resolveAttachment: t.AttachmentResolver
+      ): BaseMessage['content'] =>
+        prepareProviderRequest({
+          model: model as t.ChatModel,
+          messages: [new HumanMessage({ content })],
+          provider: Providers.ANTHROPIC,
+          context: { resolveAttachment },
+        }).messages[0].content;
+      const own = { type: 'ephemeral' as const, ttl: '1h' as const };
+
+      expect(prepare([text, marked], () => anthropicDocument)).toEqual([
+        text,
+        { ...anthropicDocument, cache_control: marker },
+      ]);
+      expect(
+        prepare([text, marked], () => ({
+          ...anthropicDocument,
+          cache_control: own,
+        }))
+      ).toEqual([text, { ...anthropicDocument, cache_control: own }]);
+      expect(prepare([text, marked], () => null)).toEqual([
+        { ...text, cache_control: marker },
+      ]);
+      expect(prepare([marked], () => null)).toEqual([
+        {
+          type: 'text',
+          text: '[Attachment omitted because its binary format is unsupported by this provider.]',
+          cache_control: marker,
+        },
+      ]);
+    });
+
     it('still reprojects a provider-native document beside a resolved reference', () => {
       const { model } = createCapturingModel();
       const resolved = {
