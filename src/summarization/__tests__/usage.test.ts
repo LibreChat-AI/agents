@@ -37,6 +37,46 @@ describe('readSummarizationUsage', () => {
     expect(JSON.stringify(result)).not.toContain(PRIVATE_CONTENT);
   });
 
+  it('preserves Responses TTL subsets in normalized usage and attempt ledgers', () => {
+    const inputDetails = {
+      cache_read: 20,
+      cache_creation: 60,
+      cache_creation_30m: 15,
+      cache_creation_12h: 45,
+    };
+    const usage: UsageMetadata = {
+      input_tokens: 100,
+      output_tokens: 10,
+      total_tokens: 110,
+      input_token_details: inputDetails,
+    };
+    const response = new AIMessage({
+      content: PRIVATE_CONTENT,
+      usage_metadata: usage,
+      response_metadata: { private: PRIVATE_CONTENT },
+    });
+    const normalized = readSummarizationUsage(response);
+    expect(normalized).toEqual(usage);
+    const attempts: SummarizationAttemptUsage[] = [
+      { provider: 'openAI', usage: normalized! },
+      {
+        provider: 'openAI',
+        usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+      },
+    ];
+    const result = buildSummarizationStepUsage(attempts);
+    expect(result).toEqual({
+      prompt_tokens: 100,
+      completion_tokens: 10,
+      total_tokens: 110,
+      attemptUsage: attempts,
+    });
+    expect(result?.attemptUsage?.[0].usage.input_token_details).not.toBe(
+      inputDetails
+    );
+    expect(JSON.stringify(result)).not.toContain(PRIVATE_CONTENT);
+  });
+
   it('reads Bedrock fallback counts and cache details without leaking raw fields', () => {
     const response = new AIMessage({
       content: PRIVATE_CONTENT,

@@ -2,8 +2,13 @@ import { z } from 'zod';
 import { tool } from '@langchain/core/tools';
 import { LangfuseOtelSpanAttributes } from '@langfuse/tracing';
 import { CallbackManager } from '@langchain/core/callbacks/manager';
-import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import { context as otelContext, trace as otelTrace } from '@opentelemetry/api';
+import {
+  AIMessage,
+  HumanMessage,
+  ToolMessage,
+  AIMessageChunk,
+} from '@langchain/core/messages';
 import {
   Command,
   END,
@@ -1524,6 +1529,128 @@ describe('Langfuse callback composition', () => {
       })
     );
   });
+
+  it.each([
+    {
+      masked: false,
+      chunk: false,
+      writes: 60,
+      halfHour: 15,
+      twelveHour: 45,
+      input: 20,
+    },
+    {
+      masked: false,
+      chunk: true,
+      writes: 60,
+      halfHour: 15,
+      twelveHour: 45,
+      input: 20,
+    },
+    {
+      masked: false,
+      chunk: false,
+      writes: 60,
+      halfHour: undefined,
+      twelveHour: 45,
+      input: 20,
+    },
+    {
+      masked: false,
+      chunk: true,
+      writes: 0,
+      halfHour: 0,
+      twelveHour: 0,
+      input: 80,
+    },
+    {
+      masked: false,
+      chunk: false,
+      writes: undefined,
+      halfHour: 15,
+      twelveHour: 45,
+      input: 20,
+    },
+    {
+      masked: true,
+      chunk: true,
+      writes: 60,
+      halfHour: 15,
+      twelveHour: 45,
+      input: 20,
+    },
+  ])(
+    'exports disjoint cache usage without changing public TTL details: %j',
+    async ({ masked, chunk, writes, halfHour, twelveHour, input }) => {
+      const { createLangfuseHandler, maskRedactedLabelGeneration } =
+        await import('@/langfuse');
+      const { initializeLangfuseTracing } = await import('@/instrumentation');
+      const langfuse = { publicKey: 'pk-test', secretKey: 'sk-test' };
+      initializeLangfuseTracing(langfuse);
+      const handler = createLangfuseHandler({ langfuse });
+      if (masked) {
+        maskRedactedLabelGeneration(handler, {
+          modelPrompt: 'hello',
+          tracedPrompt: 'masked input',
+          redaction: {
+            enabled: true,
+            redactedToolNames: new Set(),
+            redactedToolNameMatchMode: 'exact',
+            redactionText: 'masked output',
+          },
+        });
+      }
+      const runId = 'test-langfuse-cache-ttl-usage';
+      await handler?.handleChatModelStart(
+        { lc: 1, type: 'constructor', id: ['ChatOpenAI'], kwargs: {} },
+        [[new HumanMessage('hello')]],
+        runId
+      );
+      const usage = {
+        input_tokens: 100,
+        output_tokens: 10,
+        total_tokens: 110,
+        input_token_details: {
+          cache_read: 20,
+          ...(writes != null && { cache_creation: writes }),
+          ...(halfHour != null && { cache_creation_30m: halfHour }),
+          cache_creation_12h: twelveHour,
+        },
+      };
+      const Message = chunk ? AIMessageChunk : AIMessage;
+      const message = new Message({ content: 'hello', usage_metadata: usage });
+      const generation = { text: 'hello', message };
+      const output = { generations: [[generation]] };
+      await handler?.handleLLMEnd(output, runId);
+      const usageDetails = mockSpanAttributeSets
+        .map(
+          (attributes) =>
+            attributes[LangfuseOtelSpanAttributes.OBSERVATION_USAGE_DETAILS]
+        )
+        .find((value): value is string => typeof value === 'string');
+      expect(JSON.parse(usageDetails!)).toEqual({
+        input,
+        output: 10,
+        total: 110,
+        input_cache_read: 20,
+        ...(writes != null
+          ? { input_cache_creation: writes }
+          : {
+            input_cache_creation_30m: halfHour,
+            input_cache_creation_12h: twelveHour,
+          }),
+      });
+      expect(output.generations[0][0]).toBe(generation);
+      expect(message.content).toBe('hello');
+      expect(message.usage_metadata).toBe(usage);
+      expect(message.usage_metadata?.input_token_details).toEqual({
+        cache_read: 20,
+        ...(writes != null && { cache_creation: writes }),
+        ...(halfHour != null && { cache_creation_30m: halfHour }),
+        cache_creation_12h: twelveHour,
+      });
+    }
+  );
 
   it('uses deterministic trace ids when tracing is configured from env only', async () => {
     process.env.LANGFUSE_PUBLIC_KEY = 'pk-env';

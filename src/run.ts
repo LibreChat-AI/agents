@@ -83,6 +83,7 @@ import {
   hasToolOutputTracingConfig,
   resolveLangfuseConfig,
   resolveToolOutputTracingConfig,
+  withoutSkillsAvailable,
 } from '@/langfuseConfig';
 import {
   cloneToolApprovalInterruptPayload,
@@ -404,7 +405,13 @@ async function resolveCompletedSegmentConfig(
 
 function getFirstPersistedInterrupt(
   snapshot: InterruptStateSnapshot
-): { id: string; value: unknown; pending: Array<{ id: string; value: unknown }> } | undefined {
+):
+  | {
+      id: string;
+      value: unknown;
+      pending: Array<{ id: string; value: unknown }>;
+    }
+  | undefined {
   const pending: Array<{ id: string; value: unknown }> = [];
   const nestedStates: InterruptStateSnapshot[] = [];
   const next = snapshot.next == null ? undefined : new Set(snapshot.next);
@@ -416,7 +423,11 @@ function getFirstPersistedInterrupt(
       }
     }
     const nestedState = task.state;
-    if (nestedState != null && 'tasks' in nestedState && Array.isArray(nestedState.tasks)) {
+    if (
+      nestedState != null &&
+      'tasks' in nestedState &&
+      Array.isArray(nestedState.tasks)
+    ) {
       nestedStates.push(nestedState);
     }
   }
@@ -424,7 +435,9 @@ function getFirstPersistedInterrupt(
     const nested = getFirstPersistedInterrupt(nestedState);
     if (nested != null) pending.push(...nested.pending);
   }
-  const unique = [...new Map(pending.map((entry) => [entry.id, entry])).values()];
+  const unique = [
+    ...new Map(pending.map((entry) => [entry.id, entry])).values(),
+  ];
   return unique.length === 0 ? undefined : { ...unique[0], pending: unique };
 }
 
@@ -509,6 +522,7 @@ export class Run<_T extends t.BaseGraphState> {
   private readonly protectedApprovals = new Map<string, t.ToolApprovalInterruptPayload | undefined>();
   private readonly preparedToolResumes = new WeakSet<Command>();
   private providerTextProtection?: t.StandardGraphInput['providerTextProtection'];
+  private resolveAttachment?: t.StandardGraphInput['resolveAttachment'];
   private streamLimits?: t.StreamLimits;
   private subagentTasks?: t.SubagentTaskConfig;
   private subagentContext?: t.SubagentContextAdapter;
@@ -589,7 +603,9 @@ export class Run<_T extends t.BaseGraphState> {
       (config.clientDelegatedToolNames?.length ?? 0) > 0 &&
       handlerRegistry.getHandler(GraphEvents.ON_MODEL_RESPONSE) == null
     ) {
-      throw new Error('Client tool delegation requires an accepted-result handler');
+      throw new Error(
+        'Client tool delegation requires an accepted-result handler'
+      );
     }
     this.handlerRegistry = handlerRegistry;
     this.hookRegistry = config.hooks;
@@ -612,6 +628,7 @@ export class Run<_T extends t.BaseGraphState> {
     this.streamLimits = config.streamLimits;
     this.providerTextProtection = config.providerTextProtection;
     this.toolResultProtection = config.toolResultProtection;
+    this.resolveAttachment = config.resolveAttachment;
 
     if (!config.graphConfig) {
       throw new Error('Graph config not provided');
@@ -626,7 +643,10 @@ export class Run<_T extends t.BaseGraphState> {
 
     /** Handle different graph types */
     if (config.graphConfig.type === 'multi-agent') {
-      if (this.clientDelegatedToolNames != null && this.clientDelegatedToolNames.length > 0) {
+      if (
+        this.clientDelegatedToolNames != null &&
+        this.clientDelegatedToolNames.length > 0
+      ) {
         throw new Error('Client tool delegation requires a single-agent graph');
       }
       this.graphRunnable = this.createMultiAgentGraph(config.graphConfig);
@@ -721,6 +741,7 @@ export class Run<_T extends t.BaseGraphState> {
         streamLimits: this.streamLimits,
         providerTextProtection: this.providerTextProtection,
         toolResultProtection: this.toolResultProtection,
+        resolveAttachment: this.resolveAttachment,
         toolExecution: this.toolExecution,
         clientDelegatedToolNames: this.clientDelegatedToolNames,
       },
@@ -770,6 +791,7 @@ export class Run<_T extends t.BaseGraphState> {
         streamLimits: this.streamLimits,
         providerTextProtection: this.providerTextProtection,
         toolResultProtection: this.toolResultProtection,
+        resolveAttachment: this.resolveAttachment,
         toolExecution: this.toolExecution,
       },
     });
@@ -1125,7 +1147,8 @@ export class Run<_T extends t.BaseGraphState> {
       if (
         eventName === GraphEvents.ON_MODEL_RESPONSE ||
         eventName === GraphEvents.ON_MODEL_TOOLS_CLAIMED
-      ) return;
+      )
+        return;
       const handler = this.handlerRegistry?.getHandler(eventName);
       /**
        * Tool completions arriving over the custom-event channel are the only
@@ -1638,18 +1661,20 @@ export class Run<_T extends t.BaseGraphState> {
             continue;
           }
 
-          if (
-            data.chunk != null &&
-            isInterrupted<unknown>(data.chunk)
-          ) {
+          if (data.chunk != null && isInterrupted<unknown>(data.chunk)) {
             const interrupts = data.chunk[INTERRUPT];
             if (interrupts.length > 0) {
               const pending = new Map(
-                (this._interrupt?.pendingInterrupts ?? []).map((entry) => [entry.interruptId, entry])
+                (this._interrupt?.pendingInterrupts ?? []).map((entry) => [
+                  entry.interruptId,
+                  entry,
+                ])
               );
-              for (const entry of interrupts) pending.set(entry.id ?? '', {
-                interruptId: entry.id ?? '', payload: entry.value,
-              });
+              for (const entry of interrupts)
+                pending.set(entry.id ?? '', {
+                  interruptId: entry.id ?? '',
+                  payload: entry.value,
+                });
               const first = this._interrupt ?? {
                 interruptId: interrupts[0].id ?? '',
                 payload: cloneToolApprovalInterruptPayload(interrupts[0].value),
@@ -1667,7 +1692,8 @@ export class Run<_T extends t.BaseGraphState> {
           if (
             eventName === GraphEvents.ON_MODEL_RESPONSE ||
             eventName === GraphEvents.ON_MODEL_TOOLS_CLAIMED
-          ) continue;
+          )
+            continue;
           const handler = this.handlerRegistry?.getHandler(eventName);
           if (handler) {
             await handler.handle(eventName, data, metadata, this.Graph);
@@ -2014,10 +2040,12 @@ export class Run<_T extends t.BaseGraphState> {
     pending: NonNullable<t.RunInterruptResult<unknown>['pendingInterrupts']>;
     ids: Set<string>;
     } {
-    const roots = this._interrupt?.pendingInterrupts ??
+    const roots =
+      this._interrupt?.pendingInterrupts ??
       (this._interrupt == null ? [] : [this._interrupt]);
     const pending = new Map<
-      string, Pick<t.RunInterruptResult<unknown>, 'interruptId' | 'payload'>
+      string,
+      Pick<t.RunInterruptResult<unknown>, 'interruptId' | 'payload'>
     >();
     const ids = new Set<string>();
     const executions: SubagentResumeManifest['executions'] = [];
@@ -2077,7 +2105,9 @@ export class Run<_T extends t.BaseGraphState> {
       ),
       pendingInterrupts: pending.map((pending) => ({
         interruptId: pending.interruptId,
-        payload: cloneToolApprovalInterruptPayload(getPublicToolInterruptPayload(pending.payload)),
+        payload: cloneToolApprovalInterruptPayload(
+          getPublicToolInterruptPayload(pending.payload)
+        ),
       })),
     } as t.RunInterruptResult<TPayload>;
   }
@@ -2214,14 +2244,20 @@ export class Run<_T extends t.BaseGraphState> {
       );
       return;
     }
-    const addressed = new Set(pending.flatMap((entry) =>
-      resumeValue != null && typeof resumeValue === 'object' &&
+    const addressed = new Set(
+      pending.flatMap((entry) =>
+        resumeValue != null &&
+        typeof resumeValue === 'object' &&
         Object.prototype.hasOwnProperty.call(resumeValue, entry.interruptId)
-        ? [entry.interruptId] : []
-    ));
-    if (addressed.size === 0 && interrupt != null) addressed.add(interrupt.interruptId);
+          ? [entry.interruptId]
+          : []
+      )
+    );
+    if (addressed.size === 0 && interrupt != null)
+      addressed.add(interrupt.interruptId);
     const scope = getToolBatchReplayScope({ configurable }) ?? '';
-    const thread = typeof configurable.thread_id === 'string' ? configurable.thread_id : '';
+    const thread =
+      typeof configurable.thread_id === 'string' ? configurable.thread_id : '';
     restoreToolReplayConfigs(
       configurable,
       pending.map((entry) => ({ id: entry.interruptId, value: entry.payload })),
@@ -2290,7 +2326,8 @@ export class Run<_T extends t.BaseGraphState> {
         .map((entry) => getInterruptHookSessionId(entry.payload))
         .filter((id): id is string => id != null)
     );
-    for (const hookSessionId of hookSessions) this.hookRegistry?.copySession(hookSessionId, this.id);
+    for (const hookSessionId of hookSessions)
+      this.hookRegistry?.copySession(hookSessionId, this.id);
     const interruptId = interrupt?.interruptId;
     const workflow = this.graphRunnable as
       | (t.CompiledStateWorkflow & WorkflowWithStateHistory)
@@ -2480,7 +2517,10 @@ export class Run<_T extends t.BaseGraphState> {
     this._interrupt = {
       interruptId: persistedInterrupt.id,
       payload: cloneToolApprovalInterruptPayload(persistedInterrupt.value),
-      pendingInterrupts: persistedInterrupt.pending.map((entry) => ({ interruptId: entry.id, payload: entry.value })),
+      pendingInterrupts: persistedInterrupt.pending.map((entry) => ({
+        interruptId: entry.id,
+        payload: entry.value,
+      })),
       ...(typeof threadId === 'string' ? { threadId } : {}),
       ...(typeof checkpointId === 'string' ? { checkpointId } : {}),
       ...(typeof checkpointNs === 'string' ? { checkpointNs } : {}),
@@ -2535,9 +2575,11 @@ export class Run<_T extends t.BaseGraphState> {
       this.Graph == null
         ? undefined
         : this.Graph.agentContexts.get(this.Graph.defaultAgentId);
+    const titleRunLangfuse = withoutSkillsAvailable(this.langfuse);
+    const titleLangfuseOverlay = withoutSkillsAvailable(titleContext?.langfuse);
     const titleLangfuseConfig = resolveLangfuseConfig(
-      this.langfuse,
-      titleContext?.langfuse
+      titleRunLangfuse,
+      titleLangfuseOverlay
     );
     const traceMetadata = createLangfuseTraceMetadata({
       messageId: 'title-' + this.id,
@@ -2556,8 +2598,8 @@ export class Run<_T extends t.BaseGraphState> {
      *  parent seed is live; otherwise unseeded, matching the other paths. */
     const inheritedTraceSeed = getTraceIdSeed();
     const titleRuntimeScope = resolveLangfuseRuntimeScope({
-      runLangfuse: this.langfuse,
-      langfuseOverlay: titleContext?.langfuse,
+      runLangfuse: titleRunLangfuse,
+      langfuseOverlay: titleLangfuseOverlay,
       traceIdSeed:
         titleLangfuseConfig?.deterministicTraceId === true ||
         inheritedTraceSeed != null
@@ -2805,9 +2847,11 @@ export class Run<_T extends t.BaseGraphState> {
     };
     const labelRunName = labelChainOptions.runName ?? ACTIVITY_LABEL_TRACE_NAME;
     const labelTags = ['librechat', 'activity-label'];
+    const labelRunLangfuse = withoutSkillsAvailable(this.langfuse);
+    const labelLangfuseOverlay = withoutSkillsAvailable(labelContext?.langfuse);
     const labelLangfuseConfig = resolveLangfuseConfig(
-      this.langfuse,
-      labelContext?.langfuse
+      labelRunLangfuse,
+      labelLangfuseOverlay
     );
     initializeLangfuseTracing(labelLangfuseConfig);
     /** A captured source observation parents the label in the agent trace.
@@ -2822,8 +2866,8 @@ export class Run<_T extends t.BaseGraphState> {
     /** Opaque per-execution component: see `titleScopeRunId`. */
     const labelScopeRunId = `activity-label:${this.id}:${labelSeq}:${nanoid()}`;
     const labelRuntimeScope = resolveLangfuseRuntimeScope({
-      runLangfuse: this.langfuse,
-      langfuseOverlay: labelContext?.langfuse,
+      runLangfuse: labelRunLangfuse,
+      langfuseOverlay: labelLangfuseOverlay,
       traceIdSeed: labelTraceSeed,
       runId: labelScopeRunId,
     });
@@ -3155,9 +3199,11 @@ export class Run<_T extends t.BaseGraphState> {
     const reasoningRunName =
       reasoningChainOptions.runName ?? REASONING_LABEL_TRACE_NAME;
     const reasoningTags = ['librechat', 'reasoning-label', 'reasoning-step'];
+    const reasoningRunLangfuse = withoutSkillsAvailable(this.langfuse);
+    const reasoningLangfuseOverlay = withoutSkillsAvailable(reasoningContext?.langfuse);
     const reasoningLangfuseConfig = resolveLangfuseConfig(
-      this.langfuse,
-      reasoningContext?.langfuse
+      reasoningRunLangfuse,
+      reasoningLangfuseOverlay
     );
     initializeLangfuseTracing(reasoningLangfuseConfig);
 
@@ -3174,8 +3220,8 @@ export class Run<_T extends t.BaseGraphState> {
         : undefined;
     const reasoningScopeRunId = `reasoning-label:${this.id}:${reasoningSeq}:${nanoid()}`;
     const reasoningRuntimeScope = resolveLangfuseRuntimeScope({
-      runLangfuse: this.langfuse,
-      langfuseOverlay: reasoningContext?.langfuse,
+      runLangfuse: reasoningRunLangfuse,
+      langfuseOverlay: reasoningLangfuseOverlay,
       traceIdSeed: reasoningTraceSeed,
       runId: reasoningScopeRunId,
     });
@@ -3389,9 +3435,11 @@ export class Run<_T extends t.BaseGraphState> {
       this.Graph == null
         ? undefined
         : this.Graph.agentContexts.get(this.Graph.defaultAgentId);
+    const phaseRunLangfuse = withoutSkillsAvailable(this.langfuse);
+    const phaseLangfuseOverlay = withoutSkillsAvailable(phaseContext?.langfuse);
     const phaseLangfuseConfig = resolveLangfuseConfig(
-      this.langfuse,
-      phaseContext?.langfuse
+      phaseRunLangfuse,
+      phaseLangfuseOverlay
     );
 
     let redaction = hasToolOutputTracingConfig(
@@ -3520,8 +3568,8 @@ export class Run<_T extends t.BaseGraphState> {
         : undefined;
     const phaseScopeRunId = `activity-phase:${this.id}:${phaseSeq}:${nanoid()}`;
     const phaseRuntimeScope = resolveLangfuseRuntimeScope({
-      runLangfuse: this.langfuse,
-      langfuseOverlay: phaseContext?.langfuse,
+      runLangfuse: phaseRunLangfuse,
+      langfuseOverlay: phaseLangfuseOverlay,
       traceIdSeed: phaseTraceSeed,
       runId: phaseScopeRunId,
     });

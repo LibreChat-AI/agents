@@ -56,7 +56,10 @@ import {
   calculateMaxToolResultChars,
   truncateToolResultContent,
 } from '@/utils/truncation';
-import { createToolCallsDispatchedEvent, safeDispatchCustomEvent } from '@/utils/events';
+import {
+  createToolCallsDispatchedEvent,
+  safeDispatchCustomEvent,
+} from '@/utils/events';
 import { resolveToolOutcome, outcomeFieldsFromResult } from '@/tools/intentArg';
 import { snapshotValidatedModelChunk } from '@/graphs/acceptedModelResponse';
 import { ProviderTextProtectionError } from '@/protection/providerText';
@@ -172,6 +175,12 @@ function hasToolOutputReference(value: unknown): boolean {
     );
   }
   return false;
+}
+
+function hasAnthropicServerToolId(toolCall: ToolCall): boolean {
+  return (
+    toolCall.id?.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX) ?? false
+  );
 }
 
 function isEagerExecutionExcludedTool(
@@ -726,9 +735,12 @@ function createEagerToolExecutionPlan(args: {
   // Drop host-excluded tools only AFTER the batch-level guards above have run
   // against the full batch, so excluding a call never hides a sibling direct
   // tool from `hasDirectToolCallInBatch`. Excluded calls fall through to normal
-  // ToolNode execution; siblings may still eager-execute.
+  // ToolNode execution; siblings may still eager-execute. Provider-executed
+  // server tool calls (`srvtoolu_`, e.g. Anthropic web_search) already ran on
+  // the provider side, so they are never dispatched to the host.
   const candidateToolCalls = unstartedToolCalls.filter(
     (toolCall) =>
+      !hasAnthropicServerToolId(toolCall) &&
       !isEagerExecutionExcludedTool(toolCall.name, graph, agentContext)
   );
   if (candidateToolCalls.length === 0) {
@@ -896,7 +908,8 @@ function startEagerToolExecutions(args: {
     void safeDispatchCustomEvent(
       GraphEvents.ON_TOOL_EXECUTE,
       batchRequest,
-      graph.config
+      graph.config,
+      toolCalls
     )
       .then(() => {
         dispatchSettled = true;
@@ -1401,7 +1414,8 @@ function startPreparedSubagents(
   if ((graph.clientDelegatedToolNames?.size ?? 0) > 0) return;
   // A parsed string call is not executable even if the same event carries
   // sealed raw fragments. Wait for a separately validated complete call.
-  if (chunk.tool_calls?.some((call) => typeof call.args === 'string') === true) return;
+  if (chunk.tool_calls?.some((call) => typeof call.args === 'string') === true)
+    return;
   if (
     (graph as Partial<StandardGraph>).canPrestartSubagents?.(agentContext) !==
       true ||
@@ -1723,7 +1737,11 @@ export class ChatModelStreamHandler implements t.EventHandler {
       graph.breakerAbort instanceof AbortController
         ? graph.breakerAbort
         : undefined;
-    const entrySignals = [eventBreaker?.signal, graph.signal, graph.config.signal];
+    const entrySignals = [
+      eventBreaker?.signal,
+      graph.signal,
+      graph.config.signal,
+    ];
     /** Immutable scope captured at handler entry. A reset while this
      * handler is suspended in an await replaces the object, so ONE
      * reference comparison proves the event still belongs to the live run
@@ -1733,10 +1751,12 @@ export class ChatModelStreamHandler implements t.EventHandler {
       entryRunScope != null && graph.runScope !== entryRunScope;
     const throwIfRunBreakerTripped = (): void => {
       for (const signal of entrySignals) {
-        if (signal?.aborted === true &&
-            (signal.reason instanceof StreamLimitExceededError ||
-              signal.reason instanceof PreparedSubagentError ||
-              signal.reason instanceof ProviderTextProtectionError)) {
+        if (
+          signal?.aborted === true &&
+          (signal.reason instanceof StreamLimitExceededError ||
+            signal.reason instanceof PreparedSubagentError ||
+            signal.reason instanceof ProviderTextProtectionError)
+        ) {
           throw signal.reason;
         }
         if (signal?.aborted === true && graph.providerTextProtection != null) {
@@ -1959,7 +1979,8 @@ export class ChatModelStreamHandler implements t.EventHandler {
           chunk.response_metadata as Record<string, unknown> | undefined
         );
       const canStreamEager =
-        chunk.tool_calls?.some((call) => typeof call.args === 'string') !== true &&
+        chunk.tool_calls?.some((call) => typeof call.args === 'string') !==
+          true &&
         (allowSequentialSeal || hasExplicitStreamedToolCallSeals(chunk)) &&
         !hasPotentialDirectToolInStreamContext({ graph, agentContext }) &&
         isEagerToolExecutionEnabledForBatch({ graph, metadata, agentContext });
@@ -2705,6 +2726,9 @@ export function createContentAggregator(): t.ContentAggregatorResult {
       if (!runStep) {
         console.warn('No run step found for summarize delta event');
         return;
+      }
+      if (deltaData.reset === true) {
+        contentParts[runStep.index] = { type: ContentTypes.SUMMARY };
       }
       updateContent(runStep.index, deltaData.delta.summary);
       return;

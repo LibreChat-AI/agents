@@ -33,13 +33,15 @@ export type LegacyGraphConfig = BaseGraphConfig & {
     /** `streamLimits` is excluded because legacy graphs receive limits only
      * via the top-level `RunConfig.streamLimits`; accepting the field here
      * would type-check but be silently ignored by `createLegacyGraph`.
-     * Required provider-text protection also belongs only to RunConfig. */
+     * Required provider-text protection also belongs only to RunConfig, as
+     * does the attachment resolver. */
     | 'provider'
     | 'clientOptions'
     | 'agents'
     | 'streamLimits'
     | 'providerTextProtection'
     | 'toolResultProtection'
+    | 'resolveAttachment'
   > &
   Omit<g.AgentInputs, 'provider' | 'clientOptions' | 'agentId'>;
 
@@ -343,6 +345,8 @@ export type RunConfig = {
    */
   toolResultProtection?: g.StandardGraphInput['toolResultProtection'];
   providerTextProtection?: g.StandardGraphInput['providerTextProtection'];
+  /** Resolves attachments that messages carry by reference, for every graph of the run. */
+  resolveAttachment?: g.StandardGraphInput['resolveAttachment'];
   streamLimits?: StreamLimits;
   returnContent?: boolean;
   tokenCounter?: TokenCounter;

@@ -2,6 +2,7 @@
 // src/utils/events.ts
 import { dispatchCustomEvent } from '@langchain/core/callbacks/dispatch';
 import type { RunnableConfig } from '@langchain/core/runnables';
+import type { ToolCall } from '@langchain/core/messages/tool';
 import type { ToolCallsDispatchedEvent } from '@/types/stream';
 import type { ToolExecuteBatchRequest } from '@/types/tools';
 import type { AgentLogEvent } from '@/types/graph';
@@ -16,7 +17,8 @@ import { GraphEvents } from '@/common';
 export async function safeDispatchCustomEvent(
   event: string,
   payload: unknown,
-  config?: RunnableConfig
+  config?: RunnableConfig,
+  originalToolCalls?: readonly ToolCall[]
 ): Promise<boolean | void> {
   let toolRequest: ToolExecuteBatchRequest | undefined;
   let hostView: ToolExecuteBatchRequest | undefined;
@@ -34,7 +36,7 @@ export async function safeDispatchCustomEvent(
           const protectedResults = protectToolExecuteBatch(request, results, exposed);
           if (protectedResults == null) {
             const stamped = results.map((result) => ({ ...result, received_at: receivedAt }));
-            void traceHostToolResults(request, results, config).then(
+            void traceHostToolResults(request, results, config, originalToolCalls).then(
               () => request.resolve(stamped),
               () => { console.warn('Failed to record host tool execution metadata'); request.resolve(stamped); }
             );
@@ -43,7 +45,7 @@ export async function safeDispatchCustomEvent(
           void protectedResults.then(async (canonical) => {
             validateToolExecuteProtection(request, exposed);
             for (const result of canonical) result.received_at = receivedAt;
-            try { await traceHostToolResults(request, canonical, config); }
+            try { await traceHostToolResults(request, canonical, config, originalToolCalls); }
             catch { console.warn('Failed to record host tool execution metadata'); }
             validateToolExecuteProtection(request, exposed);
             request.resolve(canonical);

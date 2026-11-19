@@ -25,7 +25,7 @@ describe('convertMessageContentToParts cross-provider tool calls', () => {
     ['models/gemini-4-argon-cyber-permissive', true],
     ['gemini-2.5-pro', false],
   ])(
-    'adds a placeholder thought signature to unsigned tool calls on %s: %s',
+    'adds a placeholder thought signature to unsigned tool calls on %s: %s @scenario:gemini-foreign-history',
     (model, expected) => {
       const message = new AIMessage({
         content: '',
@@ -165,6 +165,14 @@ describe('rejectsModelTurnPrefill', () => {
       true
     );
     expect(rejectsModelTurnPrefill('google/gemini-3.8-flash-lite')).toBe(true);
+  });
+
+  test.each([
+    'gemini-4-hydrogen',
+    'models/gemini-4-hydrogen',
+    'gemini-4-hydrogen-preview',
+  ])('rejects Hydrogen prefill for %s', (model) => {
+    expect(rejectsModelTurnPrefill(model)).toBe(true);
   });
 
   test('covers Gemini 4 Argon and its variants', () => {

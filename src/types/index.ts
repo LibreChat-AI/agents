@@ -1,4 +1,5 @@
 // src/types/index.ts
+export * from './attachments';
 export * from './graph';
 export * from './hitl';
 export * from './llm';
