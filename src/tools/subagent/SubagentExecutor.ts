@@ -1174,6 +1174,8 @@ export type SubagentExecutorOptions = {
    * revert to the defaults.
    */
   providerTextProtection?: StandardGraphInput['providerTextProtection'];
+  /** The parent's tool result protection, so a child inspects the same tools. */
+  toolResultProtection?: StandardGraphInput['toolResultProtection'];
   /** The parent's attachment resolver, so a child resolves the references it inherits. */
   resolveAttachment?: StandardGraphInput['resolveAttachment'];
   streamLimits?: StandardGraphInput['streamLimits'];
@@ -1254,6 +1256,7 @@ export class SubagentExecutor {
   private readonly langfuse?: StandardGraphInput['langfuse'];
   private readonly tokenCounter?: TokenCounter;
   private readonly providerTextProtection?: StandardGraphInput['providerTextProtection'];
+  private readonly toolResultProtection?: StandardGraphInput['toolResultProtection'];
   private readonly resolveAttachment?: StandardGraphInput['resolveAttachment'];
   private readonly streamLimits?: StandardGraphInput['streamLimits'];
   private readonly humanInTheLoop?: HumanInTheLoopConfig;
@@ -1296,6 +1299,7 @@ export class SubagentExecutor {
     this.tokenCounter = options.tokenCounter;
     this.streamLimits = options.streamLimits;
     this.providerTextProtection = options.providerTextProtection;
+    this.toolResultProtection = options.toolResultProtection;
     this.resolveAttachment = options.resolveAttachment;
     this.humanInTheLoop = options.humanInTheLoop;
     this.checkpointer = isCheckpointSaver(options.checkpointer)
@@ -1582,6 +1586,7 @@ export class SubagentExecutor {
       onResolutionFailure: this.onResolutionFailure,
       streamLimits: this.streamLimits,
       providerTextProtection: this.providerTextProtection,
+      toolResultProtection: this.toolResultProtection,
       resolveAttachment: this.resolveAttachment,
       humanInTheLoop:
         this.humanInTheLoop?.enabled === true ||
@@ -3192,6 +3197,7 @@ export class SubagentExecutor {
       tokenCounter: this.tokenCounter,
       streamLimits: this.streamLimits,
       providerTextProtection: this.providerTextProtection,
+      toolResultProtection: this.toolResultProtection,
       resolveAttachment: this.resolveAttachment,
       subagentScope: true,
       subagentExecutionContext: childExecutionContext,

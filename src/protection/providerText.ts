@@ -447,6 +447,13 @@ interface UncheckedResult {
   error?: { code?: ProviderTextProtectionErrorCode };
 }
 
+/** Returns the canonical text of a host inspection result, or throws its failure code. */
+export function readProviderTextResult(
+  result: ProviderTextProtectionResult
+): string {
+  return validateResult(result);
+}
+
 function validateResult(result: UncheckedResult | undefined): string {
   try {
     if (result?.version !== 1 || typeof result.ok !== 'boolean') {

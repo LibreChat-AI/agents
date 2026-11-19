@@ -850,6 +850,78 @@ describe.each([Constants.EXECUTE_CODE, Constants.BASH_TOOL])(
       });
     });
 
+    it('retains lazily provisioned inputs when result protection ends the batch', async () => {
+      const sessions: t.ToolSessionMap = new Map();
+      let attempt = 0;
+      jest
+        .spyOn(events, 'safeDispatchCustomEvent')
+        .mockImplementation(async (event, data) => {
+          if (event !== GraphEvents.ON_TOOL_EXECUTE) return;
+          const batch = data as t.ToolExecuteBatchRequest;
+          const request = batch.toolCalls[0];
+          if (attempt++ === 0) {
+            request.codeSessionContext = {
+              session_id: 'input-context',
+              files: structuredClone(inputs),
+            };
+          } else {
+            expect(request.codeSessionContext?.files).toEqual(inputs);
+          }
+          batch.resolve([
+            { toolCallId: request.id, status: 'success', content: 'output' },
+          ]);
+        });
+      let inspections = 0;
+      const node = new ToolNode({
+        tools: [
+          tool(async () => 'unused', {
+            name: toolName,
+            description: 'Code tool',
+            schema: z.object({}),
+          }),
+        ],
+        sessions,
+        codeSessionKey: 'child-agent',
+        eventDrivenMode: true,
+        toolResultProtection: {
+          version: 1,
+          toolNames: [toolName],
+          timeoutMs: 1000,
+          maxAttemptBytes: 4096,
+          maxBufferedBytes: 4096,
+          classify: () => 'prose',
+          inspect: ({ content }) =>
+            inspections++ === 0
+              ? { version: 1, ok: false, error: { code: 'blocked' } }
+              : {
+                version: 1,
+                ok: true,
+                value: { content, replacements: 0, categories: [] },
+              },
+        },
+      });
+
+      await expect(
+        node.invoke({
+          messages: [
+            new AIMessage({
+              content: '',
+              tool_calls: [{ id: 'first', name: toolName, args: {} }],
+            }),
+          ],
+        })
+      ).rejects.toMatchObject({ code: 'blocked' });
+      await node.invoke({
+        messages: [
+          new AIMessage({
+            content: '',
+            tool_calls: [{ id: 'retry', name: toolName, args: {} }],
+          }),
+        ],
+      });
+      expect(attempt).toBe(2);
+    });
+
     it('retains lazily provisioned inputs when eager execution rejects', async () => {
       const sessions: t.ToolSessionMap = new Map();
       const request: t.ToolCallRequest = {

@@ -194,6 +194,11 @@ function isEagerExecutionExcludedTool(
   if (excluded != null && excluded.includes(name)) {
     return true;
   }
+  // A protected result must be inspected before its completion is published,
+  // which only the committed ToolNode path guarantees.
+  if (graph.toolResultProtection?.toolNames.includes(name) === true) {
+    return true;
+  }
   // Run-scoped circuit breaker: once a prestart for this tool diverged from
   // the final request ("changed after eager execution started"), stop
   // prestarting it so the model's retry executes normally instead of

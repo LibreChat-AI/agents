@@ -40,6 +40,7 @@ export type LegacyGraphConfig = BaseGraphConfig & {
     | 'agents'
     | 'streamLimits'
     | 'providerTextProtection'
+    | 'toolResultProtection'
     | 'resolveAttachment'
   > &
   Omit<g.AgentInputs, 'provider' | 'clientOptions' | 'agentId'>;
@@ -343,6 +344,8 @@ export type RunConfig = {
    * opt-in. See {@link StreamLimits}.
    */
   providerTextProtection?: g.StandardGraphInput['providerTextProtection'];
+  /** Host inspection of selected tools' result text. Default off. */
+  toolResultProtection?: g.StandardGraphInput['toolResultProtection'];
   /** Resolves attachments that messages carry by reference, for every graph of the run. */
   resolveAttachment?: g.StandardGraphInput['resolveAttachment'];
   streamLimits?: StreamLimits;

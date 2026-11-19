@@ -112,6 +112,7 @@ import { ProviderTextProtectionError } from '@/protection/providerText';
 import { LANGFUSE_OPERATION_METADATA_KEY } from '@/langfuseOperation';
 import { createTokenCounter, encodingForModel } from '@/utils/tokens';
 import { stampSyntheticProviderMessage } from '@/messages/provenance';
+import { ToolResultProtectionError } from '@/protection/toolResult';
 import { isOpenAILike, isLibreChatOpenAIModel } from '@/utils/llm';
 import { executeHooks, mergeAggregatedHookResults } from '@/hooks';
 import { convertInjectedMessages } from '@/messages/injected';
@@ -509,6 +510,7 @@ export class Run<_T extends t.BaseGraphState> {
   private preemption?: t.StreamPreemption;
   private maxStopContinuations: number;
   private providerTextProtection?: t.StandardGraphInput['providerTextProtection'];
+  private toolResultProtection?: t.StandardGraphInput['toolResultProtection'];
   private resolveAttachment?: t.StandardGraphInput['resolveAttachment'];
   private streamLimits?: t.StreamLimits;
   private subagentTasks?: t.SubagentTaskConfig;
@@ -614,6 +616,7 @@ export class Run<_T extends t.BaseGraphState> {
     );
     this.streamLimits = config.streamLimits;
     this.providerTextProtection = config.providerTextProtection;
+    this.toolResultProtection = config.toolResultProtection;
     this.resolveAttachment = config.resolveAttachment;
 
     if (!config.graphConfig) {
@@ -624,6 +627,12 @@ export class Run<_T extends t.BaseGraphState> {
       config.graphConfig.providerTextProtection != null
     ) {
       throw new ProviderTextProtectionError('incompatible');
+    }
+    if (
+      'toolResultProtection' in config.graphConfig &&
+      config.graphConfig.toolResultProtection != null
+    ) {
+      throw new ToolResultProtectionError('incompatible');
     }
 
     /** Handle different graph types */
@@ -725,6 +734,7 @@ export class Run<_T extends t.BaseGraphState> {
         preemption: this.preemption,
         streamLimits: this.streamLimits,
         providerTextProtection: this.providerTextProtection,
+        toolResultProtection: this.toolResultProtection,
         resolveAttachment: this.resolveAttachment,
         toolExecution: this.toolExecution,
         clientDelegatedToolNames: this.clientDelegatedToolNames,
@@ -774,6 +784,7 @@ export class Run<_T extends t.BaseGraphState> {
         preemption: this.preemption,
         streamLimits: this.streamLimits,
         providerTextProtection: this.providerTextProtection,
+        toolResultProtection: this.toolResultProtection,
         resolveAttachment: this.resolveAttachment,
         toolExecution: this.toolExecution,
       },
