@@ -303,6 +303,27 @@ function unwrapToolMessageResultContent(content: ToolMessage['content']): {
   }
 }
 
+/**
+ * A lone plain text block is the same tool result as its string, which is
+ * how restored history carries it; the tail cache marker turns a string into
+ * that block, so collapsing it keeps the bytes stable when the marker moves.
+ */
+function toPlainTextResult(
+  content: string | MessageContentComplex[]
+): string | MessageContentComplex[] {
+  if (!Array.isArray(content) || content.length !== 1) {
+    return content;
+  }
+  const [block] = content;
+  const isPlainText =
+    typeof block === 'object' &&
+    block.type === 'text' &&
+    typeof block.text === 'string' &&
+    block.text !== '' &&
+    Object.keys(block).every((key) => key === 'type' || key === 'text');
+  return isPlainText ? (block.text as string) : content;
+}
+
 function _ensureMessageContents(
   messages: BaseMessage[]
 ): (SystemMessage | HumanMessage | AIMessage)[] {
@@ -366,12 +387,14 @@ function _ensureMessageContents(
             ? hoistToolResultCacheControl(formattedContent)
             : { content: undefined, cacheControl: undefined };
         const cacheControl = unwrapped.cacheControl ?? innerCacheControl;
+        const resultContent =
+          hoistedContent != null ? toPlainTextResult(hoistedContent) : undefined;
         updatedMsgs.push(
           new HumanMessage({
             content: [
               {
                 type: 'tool_result',
-                ...(hoistedContent != null ? { content: hoistedContent } : {}),
+                ...(resultContent != null ? { content: resultContent } : {}),
                 ...(unwrapped.isError != null
                   ? { is_error: unwrapped.isError }
                   : {}),
