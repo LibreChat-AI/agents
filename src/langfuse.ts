@@ -1,6 +1,6 @@
-import { tool } from '@langchain/core/tools';
 import { CallbackHandler } from '@langfuse/langchain';
 import { LangfuseOtelContextKeys } from '@langfuse/core';
+import { CallbackManager } from '@langchain/core/callbacks/manager';
 import { isGraphInterrupt, isParentCommand } from '@langchain/langgraph';
 import { context as otelContext, trace as otelTrace } from '@opentelemetry/api';
 import {
@@ -1241,55 +1241,49 @@ export async function traceHostToolResults(
   if (findCallback(config?.callbacks, isLangfuseCallbackHandler) == null) {
     return;
   }
-  const callbacks = filterCallbacks(
-    config?.callbacks,
-    isLangfuseCallbackHandler
+  const callbacks = CallbackManager.configure(
+    filterCallbacks(config?.callbacks, isLangfuseCallbackHandler),
+    undefined,
+    config?.tags,
+    undefined,
+    config?.metadata
   );
+  if (callbacks == null) {
+    return;
+  }
   const callsById = new Map(request.toolCalls.map((call) => [call.id, call]));
   const originalArgsById = new Map(
     originalToolCalls?.map((call) => [call.id, call.args])
   );
   for (const result of results) {
-    const metadata = getToolObservationMetadata(result.artifact);
     const call = callsById.get(result.toolCallId);
     if (call == null) {
       continue;
     }
-    const failure =
-      result.status === 'error'
-        ? new Error('Host tool execution failed')
-        : undefined;
-    const observation = tool(
-      async () => {
-        if (failure != null) {
-          throw failure;
-        }
-        return LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT;
+    const observation = new CallbackManager(callbacks.getParentRunId(), {
+      handlers: callbacks.handlers,
+      tags: callbacks.tags,
+      metadata: {
+        ...callbacks.metadata,
+        ...getToolObservationMetadata(result.artifact),
+        ...request.metadata,
       },
-      {
-        name: call.name,
-        description: 'Host tool execution metadata',
-        schema: { type: 'object', properties: {} },
-      }
+    });
+    const run = await observation.handleToolStart(
+      { lc: 1, type: 'not_implemented', id: [call.name] },
+      JSON.stringify(originalArgsById.get(call.id) ?? {}),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      call.name,
+      call.id
     );
-    try {
-      await observation.invoke(
-        {
-          type: 'tool_call',
-          id: call.id,
-          name: call.name,
-          args: originalArgsById.get(call.id) ?? {},
-        },
-        {
-          callbacks,
-          metadata: { ...metadata, ...request.metadata },
-        }
-      );
-    } catch (error) {
-      if (failure == null || error !== failure) {
-        throw error;
-      }
+    if (result.status === 'error') {
+      await run.handleToolError(new Error('Host tool execution failed'));
+      continue;
     }
+    await run.handleToolEnd(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
   }
 }
 

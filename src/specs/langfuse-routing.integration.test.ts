@@ -3,6 +3,7 @@ import { tool } from '@langchain/core/tools';
 import { HumanMessage } from '@langchain/core/messages';
 import { LangfuseOtelSpanAttributes } from '@langfuse/tracing';
 import { FakeListChatModel } from '@langchain/core/utils/testing';
+import { CallbackManager } from '@langchain/core/callbacks/manager';
 import { getPropagatedAttributesFromContext } from '@langfuse/core';
 import { context as otelContext, trace as otelTrace } from '@opentelemetry/api';
 import type { SpanProcessor } from '@opentelemetry/sdk-trace-base';
@@ -894,6 +895,97 @@ describe('Langfuse per-run routing integration', () => {
       expect(JSON.stringify(span?.attributes)).not.toContain(privateOutput);
     }
   );
+
+  it('preserves host callback inheritance without sharing result metadata', async () => {
+    const tenantId = 'host-callback-inheritance';
+    const langfuse = tenantLangfuse(tenantId);
+    initializeLangfuseTracing(langfuse);
+    const handler = createLangfuseHandler({ langfuse });
+    expect(handler).toBeDefined();
+    const callbacks = new CallbackManager();
+    callbacks.addHandler(handler!);
+    const root = await callbacks.handleChainStart(
+      { lc: 1, type: 'not_implemented', id: ['tool-dispatch'] },
+      {},
+      'host-parent'
+    );
+    const child = root.getChild('inherited-tag');
+    child.addMetadata({ inherited: 'parent', precedence: 'parent' });
+    const toolCalls = [
+      { id: 'host-success', name: 'query', args: { sql: 'SELECT 1' } },
+      { id: 'host-failure', name: 'failed_query', args: { sql: 'SELECT 2' } },
+    ];
+    await traceHostToolResults(
+      {
+        toolCalls,
+        metadata: { precedence: 'request' },
+        resolve: jest.fn(),
+        reject: jest.fn(),
+      },
+      [
+        {
+          toolCallId: 'host-success',
+          status: 'success',
+          content: 'private rows',
+          artifact: {
+            [LANGFUSE_OBSERVATION_METADATA_ARTIFACT_KEY]: {
+              query_returned_rows: 1,
+              precedence: 'result',
+            },
+          },
+        },
+        {
+          toolCallId: 'host-failure',
+          status: 'error',
+          content: 'private failed output',
+          errorMessage: 'private host error',
+        },
+        { toolCallId: 'unmatched', status: 'success', content: 'private' },
+      ],
+      {
+        callbacks: child,
+        tags: ['local-tag'],
+        metadata: { local: 'config', precedence: 'config' },
+      },
+      toolCalls
+    );
+    await root.handleChainEnd({});
+    const starts = startsForTenant(tenantId);
+    expect(starts).toHaveLength(3);
+    for (const name of ['query', 'failed_query']) {
+      expectChildSpanParentName({
+        starts,
+        childName: name,
+        parentNamePrefix: 'tool-dispatch',
+      });
+    }
+    const tools = endedSpans.filter(
+      (span) => span.name === 'query' || span.name === 'failed_query'
+    );
+    expect(tools).toHaveLength(2);
+    for (const span of tools) {
+      expect(span.attributes).toMatchObject({
+        'langfuse.observation.metadata.inherited': JSON.stringify('parent'),
+        'langfuse.observation.metadata.local': JSON.stringify('config'),
+        'langfuse.observation.metadata.precedence': JSON.stringify('request'),
+      });
+      expect(
+        JSON.parse(String(span.attributes['langfuse.observation.metadata.tags']))
+      ).toEqual(expect.arrayContaining(['inherited-tag', 'local-tag']));
+      expect(JSON.stringify(span.attributes)).not.toContain('private');
+    }
+    expect(
+      tools[0].attributes['langfuse.observation.metadata.query_returned_rows']
+    ).toBe('1');
+    expect(
+      tools[1].attributes['langfuse.observation.metadata.query_returned_rows']
+    ).toBeUndefined();
+    expect(
+      tools[1].attributes[LangfuseOtelSpanAttributes.OBSERVATION_LEVEL]
+    ).toBe('ERROR');
+    expect(child.metadata).toEqual({ inherited: 'parent', precedence: 'parent' });
+    expect(child.tags).toEqual(['inherited-tag']);
+  });
 
   it('omits host arguments when original calls are unavailable', async () => {
     const tenantId = 'host-input-unavailable';
