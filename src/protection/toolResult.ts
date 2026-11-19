@@ -1934,7 +1934,8 @@ export async function protectToolMessage(
   signal?: AbortSignal,
   replayRelease?: ToolMessageRelease
 ): Promise<ToolMessage> {
-  if (!requiresToolResultProtection(policy, name)) return message;
+  if (policy == null) return message;
+  if (!requiresToolResultProtection(policy, name)) return createToolOutcomeGuard(policy, message, toolOutcomeSourceScope.getStore()).snapshot() as ToolMessage;
   const envelope = snapshotToolMessageEnvelope(message);
   const status: string | undefined = envelope.status;
   if (
@@ -2501,7 +2502,10 @@ function withToolResultCarrierBoundary(tool: GenericTool, policy: ToolResultProt
         } });
       }
       let raw: unknown;
-      try { raw = await call.call(tool, input, manager, config); }
+      try {
+        const producerConfig = { ...config, callbacks: [] };
+        raw = await AsyncLocalStorageProviderSingleton.runWithConfig(producerConfig, () => call.call(tool, input, toolBodyCallbacks(manager), producerConfig));
+      }
       catch (error) { throw admitToolResultControl(policy, error, sources); }
       validateFormatting();
       if (responseFormat !== 'content_and_artifact') return createToolOutcomeGuard(policy, raw, sources, raw, inspection).snapshot();
