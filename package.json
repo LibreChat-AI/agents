@@ -313,7 +313,7 @@
     "label:eval": "tsx -r dotenv/config ./src/scripts/activity-labels/run.ts",
     "label:rescore": "node ./src/scripts/activity-labels/rescore.cjs",
     "test:runtime-package": "node --test config/runtime-package.test.mjs",
-    "build:types": "tsc -p tsconfig.build.json && tsc-alias -p tsconfig.build.json"
+    "build:types": "tsc -p tsconfig.build.json && tsc-alias -p tsconfig.build.json && node scripts/fix-dts-extensions.mjs"
   },
   "overrides": {
     "@langchain/openai": "$@langchain/openai",
