@@ -75,6 +75,7 @@ import {
   buildReasoningLabelPrompt,
   normalizeReasoningLabel,
 } from '@/prompts/reasoningLabel';
+import { nextReferenceTurn } from '@/tools/toolOutputReferences';
 import {
   hasToolOutputTracingConfig,
   resolveLangfuseConfig,
@@ -1544,6 +1545,12 @@ export class Run<_T extends t.BaseGraphState> {
     }
 
     const threadId = config.configurable.thread_id as string | undefined;
+
+    if (stateInputs != null) {
+      graph
+        .getOrCreateToolOutputRegistry()
+        ?.seedTurn(this.id, nextReferenceTurn(stateInputs.messages));
+    }
 
     if (this.hookRegistry != null && stateInputs != null) {
       const shouldHalt = await this.runPreStreamHooks(

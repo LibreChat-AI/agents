@@ -1,8 +1,93 @@
 import { HumanMessage, AIMessage, ToolMessage } from '@langchain/core/messages';
 import type { TPayload } from '@/types';
 import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
+import { annotateMessagesForLLM, ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import { formatAgentMessages } from './format';
-import { Constants, ContentTypes } from '@/common';
+import { createContentAggregator } from '@/stream';
+import { Constants, ContentTypes, GraphEvents } from '@/common';
+
+describe('formatAgentMessages tool output reference labels', () => {
+  it('restores the stored key and unresolved refs, labelled as live', () => {
+    const payload: TPayload = [
+      { role: 'user', content: 'go' },
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: 'c1',
+              name: 'echo',
+              args: '{}',
+              output: 'bad',
+              ref: 'tool1turn3',
+              unresolved_refs: ['tool0turn0'],
+            },
+          },
+        ],
+      },
+    ];
+
+    const { messages } = formatAgentMessages(payload);
+    const restored = messages.find((m) => m instanceof ToolMessage)!;
+    const [wire] = annotateMessagesForLLM(
+      [restored],
+      new ToolOutputReferenceRegistry()
+    );
+
+    expect(restored.additional_kwargs).toMatchObject({
+      _refKey: 'tool1turn3',
+      _unresolvedRefs: ['tool0turn0'],
+    });
+    expect(wire.content).toBe(
+      '[ref: tool1turn3]\nbad\n[unresolved refs: tool0turn0]'
+    );
+    const call = (messages.find((m) => m instanceof AIMessage) as AIMessage)
+      .tool_calls?.[0];
+    expect(call).not.toHaveProperty('ref');
+  });
+
+  it('keeps the labels the content aggregator stored with the result', () => {
+    const { contentParts, aggregateContent } = createContentAggregator();
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP,
+      data: {
+        id: 'step_1',
+        stepIndex: 0,
+        index: 0,
+        type: 'tool_calls',
+        stepDetails: {
+          type: 'tool_calls',
+          tool_calls: [{ id: 'c1', name: 'echo', args: '{}' }],
+        },
+        usage: null,
+      } as never,
+    });
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP_COMPLETED,
+      data: {
+        result: {
+          id: 'step_1',
+          index: 0,
+          type: 'tool_call',
+          tool_call: {
+            id: 'c1',
+            name: 'echo',
+            args: '{}',
+            output: 'out',
+            progress: 1,
+            ref: 'tool0turn2',
+            unresolved_refs: ['tool0turn9'],
+          },
+        },
+      } as never,
+    });
+
+    expect(contentParts[0]).toMatchObject({
+      tool_call: { ref: 'tool0turn2', unresolved_refs: ['tool0turn9'] },
+    });
+  });
+});
 
 describe('formatAgentMessages with tools parameter', () => {
   it('should process messages normally when tools is not provided', () => {
