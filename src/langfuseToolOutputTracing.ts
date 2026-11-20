@@ -17,6 +17,7 @@ import {
   resolveToolOutputTracingConfig,
 } from '@/langfuseConfig';
 import {
+  getObservationMetadataAttribute,
   shapeLangfuseSpan,
   shouldDropLangfuseSpan,
 } from '@/langfuseTraceShaping';
@@ -741,10 +742,10 @@ function classifyLangGraphToolNodeSpan(
     return;
   }
 
-  const langGraphNode =
-    attributes[
-      `${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.langgraph_node`
-    ];
+  const langGraphNode = getObservationMetadataAttribute(
+    attributes,
+    'langgraph_node'
+  );
   if (
     typeof langGraphNode === 'string' &&
     langGraphNode.startsWith(LANGGRAPH_TOOL_NODE_PREFIX)

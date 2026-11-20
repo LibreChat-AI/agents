@@ -19,7 +19,6 @@ import {
   wrapOpenAIClientError,
   getHeadersWithUserAgent,
   convertMessagesToResponsesInput,
-  convertResponsesDeltaToChatGenerationChunk,
   ChatOpenAI as OriginalChatOpenAI,
   ChatOpenAIResponses as OriginalChatOpenAIResponses,
   ChatOpenAICompletions as OriginalChatOpenAICompletions,
@@ -69,6 +68,7 @@ import {
   OPENAI_RESPONSES_ORIGIN_KEY,
 } from '@/messages/responsesToolRounds';
 import { registerProviderTextChunkConstructor } from '@/llm/providerTextChunk';
+import { createResponsesToolArgumentConverter } from './responseToolArguments';
 import { isReasoningModel, _convertMessagesToOpenAIParams } from './utils';
 import { smoothStream, resolveStreamDelay } from '@/llm/stream/smoother';
 import { INTENT_ARG, isIntentLabelProperty } from '@/tools/intentArg';
@@ -1176,7 +1176,10 @@ type ResponsesAnnotationsBoundaryEvent = {
 export function ensureResponsesOutputAnnotations(
   event: ResponsesAnnotationsBoundaryEvent
 ): void {
-  if (event.type !== 'response.completed' && event.type !== 'response.incomplete') {
+  if (
+    event.type !== 'response.completed' &&
+    event.type !== 'response.incomplete'
+  ) {
     return;
   }
   const output = event.response?.output;
@@ -1230,6 +1233,7 @@ async function* convertLibreChatResponsesStream(
 ): AsyncGenerator<ChatGenerationChunk> {
   const seenReplayPositions = new Set<string>();
   const responsesTextBlockIndices = new Map<string, number>();
+  const convertResponseEvent = createResponsesToolArgumentConverter();
   try {
     for await (const event of stream) {
       options.signal?.throwIfAborted();
@@ -1239,7 +1243,7 @@ async function* convertLibreChatResponsesStream(
       }
       ensureResponsesOutputAnnotations(event);
       const convertedChunk =
-        convertResponsesDeltaToChatGenerationChunk(event) ??
+        convertResponseEvent(event) ??
         convertDroppedResponsesReplayOutput(event);
       if (convertedChunk == null) {
         continue;
@@ -1449,7 +1453,8 @@ async function completionWithFilteredOpenAIStream(
 
 function attachLibreChatDeltaFields(
   chunk: BaseMessageChunk,
-  delta: Record<string, unknown>
+  delta: Record<string, unknown>,
+  rawResponse?: unknown
 ): BaseMessageChunk {
   if (!AIMessageChunk.isInstance(chunk)) {
     return chunk;
@@ -1470,12 +1475,32 @@ function attachLibreChatDeltaFields(
     chunk.additional_kwargs.provider_specific_fields =
       libreChatDelta.provider_specific_fields;
   }
+  if ('usage' in chunk.response_metadata) {
+    delete chunk.response_metadata.usage;
+  }
+  const rawRecord = rawResponse as
+    | {
+        provider?: unknown;
+        choices?: Array<{ finish_reason?: unknown }>;
+      }
+    | undefined;
+  const provider = rawRecord?.provider;
+  if (
+    typeof provider === 'string' &&
+    provider.length > 0 &&
+    (chunk.response_metadata.finish_reason != null ||
+      rawRecord?.choices?.some((choice) => choice.finish_reason != null) ===
+        true)
+  ) {
+    chunk.response_metadata.provider = provider;
+  }
   return chunk;
 }
 
 function attachLibreChatMessageFields(
   message: BaseMessage,
-  rawMessage: Record<string, unknown>
+  rawMessage: Record<string, unknown>,
+  rawResponse?: unknown
 ): BaseMessage {
   if (!isAIMessage(message)) {
     return message;
@@ -1492,6 +1517,11 @@ function attachLibreChatMessageFields(
   if (rawMessage.provider_specific_fields != null) {
     message.additional_kwargs.provider_specific_fields =
       rawMessage.provider_specific_fields;
+  }
+  const provider = (rawResponse as { provider?: unknown } | undefined)
+    ?.provider;
+  if (typeof provider === 'string' && provider.length > 0) {
+    message.response_metadata.provider = provider;
   }
   return message;
 }
@@ -2067,7 +2097,8 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
         rawResponse,
         defaultRole
       ),
-      delta
+      delta,
+      rawResponse
     );
     if (isOfficialOpenAIBaseURL(this.clientConfig.baseURL)) {
       return stampSequentialStreamedToolCallAdapter(message);
@@ -2081,7 +2112,8 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
   ): BaseMessage {
     return attachLibreChatMessageFields(
       super._convertCompletionsMessageToBaseMessage(message, rawResponse),
-      message as unknown as Record<string, unknown>
+      message as unknown as Record<string, unknown>,
+      rawResponse
     );
   }
 
@@ -2090,31 +2122,23 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
     options: this['ParsedCallOptions'],
     runManager?: CallbackManagerForLLMRun
   ): Promise<ChatResult> {
+    options.signal?.throwIfAborted();
+    const params = this.invocationParams(options);
     if (
+      params.stream !== true &&
       this.includeReasoningContent !== true &&
       this.includeReasoningDetails !== true
     ) {
       return super._generate(messages, options, runManager);
     }
 
-    options.signal?.throwIfAborted();
     const usageMetadata: Partial<UsageMetadata> = {};
-    const params = this.invocationParams(options);
-    const messagesMapped = _convertMessagesToOpenAIParams(
-      messages,
-      this.model,
-      {
-        includeReasoningContent: this.includeReasoningContent,
-        includeReasoningDetails: this.includeReasoningDetails,
-        convertReasoningDetailsToContent: this.convertReasoningDetailsToContent,
-        preserveToolCacheControl: this.preserveToolCacheControl,
-      }
-    );
-
     if (params.stream === true) {
       const stream = this._streamResponseChunks(messages, options, runManager);
       const finalChunks = new Map<number, ChatGenerationChunk>();
+      const seenScalarMetadata: SeenScalarMetadata = new Map();
       for await (const chunk of stream) {
+        dropRepeatedScalarMetadata(chunk, seenScalarMetadata);
         chunk.message.response_metadata = {
           ...chunk.generationInfo,
           ...chunk.message.response_metadata,
@@ -2156,6 +2180,16 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
       };
     }
 
+    const messagesMapped = _convertMessagesToOpenAIParams(
+      messages,
+      this.model,
+      {
+        includeReasoningContent: this.includeReasoningContent,
+        includeReasoningDetails: this.includeReasoningDetails,
+        convertReasoningDetailsToContent: this.convertReasoningDetailsToContent,
+        preserveToolCacheControl: this.preserveToolCacheControl,
+      }
+    );
     const data = await this.completionWithRetry(
       {
         ...params,
@@ -2478,7 +2512,9 @@ class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
         cache_control: cacheControl,
       }),
     };
-    if (shouldIncludeEncryptedReasoning(this.model, params, this.astraRulesApply)) {
+    if (
+      shouldIncludeEncryptedReasoning(this.model, params, this.astraRulesApply)
+    ) {
       params.include = [
         ...new Set([
           ...(params.include ?? []),
@@ -2781,7 +2817,9 @@ class LibreChatAzureOpenAIResponses extends OriginalAzureChatOpenAIResponses {
       promptCacheExplicit: this.promptCacheExplicit,
       safetyIdentifier: this.safetyIdentifier,
     });
-    if (shouldIncludeEncryptedReasoning(this.model, params, this.astraRulesApply)) {
+    if (
+      shouldIncludeEncryptedReasoning(this.model, params, this.astraRulesApply)
+    ) {
       params.include = [
         ...new Set([
           ...(params.include ?? []),
@@ -2986,6 +3024,20 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
   }
   static lc_name(): string {
     return 'LibreChatOpenAI';
+  }
+
+  override withConfig(config: Partial<t.ChatOpenAICallOptions>): this {
+    const Ctor = this.constructor as new (
+      fields?: LibreChatOpenAIFields & t.OpenAIChatInput['modelKwargs']
+    ) => this;
+    const newModel = new Ctor(this.fields);
+    newModel.defaultOptions = {
+      ...this.defaultOptions,
+      ...config,
+    };
+    newModel._lc_stream_delay = this._lc_stream_delay;
+    newModel.firstPartyEndpoint = this.firstPartyEndpoint;
+    return newModel;
   }
   _getClientOptions(
     options?: OpenAICoreRequestOptions
@@ -3528,6 +3580,9 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
         data,
         defaultRole
       );
+      if ('usage' in messageChunk.response_metadata) {
+        delete messageChunk.response_metadata.usage;
+      }
       defaultRole = delta.role ?? defaultRole;
 
       if (typeof messageChunk.content !== 'string') {

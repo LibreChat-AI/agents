@@ -471,6 +471,34 @@ export function validateGraphSubagentConfig(config: unknown): void {
   }
 }
 
+/**
+ * A `self` config that declares host arguments keeps its usual inputs (the
+ * provided copy, else the parent's) for calls that pass none; the executor
+ * sends calls that pass them through `resolveAgentInputs`.
+ */
+function normalizeSelfHostArgConfig(
+  config: SubagentConfig,
+  parentContext: AgentContext
+): ResolvedSubagentConfig | null {
+  if (config.resolveAgentInputs == null) {
+    throw new Error(
+      `Self subagent "${config.type}" declares hostArgs, which requires resolveAgentInputs for the calls that pass them.`
+    );
+  }
+  if (!isNonEmptyString(config.configId)) {
+    throw new Error(
+      `Self subagent "${config.type}" declares hostArgs and requires a non-empty "configId".`
+    );
+  }
+  if (config.agentInputs != null) {
+    return config as ResolvedSubagentConfig;
+  }
+  if (parentContext._sourceInputs == null) {
+    return null;
+  }
+  return { ...config, agentInputs: { ...parentContext._sourceInputs } };
+}
+
 function normalizeSingleAgentConfig(
   config: SubagentConfig,
   parentContext: AgentContext
@@ -487,13 +515,17 @@ function normalizeSingleAgentConfig(
       `Single-agent subagent "${config.type}" cannot define graph topology fields.`
     );
   }
+  const declaresHostArgs = getSubagentHostArgSpecs(config).length > 0;
+  if (config.self === true && declaresHostArgs) {
+    return normalizeSelfHostArgConfig(config, parentContext);
+  }
   if (config.self === true && config.resolveAgentInputs != null) {
     throw new Error(
       `Subagent "${config.type}" cannot combine self with resolveAgentInputs.`
     );
   }
   if (
-    getSubagentHostArgSpecs(config).length > 0 &&
+    declaresHostArgs &&
     (config.resolveAgentInputs == null || config.agentInputs != null)
   ) {
     throw new Error(

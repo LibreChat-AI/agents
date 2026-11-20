@@ -3,6 +3,8 @@ import { tool } from '@langchain/core/tools';
 import { HumanMessage } from '@langchain/core/messages';
 import { LangfuseOtelSpanAttributes } from '@langfuse/tracing';
 import { FakeListChatModel } from '@langchain/core/utils/testing';
+import { CallbackManager } from '@langchain/core/callbacks/manager';
+import { getPropagatedAttributesFromContext } from '@langfuse/core';
 import { context as otelContext, trace as otelTrace } from '@opentelemetry/api';
 import type { SpanProcessor } from '@opentelemetry/sdk-trace-base';
 import type { RunnableConfig } from '@langchain/core/runnables';
@@ -23,10 +25,10 @@ import {
   TitleMethod,
 } from '@/common';
 import { LANGFUSE_OBSERVATION_METADATA_ARTIFACT_KEY } from '@/langfuseToolOutputTracing';
+import { createLangfuseHandler, traceHostToolResults } from '@/langfuse';
 import { withLangfuseRuntimeScope } from '@/langfuseRuntimeScope';
 import { initializeLangfuseTracing } from '@/instrumentation';
 import { traceIdFromSeed } from '@/langfuseRuntimeContext';
-import { createLangfuseHandler } from '@/langfuse';
 import * as providers from '@/llm/providers';
 import { HookRegistry } from '@/hooks';
 import { Run } from '@/run';
@@ -43,6 +45,7 @@ type SpanStartRecord = {
   traceId: string;
   spanId: string;
   parentSpanId?: string;
+  skillsAvailable?: unknown;
 };
 
 const spanStarts: SpanStartRecord[] = [];
@@ -169,6 +172,9 @@ jest.mock('@langfuse/otel', () => ({
         traceId: spanContext.traceId,
         spanId: spanContext.spanId,
         ...(parentSpanId != null ? { parentSpanId } : {}),
+        skillsAvailable: getPropagatedAttributesFromContext(parentContext)[
+          LangfuseOtelSpanAttributes.OBSERVATION_SKILLS_AVAILABLE
+        ],
       });
     }),
     shutdown: jest.fn(),
@@ -738,11 +744,19 @@ describe('Langfuse per-run routing integration', () => {
         })
       );
       expect(startsForTenant('host-disabled')).toHaveLength(0);
-      expect(
-        spanStarts.filter((span) => span.name === 'unannotated')
-      ).toHaveLength(0);
       expect(otherToolEnd).not.toHaveBeenCalled();
       for (const [index, tenantId] of ['host-a', 'host-b'].entries()) {
+        const plainStarts = startsForTenant(tenantId).filter(
+          (span) => span.name === 'unannotated'
+        );
+        expect(plainStarts).toHaveLength(1);
+        const plain = endedSpans.find(
+          (entry) => entry.spanContext().spanId === plainStarts[0].spanId
+        );
+        expect(
+          plain?.attributes[LangfuseOtelSpanAttributes.OBSERVATION_TYPE]
+        ).toBe('tool');
+        expect(JSON.stringify(plain?.attributes)).not.toContain('private');
         const failedStarts = startsForTenant(tenantId).filter(
           (span) => span.name === 'failed_query'
         );
@@ -796,6 +810,311 @@ describe('Langfuse per-run routing integration', () => {
       }
     }
   );
+
+  it.each([false, true])(
+    'traces original host arguments without substituted tool output (eager=%s)',
+    async (eager) => {
+      const tenantId = `host-input-redaction-${eager}`;
+      const runId = `routing-${tenantId}`;
+      const referenceKey = 'tool0turn99';
+      const privateOutput = 'PRIVATE_TOOL_ROWS_664';
+      const originalArgs = { command: `echo {{${referenceKey}}}` };
+      const hostArgs: t.ToolCallRequest['args'][] = [];
+      const run = await Run.create<t.IState>({
+        runId,
+        graphConfig: {
+          type: 'standard',
+          llmConfig: {
+            provider: Providers.OPENAI,
+            streaming: true,
+            streamUsage: false,
+          },
+          toolDefinitions: [
+            {
+              name: 'consume',
+              description: 'Consumes a previous tool output',
+              parameters: {
+                type: 'object',
+                properties: { command: { type: 'string' } },
+              },
+            },
+          ],
+        },
+        langfuse: {
+          ...tenantLangfuse(tenantId),
+          toolOutputTracing: { enabled: false },
+        },
+        toolOutputReferences: { enabled: true },
+        eagerEventToolExecution: { enabled: eager },
+        returnContent: true,
+        skipCleanup: true,
+        customHandlers: {
+          [GraphEvents.ON_TOOL_EXECUTE]: {
+            handle: async (_event, rawData) => {
+              const data = rawData as t.ToolExecuteBatchRequest;
+              data.resolve(
+                data.toolCalls.map((call) => {
+                  hostArgs.push(call.args);
+                  return {
+                    toolCallId: call.id,
+                    status: 'success' as const,
+                    content: 'Consumed',
+                  };
+                })
+              );
+            },
+          },
+        },
+      });
+      run.Graph?.getOrCreateToolOutputRegistry()?.set(
+        runId,
+        referenceKey,
+        privateOutput
+      );
+      run.Graph?.overrideTestModel(['Consuming', 'Done'], 1, [
+        { id: 'consume-reference', name: 'consume', args: originalArgs },
+      ]);
+      await run.processStream(
+        { messages: [new HumanMessage('Consume the previous output')] },
+        callerConfig
+      );
+
+      expect(hostArgs).toEqual([{ command: `echo ${privateOutput}` }]);
+      const starts = startsForTenant(tenantId).filter(
+        (span) => span.name === 'consume'
+      );
+      expect(starts).toHaveLength(1);
+      const span = endedSpans.find(
+        (entry) => entry.spanContext().spanId === starts[0].spanId
+      );
+      expect(
+        JSON.parse(
+          String(span?.attributes[LangfuseOtelSpanAttributes.OBSERVATION_INPUT])
+        )
+      ).toEqual(originalArgs);
+      expect(JSON.stringify(span?.attributes)).not.toContain(privateOutput);
+    }
+  );
+
+  it('preserves host callback inheritance without sharing result metadata', async () => {
+    const tenantId = 'host-callback-inheritance';
+    const langfuse = tenantLangfuse(tenantId);
+    initializeLangfuseTracing(langfuse);
+    const handler = createLangfuseHandler({ langfuse });
+    expect(handler).toBeDefined();
+    const callbacks = new CallbackManager();
+    callbacks.addHandler(handler!);
+    const root = await callbacks.handleChainStart(
+      { lc: 1, type: 'not_implemented', id: ['tool-dispatch'] },
+      {},
+      'host-parent'
+    );
+    const child = root.getChild('inherited-tag');
+    child.addMetadata({ inherited: 'parent', precedence: 'parent' });
+    const toolCalls = [
+      { id: 'host-success', name: 'query', args: { sql: 'SELECT 1' } },
+      { id: 'host-failure', name: 'failed_query', args: { sql: 'SELECT 2' } },
+    ];
+    await traceHostToolResults(
+      {
+        toolCalls,
+        metadata: { precedence: 'request' },
+        resolve: jest.fn(),
+        reject: jest.fn(),
+      },
+      [
+        {
+          toolCallId: 'host-success',
+          status: 'success',
+          content: 'private rows',
+          artifact: {
+            [LANGFUSE_OBSERVATION_METADATA_ARTIFACT_KEY]: {
+              query_returned_rows: 1,
+              precedence: 'result',
+            },
+          },
+        },
+        {
+          toolCallId: 'host-failure',
+          status: 'error',
+          content: 'private failed output',
+          errorMessage: 'private host error',
+        },
+        { toolCallId: 'unmatched', status: 'success', content: 'private' },
+      ],
+      {
+        callbacks: child,
+        tags: ['local-tag'],
+        metadata: { local: 'config', precedence: 'config' },
+      },
+      toolCalls
+    );
+    await root.handleChainEnd({});
+    const starts = startsForTenant(tenantId);
+    expect(starts).toHaveLength(3);
+    for (const name of ['query', 'failed_query']) {
+      expectChildSpanParentName({
+        starts,
+        childName: name,
+        parentNamePrefix: 'tool-dispatch',
+      });
+    }
+    const tools = endedSpans.filter(
+      (span) => span.name === 'query' || span.name === 'failed_query'
+    );
+    expect(tools).toHaveLength(2);
+    for (const span of tools) {
+      expect(span.attributes).toMatchObject({
+        'langfuse.observation.metadata.inherited': JSON.stringify('parent'),
+        'langfuse.observation.metadata.local': JSON.stringify('config'),
+        'langfuse.observation.metadata.precedence': JSON.stringify('request'),
+      });
+      expect(
+        JSON.parse(String(span.attributes['langfuse.observation.metadata.tags']))
+      ).toEqual(expect.arrayContaining(['inherited-tag', 'local-tag']));
+      expect(JSON.stringify(span.attributes)).not.toContain('private');
+    }
+    expect(
+      tools[0].attributes['langfuse.observation.metadata.query_returned_rows']
+    ).toBe('1');
+    expect(
+      tools[1].attributes['langfuse.observation.metadata.query_returned_rows']
+    ).toBeUndefined();
+    expect(
+      tools[1].attributes[LangfuseOtelSpanAttributes.OBSERVATION_LEVEL]
+    ).toBe('ERROR');
+    expect(child.metadata).toEqual({ inherited: 'parent', precedence: 'parent' });
+    expect(child.tags).toEqual(['inherited-tag']);
+  });
+
+  it('omits host arguments when original calls are unavailable', async () => {
+    const tenantId = 'host-input-unavailable';
+    const langfuse = tenantLangfuse(tenantId);
+    initializeLangfuseTracing(langfuse);
+    const handler = createLangfuseHandler({ langfuse });
+    expect(handler).toBeDefined();
+    await traceHostToolResults(
+      {
+        toolCalls: [
+          { id: 'host-only', name: 'consume', args: { command: 'private rows' } },
+        ],
+        resolve: jest.fn(),
+        reject: jest.fn(),
+      },
+      [{ toolCallId: 'host-only', status: 'success', content: 'Consumed' }],
+      { callbacks: [handler!] }
+    );
+    const starts = startsForTenant(tenantId);
+    expect(starts).toHaveLength(1);
+    const span = endedSpans.find(
+      (entry) => entry.spanContext().spanId === starts[0].spanId
+    );
+    expect(
+      JSON.parse(
+        String(span?.attributes[LangfuseOtelSpanAttributes.OBSERVATION_INPUT])
+      )
+    ).toEqual({});
+    expect(JSON.stringify(span?.attributes)).not.toContain('private rows');
+  });
+
+  it('reports agent skills on agent spans and the loaded skill on its tool observation', async () => {
+    const tenantId = 'tenant-skills';
+    const runId = `routing-${tenantId}`;
+    const skillsAvailable = JSON.stringify([{ name: 'sql-review' }]);
+    const run = await Run.create<t.IState>({
+      runId,
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: Providers.OPENAI,
+          streaming: true,
+          streamUsage: false,
+        },
+        toolDefinitions: [
+          {
+            name: Constants.SKILL_TOOL,
+            description: 'Loads a skill',
+            parameters: {
+              type: 'object',
+              properties: { skillName: { type: 'string' } },
+            },
+          },
+        ],
+      },
+      langfuse: {
+        ...tenantLangfuse(tenantId),
+        skillsAvailable: [{ name: 'sql-review' }],
+      },
+      returnContent: true,
+      skipCleanup: true,
+      customHandlers: {
+        [GraphEvents.ON_TOOL_EXECUTE]: {
+          handle: async (_event, rawData) => {
+            const data = rawData as t.ToolExecuteBatchRequest;
+            data.resolve(
+              data.toolCalls.map((call) => ({
+                toolCallId: call.id,
+                status: 'success' as const,
+                content: 'SQL review steps',
+              }))
+            );
+          },
+        },
+      },
+    });
+    run.Graph?.overrideTestModel(['Loading the skill', 'Reviewed'], 1, [
+      {
+        id: 'call-skill',
+        name: Constants.SKILL_TOOL,
+        args: { skillName: 'sql-review' },
+        type: 'tool_call',
+      },
+    ]);
+    await run.processStream(
+      { messages: [new HumanMessage('Review my SQL')] },
+      callerConfig
+    );
+    await run.generateTitle({
+      provider: Providers.OPENAI,
+      inputText: 'Review my SQL',
+      titleMethod: TitleMethod.COMPLETION,
+      contentParts: [{ type: ContentTypes.TEXT, text: 'Reviewed' }],
+      chainOptions: { configurable: callerConfig.configurable },
+    });
+
+    const ended = new Map(
+      endedSpans.map((span) => [span.spanContext().spanId, span])
+    );
+    const typeOf = (start: SpanStartRecord): unknown =>
+      ended.get(start.spanId)?.attributes[
+        LangfuseOtelSpanAttributes.OBSERVATION_TYPE
+      ];
+    const starts = startsForTenant(tenantId);
+    const agentTraceId = traceIdFromSeed(runId);
+    const agentStarts = starts.filter((s) => s.traceId === agentTraceId);
+    const titleStarts = starts.filter((s) => s.traceId !== agentTraceId);
+    const generations = agentStarts.filter((s) => typeOf(s) === 'generation');
+    const skillTool = agentStarts.find((s) => s.name === Constants.SKILL_TOOL);
+
+    expect(generations.length).toBeGreaterThan(0);
+    for (const generation of generations) {
+      expect(generation.skillsAvailable).toBe(skillsAvailable);
+    }
+    expect(skillTool).toBeDefined();
+    expect(typeOf(skillTool!)).toBe('tool');
+    expect(skillTool?.skillsAvailable).toBe(skillsAvailable);
+    expect(
+      JSON.parse(
+        String(
+          ended.get(skillTool!.spanId)?.attributes[
+            LangfuseOtelSpanAttributes.OBSERVATION_INPUT
+          ]
+        )
+      )
+    ).toEqual({ name: 'sql-review', skillName: 'sql-review' });
+    expect(titleStarts.some((s) => typeOf(s) === 'generation')).toBe(true);
+    expect(titleStarts.filter((s) => s.skillsAvailable != null)).toEqual([]);
+  });
 
   it('keeps caller run names from replacing the graph operation name', async () => {
     const tenantId = 'tenant-caller-run-name';

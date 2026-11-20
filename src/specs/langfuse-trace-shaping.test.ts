@@ -126,6 +126,29 @@ describe('shapeLangfuseSpan', () => {
     expect(span.attributes[OBSERVATION_TYPE]).toBe('chain');
   });
 
+  it('reads metadata values that the Langfuse SDK stores as JSON', () => {
+    const sequence = createSpan(
+      'RunnableSequence',
+      { [METADATA_LANGGRAPH_NODE]: JSON.stringify('agent=openAI__gpt-5.4') },
+      'parent-1'
+    );
+    const reasoning = createSpan(
+      'ChatOpenAI',
+      {
+        [OBSERVATION_TYPE]: 'generation',
+        [TRACE_TAGS]: JSON.stringify(['librechat', 'reasoning-label']),
+        [METADATA_OPERATION]: JSON.stringify(REASONING_LABEL_RUN_NAME),
+      },
+      'parent-1'
+    );
+
+    shapeLangfuseSpan(sequence);
+    shapeLangfuseSpan(reasoning);
+
+    expect(sequence.name).toBe('AgentModelCall');
+    expect(reasoning.name).toBe('ReasoningLabel');
+  });
+
   it('does not rename unrelated runnable sequences', () => {
     const span = createSpan('RunnableSequence', {}, 'parent-1');
 
