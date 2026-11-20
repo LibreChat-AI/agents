@@ -79,6 +79,7 @@ export function selectProgrammaticTools(args: {
   allowedToolDefs?: t.LCTool[];
   disallowedToolDefs?: t.LCTool[];
   programmaticToolName: string;
+  normalizeIdentifier?: (name: string) => string;
 }): t.LCTool[] {
   const allowedToolDefs = args.allowedToolDefs ?? [];
   const disallowedToolDefs = args.disallowedToolDefs ?? [];
@@ -111,6 +112,42 @@ export function selectProgrammaticTools(args: {
   const unknownNames = new Set(
     requestedToolNames.filter((name) => !allowedByName.has(name))
   );
+  if (unknownNames.size > 0 && args.normalizeIdentifier != null) {
+    const candidatesByIdentifier = new Map<string, t.LCTool[]>();
+    for (const toolDef of allowedToolDefs) {
+      const identifier = args.normalizeIdentifier(toolDef.name);
+      if (!unknownNames.has(identifier)) {
+        continue;
+      }
+      const candidates = candidatesByIdentifier.get(identifier) ?? [];
+      candidates.push(toolDef);
+      candidatesByIdentifier.set(identifier, candidates);
+    }
+
+    const disallowedAliases = new Set<string>();
+    for (const toolDef of disallowedToolDefs) {
+      const identifier = args.normalizeIdentifier(toolDef.name);
+      if (unknownNames.has(identifier)) {
+        disallowedAliases.add(toolDef.name);
+      }
+    }
+    assertDisallowedToolUsage(disallowedAliases, args.programmaticToolName);
+
+    for (const name of unknownNames) {
+      const candidates = candidatesByIdentifier.get(name);
+      if (candidates == null) {
+        continue;
+      }
+      assertUnambiguousIdentifiers(
+        candidates,
+        args.normalizeIdentifier,
+        args.programmaticToolName
+      );
+      allowedByName.set(name, candidates[0]);
+      unknownNames.delete(name);
+    }
+  }
+
   if (unknownNames.size > 0) {
     throw new Error(
       `Tool${unknownNames.size === 1 ? '' : 's'} ${[...unknownNames]
@@ -122,7 +159,9 @@ export function selectProgrammaticTools(args: {
     );
   }
 
-  return [...new Set(requestedToolNames)].map(
-    (name) => allowedByName.get(name) as t.LCTool
-  );
+  return [
+    ...new Set(
+      requestedToolNames.map((name) => allowedByName.get(name) as t.LCTool)
+    ),
+  ];
 }

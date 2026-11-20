@@ -279,3 +279,17 @@ export function resolveLangfuseConfig(
     ...(toolOutputTracing != null ? { toolOutputTracing } : {}),
   };
 }
+
+/**
+ * Removes the agent's skills from the config of a run the agent does not
+ * drive, such as the title or a label. Those runs cannot load the skills.
+ */
+export function withoutSkillsAvailable(
+  langfuse?: t.LangfuseConfig
+): t.LangfuseConfig | undefined {
+  if (langfuse?.skillsAvailable == null) {
+    return langfuse;
+  }
+  const { skillsAvailable: _skillsAvailable, ...auxiliary } = langfuse;
+  return auxiliary;
+}

@@ -164,6 +164,14 @@ export interface SummarizeStartEvent {
 
 export interface SummarizeDeltaEvent {
   id: string;
+  /**
+   * Discard what this step has streamed so far, then apply `delta`. Deltas go
+   * out while the provider is still responding, so an attempt that is then
+   * abandoned (a retry, a smaller window, a fallback provider, a response with
+   * no summary in it) has already published text. The first delta of the next
+   * attempt carries this, or a delta with no content when no attempt follows.
+   */
+  reset?: boolean;
   delta: {
     summary: SummaryContentBlock;
   };

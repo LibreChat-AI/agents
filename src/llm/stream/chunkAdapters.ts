@@ -285,11 +285,13 @@ export async function* smoothGenerationChunks({
   delayMs,
   signal,
   runManager,
+  abortUpstream,
 }: {
   chunks: AsyncGenerator<ChatGenerationChunk>;
   delayMs: number;
   signal?: AbortSignal;
   runManager?: CallbackManagerForLLMRun;
+  abortUpstream?: () => void;
 }): AsyncGenerator<ChatGenerationChunk> {
   const source = (async function* (): AsyncGenerator<
     SmoothItem<ChatGenerationChunk>
@@ -299,7 +301,7 @@ export async function* smoothGenerationChunks({
     }
   })();
 
-  for await (const outputChunk of smoothStream({ source, delayMs, signal })) {
+  for await (const outputChunk of smoothStream({ source, delayMs, signal, abortUpstream })) {
     yield outputChunk;
     await runManager?.handleLLMNewToken(
       outputChunk.text || '',

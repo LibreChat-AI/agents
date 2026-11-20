@@ -568,6 +568,8 @@ export type TPayload = Array<Partial<TMessage>>;
 
 export type SummarizeDeltaData = {
   id: string;
+  /** Discard what the step has streamed so far before applying `delta`. */
+  reset?: boolean;
   delta: {
     summary: SummaryContentBlock;
   };

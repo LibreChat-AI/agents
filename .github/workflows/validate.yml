@@ -99,10 +99,13 @@ jobs:
         run: npm run check:circular-deps
 
       - name: Build declarations
-        run: npx tsc -p tsconfig.build.json
+        run: npm run build:types
 
       - name: Test light entry points
         run: npm run test:light-entries
+
+      - name: Test independently installed runtime
+        run: npm run test:runtime-package
 
   unit-tests:
     name: 'unit tests (shard ${{ matrix.shard }}/4)'

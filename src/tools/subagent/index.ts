@@ -27,6 +27,7 @@ export {
 } from './diagnostics';
 export {
   SUBAGENT_HOST_ARG_LIMITS,
+  SELF_SUBAGENT_HOST_ARGS_SUPPORTED,
   buildSubagentHostArgProperties,
   resolveSubagentHostArgs,
 } from './hostArgs';
