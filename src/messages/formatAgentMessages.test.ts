@@ -8648,3 +8648,206 @@ describe('formatAgentMessages', () => {
     });
   });
 });
+
+describe('formatAgentMessages provider reasoning replay', () => {
+  const anthropicModel = 'claude-sonnet-5-20260701';
+  const bedrockModel = 'anthropic.claude-sonnet-5-20260701-v1:0';
+  const anthropicTarget = {
+    provider: Providers.ANTHROPIC,
+    model: anthropicModel,
+  };
+  const anthropicThink = (signature?: string, model = anthropicModel) =>
+    ({
+      type: ContentTypes.THINK,
+      think: 'plan',
+      ...(signature != null && {
+        provider_replay: {
+          anthropic: {
+            model,
+            blocks: [{ type: ContentTypes.THINKING, thinking: 'plan', signature }],
+          },
+        },
+      }),
+    }) as MessageContentComplex;
+  const toolCall = (id: string, roundId: string): MessageContentComplex =>
+    ({
+      type: ContentTypes.TOOL_CALL,
+      tool_call: { id, name: 'lookup', args: '{}', output: 'done', roundId },
+    }) as MessageContentComplex;
+  const turn = (signature?: string, model?: string): TPayload[number] => ({
+    role: 'assistant',
+    content: [
+      anthropicThink(signature, model),
+      { type: ContentTypes.TEXT, text: 'answer' },
+    ],
+  });
+  const format = (
+    payload: TPayload,
+    target: { provider: Providers; model: string } | undefined,
+    tokens?: Record<number, number>
+  ) =>
+    formatAgentMessages(payload, tokens, undefined, undefined, {
+      replayProviderReasoning: target,
+    });
+  const contentOf = (messages: BaseMessage[]): Array<Record<string, unknown>> =>
+    messages.flatMap((message) =>
+      Array.isArray(message.content)
+        ? (message.content as Array<Record<string, unknown>>)
+        : []
+    );
+
+  it('puts signed and redacted Anthropic blocks back before their tool call, per round', () => {
+    const payload: TPayload = [
+      {
+        role: 'assistant',
+        content: [
+          {
+            ...anthropicThink('sig-1'),
+            provider_replay: {
+              anthropic: {
+                model: anthropicModel,
+                blocks: [
+                  { type: ContentTypes.THINKING, thinking: '', signature: 'sig-1' },
+                  { type: 'redacted_thinking', data: 'opaque' },
+                ],
+              },
+            },
+          } as MessageContentComplex,
+          toolCall('toolu_1', 'r1'),
+          anthropicThink('sig-2'),
+          toolCall('toolu_2', 'r2'),
+          { type: ContentTypes.TEXT, text: 'final' },
+        ],
+      },
+    ];
+
+    const { messages, indexTokenCountMap } = format(payload, anthropicTarget, { 0: 700 });
+
+    const ai = messages.filter((message) => message.getType() === 'ai');
+    expect(contentOf([ai[0]])).toEqual([
+      { type: ContentTypes.THINKING, thinking: '', signature: 'sig-1' },
+      { type: 'redacted_thinking', data: 'opaque' },
+    ]);
+    expect(contentOf([ai[1]])).toEqual([
+      { type: ContentTypes.THINKING, thinking: 'plan', signature: 'sig-2' },
+    ]);
+    expect((ai[0] as AIMessage).tool_calls?.[0].id).toBe('toolu_1');
+    // The replayed blocks are not part of the stored weight, so it is recounted.
+    expect(indexTokenCountMap).toEqual({});
+  });
+
+  it('puts signed Bedrock reasoning back before its tool call', () => {
+    const payload: TPayload = [
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.THINK,
+            think: 'plan',
+            provider_replay: {
+              bedrock: {
+                model: bedrockModel,
+                blocks: [
+                  {
+                    type: ContentTypes.REASONING_CONTENT,
+                    reasoningText: { text: 'plan', signature: 'sig-b' },
+                  },
+                  { type: ContentTypes.REASONING_CONTENT, redactedContent: 'opaque' },
+                ],
+              },
+            },
+          } as MessageContentComplex,
+          toolCall('tool-1', 'r1'),
+        ],
+      },
+    ];
+
+    const { messages } = format(payload, { provider: Providers.BEDROCK, model: bedrockModel });
+
+    expect(contentOf(messages)).toEqual([
+      {
+        type: ContentTypes.REASONING_CONTENT,
+        reasoningText: { text: 'plan', signature: 'sig-b' },
+      },
+      { type: ContentTypes.REASONING_CONTENT, redactedContent: 'opaque' },
+    ]);
+  });
+
+  it('replays only to the provider and model that signed the blocks, and only when asked', () => {
+    const payload = [turn('sig-1')];
+    const sent = (target?: { provider: Providers; model: string }): boolean =>
+      JSON.stringify(format(payload, target, { 0: 50 }).messages).includes('sig-1');
+
+    expect(sent(anthropicTarget)).toBe(true);
+    expect(sent({ provider: Providers.ANTHROPIC, model: 'claude-opus-4-8' })).toBe(false);
+    expect(sent({ provider: Providers.BEDROCK, model: bedrockModel })).toBe(false);
+    expect(sent(undefined)).toBe(false);
+    // A turn that is not replayed keeps its stored weight.
+    expect(
+      format(payload, { provider: Providers.BEDROCK, model: bedrockModel }, { 0: 50 })
+        .indexTokenCountMap
+    ).toEqual({ 0: 50 });
+  });
+
+  it('drops unsigned stored blocks', () => {
+    const unsigned = {
+      ...anthropicThink(),
+      provider_replay: {
+        anthropic: {
+          model: anthropicModel,
+          blocks: [{ type: ContentTypes.THINKING, thinking: 'plan' }],
+        },
+      },
+    } as MessageContentComplex;
+
+    const { messages } = format(
+      [{ role: 'assistant', content: [unsigned, { type: ContentTypes.TEXT, text: 'answer' }] }],
+      anthropicTarget
+    );
+
+    expect(messages[0].content).toBe('answer');
+  });
+
+  it('replays nothing before a turn whose reasoning cannot be replayed', () => {
+    const sent = (payload: TPayload): string[] => [
+      ...new Set(JSON.stringify(format(payload, anthropicTarget).messages).match(/sig-\d/g)),
+    ];
+
+    expect(sent([turn('sig-1'), turn('sig-2')])).toEqual(['sig-1', 'sig-2']);
+    // A signed block is bound to everything before it: a missing or foreign turn breaks the chain.
+    expect(sent([turn('sig-1'), turn(), turn('sig-3')])).toEqual(['sig-3']);
+    expect(sent([turn('sig-1'), turn('sig-2', 'claude-other'), turn('sig-3')])).toEqual([
+      'sig-3',
+    ]);
+  });
+
+  it('starts a new chain after the summary, for a retained tail and for a positional summary', () => {
+    const sent = (payload: TPayload): string[] => [
+      ...new Set(JSON.stringify(format(payload, anthropicTarget).messages).match(/sig-\d/g)),
+    ];
+    const summary = (coverage?: { retainedFromMessageId: string }) =>
+      ({
+        type: ContentTypes.SUMMARY,
+        content: [{ type: ContentTypes.TEXT, text: 'Earlier turns' }],
+        tokenCount: 3,
+        ...(coverage != null && { coverage }),
+      }) as MessageContentComplex;
+    const payload = (coverage?: { retainedFromMessageId: string }): TPayload => [
+      { messageId: 'm1', role: 'user', content: 'Covered question' },
+      { messageId: 'm2', ...turn('sig-1') },
+      {
+        messageId: 'm3',
+        role: 'assistant',
+        content: [
+          anthropicThink('sig-2'),
+          summary(coverage),
+          anthropicThink('sig-3'),
+          { type: ContentTypes.TEXT, text: 'Post-compaction reply' },
+        ],
+      },
+    ];
+
+    expect(sent(payload({ retainedFromMessageId: 'm2' }))).toEqual(['sig-3']);
+    expect(sent(payload())).toEqual(['sig-3']);
+  });
+});

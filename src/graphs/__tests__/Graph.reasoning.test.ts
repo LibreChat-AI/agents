@@ -10,6 +10,7 @@ import { ContentTypes, GraphEvents, Providers, StepTypes } from '@/common';
 import { ChatModelStreamHandler, createContentAggregator } from '@/stream';
 import { ModelEndHandler, ToolEndHandler } from '@/events';
 import { toLangChainContent } from '@/messages/langchain';
+import { OPENAI_RESPONSES_ORIGIN_KEY } from '@/messages/responsesToolRounds';
 import { ChatOpenRouter } from '@/llm/openrouter';
 import { Run } from '@/run';
 
@@ -868,6 +869,64 @@ describe('StandardGraph final response reasoning fallback', () => {
     ]);
   });
 
+  it('keeps reasoning that resumes after text in a part of its own when replaying provider reasoning', async () => {
+    const streamParts = async (
+      providerReasoningReplay: boolean
+    ): Promise<t.MessageContentComplex[]> => {
+      const { contentParts, aggregateContent } = createContentAggregator();
+      const run = await Run.create<t.IState>({
+        runId: `reasoning-resumes-${providerReasoningReplay}`,
+        graphConfig: {
+          type: 'standard',
+          llmConfig: {
+            provider: Providers.ANTHROPIC,
+            model: 'claude-test',
+            apiKey: 'test-key',
+            streamUsage: false,
+          },
+          providerReasoningReplay,
+        },
+        returnContent: true,
+        skipCleanup: true,
+        customHandlers: createReasoningHandlers(aggregateContent, []),
+      });
+      if (!run.Graph) {
+        throw new Error('Expected graph to be initialized');
+      }
+      run.Graph.overrideModel = new StreamingReasoningModel([
+        new AIMessageChunk({
+          content: [{ type: ContentTypes.THINKING, thinking: 'first' }],
+        }),
+        new AIMessageChunk({ content: 'checking' }),
+        new AIMessageChunk({
+          content: [{ type: ContentTypes.THINKING, thinking: 'second' }],
+        }),
+        new AIMessageChunk({ content: 'done' }),
+      ]);
+      await run.processStream(
+        { messages: [new HumanMessage('think twice')] },
+        {
+          ...config,
+          configurable: { thread_id: `reasoning-resumes-${providerReasoningReplay}` },
+        }
+      );
+      return contentParts as t.MessageContentComplex[];
+    };
+
+    const types = (parts: t.MessageContentComplex[]): string[] =>
+      parts.map((part) => part.type as string);
+
+    expect(types(await streamParts(true))).toEqual([
+      ContentTypes.THINK,
+      ContentTypes.TEXT,
+      ContentTypes.THINK,
+      ContentTypes.TEXT,
+    ]);
+    expect(
+      types(await streamParts(false)).filter((type) => type === ContentTypes.THINK)
+    ).toHaveLength(1);
+  });
+
   it('does not replay streamed OpenRouter text when the final chunk has reasoning_details', async () => {
     const text = '391.';
     const reasoningText = '17 times 23 equals 391.';
@@ -1712,6 +1771,105 @@ describe('StandardGraph final response reasoning fallback', () => {
     expect(contentParts).toEqual([
       { type: ContentTypes.THINK, think: reasoningText },
       { type: ContentTypes.TEXT, text },
+    ]);
+  });
+});
+
+describe('StandardGraph Responses tool round capture', () => {
+  it('hands each call its slice of the stamped output and one round id per model response', async () => {
+    const { contentParts, aggregateContent } = createContentAggregator();
+    const aggregate = {
+      handle: (event: string, data: t.StreamEventData): void =>
+        aggregateContent({
+          event: event as GraphEvents,
+          data: data as t.RunStep,
+        }),
+    };
+    const run = await Run.create<t.IState>({
+      runId: 'responses-tool-round-capture',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: Providers.OPENAI,
+          disableStreaming: true,
+          streamUsage: false,
+        },
+      },
+      returnContent: true,
+      skipCleanup: true,
+      customHandlers: {
+        [GraphEvents.ON_RUN_STEP]: aggregate,
+        [GraphEvents.ON_PROVIDER_OUTPUT_ITEMS]: aggregate,
+      },
+    });
+    const graph = run.Graph!;
+    const functionCall = (id: string) => ({
+      id: `fc_${id}`,
+      type: 'function_call',
+      status: 'completed',
+      arguments: '{}',
+      call_id: id,
+      name: 'lookup',
+    });
+    const output = [
+      { id: 'rs_1', type: 'reasoning', summary: [] },
+      functionCall('call_a'),
+      functionCall('call_b'),
+    ];
+    const callModel = async (step: number, message: AIMessageChunk) => {
+      const metadata = {
+        thread_id: 'responses-tool-round-capture',
+        langgraph_node: 'agent=default',
+        langgraph_step: step,
+        checkpoint_ns: '',
+      };
+      const runConfig = {
+        configurable: { thread_id: 'responses-tool-round-capture' },
+        metadata,
+      };
+      graph.config = runConfig;
+      graph.overrideModel = new InvokeOnlyMessageModel(message);
+      await graph.createCallModel('default')(
+        { messages: [new HumanMessage('look up')] },
+        runConfig
+      );
+    };
+
+    await callModel(
+      1,
+      new AIMessageChunk({
+        content: '',
+        tool_calls: [
+          { id: 'call_a', name: 'lookup', args: {} },
+          { id: 'call_b', name: 'lookup', args: {} },
+        ],
+        response_metadata: {
+          output,
+          created_at: 1_000,
+          [OPENAI_RESPONSES_ORIGIN_KEY]: 'origin-a',
+        },
+      })
+    );
+    await callModel(
+      2,
+      new AIMessageChunk({
+        content: '',
+        tool_calls: [{ id: 'call_c', name: 'lookup', args: {} }],
+      })
+    );
+
+    const calls = contentParts.flatMap((part) =>
+      part?.type === ContentTypes.TOOL_CALL ? [part.tool_call as t.ToolCallPart] : []
+    );
+    expect(calls.map((call) => call.id)).toEqual(['call_a', 'call_b', 'call_c']);
+    expect(calls[0].roundId).toBeDefined();
+    expect(calls[1].roundId).toBe(calls[0].roundId);
+    expect(calls[2].roundId).toBeDefined();
+    expect(calls[2].roundId).not.toBe(calls[0].roundId);
+    expect(calls.map((call) => call.providerItems)).toEqual([
+      { origin: 'origin-a', created_at: 1_000, items: output.slice(0, 2) },
+      { origin: 'origin-a', created_at: 1_000, items: output.slice(2) },
+      undefined,
     ]);
   });
 });
