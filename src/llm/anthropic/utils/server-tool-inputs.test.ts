@@ -2,6 +2,7 @@
 import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
 import { _convertMessagesToAnthropicPayload } from './message_inputs';
+import { _makeMessageChunkFromAnthropicEvent } from './message_outputs';
 
 type AnthropicTestBlock = {
   id?: unknown;
@@ -505,4 +506,139 @@ describe('_convertMessagesToAnthropicPayload — server tool use (web search) mu
       expect(textBlocks[0].text).toBe('Here are the results.');
     }
   );
+
+  it('preserves code_execution_tool_result in stream chunks and replays caller/code_execution_tool_result for web_search_20260209', () => {
+    const codeExecResultEvent = {
+      type: 'content_block_start',
+      index: 3,
+      content_block: {
+        type: 'code_execution_tool_result',
+        tool_use_id: 'srvtoolu_code_1',
+        content: {
+          type: 'code_execution_result',
+          stdout: 'filtered results',
+          stderr: '',
+          return_code: 0,
+        },
+      },
+    } as any;
+
+    const streamed = _makeMessageChunkFromAnthropicEvent(codeExecResultEvent, {
+      streamUsage: false,
+      coerceContentToString: false,
+    });
+    expect(streamed).not.toBeNull();
+    const streamedBlocks = streamed!.chunk.content as any[];
+    expect(streamedBlocks).toHaveLength(1);
+    expect(streamedBlocks[0]).toMatchObject({
+      type: 'code_execution_tool_result',
+      tool_use_id: 'srvtoolu_code_1',
+      content: {
+        type: 'code_execution_result',
+        stdout: 'filtered results',
+        stderr: '',
+        return_code: 0,
+      },
+    });
+
+    const caller = {
+      type: 'code_execution_20260120',
+      tool_id: 'srvtoolu_code_1',
+    };
+    const messageHistory: BaseMessage[] = [
+      new HumanMessage('search with dynamic filtering'),
+      new AIMessage({
+        content: [
+          {
+            type: 'server_tool_use',
+            id: 'srvtoolu_code_1',
+            name: 'code_execution',
+            input: { code: 'print(1)' },
+            index: 0,
+          },
+          {
+            type: 'server_tool_use',
+            id: 'srvtoolu_search_1',
+            name: 'web_search',
+            input: { query: 'test' },
+            caller,
+            index: 1,
+          },
+          {
+            type: 'web_search_tool_result',
+            tool_use_id: 'srvtoolu_search_1',
+            caller,
+            index: 2,
+            input: undefined,
+            content: [
+              {
+                type: 'web_search_result',
+                url: 'https://example.com',
+                title: 'Example',
+                encrypted_content: 'enc',
+                page_age: '1d',
+              },
+            ],
+          },
+          {
+            type: 'code_execution_tool_result',
+            tool_use_id: 'srvtoolu_code_1',
+            index: 3,
+            input: undefined,
+            content: {
+              type: 'code_execution_result',
+              stdout: 'filtered results',
+              stderr: '',
+              return_code: 0,
+            },
+          },
+          { type: 'text', text: 'Done.' },
+        ],
+      }),
+      new HumanMessage('next turn'),
+    ];
+
+    const { messages } = _convertMessagesToAnthropicPayload(messageHistory);
+    const assistantContent = messages[1].content as any[];
+
+    expect(assistantContent).toHaveLength(5);
+    expect(assistantContent[0]).toEqual({
+      type: 'server_tool_use',
+      id: 'srvtoolu_code_1',
+      name: 'code_execution',
+      input: { code: 'print(1)' },
+    });
+    expect(assistantContent[1]).toEqual({
+      type: 'server_tool_use',
+      id: 'srvtoolu_search_1',
+      name: 'web_search',
+      input: { query: 'test' },
+      caller,
+    });
+    expect(assistantContent[2]).toEqual({
+      type: 'web_search_tool_result',
+      tool_use_id: 'srvtoolu_search_1',
+      caller,
+      content: [
+        {
+          type: 'web_search_result',
+          url: 'https://example.com',
+          title: 'Example',
+          encrypted_content: 'enc',
+          page_age: '1d',
+        },
+      ],
+    });
+    expect(assistantContent[3]).toEqual({
+      type: 'code_execution_tool_result',
+      tool_use_id: 'srvtoolu_code_1',
+      content: {
+        type: 'code_execution_result',
+        stdout: 'filtered results',
+        stderr: '',
+        return_code: 0,
+      },
+    });
+    expect(assistantContent[4]).toEqual({ type: 'text', text: 'Done.' });
+  });
 });

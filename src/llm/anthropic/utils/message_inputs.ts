@@ -645,13 +645,21 @@ const standardContentBlockConverter: StandardContentBlockConverter<{
 };
 
 function _formatContent(message: BaseMessage) {
+  const serverToolResultTypes = [
+    'web_search_tool_result',
+    'code_execution_tool_result',
+    'web_fetch_tool_result',
+    'bash_code_execution_tool_result',
+    'text_editor_code_execution_tool_result',
+    'tool_search_tool_result',
+  ];
   const toolTypes = [
     'tool_use',
     'tool_result',
     'input_json_delta',
     'server_tool_use',
-    'web_search_tool_result',
     'web_search_result',
+    ...serverToolResultTypes,
   ];
   const textTypes = ['text', 'text_delta'];
   /**
@@ -691,19 +699,24 @@ function _formatContent(message: BaseMessage) {
         'name' in contentPart
       ) {
         const rawPart = contentPart as Record<string, unknown>;
-        const corrected: AnthropicServerToolUseBlockParam = {
+        const corrected: Record<string, unknown> = {
           type: 'server_tool_use',
           id: rawPart.id as string,
-          name: (rawPart.name ?? 'web_search') as 'web_search',
+          name: (rawPart.name ?? 'web_search') as string,
           input: coerceAnthropicToolUseInput(rawPart.input ?? rawPart.args),
         };
-        return corrected;
+        if (rawPart.caller !== undefined) {
+          corrected.caller = rawPart.caller;
+        }
+        return corrected as unknown as AnthropicServerToolUseBlockParam;
       }
 
       /**
-       * Normalize web_search_tool_result blocks into a clean shape.
-       * Same rationale as above — the block may carry extra properties from
-       * streaming (input, index, etc.) that the API rejects. Rebuild cleanly.
+       * Normalize Anthropic server tool result blocks (`web_search_tool_result`,
+       * `code_execution_tool_result`, `web_fetch_tool_result`, etc.) into a clean
+       * shape. These blocks may carry extra properties from streaming (`index`,
+       * `input`, etc.) that the API rejects, while `caller` must be preserved
+       * for nested server tool calls (e.g. `web_search_20260209`).
        */
       if (
         'tool_use_id' in contentPart &&
@@ -715,7 +728,28 @@ function _formatContent(message: BaseMessage) {
         'content' in contentPart
       ) {
         const rawPart = contentPart as Record<string, unknown>;
+        const rawType = typeof rawPart.type === 'string' ? rawPart.type : undefined;
         const content = rawPart.content;
+
+        if (
+          rawType !== undefined &&
+          rawType !== 'web_search_tool_result' &&
+          serverToolResultTypes.includes(rawType)
+        ) {
+          if (content == null) {
+            return null;
+          }
+          const corrected: Record<string, unknown> = {
+            type: rawType,
+            tool_use_id: rawPart.tool_use_id as string,
+            content,
+          };
+          if (rawPart.caller !== undefined) {
+            corrected.caller = rawPart.caller;
+          }
+          return corrected as unknown as AnthropicWebSearchToolResultBlockParam;
+        }
+
         const isValidContent =
           Array.isArray(content) ||
           (content != null &&
@@ -725,13 +759,16 @@ function _formatContent(message: BaseMessage) {
               'web_search_tool_result_error');
 
         if (isValidContent) {
-          const corrected: AnthropicWebSearchToolResultBlockParam = {
+          const corrected: Record<string, unknown> = {
             type: 'web_search_tool_result',
             tool_use_id: rawPart.tool_use_id as string,
             content:
               content as AnthropicWebSearchToolResultBlockParam['content'],
           };
-          return corrected;
+          if (rawPart.caller !== undefined) {
+            corrected.caller = rawPart.caller;
+          }
+          return corrected as unknown as AnthropicWebSearchToolResultBlockParam;
         }
         return null;
       }
