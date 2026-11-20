@@ -1,4 +1,5 @@
 import type { ProviderTextProtection } from '@/protection/providerText';
+import type { AttachmentResolver } from './attachments';
 // src/types/graph.ts
 import type {
   BaseMessage,
@@ -410,6 +411,8 @@ export type ModelEndData =
 export type GraphTools = GenericTool[] | BindToolsInput[] | GoogleAIToolType[];
 export type StandardGraphInput = {
   providerTextProtection?: ProviderTextProtection;
+  /** Resolves attachments that messages carry by reference; see {@link AttachmentResolver}. */
+  resolveAttachment?: AttachmentResolver;
   runId?: string;
   signal?: AbortSignal;
   agents: AgentInputs[];
@@ -645,8 +648,10 @@ export interface SubagentConfig extends SubagentConfigBase {
   agentInputs?: AgentInputs;
   /**
    * Resolve the full child config only after this descriptor is selected.
-   * Eager `agentInputs` take precedence when also supplied. `self` and a
-   * resolver are mutually exclusive and normalization rejects that pairing.
+   * Eager `agentInputs` take precedence when also supplied. A `self` config
+   * may set a resolver only together with `hostArgs` and a `configId`; it then
+   * runs only for calls that pass host arguments, and every other call reuses
+   * the self inputs. Normalization rejects any other `self` + resolver pairing.
    *
    * Resolvers should rebuild inputs from the stable execution context instead
    * of retaining request-owned state. The SDK keeps resolved inputs in memory
@@ -660,7 +665,8 @@ export interface SubagentConfig extends SubagentConfigBase {
   /**
    * Optional per-call arguments the parent model may pass for this subagent,
    * delivered to `resolveAgentInputs` as `context.hostArgs`. Only lazy
-   * configs accept them. Declaring none leaves the tool schema unchanged.
+   * configs and `self` configs with a resolver accept them. Declaring none
+   * leaves the tool schema unchanged.
    */
   hostArgs?: SubagentHostArgSpecs;
   /** When true, reuse the parent's AgentInputs (context isolation without separate config). */
@@ -998,6 +1004,12 @@ export interface LangfuseConfig {
    * from the run/message id, without a trace lookup. Default: random ids.
    */
   deterministicTraceId?: boolean;
+  /**
+   * Skills the agent can load with the `skill` tool, reported to Langfuse on
+   * the observations its run starts. `name` matches the tool's `skillName`;
+   * `version` is the skill's Langfuse version, when it has one.
+   */
+  skillsAvailable?: { name: string; version?: number }[];
 }
 
 interface AgentInputFields {

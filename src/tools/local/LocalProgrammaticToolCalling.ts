@@ -600,6 +600,10 @@ async function runLocalProgrammaticTool(args: {
     allowedToolDefs: toolDefs,
     disallowedToolDefs,
     programmaticToolName: runnerName,
+    normalizeIdentifier:
+      args.runtime === 'bash'
+        ? normalizeToBashIdentifier
+        : normalizeToPythonIdentifier,
   });
 
   /* The local program builder supports zero stubs, so a call that selected no

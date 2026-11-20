@@ -956,6 +956,7 @@ async function runSummarizationAttempts(
     onUsage: (attempt: t.SummarizationAttemptUsage) => void;
     /** Carries the run's stream limits so the event cap covers summary streams. */
     graph?: StreamLimitState & {
+      resolveAttachment?: t.AttachmentResolver;
       getBreakerSignal?: () => AbortSignal;
       getToolsForBinding?: (
         provider: t.ProviderName,
@@ -1235,6 +1236,7 @@ async function runSummarizationAttempts(
               model,
               messages: [...history, new HumanMessage(instruction)],
               provider,
+              context: graph,
               config,
             });
             fallbackIdentity = {
@@ -1463,6 +1465,8 @@ interface CreateSummarizeNodeParams {
     contentIndexMap: Map<string, number>;
     config?: RunnableConfig;
     runId?: string;
+    /** The graph's attachment resolver: a summary request carries the same references. */
+    resolveAttachment?: t.AttachmentResolver;
     isMultiAgent: boolean;
     getSubagentExecutionContext?: () => t.SubagentExecutionContext | undefined;
     hookRegistry?: HookRegistry;
@@ -2460,7 +2464,10 @@ async function summarizeWithCacheHit({
   config?: RunnableConfig;
   stepId?: string;
   provider: t.ProviderName;
-  graph?: StreamLimitState & { getBreakerSignal?: () => AbortSignal };
+  graph?: StreamLimitState & {
+    resolveAttachment?: t.AttachmentResolver;
+    getBreakerSignal?: () => AbortSignal;
+  };
   deltas?: SummaryDeltaStream;
   usePromptCache?: boolean;
   promptCacheTtl?: PromptCacheTtl;
@@ -2540,11 +2547,17 @@ async function summarizeWithCacheHit({
     /** Each pass is a new attempt: what an earlier one streamed is not its output. */
     deltas?.abandon();
     try {
+      /** Prepared here because this attempt passes no invocation context, which is where the attachment resolver would otherwise come from. */
+      const request = prepareProviderRequest({
+        model,
+        messages: [...cachedHistory, new HumanMessage(instruction)],
+        provider,
+        context: graph,
+        config: signalConfig,
+      });
       result = await attemptInvoke(
         {
-          model,
-          messages: [...cachedHistory, new HumanMessage(instruction)],
-          provider,
+          request,
           onModelComplete: (response) => {
             const usage = readSummarizationUsage(response);
             if (usage != null) onUsage(usage);

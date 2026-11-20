@@ -30,6 +30,7 @@ import {
   type InlineDataPart,
   type FunctionCallPart,
   type GenerateContentCandidate,
+  type GenerateContentResponse,
   type EnhancedGenerateContentResponse,
   type FunctionDeclaration as GenerativeAIFunctionDeclaration,
   type FunctionDeclarationsTool as GoogleGenerativeAIFunctionDeclarationsTool,
@@ -55,6 +56,9 @@ import { GoogleGenerativeAIToolType } from '../types';
 
 export const _FUNCTION_CALL_THOUGHT_SIGNATURES_MAP_KEY =
   '__gemini_function_call_thought_signatures__';
+
+type GoogleResponse = GenerateContentResponse &
+  Partial<EnhancedGenerateContentResponse>;
 
 const DUMMY_SIGNATURE =
   'ErYCCrMCAdHtim9kOoOkrPiCNVsmlpMIKd7ZMxgiFbVQOkgp7nlLcDMzVsZwIzvuT7nQROivoXA72ccC2lSDvR0Gh7dkWaGuj7ctv6t7ZceHnecx0QYa+ix8tYpRfjhyWozQ49lWiws6+YGjCt10KRTyWsZ2h6O7iHTYJwKIRwGUHRKy/qK/6kFxJm5ML00gLq4D8s5Z6DBpp2ZlR+uF4G8jJgeWQgyHWVdx2wGYElaceVAc66tZdPQRdOHpWtgYSI1YdaXgVI8KHY3/EfNc2YqqMIulvkDBAnuMhkAjV9xmBa54Tq+ih3Im4+r3DzqhGqYdsSkhS0kZMwte4Hjs65dZzCw9lANxIqYi1DJ639WNPYihp/DCJCos7o+/EeSPJaio5sgWDyUnMGkY1atsJZ+m7pj7DD5tvQ==';
@@ -759,7 +763,7 @@ export function dropUnsupportedModelTurnPrefill<T extends { role: string }>(
 }
 
 export function convertResponseContentToChatGenerationChunk(
-  response: EnhancedGenerateContentResponse,
+  response: GoogleResponse,
   extra: {
     usageMetadata?: UsageMetadata | undefined;
     index: number;
@@ -937,7 +941,7 @@ export function convertResponseContentToChatGenerationChunk(
  * Maps a Google GenerateContentResult to a LangChain ChatResult
  */
 export function mapGenerateContentResultToChatResult(
-  response: EnhancedGenerateContentResponse,
+  response: GoogleResponse,
   extra?: {
     usageMetadata: UsageMetadata | undefined;
     model?: string;

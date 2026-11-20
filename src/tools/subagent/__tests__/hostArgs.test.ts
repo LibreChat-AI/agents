@@ -1,13 +1,18 @@
+import { z } from 'zod';
+import { tool } from '@langchain/core/tools';
 import { MemorySaver } from '@langchain/langgraph';
 import { AIMessage } from '@langchain/core/messages';
 import { describe, expect, it, jest } from '@jest/globals';
 import type {
   AgentInputs,
+  SubagentConfig,
+  StandardGraphInput,
+  MultiAgentGraphState,
+  SubagentResolveContext,
+  SubagentAgentInputsResolver,
+  CompactionSemanticIndexEntry,
   ExecutableSubagentConfigEntry,
   LazySingleAgentSubagentConfig,
-  MultiAgentGraphState,
-  SubagentConfig,
-  SubagentResolveContext,
 } from '@/types';
 import type { SubagentResolutionFailureHandler } from '@/tools/subagent/diagnostics';
 import type { SubagentResumeExecution } from '@/tools/subagent/SubagentReplay';
@@ -17,6 +22,7 @@ import {
   pickSubagentHostArgInput,
   resolveSubagentHostArgs,
   SUBAGENT_HOST_ARG_LIMITS,
+  SELF_SUBAGENT_HOST_ARGS_SUPPORTED,
 } from '@/tools/subagent/hostArgs';
 import { InMemorySubagentTaskStore } from '@/tools/subagent/InMemorySubagentTaskStore';
 import { SUBAGENT_RESUME_MANIFEST_CONFIG_KEY } from '@/tools/subagent/SubagentReplay';
@@ -25,6 +31,7 @@ import { SubagentHostArgumentError } from '@/tools/subagent/diagnostics';
 import { SubagentExecutor } from '@/tools/subagent/SubagentExecutor';
 import { buildSubagentToolParams } from '@/tools/SubagentTool';
 import { AgentContext } from '@/agents/AgentContext';
+import * as publicApi from '@/index';
 import { Providers } from '@/common';
 
 const makeAgent = (agentId = 'child-agent'): AgentInputs => ({
@@ -925,5 +932,374 @@ describe('SubagentExecutor host arguments', () => {
         ),
       });
     });
+  });
+});
+
+describe('self subagent host arguments', () => {
+  const WORKSPACE = {
+    description: 'Workspace the copy opens.',
+    enum: ['librechat', 'agents'],
+  };
+  const SELF_CONFIG_ID = 'self@v1';
+  const graphOnlyTool = tool(async () => 'ok', {
+    name: 'graph_only',
+    description: 'Graph-bound tool.',
+    schema: z.object({}),
+  });
+  const semanticIndex: CompactionSemanticIndexEntry[] = [
+    {
+      type: 'activity_phase',
+      sourceMessageId: 'message-1',
+      sourceContentIndex: 0,
+      revision: 1,
+      status: 'committed',
+      text: 'Committed label',
+    },
+  ];
+  const withParentState = (agent: AgentInputs): AgentInputs => ({
+    ...agent,
+    graphTools: [graphOnlyTool],
+    compactionSemanticIndex: semanticIndex,
+  });
+
+  const makeSelfConfig = (
+    resolveAgentInputs: SubagentAgentInputsResolver,
+    overrides: Partial<SubagentConfig> = {}
+  ): SubagentConfig => ({
+    self: true,
+    type: 'self',
+    name: 'Parent',
+    description: 'Spawn a copy of the parent.',
+    configId: SELF_CONFIG_ID,
+    hostArgs: { workspace: WORKSPACE },
+    resolveAgentInputs,
+    ...overrides,
+  });
+
+  const normalizeSelf = (
+    config: SubagentConfig,
+    parent: AgentInputs = makeAgent('parent')
+  ): ExecutableSubagentConfigEntry[] =>
+    normalizeSubagentConfigEntries([config], AgentContext.fromConfig(parent));
+
+  const capturingGraph =
+    (graphInputs: StandardGraphInput[]) =>
+      (input: StandardGraphInput): StandardGraph => {
+        graphInputs.push(input);
+        return makeGraph();
+      };
+
+  const makeSelfResumeExecution = (
+    parentToolCallId: string,
+    hostArgsDigest?: string
+  ): SubagentResumeExecution => ({
+    ...makeResumeExecution(parentToolCallId, hostArgsDigest),
+    subagentType: 'self',
+    configId: SELF_CONFIG_ID,
+  });
+
+  it('is advertised as supported', () => {
+    expect(SELF_SUBAGENT_HOST_ARGS_SUPPORTED).toBe(true);
+    expect(publicApi.SELF_SUBAGENT_HOST_ARGS_SUPPORTED).toBe(true);
+  });
+
+  it('validates a self config with host arguments, a resolver, and a configId', () => {
+    const resolver = jest.fn(async () => makeAgent('resolved'));
+    const reused = normalizeSelf(makeSelfConfig(resolver));
+    const provided = makeAgent('sanitized-parent');
+    const sanitized = normalizeSelf(
+      makeSelfConfig(resolver, { agentInputs: provided })
+    );
+
+    expect(reused).toHaveLength(1);
+    expect(reused[0]).toMatchObject({
+      self: true,
+      type: 'self',
+      configId: SELF_CONFIG_ID,
+      resolveAgentInputs: resolver,
+      agentInputs: expect.objectContaining({ agentId: 'parent' }),
+    });
+    expect(sanitized[0]).toMatchObject({ agentInputs: provided });
+    expect(resolver).not.toHaveBeenCalled();
+  });
+
+  it('declares its host arguments on the subagent tool', () => {
+    const params = buildSubagentToolParams(
+      normalizeSelf(makeSelfConfig(async () => makeAgent()))
+    );
+
+    expect(params.schema.properties?.workspace).toEqual({
+      type: 'string',
+      description: WORKSPACE.description,
+      enum: WORKSPACE.enum,
+    });
+  });
+
+  it.each([
+    [
+      'without a resolver',
+      { resolveAgentInputs: undefined },
+      'requires resolveAgentInputs',
+    ],
+    [
+      'without a configId',
+      { configId: undefined },
+      'requires a non-empty "configId"',
+    ],
+    [
+      'with a resolver but no host arguments',
+      { hostArgs: undefined },
+      'cannot combine self with resolveAgentInputs',
+    ],
+  ])('rejects a self config %s', (_label, overrides, message) => {
+    const config = makeSelfConfig(async () => makeAgent(), overrides);
+
+    expect(() => normalizeSelf(config)).toThrow(message);
+  });
+
+  it('keeps rejecting host arguments on eager configs', () => {
+    const eager: SubagentConfig = {
+      type: 'eager',
+      name: 'Eager',
+      description: 'Eager child.',
+      agentInputs: makeAgent('eager'),
+      hostArgs: { workspace: WORKSPACE },
+    };
+    const eagerWithResolver: SubagentConfig = {
+      ...eager,
+      configId: 'eager@v1',
+      resolveAgentInputs: async () => makeAgent(),
+    };
+
+    for (const config of [eager, eagerWithResolver]) {
+      expect(() => normalizeSelf(config)).toThrow(
+        'only a lazy resolveAgentInputs config'
+      );
+    }
+  });
+
+  it('resolves a call with host arguments and still applies self handling', async () => {
+    const contexts: SubagentResolveContext[] = [];
+    const graphInputs: StandardGraphInput[] = [];
+    const config = makeSelfConfig(async (context) => {
+      contexts.push(context);
+      return withParentState(makeAgent('routed-parent'));
+    });
+    const executor = createExecutor(normalizeSelf(config), {
+      createChildGraph: capturingGraph(graphInputs),
+    });
+
+    const result = await executor.execute({
+      description: 'Work in the librechat checkout.',
+      subagentType: 'self',
+      parentToolCallId: 'call_self_routed',
+      hostArgs: { workspace: 'librechat' },
+    });
+
+    expect(result.content).toBe('Task completed');
+    expect(contexts).toHaveLength(1);
+    expect(contexts[0].hostArgs).toEqual({ workspace: 'librechat' });
+    expect(contexts[0].descriptor).toEqual({
+      type: 'self',
+      name: 'Parent',
+      description: 'Spawn a copy of the parent.',
+      configId: SELF_CONFIG_ID,
+    });
+    const [child] = graphInputs[0].agents;
+    expect(child.instructions).toBe('You are routed-parent.');
+    expect(child.graphTools).toBeUndefined();
+    expect(child.compactionSemanticIndex).toBeUndefined();
+  });
+
+  it.each([
+    ['the parent inputs', undefined, 'You are parent.'],
+    [
+      'the provided inputs',
+      withParentState(makeAgent('sanitized-parent')),
+      'You are sanitized-parent.',
+    ],
+  ])(
+    'runs a call without host arguments on %s, as before',
+    async (_label, agentInputs, instructions) => {
+      const resolver = jest.fn(async () => makeAgent('routed-parent'));
+      const graphInputs: StandardGraphInput[] = [];
+      const config = makeSelfConfig(
+        resolver,
+        agentInputs == null ? {} : { agentInputs }
+      );
+      const executor = createExecutor(
+        normalizeSelf(config, withParentState(makeAgent('parent'))),
+        { createChildGraph: capturingGraph(graphInputs) }
+      );
+
+      const result = await executor.execute({
+        description: 'Work wherever the parent works.',
+        subagentType: 'self',
+        parentToolCallId: 'call_self_default',
+      });
+
+      expect(result.content).toBe('Task completed');
+      expect(resolver).not.toHaveBeenCalled();
+      const [child] = graphInputs[0].agents;
+      expect(child.instructions).toBe(instructions);
+      expect(child.graphTools).toBeUndefined();
+      expect(child.compactionSemanticIndex).toBeUndefined();
+    }
+  );
+
+  it('rejects invalid and undeclared values with the existing messages', async () => {
+    const resolver = jest.fn(async () => makeAgent());
+    const executor = createExecutor(normalizeSelf(makeSelfConfig(resolver)));
+
+    const invalid = await executor.execute({
+      description: 'Work in an unknown checkout.',
+      subagentType: 'self',
+      parentToolCallId: 'call_self_invalid',
+      hostArgs: { workspace: 'unknown' },
+    });
+    const undeclared = await executor.execute({
+      description: 'Work on a machine.',
+      subagentType: 'self',
+      parentToolCallId: 'call_self_undeclared',
+      hostArgs: { machine: 'laptop' },
+    });
+
+    expect(invalid.content).toBe(
+      'Error: "workspace" for subagent "self" must be one of: librechat, agents. Omit "workspace" to let the host choose.'
+    );
+    expect(undeclared.content).toBe(
+      'Error: Subagent "self" does not accept "machine". Omit it for this subagent type.'
+    );
+    expect(resolver).not.toHaveBeenCalled();
+  });
+
+  it('turns a resolver refusal into the fixed host-argument message', async () => {
+    const config = makeSelfConfig(async () => {
+      throw new SubagentHostArgumentError('workspace', 'not_allowed');
+    });
+    const executor = createExecutor(normalizeSelf(config));
+
+    const result = await executor.execute({
+      description: 'Work in the agents checkout.',
+      subagentType: 'self',
+      parentToolCallId: 'call_self_refused',
+      hostArgs: { workspace: 'agents' },
+    });
+
+    expect(result.content).toBe(
+      'Subagent error: The requested "workspace" is not allowed for this subagent. Omit "workspace" to let the host choose, or pass a different value.'
+    );
+  });
+
+  it('resumes a routed self execution through the resolver with the same arguments', async () => {
+    const contexts: SubagentResolveContext[] = [];
+    const config = makeSelfConfig(async (context) => {
+      contexts.push(context);
+      return makeAgent('routed-parent');
+    });
+    const parentToolCallId = 'call_self_resume';
+    const executor = createExecutor(normalizeSelf(config), {
+      checkpointer: new MemorySaver(),
+      humanInTheLoop: { enabled: true },
+      createChildGraph: makeRecoveredGraph,
+    });
+    const forkTarget = executor as unknown as {
+      forkCheckpointSnapshot: () => Promise<void>;
+    };
+    jest
+      .spyOn(forkTarget, 'forkCheckpointSnapshot')
+      .mockResolvedValue(undefined);
+
+    await executor.execute({
+      description: 'Resume in the librechat checkout.',
+      subagentType: 'self',
+      threadId: 'durable-thread',
+      parentToolCallId,
+      hostArgs: { workspace: 'librechat' },
+      parentConfigurable: {
+        [SUBAGENT_RESUME_MANIFEST_CONFIG_KEY]: {
+          version: 1,
+          executions: [
+            makeSelfResumeExecution(
+              parentToolCallId,
+              getSubagentHostArgsDigest({ workspace: 'librechat' })
+            ),
+          ],
+        },
+      },
+    });
+
+    expect(contexts).toHaveLength(1);
+    expect(contexts[0].executionId).toBe('persisted-execution-id');
+    expect(contexts[0].hostArgs).toEqual({ workspace: 'librechat' });
+  });
+
+  it('rejects a resume whose host arguments changed', async () => {
+    const resolver = jest.fn(async () => makeAgent());
+    const parentToolCallId = 'call_self_resume_changed';
+    const executor = createExecutor(normalizeSelf(makeSelfConfig(resolver)), {
+      checkpointer: new MemorySaver(),
+      humanInTheLoop: { enabled: true },
+      createChildGraph: makeRecoveredGraph,
+    });
+
+    const result = await executor.execute({
+      description: 'Resume without the workspace.',
+      subagentType: 'self',
+      threadId: 'durable-thread',
+      parentToolCallId,
+      parentConfigurable: {
+        [SUBAGENT_RESUME_MANIFEST_CONFIG_KEY]: {
+          version: 1,
+          executions: [
+            makeSelfResumeExecution(
+              parentToolCallId,
+              getSubagentHostArgsDigest({ workspace: 'librechat' })
+            ),
+          ],
+        },
+      },
+    });
+
+    expect(result.content).toBe(
+      'Subagent error: Subagent invocation changed for this execution.'
+    );
+    expect(resolver).not.toHaveBeenCalled();
+  });
+
+  it('forwards host arguments to a background self execution', async () => {
+    const scopeId = 'owner:conversation';
+    const contexts: SubagentResolveContext[] = [];
+    const store = new InMemorySubagentTaskStore();
+    const config = makeSelfConfig(async (context) => {
+      contexts.push(context);
+      return makeAgent('routed-parent');
+    });
+    const executor = createExecutor(normalizeSelf(config), {
+      taskConfig: { store, scopeId },
+    });
+
+    const started = JSON.parse(
+      executor.executeInBackground({
+        description: 'Work in the librechat checkout in the background.',
+        subagentType: 'self',
+        parentToolCallId: 'call_self_background',
+        hostArgs: { workspace: 'librechat' },
+      })
+    ) as { background_task_id: string };
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      const task = store.get(scopeId, started.background_task_id);
+      if (task != null && task.status !== 'running') {
+        break;
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+
+    expect(store.get(scopeId, started.background_task_id)?.status).toBe(
+      'completed'
+    );
+    expect(contexts.map((context) => context.hostArgs)).toEqual([
+      { workspace: 'librechat' },
+    ]);
   });
 });

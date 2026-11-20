@@ -1,4 +1,5 @@
 import { performance } from 'node:perf_hooks';
+import type { ProviderTextAdmission, ProviderTextAdmissionLease } from './providerTextAdmission';
 import { PreparedSubagentError } from '@/tools/preparedSubagents';
 import { StreamLimitExceededError } from '@/llm/streamLimits';
 
@@ -101,6 +102,46 @@ const errorCodes = new Set<ProviderTextProtectionErrorCode>([
   'incompatible',
 ]);
 
+export type ProviderTextProtectionFailure = Extract<ProviderTextProtectionResult, { ok: false }>;
+
+function isProtectionErrorCode(code: unknown): code is ProviderTextProtectionErrorCode {
+  return typeof code === 'string' && (errorCodes as ReadonlySet<string>).has(code);
+}
+
+/** Safe wire failure, including errors raised by a separate CJS/ESM copy of the SDK. */
+export function serializeProviderTextProtectionError(error: unknown): ProviderTextProtectionFailure {
+  let code: ProviderTextProtectionErrorCode = 'unavailable';
+  try {
+    if (error != null && typeof error === 'object' &&
+        'name' in error && error.name === 'ProviderTextProtectionError' &&
+        'code' in error && isProtectionErrorCode(error.code)) code = error.code;
+  } catch {
+    // Never serialize arbitrary exception messages, stacks, causes, or getters.
+  }
+  return { version: 1, ok: false, error: { code } };
+}
+
+/** Decode only an authenticated host's failure envelope; unknown versions/codes fail closed. */
+export function deserializeProviderTextProtectionError(failure: unknown): ProviderTextProtectionError {
+  try {
+    if (failure != null && typeof failure === 'object' &&
+        'version' in failure && failure.version === 1 &&
+        'ok' in failure && failure.ok === false &&
+        'error' in failure && failure.error != null && typeof failure.error === 'object' &&
+        'code' in failure.error && isProtectionErrorCode(failure.error.code)) {
+      return new ProviderTextProtectionError(failure.error.code);
+    }
+  } catch {
+    // Malformed failures cannot become host policy decisions.
+  }
+  return new ProviderTextProtectionError('incompatible');
+}
+
+export function validateProviderTextTimeout(timeoutMs: number): void {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 2_147_483_647)
+    throw new ProviderTextProtectionError('incompatible');
+}
+
 export function validateProviderTextProtection(
   policy: ProviderTextProtection
 ): void {
@@ -130,6 +171,11 @@ export function validateProviderTextProtection(
   }
 }
 
+export interface ProviderTextAttemptOptions {
+  readonly timeoutMs?: number;
+  readonly admission?: ProviderTextAdmission;
+}
+
 /** A lease stays charged while a cancellation-ignoring producer/handler still owns raw text. */
 export class ProviderTextAttempt {
   private readonly controller = new AbortController();
@@ -142,25 +188,44 @@ export class ProviderTextAttempt {
   private readonly timer: ReturnType<typeof setTimeout>;
   private readonly abort: () => void;
   private finished = false;
+  private readonly admission?: ProviderTextAdmissionLease;
 
   constructor(
     private readonly policy: ProviderTextProtection,
-    private readonly parent?: AbortSignal
+    private readonly parent?: AbortSignal,
+    options: ProviderTextAttemptOptions = {}
   ) {
     validateProviderTextProtection(policy);
-    this.deadline = performance.now() + policy.timeoutMs;
+    const timeoutMs = options.timeoutMs ?? policy.timeoutMs;
+    validateProviderTextTimeout(timeoutMs);
+    this.deadline = performance.now() + Math.min(timeoutMs, policy.timeoutMs);
     this.budget = budgets.get(policy) ?? { bytes: 0 };
     budgets.set(policy, this.budget);
-    if (parent?.aborted === true) throw protectionAbortError(parent);
-    this.charge(512);
-    protectedSignals.add(this.signal);
     this.abort = (): void =>
       this.controller.abort(protectionAbortError(this.parent));
-    parent?.addEventListener('abort', this.abort, { once: true });
-    this.timer = setTimeout(() => {
-      this.controller.abort(new ProviderTextProtectionError('timeout'));
-    }, policy.timeoutMs);
-    this.timer.unref();
+    if (parent?.aborted === true) throw protectionAbortError(parent);
+    this.admission = options.admission?.acquire();
+    try {
+      this.charge(512);
+      parent?.addEventListener('abort', this.abort, { once: true });
+      this.check();
+      this.timer = setTimeout(() => {
+        this.controller.abort(new ProviderTextProtectionError('timeout'));
+      }, Math.min(timeoutMs, policy.timeoutMs));
+      this.timer.unref();
+      protectedSignals.add(this.signal);
+    } catch (error) {
+      this.budget.bytes -= this.bytes;
+      this.bytes = 0;
+      this.admission?.release();
+      try {
+        parent?.removeEventListener('abort', this.abort);
+      } catch {
+        // Malformed transport signals must not prevent admission rollback.
+      }
+      if (error instanceof ProviderTextProtectionError || error instanceof StreamLimitExceededError || error instanceof PreparedSubagentError) throw error;
+      throw new ProviderTextProtectionError('incompatible');
+    }
   }
 
   get signal(): AbortSignal {
@@ -168,6 +233,7 @@ export class ProviderTextAttempt {
   }
 
   check(): void {
+    if (this.finished) throw new ProviderTextProtectionError('incompatible');
     if (this.signal.aborted) throw this.signal.reason;
     if (this.parent?.aborted === true)
       throw protectionAbortError(this.parent);
@@ -184,6 +250,12 @@ export class ProviderTextAttempt {
     ) {
       this.controller.abort(new ProviderTextProtectionError('overflow'));
       throw this.signal.reason;
+    }
+    try {
+      this.admission?.charge(bytes);
+    } catch (error) {
+      this.controller.abort(error);
+      throw error;
     }
     this.bytes += bytes;
     this.budget.bytes += bytes;
@@ -268,8 +340,7 @@ export class ProviderTextAttempt {
     } catch (error) {
       this.check();
       if (isProviderTextRestartCancellation(error)) throw error;
-      if (error instanceof ProviderTextProtectionError) throw new ProviderTextProtectionError(error.code);
-      throw new ProviderTextProtectionError('unavailable');
+      throw deserializeProviderTextProtectionError(serializeProviderTextProtectionError(error));
     }
     this.check();
     const canonical = validateResult(result);
@@ -282,14 +353,22 @@ export class ProviderTextAttempt {
     if (this.finished) return;
     this.finished = true;
     clearTimeout(this.timer);
-    this.parent?.removeEventListener('abort', this.abort);
+    try {
+      this.parent?.removeEventListener('abort', this.abort);
+    } catch {
+      // Cleanup must still drain leases if a malformed transport signal throws.
+    }
     const dispose = (): void => {
       this.fragments.length = 0;
       this.budget.bytes -= this.bytes;
       this.bytes = 0;
+      this.admission?.release();
     };
     if (this.pending.size === 0) dispose();
-    else void Promise.allSettled([...this.pending]).then(dispose);
+    else {
+      this.admission?.retain();
+      void Promise.allSettled([...this.pending]).then(dispose);
+    }
   }
 }
 
