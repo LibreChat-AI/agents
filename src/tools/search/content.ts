@@ -1,6 +1,105 @@
 import * as cheerio from 'cheerio';
 import type { References, MediaReference } from './types';
 
+type ReferenceType = 'image' | 'video' | 'iframe' | 'link';
+
+interface ReferenceTarget {
+  type: ReferenceType;
+  idx: number;
+}
+
+interface ReferenceTargets {
+  byUrl: Map<string, ReferenceTarget>;
+  /** Distinct URL lengths, longest first, so a longer URL wins at the same position. */
+  lengths: number[];
+}
+
+const TITLE_SUFFIX = /\s+"([^"]*)"\)/y;
+
+/**
+ * Indexes every referenced URL once. A URL listed under several types keeps the
+ * first, in image, video, iframe, link order, which is the order the replacement
+ * has always preferred.
+ */
+function collectTargets(
+  groups: ReadonlyArray<[ReferenceType, Map<string, MediaReference>]>
+): ReferenceTargets {
+  const byUrl = new Map<string, ReferenceTarget>();
+  const lengths = new Set<number>();
+  for (const [type, references] of groups) {
+    let idx = 0;
+    for (const url of references.keys()) {
+      idx++;
+      if (byUrl.has(url)) {
+        continue;
+      }
+      byUrl.set(url, { type, idx });
+      lengths.add(url.length);
+    }
+  }
+  return { byUrl, lengths: Array.from(lengths).sort((a, b) => b - a) };
+}
+
+/** Matches `(url)` or `(url "title")` for a known URL starting at `start`. */
+function matchReference(
+  markdown: string,
+  start: number,
+  { byUrl, lengths }: ReferenceTargets
+): { text: string; end: number } | undefined {
+  for (const length of lengths) {
+    const urlEnd = start + length;
+    if (urlEnd >= markdown.length) {
+      continue;
+    }
+    const target = byUrl.get(markdown.slice(start, urlEnd));
+    if (target == null) {
+      continue;
+    }
+    const label = `${target.type}#${target.idx}`;
+    if (markdown[urlEnd] === ')') {
+      return { text: `(${label})`, end: urlEnd + 1 };
+    }
+    TITLE_SUFFIX.lastIndex = urlEnd;
+    const title = TITLE_SUFFIX.exec(markdown);
+    if (title != null) {
+      return {
+        text: `(${label} "${title[1]}")`,
+        end: TITLE_SUFFIX.lastIndex,
+      };
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Rewrites every markdown reference to a known URL in one left-to-right pass.
+ * Looking each candidate up by length keeps the work proportional to the
+ * markdown, where one regex per URL over the whole page grew with links times
+ * page size and blocked the event loop for seconds on a link-heavy page.
+ */
+function replaceReferences(
+  markdown: string,
+  targets: ReferenceTargets
+): string {
+  if (targets.byUrl.size === 0) {
+    return markdown;
+  }
+  let result = '';
+  let copied = 0;
+  let open = markdown.indexOf('(');
+  while (open !== -1) {
+    const match = matchReference(markdown, open + 1, targets);
+    if (match == null) {
+      open = markdown.indexOf('(', open + 1);
+      continue;
+    }
+    result += markdown.slice(copied, open) + match.text;
+    copied = match.end;
+    open = markdown.indexOf('(', match.end);
+  }
+  return result + markdown.slice(copied);
+}
+
 export function processContent(
   html: string,
   markdown: string
@@ -67,68 +166,15 @@ export function processContent(
     }
   });
 
-  // Create lookup maps with indices
-  const linkIndexMap = new Map<string, number>();
-  const imageIndexMap = new Map<string, number>();
-  const videoIndexMap = new Map<string, number>();
-  const iframeIndexMap = new Map<string, number>();
-
-  Array.from(linkMap.keys()).forEach((url, i) => linkIndexMap.set(url, i + 1));
-  Array.from(imageMap.keys()).forEach((url, i) =>
-    imageIndexMap.set(url, i + 1)
+  const result = replaceReferences(
+    markdown,
+    collectTargets([
+      ['image', imageMap],
+      ['video', videoMap],
+      ['iframe', iframeMap],
+      ['link', linkMap],
+    ])
   );
-  Array.from(videoMap.keys()).forEach((url, i) =>
-    videoIndexMap.set(url, i + 1)
-  );
-  Array.from(iframeMap.keys()).forEach((url, i) =>
-    iframeIndexMap.set(url, i + 1)
-  );
-
-  // Process the markdown
-  let result = markdown;
-
-  // Replace each URL one by one, starting with the longest URLs first to avoid partial matches
-  const allUrls = [
-    ...Array.from(imageMap.keys()).map((url) => ({
-      url,
-      type: 'image',
-      idx: imageIndexMap.get(url),
-    })),
-    ...Array.from(videoMap.keys()).map((url) => ({
-      url,
-      type: 'video',
-      idx: videoIndexMap.get(url),
-    })),
-    ...Array.from(iframeMap.keys()).map((url) => ({
-      url,
-      type: 'iframe',
-      idx: iframeIndexMap.get(url),
-    })),
-    ...Array.from(linkMap.keys()).map((url) => ({
-      url,
-      type: 'link',
-      idx: linkIndexMap.get(url),
-    })),
-  ].sort((a, b) => b.url.length - a.url.length);
-
-  // Create a function to escape special characters in URLs for regex
-  function escapeRegex(string: string): string {
-    return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  }
-
-  // Replace each URL in the markdown
-  for (const { url, type, idx } of allUrls) {
-    // Create a regex that captures URLs in markdown links
-    const regex = new RegExp(`\\(${escapeRegex(url)}(?:\\s+"[^"]*")?\\)`, 'g');
-
-    result = result.replace(regex, (match) => {
-      // Keep any title attribute that might exist
-      const titleMatch = match.match(/\s+"([^"]*)"/);
-      const titlePart = titleMatch ? ` "${titleMatch[1]}"` : '';
-
-      return `(${type}#${idx}${titlePart})`;
-    });
-  }
 
   iframeMap.clear();
   const links = Array.from(linkMap.values());

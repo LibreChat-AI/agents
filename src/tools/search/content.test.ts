@@ -56,6 +56,55 @@ describe('Link Processor', () => {
     expect(result.markdown).toContain('link#2');
   });
 
+  test('prefers the longest known URL at a position, including URLs with parentheses', () => {
+    const html = `
+      <a href="https://w.org/wiki/Foo_(bar)">a</a>
+      <a href="https://w.org/wiki/Foo_">b</a>
+      <a href="https://w.org/wiki/Foo_(bar)_baz">c</a>
+    `;
+    const markdown =
+      '[a](https://w.org/wiki/Foo_(bar)) [b](https://w.org/wiki/Foo_) [c](https://w.org/wiki/Foo_(bar)_baz "T x") (https://w.org/wiki/Foo_';
+
+    const result = processContent(html, markdown);
+
+    expect(result.markdown).toBe(
+      '[a](link#1) [b](link#2) [c](link#3 "T x") (https://w.org/wiki/Foo_'
+    );
+  });
+
+  test('keeps the image reference when a URL is both an image and a link', () => {
+    const html =
+      '<a href="https://x.io/a.png">a</a><img src="https://x.io/a.png" alt="i">';
+    const markdown = '![i](https://x.io/a.png) [a](https://x.io/a.png "t")';
+
+    const result = processContent(html, markdown);
+
+    expect(result.markdown).toBe('![i](image#1) [a](image#1 "t")');
+    expect(result.links).toHaveLength(1);
+    expect(result.images).toHaveLength(1);
+  });
+
+  test('rewrites a link-heavy page in time linear in its size', () => {
+    /** One regex per URL over the whole page grew with links times page size (4,000
+     *  links took ~3 s, doubling the page quintupled it) and blocked the event loop. */
+    let html = '<html><body>';
+    let markdown = '';
+    for (let i = 0; i < 6000; i++) {
+      const url = `https://example.com/docs/section-${i}/page-${i * 7}`;
+      html += `<p><a href="${url}">l${i}</a> <img src="${url}.png" alt="i${i}"></p>`;
+      markdown += `text [l${i}](${url}) ![i${i}](${url}.png)\n`;
+    }
+
+    const start = performance.now();
+    const result = processContent(html, markdown);
+    const elapsed = performance.now() - start;
+
+    expect(result.links).toHaveLength(6000);
+    expect(result.images).toHaveLength(6000);
+    expect(result.markdown).not.toMatch(/\]\(https:\/\/example\.com\//);
+    expect(elapsed).toBeLessThan(1500);
+  });
+
   // Performance test with large files
   test('should process large files efficiently', () => {
     const html = fs.readFileSync('src/tools/search/test.html', 'utf-8');
