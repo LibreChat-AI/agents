@@ -8,12 +8,16 @@ interface ReferenceTarget {
   idx: number;
 }
 
-interface ReferenceTargets {
-  byUrl: Map<string, ReferenceTarget>;
-  /** Distinct URL lengths, longest first, so a longer URL wins at the same position. */
-  lengths: number[];
+/**
+ * Character trie over every referenced URL. Edges live in one map keyed by
+ * `node * EDGE_STRIDE + charCode`, so memory stays proportional to the URL text.
+ */
+interface ReferenceTrie {
+  edges: Map<number, number>;
+  terminals: Map<number, ReferenceTarget>;
 }
 
+const EDGE_STRIDE = 0x10000;
 const TITLE_SUFFIX = /\s+"([^"]*)"\)/y;
 
 /**
@@ -21,74 +25,98 @@ const TITLE_SUFFIX = /\s+"([^"]*)"\)/y;
  * first, in image, video, iframe, link order, which is the order the replacement
  * has always preferred.
  */
-function collectTargets(
+function buildTrie(
   groups: ReadonlyArray<[ReferenceType, Map<string, MediaReference>]>
-): ReferenceTargets {
-  const byUrl = new Map<string, ReferenceTarget>();
-  const lengths = new Set<number>();
+): ReferenceTrie {
+  const edges = new Map<number, number>();
+  const terminals = new Map<number, ReferenceTarget>();
+  let nodes = 1;
   for (const [type, references] of groups) {
     let idx = 0;
     for (const url of references.keys()) {
       idx++;
-      if (byUrl.has(url)) {
-        continue;
+      let node = 0;
+      for (let i = 0; i < url.length; i++) {
+        const key = node * EDGE_STRIDE + url.charCodeAt(i);
+        let next = edges.get(key);
+        if (next == null) {
+          next = nodes++;
+          edges.set(key, next);
+        }
+        node = next;
       }
-      byUrl.set(url, { type, idx });
-      lengths.add(url.length);
+      if (!terminals.has(node)) {
+        terminals.set(node, { type, idx });
+      }
     }
   }
-  return { byUrl, lengths: Array.from(lengths).sort((a, b) => b - a) };
+  return { edges, terminals };
 }
 
-/** Matches `(url)` or `(url "title")` for a known URL starting at `start`. */
+/** Where `(url)` or `(url "title")` ends when `url` ends just before `urlEnd`. */
+function referenceEnd(
+  markdown: string,
+  urlEnd: number
+): { end: number; title?: string } | undefined {
+  if (markdown[urlEnd] === ')') {
+    return { end: urlEnd + 1 };
+  }
+  TITLE_SUFFIX.lastIndex = urlEnd;
+  const title = TITLE_SUFFIX.exec(markdown);
+  return title == null
+    ? undefined
+    : { end: TITLE_SUFFIX.lastIndex, title: title[1] };
+}
+
+/**
+ * Matches the longest known URL starting at `start` that is closed as a
+ * reference. The walk stops at the first character no URL continues with, so
+ * a position costs at most the URL text actually present there.
+ */
 function matchReference(
   markdown: string,
   start: number,
-  { byUrl, lengths }: ReferenceTargets
+  { edges, terminals }: ReferenceTrie
 ): { text: string; end: number } | undefined {
-  for (const length of lengths) {
-    const urlEnd = start + length;
-    if (urlEnd >= markdown.length) {
-      continue;
+  let best: { text: string; end: number } | undefined;
+  let node = 0;
+  for (let i = start; i < markdown.length; i++) {
+    const next = edges.get(node * EDGE_STRIDE + markdown.charCodeAt(i));
+    if (next == null) {
+      break;
     }
-    const target = byUrl.get(markdown.slice(start, urlEnd));
+    node = next;
+    const target = terminals.get(node);
     if (target == null) {
       continue;
     }
+    const close = referenceEnd(markdown, i + 1);
+    if (close == null) {
+      continue;
+    }
     const label = `${target.type}#${target.idx}`;
-    if (markdown[urlEnd] === ')') {
-      return { text: `(${label})`, end: urlEnd + 1 };
-    }
-    TITLE_SUFFIX.lastIndex = urlEnd;
-    const title = TITLE_SUFFIX.exec(markdown);
-    if (title != null) {
-      return {
-        text: `(${label} "${title[1]}")`,
-        end: TITLE_SUFFIX.lastIndex,
-      };
-    }
+    best = {
+      text: close.title == null ? `(${label})` : `(${label} "${close.title}")`,
+      end: close.end,
+    };
   }
-  return undefined;
+  return best;
 }
 
 /**
  * Rewrites every markdown reference to a known URL in one left-to-right pass.
- * Looking each candidate up by length keeps the work proportional to the
- * markdown, where one regex per URL over the whole page grew with links times
- * page size and blocked the event loop for seconds on a link-heavy page.
+ * One regex per URL over the whole page grew with links times page size and
+ * blocked the event loop for seconds on a link-heavy page.
  */
-function replaceReferences(
-  markdown: string,
-  targets: ReferenceTargets
-): string {
-  if (targets.byUrl.size === 0) {
+function replaceReferences(markdown: string, trie: ReferenceTrie): string {
+  if (trie.terminals.size === 0) {
     return markdown;
   }
   let result = '';
   let copied = 0;
   let open = markdown.indexOf('(');
   while (open !== -1) {
-    const match = matchReference(markdown, open + 1, targets);
+    const match = matchReference(markdown, open + 1, trie);
     if (match == null) {
       open = markdown.indexOf('(', open + 1);
       continue;
@@ -168,7 +196,7 @@ export function processContent(
 
   const result = replaceReferences(
     markdown,
-    collectTargets([
+    buildTrie([
       ['image', imageMap],
       ['video', videoMap],
       ['iframe', iframeMap],

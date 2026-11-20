@@ -105,6 +105,27 @@ describe('Link Processor', () => {
     expect(elapsed).toBeLessThan(1500);
   });
 
+  test('rewrites links of many different lengths in time linear in the page', () => {
+    /** A query that grows per entry gives every link its own URL length, which
+     *  defeats any scheme that tries every known length at every position. */
+    let html = '<html><body>';
+    let markdown = '';
+    for (let i = 0; i < 2000; i++) {
+      const url = `https://example.com/search?q=${'a'.repeat(i)}`;
+      html += `<p><a href="${url}">l${i}</a></p>`;
+      markdown += `text [l${i}](${url} "t${i}")\n`;
+    }
+
+    const start = performance.now();
+    const result = processContent(html, markdown);
+    const elapsed = performance.now() - start;
+
+    expect(result.links).toHaveLength(2000);
+    expect(result.markdown).toContain('[l1999](link#2000 "t1999")');
+    expect(result.markdown).not.toMatch(/\]\(https:\/\/example\.com\//);
+    expect(elapsed).toBeLessThan(1500);
+  });
+
   // Performance test with large files
   test('should process large files efficiently', () => {
     const html = fs.readFileSync('src/tools/search/test.html', 'utf-8');
