@@ -409,26 +409,71 @@ function selectCacheBreakpointIndexes(
   roles: Array<string | undefined>,
   cacheable: boolean[]
 ): number[] {
-  let instructionIndex = -1;
+  let firstInstructionIndex = -1;
+  let leadingInstructionIndex = -1;
+  let inLeadingInstructions = true;
   let latestUserIndex = -1;
   for (let index = 0; index < roles.length; index++) {
     const role = roles[index];
-    if ((role === 'system' || role === 'developer') && cacheable[index]) {
-      instructionIndex = index;
+    const isInstruction = role === 'system' || role === 'developer';
+    if (!isInstruction) {
+      inLeadingInstructions = false;
+    }
+    if (isInstruction && cacheable[index]) {
+      if (firstInstructionIndex === -1) {
+        firstInstructionIndex = index;
+      }
+      if (inLeadingInstructions) {
+        leadingInstructionIndex = index;
+      }
     }
     if (role === 'user') {
       latestUserIndex = index;
     }
   }
 
+  /**
+   * Two instruction boundaries, which coincide whenever there is a single
+   * instruction message. The first one is the stable prefix `AgentContext`
+   * builds when it relocates the volatile tail into its own system message;
+   * marking only the last would put the breakpoint behind content that turns
+   * over every turn. The end of the leading instruction run covers callers
+   * that split one stable prompt across several instruction messages.
+   */
   const indexes = new Set<number>();
-  if (instructionIndex >= 0) {
-    indexes.add(instructionIndex);
+  if (firstInstructionIndex >= 0) {
+    indexes.add(firstInstructionIndex);
+  }
+  if (leadingInstructionIndex >= 0) {
+    indexes.add(leadingInstructionIndex);
   }
   for (let index = latestUserIndex - 1; index >= 0; index--) {
     if (cacheable[index]) {
       indexes.add(index);
       break;
+    }
+  }
+
+  /**
+   * Instructions right before the current turn after earlier history are the
+   * tail `AgentContext` relocates there. That position moves every turn, so a
+   * prefix ending at it never recurs; the history in front of it does, and
+   * gets its own breakpoint. Four at most, the most an explicit request may
+   * write.
+   */
+  let tailStart = latestUserIndex;
+  while (
+    tailStart > 0 &&
+    (roles[tailStart - 1] === 'system' || roles[tailStart - 1] === 'developer')
+  ) {
+    tailStart--;
+  }
+  if (tailStart < latestUserIndex && tailStart > leadingInstructionIndex + 1) {
+    for (let index = tailStart - 1; index > leadingInstructionIndex; index--) {
+      if (cacheable[index]) {
+        indexes.add(index);
+        break;
+      }
     }
   }
   return [...indexes];
