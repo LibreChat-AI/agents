@@ -4383,12 +4383,17 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     }
 
     for (const entry of referenceFailures) {
+      const rejection = messageByCallId.get(entry.call.id ?? '')!;
       await this.dispatchStepCompleted(
         entry.call.id ?? '',
         entry.call.name,
         entry.args,
-        String(messageByCallId.get(entry.call.id ?? '')!.content),
-        config
+        String(rejection.content),
+        config,
+        undefined,
+        undefined,
+        undefined,
+        rejection.additional_kwargs as t.ToolMessageRefMetadata
       );
     }
     const injected: BaseMessage[] = [];

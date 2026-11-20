@@ -1760,9 +1760,28 @@ describe('ToolNode tool output references', () => {
         'unresolved_refs'
       );
       expect(completions[1].result.tool_call).toMatchObject({
-        ref: 'tool0turn1',
         unresolved_refs: ['tool0turn9'],
       });
+      expect(completions[1].result.tool_call).not.toHaveProperty('ref');
+    });
+
+    it('carries the unresolved refs of a call rejected on the event path', async () => {
+      const completions = capture();
+      const node = new ToolNode({
+        tools: [echo()],
+        eventDrivenMode: true,
+        toolCallStepIds: new Map([['c1', 's1']]),
+        toolOutputReferences: { enabled: true },
+      });
+
+      const msg = await run(node, 'c1', 'use {{tool0turn9}}');
+
+      expect(msg.status).toBe('error');
+      expect(completions).toHaveLength(1);
+      expect(completions[0].result.tool_call).toMatchObject({
+        unresolved_refs: ['tool0turn9'],
+      });
+      expect(completions[0].result.tool_call).not.toHaveProperty('ref');
     });
 
     it('carries the key on event-driven completions', async () => {
@@ -1810,9 +1829,12 @@ describe('ToolNode tool output references', () => {
 
       const msg = await run(node, 'c1', 'echo {{tool0turn0}}', 'run-b');
 
-      expect(getRefKey(msg)).toBe('tool0turn1');
+      expect(msg.status).toBe('error');
+      expect(getRefKey(msg)).toBeUndefined();
       expect(getUnresolvedRefs(msg)).toEqual(['tool0turn0']);
-      expect(msg.content).toBe('echo {{tool0turn0}}');
+      expect(msg.content).toContain(
+        'Unknown tool output references: tool0turn0'
+      );
       const [wire] = annotateMessagesForLLM(
         [msg],
         node._unsafeGetToolOutputRegistry()
