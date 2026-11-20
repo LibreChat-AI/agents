@@ -1,6 +1,6 @@
-import { tool } from '@langchain/core/tools';
 import { CallbackHandler } from '@langfuse/langchain';
 import { LangfuseOtelContextKeys } from '@langfuse/core';
+import { CallbackManager } from '@langchain/core/callbacks/manager';
 import { isGraphInterrupt, isParentCommand } from '@langchain/langgraph';
 import { context as otelContext, trace as otelTrace } from '@opentelemetry/api';
 import {
@@ -25,6 +25,7 @@ import type {
 import type { PropagateAttributesParams } from '@langfuse/tracing';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { Context, SpanContext } from '@opentelemetry/api';
+import type { ToolCall } from '@langchain/core/messages/tool';
 import type { ResolvedLangfuseToolOutputTracingConfig } from '@/langfuseRuntimeContext';
 import type * as t from '@/types';
 import {
@@ -55,6 +56,7 @@ import {
 } from '@/llm/preempt';
 import { filterCallbacks, findCallback } from '@/utils/callbacks';
 import { isPresent, parseBooleanEnv } from '@/utils/misc';
+import { Constants } from '@/common';
 
 export {
   hasLangfuseConfigCredentials,
@@ -68,6 +70,71 @@ const GRAPH_INTERRUPT_CONTROL_FLOW = { controlFlow: 'GraphInterrupt' } as const;
 const GRAPH_INTERRUPT_TOOL_OUTPUT = JSON.stringify(
   GRAPH_INTERRUPT_CONTROL_FLOW
 );
+
+/**
+ * A LangGraph control-flow error that escapes the root graph is a failure.
+ * Nested `GraphInterrupt` and `ParentCommand` errors end their observations
+ * successfully in `handleChainError`, and a real pause ends the root run
+ * normally, so one that reaches a root callback has nowhere to go: for
+ * example, a `ParentCommand` with no parent graph. `@langfuse/langchain`
+ * records `is_bubble_up` errors as control flow, so the root reports a plain
+ * error with the same name and message.
+ */
+function toRootFailure(error: unknown): unknown {
+  if (
+    !(error instanceof Error) ||
+    (error as { is_bubble_up?: unknown }).is_bubble_up !== true
+  ) {
+    return error;
+  }
+  const failure = new Error(error.message);
+  failure.name = error.name;
+  return failure;
+}
+
+/** Reports the agent's available skills on the observations `action` starts. */
+function withSkillsAvailable<T>(
+  langfuse: t.LangfuseConfig | undefined,
+  action: () => T
+): T {
+  const skillsAvailable = langfuse?.skillsAvailable;
+  return skillsAvailable == null
+    ? action()
+    : propagateAttributes({ skillsAvailable }, action);
+}
+
+type SkillToolArgs = { name?: unknown; skillName?: unknown };
+
+/** Returns the arguments of a tool input, which can be a whole tool call. */
+function getSkillToolArgs(input: unknown): SkillToolArgs | undefined {
+  const args =
+    (input as { type?: unknown } | null)?.type === 'tool_call'
+      ? (input as { args?: unknown }).args
+      : input;
+  return args != null && typeof args === 'object' && !Array.isArray(args)
+    ? (args as SkillToolArgs)
+    : undefined;
+}
+
+/**
+ * Langfuse reads a `skill` tool's skill from the top-level `name` input
+ * field. The tool's argument is `skillName`, and the traced input of a tool
+ * call wraps the arguments, so the traced input is the arguments plus `name`.
+ */
+function toTracedToolInput(toolName: unknown, input: string): string {
+  if (toolName !== Constants.SKILL_TOOL) {
+    return input;
+  }
+  try {
+    const args = getSkillToolArgs(JSON.parse(input));
+    if (args == null || 'name' in args || typeof args.skillName !== 'string') {
+      return input;
+    }
+    return JSON.stringify({ name: args.skillName, ...args });
+  } catch {
+    return input;
+  }
+}
 
 export type LangfuseTraceMetadata = Record<string, string>;
 export type LangfuseTraceAttributes = Record<string, string | number | boolean>;
@@ -528,7 +595,7 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
           runId: scopeRunId ?? this.runId,
           agentId: scopeAgentId ?? this.agentId,
         },
-        action
+        () => withSkillsAvailable(langfuse, action)
       );
     return activeContext === currentContext
       ? scoped()
@@ -563,7 +630,7 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
             this.toolOutputTracing ??
             resolveToolOutputTracingConfig(this.langfuse),
         },
-        action,
+        () => withSkillsAvailable(this.langfuse, action),
         { replace: true }
       );
     const { userId, sessionId, tags, metadata, traceName } = this.identity;
@@ -632,6 +699,13 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
         parentRunId
       );
     }
+    if (error != null && parentRunId == null) {
+      const rootArgs = [...args] as Parameters<
+        CallbackHandler['handleChainError']
+      >;
+      rootArgs[0] = toRootFailure(error);
+      return super.handleChainError(...rootArgs);
+    }
     return super.handleChainError(...args);
   }
 
@@ -699,7 +773,11 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
     this.deferredRootStarted = false;
     this.deferredRootOutcome = undefined;
     if (outcome.type === 'error') {
-      await super.handleChainError(outcome.error, runId, outcome.parentRunId);
+      await super.handleChainError(
+        toRootFailure(outcome.error),
+        runId,
+        outcome.parentRunId
+      );
       return;
     }
     await super.handleChainEnd(outcome.output, runId, outcome.parentRunId);
@@ -819,8 +897,13 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
   override handleToolStart(
     ...args: Parameters<CallbackHandler['handleToolStart']>
   ): ReturnType<CallbackHandler['handleToolStart']> {
+    const [tool, input, , , , , name] = args;
+    const toolArgs = [...args] as Parameters<
+      CallbackHandler['handleToolStart']
+    >;
+    toolArgs[1] = toTracedToolInput(name ?? tool.id.at(-1), input);
     return this.withRuntimeContext(
-      () => super.handleToolStart(...args),
+      () => super.handleToolStart(...toolArgs),
       this.startsDetachedRun(args[2], args[3]),
       args[5]
     );
@@ -1144,58 +1227,63 @@ export function isLangfuseCallbackHandler(value: unknown): boolean {
   return value instanceof CallbackHandler;
 }
 
-/** Host results have passed host output filters. Record only reserved metadata,
- * not arguments, rows, errors, or attachments. These completion observations
- * do not measure tool latency; execution timing belongs in the metadata. */
+/** Records host results using model-authored arguments, never substituted
+ * tool outputs, and reserved metadata.
+ * Host results have passed host output filters, so rows, errors, and
+ * attachments are not recorded. These completion observations do not measure
+ * tool latency; execution timing belongs in the metadata. */
 export async function traceHostToolResults(
   request: t.ToolExecuteBatchRequest,
   results: t.ToolExecuteResult[],
-  config?: RunnableConfig
+  config?: RunnableConfig,
+  originalToolCalls?: readonly ToolCall[]
 ): Promise<void> {
   if (findCallback(config?.callbacks, isLangfuseCallbackHandler) == null) {
     return;
   }
-  const callbacks = filterCallbacks(
-    config?.callbacks,
-    isLangfuseCallbackHandler
+  const callbacks = CallbackManager.configure(
+    filterCallbacks(config?.callbacks, isLangfuseCallbackHandler),
+    undefined,
+    config?.tags,
+    undefined,
+    config?.metadata
   );
+  if (callbacks == null) {
+    return;
+  }
   const callsById = new Map(request.toolCalls.map((call) => [call.id, call]));
+  const originalArgsById = new Map(
+    originalToolCalls?.map((call) => [call.id, call.args])
+  );
   for (const result of results) {
-    const metadata = getToolObservationMetadata(result.artifact);
     const call = callsById.get(result.toolCallId);
-    if (call == null || Object.keys(metadata).length === 0) {
+    if (call == null) {
       continue;
     }
-    const failure =
-      result.status === 'error'
-        ? new Error('Host tool execution failed')
-        : undefined;
-    const observation = tool(
-      async () => {
-        if (failure != null) {
-          throw failure;
-        }
-        return LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT;
+    const observation = new CallbackManager(callbacks.getParentRunId(), {
+      handlers: callbacks.handlers,
+      tags: callbacks.tags,
+      metadata: {
+        ...callbacks.metadata,
+        ...getToolObservationMetadata(result.artifact),
+        ...request.metadata,
       },
-      {
-        name: call.name,
-        description: 'Host tool execution metadata',
-        schema: { type: 'object', properties: {} },
-      }
+    });
+    const run = await observation.handleToolStart(
+      { lc: 1, type: 'not_implemented', id: [call.name] },
+      JSON.stringify(originalArgsById.get(call.id) ?? {}),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      call.name,
+      call.id
     );
-    try {
-      await observation.invoke(
-        { type: 'tool_call', id: call.id, name: call.name, args: {} },
-        {
-          callbacks,
-          metadata: { ...metadata, ...request.metadata },
-        }
-      );
-    } catch (error) {
-      if (failure == null || error !== failure) {
-        throw error;
-      }
+    if (result.status === 'error') {
+      await run.handleToolError(new Error('Host tool execution failed'));
+      continue;
     }
+    await run.handleToolEnd(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
   }
 }
 

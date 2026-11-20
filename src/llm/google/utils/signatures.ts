@@ -152,21 +152,28 @@ export function restoreGeminiReplayParts(
   )
     return undefined;
   let text = '';
-  let contentReasoning = '';
+  let contentReasoning: string | undefined;
   if (typeof message.content === 'string') text = message.content;
   else
     for (const block of message.content) {
       if (block.type === 'text' && typeof block.text === 'string')
         text += block.text;
       else if (block.type === 'thinking' && typeof block.thinking === 'string')
-        contentReasoning += block.thinking;
+        contentReasoning = (contentReasoning ?? '') + block.thinking;
+      else if (
+        block.type === 'reasoning' &&
+        typeof block.reasoning === 'string'
+      )
+        contentReasoning = (contentReasoning ?? '') + block.reasoning;
       else if (!('functionCall' in block)) return undefined;
     }
-  let reasoning = contentReasoning;
+  let reasoning = contentReasoning ?? '';
   if (typeof message.additional_kwargs.reasoning_content === 'string')
     reasoning = message.additional_kwargs.reasoning_content;
   if (typeof message.additional_kwargs.reasoning === 'string')
     reasoning = message.additional_kwargs.reasoning;
+  if (contentReasoning != null && contentReasoning !== reasoning)
+    return undefined;
   const calls = new Map(
     (message.tool_calls ?? []).map((call) => [call.id, call])
   );

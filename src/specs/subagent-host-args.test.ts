@@ -57,18 +57,45 @@ const createParentAgent = (
   ],
 });
 
+const createSelfSpawningAgent = (
+  resolveSelf: jest.Mock<Promise<t.AgentInputs>, [t.SubagentResolveContext]>
+): t.AgentInputs => ({
+  agentId: 'parent',
+  provider: Providers.OPENAI,
+  clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+  instructions: 'Delegate focused work to a copy of yourself.',
+  maxContextTokens: 8000,
+  subagentConfigs: [
+    {
+      self: true,
+      type: 'self',
+      name: 'Parent',
+      description: 'Spawn a copy of yourself.',
+      configId: 'self@v1',
+      resolveAgentInputs: resolveSelf,
+      hostArgs: {
+        workspace: {
+          description: 'Workspace the copy opens.',
+          enum: ['librechat', 'agents'],
+        },
+      },
+    },
+  ],
+});
+
 async function runWithToolCall(
   resolveReviewer: jest.Mock<
     Promise<t.AgentInputs>,
     [t.SubagentResolveContext]
   >,
-  args: Record<string, string>
+  args: Record<string, string>,
+  createAgent: typeof createParentAgent = createParentAgent
 ): Promise<string> {
   const run = await Run.create<t.IState>({
     runId: `subagent-host-args-${Date.now()}`,
     graphConfig: {
       type: 'standard',
-      agents: [createParentAgent(resolveReviewer)],
+      agents: [createAgent(resolveReviewer)],
     },
     returnContent: true,
     skipCleanup: true,
@@ -170,5 +197,37 @@ describe('subagent host arguments through a run', () => {
       'Subagent "researcher" does not accept "machine". Omit it for this subagent type.'
     );
     expect(resolveReviewer).not.toHaveBeenCalled();
+  });
+
+  it('routes a self spawn through the resolver only when the call passes host arguments', async () => {
+    const resolveSelf = jest.fn(async (_context: t.SubagentResolveContext) =>
+      childInputs('parent')
+    );
+
+    const routed = await runWithToolCall(
+      resolveSelf,
+      {
+        description: 'Work in the librechat checkout.',
+        subagent_type: 'self',
+        workspace: 'librechat',
+      },
+      createSelfSpawningAgent
+    );
+    const reused = await runWithToolCall(
+      resolveSelf,
+      {
+        description: 'Work wherever you already are.',
+        subagent_type: 'self',
+      },
+      createSelfSpawningAgent
+    );
+
+    expect(routed).toContain(CHILD_RESPONSE);
+    expect(reused).toContain(CHILD_RESPONSE);
+    expect(resolveSelf).toHaveBeenCalledTimes(1);
+    expect(resolveSelf.mock.calls[0][0].hostArgs).toEqual({
+      workspace: 'librechat',
+    });
+    expect(resolveSelf.mock.calls[0][0].descriptor.configId).toBe('self@v1');
   });
 });

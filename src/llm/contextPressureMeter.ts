@@ -1,16 +1,14 @@
 import { isProxy } from 'node:util/types';
 import { ToolMessage } from '@langchain/core/messages';
-
 import type { AIMessage, BaseMessage } from '@langchain/core/messages';
 import type { ProviderPayloadMeasurement } from '@/llm/prepareProviderRequest';
 import type * as t from '@/types';
-
 import {
   REPLY_PRIMER_TOKENS,
   isSyntheticProviderContextMessage,
 } from '@/messages';
-import { createToolMessageUsageAccumulator } from '@/messages/budget';
 import { readTokenMetadataProperty, apportionTokenCounts } from '@/utils';
+import { createToolMessageUsageAccumulator } from '@/messages/budget';
 
 interface ContextPressureUsage {
   contextBudget?: number;
@@ -409,7 +407,7 @@ export function createContextPressureMeter({
       baselineRemaining != null &&
       Number.isFinite(baselineRemaining)
         ? availableMessageTokens -
-          Math.min(availableMessageTokens, Math.max(0, baselineRemaining))
+          Math.min(availableMessageTokens, baselineRemaining)
         : undefined;
     const toolUsage = createToolMessageUsageAccumulator(provider);
     const toolUsageState: { error?: Error } = {};

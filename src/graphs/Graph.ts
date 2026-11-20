@@ -1179,7 +1179,10 @@ export abstract class Graph<
     }
     const savedStateKeys = new Set<string>();
     const toolNodeStatesByKey = new Map<string, SubagentToolNodeResumeState>();
-    const legacyNodeStatesByKey = new Map<string, SubagentToolNodeResumeState>();
+    const legacyNodeStatesByKey = new Map<
+      string,
+      SubagentToolNodeResumeState
+    >();
     for (const nodeState of state.toolNodes) {
       const identity = parseSubagentToolNodeStateKey(nodeState.stateKey);
       if (identity == null) {
@@ -1442,6 +1445,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   streamLimits: ResolvedStreamLimits;
   /** Default-off mandatory provider prose release. */
   providerTextProtection?: t.StandardGraphInput['providerTextProtection'];
+  /** Host lookup for attachments carried by reference; read while a provider request is prepared. */
+  resolveAttachment?: t.StandardGraphInput['resolveAttachment'];
   /**
    * Cumulative streamed argument bytes per in-flight tool call, keyed by
    * generation key + chunk index (see `resolveGenerationKey`). Per-run
@@ -1622,6 +1627,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       preemption,
       streamLimits,
       providerTextProtection,
+      resolveAttachment,
       toolExecution,
       clientDelegatedToolNames,
     }: t.StandardGraphInput,
@@ -1654,6 +1660,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     if (providerTextProtection != null)
       validateProviderTextProtection(providerTextProtection);
     this.providerTextProtection = providerTextProtection;
+    this.resolveAttachment = resolveAttachment;
     this.toolExecution = toolExecution;
     if (
       clientDelegatedToolNames != null &&
@@ -5495,6 +5502,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           onResolutionFailure: this.onSubagentResolutionFailure,
           streamLimits: this.streamLimits,
           providerTextProtection: this.providerTextProtection,
+          resolveAttachment: this.resolveAttachment,
           humanInTheLoop: this.humanInTheLoop,
           checkpointer: this.compileOptions?.checkpointer,
           maxDepth: effectiveSubagentDepth,
@@ -5810,6 +5818,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               return getConfig();
             },
             runId: this.runId,
+            resolveAttachment: this.resolveAttachment,
             isMultiAgent: this.isMultiAgentGraph(),
             getSubagentExecutionContext: () => this.subagentExecutionContext,
             hookRegistry: this.hookRegistry,

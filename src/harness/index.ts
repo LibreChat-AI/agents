@@ -5,17 +5,11 @@ import type {
   ToolExecuteBatchRequest,
   ToolExecuteResult,
 } from '@/types';
+import type { ExecutionIdentity } from './identity';
+import { snapshotExecutionIdentity } from './identity';
 import { GraphEvents } from '@/common';
-
-/** Established by the authenticated host, never inferred from model arguments. */
-export interface ExecutionIdentity {
-  runtimeId: string;
-  agentId: string;
-  runId: string;
-  userId: string;
-  tenantId?: string;
-  conversationId?: string;
-}
+export { snapshotExecutionIdentity } from './identity';
+export type { ExecutionIdentity } from './identity';
 
 /** A host reference selects an authorized implementation, not a URL or executable name. */
 export interface HostToolDescriptor {
@@ -81,19 +75,7 @@ export function createHostToolBindings(options: {
 }): HostToolBindings {
   if (Number(options.service.version) !== 1)
     throw new Error('Unsupported host tool service version');
-  const source = options.identity;
-  const identity = Object.freeze({
-    runtimeId: source.runtimeId,
-    agentId: source.agentId,
-    runId: source.runId,
-    userId: source.userId,
-    tenantId: source.tenantId,
-    conversationId: source.conversationId,
-  });
-  for (const key of ['runtimeId', 'agentId', 'runId', 'userId'] as const) {
-    if (identity[key].trim().length === 0)
-      throw new Error('Incomplete execution identity');
-  }
+  const identity = snapshotExecutionIdentity(options.identity);
   const references = new Map<string, string>();
   const toolDefinitions: LCTool[] = [];
   for (const descriptor of options.tools) {
@@ -224,3 +206,50 @@ export function createHostToolBindings(options: {
     },
   };
 }
+
+export {
+  createHostProviderTextService,
+  createHostProviderTextProtection,
+} from './providerText';
+export type {
+  HostProviderTextDescriptor,
+  HostProviderTextRequest,
+  HostProviderTextService,
+} from './providerText';
+
+export { HostChatModel, HostModelServiceError } from './model';
+export type { ModelInvocationContext } from '@/llm/invocation';
+export type {
+  HostModelDescriptor,
+  HostModelRequest,
+  HostModelService,
+  HostModelToolChoice,
+  HostModelErrorCode,
+} from './model';
+
+export { createHostModelService, HostModelAdmission } from './modelService';
+export type { HostModelLimits } from './modelService';
+
+export { createHostFileService, HostFileAdmission } from './fileService';
+export type { HostFileStore } from './fileService';
+export { createHostFileBindings } from './fileBindings';
+export type { HostFileBindings } from './fileBindings';
+export {
+  HostFileServiceError,
+  hostFileDescriptorSchema,
+  hostFileServiceDescriptorSchema,
+  hostFileReadRequestSchema,
+  hostFileStageRequestSchema,
+  hostFilePublishRequestSchema,
+} from './files';
+export type {
+  HostFileDescriptor,
+  HostFileServiceDescriptor,
+  HostFileService,
+  HostFileReadRequest,
+  HostFileStageRequest,
+  HostFilePublishRequest,
+  HostFileChunk,
+  HostFilePublication,
+  HostFileErrorCode,
+} from './files';

@@ -1,4 +1,3 @@
-import { GenerativeModel } from '@google/generative-ai';
 import { afterEach, describe, expect, jest, test } from '@jest/globals';
 import {
   AIMessage,
@@ -9,6 +8,7 @@ import type { EnhancedGenerateContentResponse } from '@google/generative-ai';
 import type { BaseMessage } from '@langchain/core/messages';
 import { toLangChainContent } from '@/messages/langchain';
 import { CustomChatGoogleGenerativeAI } from './index';
+import { GoogleTransport } from './transport';
 
 const response: EnhancedGenerateContentResponse = {
   text: () => 'Answer.',
@@ -54,10 +54,9 @@ describe('Google Hydrogen request configuration', () => {
           yield responseWithUsage;
         }
         jest
-          .spyOn(GenerativeModel.prototype, 'generateContentStream')
+          .spyOn(GoogleTransport.prototype, 'generateContentStream')
           .mockResolvedValue({
             stream: responses(),
-            response: Promise.resolve(responseWithUsage),
           });
         let combined = new AIMessageChunk('');
         for await (const chunk of model._streamResponseChunks(
@@ -71,7 +70,7 @@ describe('Google Hydrogen request configuration', () => {
         message = combined;
       } else {
         jest
-          .spyOn(GenerativeModel.prototype, 'generateContent')
+          .spyOn(GoogleTransport.prototype, 'generateContent')
           .mockResolvedValue({ response: responseWithUsage });
         message = (await model._generate([new HumanMessage('Question.')], {}))
           .generations[0].message;
@@ -92,7 +91,7 @@ describe('Google Hydrogen request configuration', () => {
     async (mimeType) => {
       const model = createModel();
       const generate = jest
-        .spyOn(GenerativeModel.prototype, 'generateContent')
+        .spyOn(GoogleTransport.prototype, 'generateContent')
         .mockResolvedValue({ response });
       const message = new HumanMessage({
         content: toLangChainContent([
@@ -121,7 +120,7 @@ describe('Google Hydrogen request configuration', () => {
   test('forwards XHIGH and strips trailing model prefill on invoke @scenario:google-hydrogen-invoke', async () => {
     const model = createModel();
     const generate = jest
-      .spyOn(GenerativeModel.prototype, 'generateContent')
+      .spyOn(GoogleTransport.prototype, 'generateContent')
       .mockResolvedValue({ response });
     await model._generate(
       [new HumanMessage('Question.'), new AIMessage('Draft.')],
@@ -130,10 +129,9 @@ describe('Google Hydrogen request configuration', () => {
     expect(generate.mock.calls[0][0]).toMatchObject({
       contents: [{ role: 'user', parts: [{ text: 'Question.' }] }],
     });
-    expect(generate.mock.contexts[0]).toHaveProperty(
-      'generationConfig.thinkingConfig.thinkingLevel',
-      'XHIGH'
-    );
+    expect(generate.mock.calls[0][0]).toMatchObject({
+      generationConfig: { thinkingConfig: { thinkingLevel: 'XHIGH' } },
+    });
   });
 
   test('strips trailing model prefill on stream @scenario:google-hydrogen-stream', async () => {
@@ -142,10 +140,9 @@ describe('Google Hydrogen request configuration', () => {
       yield response;
     }
     const generate = jest
-      .spyOn(GenerativeModel.prototype, 'generateContentStream')
+      .spyOn(GoogleTransport.prototype, 'generateContentStream')
       .mockResolvedValue({
         stream: responses(),
-        response: Promise.resolve(response),
       });
     const chunks = [];
     for await (const chunk of model._streamResponseChunks(

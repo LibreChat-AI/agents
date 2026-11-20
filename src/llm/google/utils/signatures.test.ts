@@ -445,4 +445,54 @@ describe('Gemini native part replay', () => {
     delete message.additional_kwargs.reasoning;
     expect(restoreGeminiReplayParts(message)).toEqual(nativeParts);
   });
+
+  test.each(['thinking', 'reasoning'] as const)(
+    'validates %s blocks and rejects same-length edits even with captured kwargs',
+    (type) => {
+      const message = new AIMessage({
+        content: [
+          type === 'thinking'
+            ? { type, thinking: 'Plan.' }
+            : { type, reasoning: 'Plan.' },
+        ],
+        tool_calls: [{ id: 'a', name: 'calculator', args: { value: 1 } }],
+      });
+      const nativeParts = [
+        { text: 'Plan.', thought: true, thoughtSignature: 'thought-signature' },
+        {
+          functionCall: { id: 'a', name: 'calculator', args: { value: 1 } },
+          thoughtSignature: 'call-signature',
+        },
+      ];
+      captureGeminiReplayParts(message, nativeParts, 'gemini-3.8-flash');
+      expect(restoreGeminiReplayParts(message)).toEqual(nativeParts);
+      message.additional_kwargs.reasoning = 'Plan.';
+      message.content = [
+        type === 'thinking'
+          ? { type, thinking: 'Edit.' }
+          : { type, reasoning: 'Edit.' },
+      ];
+      expect(restoreGeminiReplayParts(message)).toBeUndefined();
+    }
+  );
+
+  test('restores split Vertex reasoning blocks without duplicate kwargs', () => {
+    const message = new AIMessage({
+      content: [
+        { type: 'reasoning', reasoning: 'One.' },
+        { type: 'reasoning', reasoning: '' },
+        { type: 'reasoning', reasoning: 'Two.' },
+        { type: 'text', text: 'Answer.' },
+      ],
+    });
+    const nativeParts = [
+      { text: 'One.', thought: true, thoughtSignature: 'one' },
+      { text: '', thought: true, thoughtSignature: 'empty-thought' },
+      { text: 'Two.', thought: true },
+      { text: 'Answer.' },
+    ];
+    captureGeminiReplayParts(message, nativeParts, 'gemini-4-hydrogen');
+    delete message.additional_kwargs.reasoning;
+    expect(restoreGeminiReplayParts(message)).toEqual(nativeParts);
+  });
 });
