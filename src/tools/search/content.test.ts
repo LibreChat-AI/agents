@@ -87,6 +87,28 @@ describe('Link Processor', () => {
     expect(elapsed).toBeLessThan(1500);
   });
 
+  test('stays fast when many URLs are suffixes of one another', () => {
+    /** Each URL ends with the previous one, so every segment end reports several
+     *  nested references; only the outermost one at each opening is applied. */
+    const url = (k: number) => 'https://x/' + ')(https://x/'.repeat(k - 1);
+    let html = '';
+    for (let k = 1; k <= 200; k++) {
+      html += `<a href="${url(k)}">x</a>`;
+    }
+    const markdown = Array.from({ length: 200 }, () => `[x](${url(200)})`).join(
+      '\n'
+    );
+
+    const start = performance.now();
+    const result = processContent(html, markdown);
+    const elapsed = performance.now() - start;
+
+    expect(result.markdown.split('\n')).toEqual(
+      Array.from({ length: 200 }, () => '[x](link#200)')
+    );
+    expect(elapsed).toBeLessThan(1500);
+  });
+
   test('keeps the image reference when a URL is both an image and a link', () => {
     const html =
       '<a href="https://x.io/a.png">a</a><img src="https://x.io/a.png" alt="i">';

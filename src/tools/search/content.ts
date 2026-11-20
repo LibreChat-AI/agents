@@ -153,6 +153,9 @@ function createCloser(
  * parenthesis is applied left to right. The work is linear in the markdown
  * plus the occurrences found, where one regex per URL over the whole page grew
  * with links times page size and blocked the event loop for seconds.
+ * Occurrences exceed the markdown length only when URLs are suffixes of one
+ * another; n such URLs need about n * n characters of HTML, so the worst case
+ * stays near the input size to the power 1.5.
  */
 function replaceReferences(
   markdown: string,
