@@ -9,121 +9,194 @@ interface ReferenceTarget {
 }
 
 /**
- * Character trie over every referenced URL. Edges live in one map keyed by
- * `node * EDGE_STRIDE + charCode`, so memory stays proportional to the URL text.
+ * Aho-Corasick automaton over `(` followed by every referenced URL. Edges live in
+ * one map keyed by `node * EDGE_STRIDE + charCode`, so memory stays proportional
+ * to the URL text, and a single scan of the markdown finds every occurrence.
  */
-interface ReferenceTrie {
+interface ReferenceMatcher {
   edges: Map<number, number>;
-  terminals: Map<number, ReferenceTarget>;
+  depth: number[];
+  fail: number[];
+  /** Nearest node on the fail chain, itself included, that ends a URL, or -1. */
+  output: number[];
+  targets: Map<number, ReferenceTarget>;
+}
+
+interface ReferenceClose {
+  end: number;
+  title?: string;
 }
 
 const EDGE_STRIDE = 0x10000;
-const TITLE_SUFFIX = /\s+"([^"]*)"\)/y;
+const OPEN_PAREN = 0x28;
+const CLOSE_PAREN = 0x29;
+const QUOTE = 0x22;
+const WHITESPACE = /\s/;
 
 /**
  * Indexes every referenced URL once. A URL listed under several types keeps the
  * first, in image, video, iframe, link order, which is the order the replacement
  * has always preferred.
  */
-function buildTrie(
+function buildMatcher(
   groups: ReadonlyArray<[ReferenceType, Map<string, MediaReference>]>
-): ReferenceTrie {
+): ReferenceMatcher {
   const edges = new Map<number, number>();
-  const terminals = new Map<number, ReferenceTarget>();
-  let nodes = 1;
+  const depth = [0];
+  const charOf = [0];
+  const children: number[][] = [[]];
+  const targets = new Map<number, ReferenceTarget>();
+  const advance = (node: number, code: number): number => {
+    const key = node * EDGE_STRIDE + code;
+    const existing = edges.get(key);
+    if (existing != null) {
+      return existing;
+    }
+    const next = depth.length;
+    edges.set(key, next);
+    depth.push(depth[node] + 1);
+    charOf.push(code);
+    children.push([]);
+    children[node].push(next);
+    return next;
+  };
   for (const [type, references] of groups) {
     let idx = 0;
     for (const url of references.keys()) {
       idx++;
-      let node = 0;
+      let node = advance(0, OPEN_PAREN);
       for (let i = 0; i < url.length; i++) {
-        const key = node * EDGE_STRIDE + url.charCodeAt(i);
-        let next = edges.get(key);
-        if (next == null) {
-          next = nodes++;
-          edges.set(key, next);
-        }
-        node = next;
+        node = advance(node, url.charCodeAt(i));
       }
-      if (!terminals.has(node)) {
-        terminals.set(node, { type, idx });
+      if (!targets.has(node)) {
+        targets.set(node, { type, idx });
       }
     }
   }
-  return { edges, terminals };
+
+  const fail = new Array<number>(depth.length).fill(0);
+  const output = new Array<number>(depth.length).fill(-1);
+  const queue = [...children[0]];
+  for (let head = 0; head < queue.length; head++) {
+    const node = queue[head];
+    output[node] = targets.has(node) ? node : output[fail[node]];
+    for (const child of children[node]) {
+      fail[child] = transition(edges, fail, fail[node], charOf[child]);
+      queue.push(child);
+    }
+  }
+  return { edges, depth, fail, output, targets };
 }
 
-/** Where `(url)` or `(url "title")` ends when `url` ends just before `urlEnd`. */
-function referenceEnd(
-  markdown: string,
-  urlEnd: number
-): { end: number; title?: string } | undefined {
-  if (markdown[urlEnd] === ')') {
-    return { end: urlEnd + 1 };
+function transition(
+  edges: Map<number, number>,
+  fail: number[],
+  from: number,
+  code: number
+): number {
+  let state = from;
+  while (state !== 0 && !edges.has(state * EDGE_STRIDE + code)) {
+    state = fail[state];
   }
-  TITLE_SUFFIX.lastIndex = urlEnd;
-  const title = TITLE_SUFFIX.exec(markdown);
-  return title == null
-    ? undefined
-    : { end: TITLE_SUFFIX.lastIndex, title: title[1] };
+  return edges.get(state * EDGE_STRIDE + code) ?? 0;
 }
 
 /**
- * Matches the longest known URL starting at `start` that is closed as a
- * reference. The walk stops at the first character no URL continues with, so
- * a position costs at most the URL text actually present there.
+ * Closes a reference whose URL ends just before `urlEnd` with `)` or
+ * ` "title")`. Whitespace runs and quote pairs are resolved once each and
+ * cached, so checking many URL ends never rescans the same text.
  */
-function matchReference(
-  markdown: string,
-  start: number,
-  { edges, terminals }: ReferenceTrie
-): { text: string; end: number } | undefined {
-  let best: { text: string; end: number } | undefined;
-  let node = 0;
-  for (let i = start; i < markdown.length; i++) {
-    const next = edges.get(node * EDGE_STRIDE + markdown.charCodeAt(i));
-    if (next == null) {
-      break;
+function createCloser(
+  markdown: string
+): (urlEnd: number) => ReferenceClose | undefined {
+  const closingQuote = new Map<number, number>();
+  let nonSpaceFrom: Int32Array | undefined;
+  const firstNonSpace = (index: number): number => {
+    if (nonSpaceFrom == null) {
+      nonSpaceFrom = new Int32Array(markdown.length + 1);
+      nonSpaceFrom[markdown.length] = markdown.length;
+      for (let i = markdown.length - 1; i >= 0; i--) {
+        nonSpaceFrom[i] = WHITESPACE.test(markdown[i])
+          ? nonSpaceFrom[i + 1]
+          : i;
+      }
     }
-    node = next;
-    const target = terminals.get(node);
-    if (target == null) {
+    return nonSpaceFrom[index];
+  };
+  return (urlEnd) => {
+    const next = markdown.charCodeAt(urlEnd);
+    if (next === CLOSE_PAREN) {
+      return { end: urlEnd + 1 };
+    }
+    if (!WHITESPACE.test(markdown[urlEnd] ?? '')) {
+      return undefined;
+    }
+    const open = firstNonSpace(urlEnd);
+    if (markdown.charCodeAt(open) !== QUOTE) {
+      return undefined;
+    }
+    let close = closingQuote.get(open);
+    if (close == null) {
+      close = markdown.indexOf('"', open + 1);
+      closingQuote.set(open, close);
+    }
+    if (close === -1 || markdown.charCodeAt(close + 1) !== CLOSE_PAREN) {
+      return undefined;
+    }
+    return { end: close + 2, title: markdown.slice(open + 1, close) };
+  };
+}
+
+/**
+ * Rewrites every markdown reference to a known URL. One scan finds each
+ * `(url` occurrence that is closed as a reference; the longest at each opening
+ * parenthesis is applied left to right. The work is linear in the markdown
+ * plus the occurrences found, where one regex per URL over the whole page grew
+ * with links times page size and blocked the event loop for seconds.
+ */
+function replaceReferences(
+  markdown: string,
+  matcher: ReferenceMatcher
+): string {
+  if (matcher.targets.size === 0) {
+    return markdown;
+  }
+  const { edges, depth, fail, output, targets } = matcher;
+  const closeAt = createCloser(markdown);
+  const longest = new Map<number, { node: number; close: ReferenceClose }>();
+  let state = 0;
+  for (let i = 0; i < markdown.length; i++) {
+    state = transition(edges, fail, state, markdown.charCodeAt(i));
+    let node = output[state];
+    if (node === -1) {
       continue;
     }
-    const close = referenceEnd(markdown, i + 1);
+    const close = closeAt(i + 1);
     if (close == null) {
       continue;
     }
-    const label = `${target.type}#${target.idx}`;
-    best = {
-      text: close.title == null ? `(${label})` : `(${label} "${close.title}")`,
-      end: close.end,
-    };
+    for (; node !== -1; node = output[fail[node]]) {
+      const start = i - depth[node] + 1;
+      const current = longest.get(start);
+      if (current == null || depth[current.node] < depth[node]) {
+        longest.set(start, { node, close });
+      }
+    }
   }
-  return best;
-}
 
-/**
- * Rewrites every markdown reference to a known URL in one left-to-right pass.
- * One regex per URL over the whole page grew with links times page size and
- * blocked the event loop for seconds on a link-heavy page.
- */
-function replaceReferences(markdown: string, trie: ReferenceTrie): string {
-  if (trie.terminals.size === 0) {
-    return markdown;
-  }
   let result = '';
   let copied = 0;
-  let open = markdown.indexOf('(');
-  while (open !== -1) {
-    const match = matchReference(markdown, open + 1, trie);
-    if (match == null) {
-      open = markdown.indexOf('(', open + 1);
+  const ordered = Array.from(longest.entries()).sort((a, b) => a[0] - b[0]);
+  for (const [start, { node, close }] of ordered) {
+    const target = targets.get(node);
+    if (start < copied || target == null) {
       continue;
     }
-    result += markdown.slice(copied, open) + match.text;
-    copied = match.end;
-    open = markdown.indexOf('(', match.end);
+    const label = `${target.type}#${target.idx}`;
+    const text =
+      close.title == null ? `(${label})` : `(${label} "${close.title}")`;
+    result += markdown.slice(copied, start) + text;
+    copied = close.end;
   }
   return result + markdown.slice(copied);
 }
@@ -196,7 +269,7 @@ export function processContent(
 
   const result = replaceReferences(
     markdown,
-    buildTrie([
+    buildMatcher([
       ['image', imageMap],
       ['video', videoMap],
       ['iframe', iframeMap],

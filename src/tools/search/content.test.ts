@@ -72,6 +72,21 @@ describe('Link Processor', () => {
     );
   });
 
+  test('handles a URL whose prefix repeats without a quadratic rescan or a regex limit', () => {
+    /** A trie walk restarted at every inner parenthesis took ~6 s here, and one
+     *  regex per URL threw "Invalid regular expression" for a URL this long. */
+    const prefix = 'https://x/(';
+    const html = `<a href="${prefix.repeat(5000)}a">x</a>`;
+    const markdown = `(${prefix.repeat(5000)}b) [x](${prefix.repeat(5000)}a)`;
+
+    const start = performance.now();
+    const result = processContent(html, markdown);
+    const elapsed = performance.now() - start;
+
+    expect(result.markdown).toBe(`(${prefix.repeat(5000)}b) [x](link#1)`);
+    expect(elapsed).toBeLessThan(1500);
+  });
+
   test('keeps the image reference when a URL is both an image and a link', () => {
     const html =
       '<a href="https://x.io/a.png">a</a><img src="https://x.io/a.png" alt="i">';
