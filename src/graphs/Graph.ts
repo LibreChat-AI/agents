@@ -49,6 +49,7 @@ import {
   sanitizeOrphanToolBlocks,
   extractToolDiscoveries,
   addBedrockTailCacheControl,
+  getBedrockMessageCachePointBudget,
   projectArtifactPayload,
   formatContentStrings,
   cloneMessage,
@@ -3991,7 +3992,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                 resolveBedrockPromptCacheTtl(
                   options.promptCacheTtl,
                   options.model
-                )
+                ),
+                getBedrockMessageCachePointBudget(candidate)
               )
             )
             : candidate;
