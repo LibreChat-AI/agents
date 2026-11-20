@@ -576,6 +576,126 @@ export class InfinityReranker extends BaseReranker {
   }
 }
 
+export class CustomReranker extends BaseReranker {
+  private apiUrl: string | undefined;
+  private model: string | undefined;
+  private timeout: number;
+  private httpAgent?: t.HttpAgent;
+  private httpsAgent?: t.HttpsAgent;
+
+  constructor({
+    apiUrl = process.env.CUSTOM_RERANKER_API_URL,
+    apiKey = process.env.CUSTOM_RERANKER_API_KEY,
+    model = process.env.CUSTOM_RERANKER_MODEL,
+    timeout = DEFAULT_RERANKER_TIMEOUT,
+    logger,
+    httpAgent,
+    httpsAgent,
+  }: {
+    apiUrl?: string;
+    apiKey?: string;
+    model?: string;
+    timeout?: number;
+    logger?: t.Logger;
+  } & t.HttpAgentConfig) {
+    super(logger);
+    this.apiKey = apiKey;
+    this.apiUrl = apiUrl;
+    this.model = model;
+    this.timeout = timeout;
+    this.httpAgent = httpAgent;
+    this.httpsAgent = httpsAgent;
+  }
+
+  async rerank(
+    query: string,
+    documents: string[],
+    topK: number = 5
+  ): Promise<t.Highlight[]> {
+    this.logger.debug(
+      `Reranking ${documents.length} chunks with custom reranker using API URL: ${this.apiUrl}`
+    );
+
+    if (this.apiUrl == null || this.apiUrl === '') {
+      this.logger.warn(
+        'CUSTOM_RERANKER_API_URL is not set. Using default ranking.'
+      );
+      return this.getDefaultRanking(documents, topK);
+    }
+
+    if (this.model == null || this.model === '') {
+      this.logger.warn(
+        'CUSTOM_RERANKER_MODEL is not set. Using default ranking.'
+      );
+      return this.getDefaultRanking(documents, topK);
+    }
+
+    try {
+      const requestData = {
+        model: this.model,
+        query: query,
+        top_n: topK,
+        documents: documents,
+        return_documents: true,
+      };
+
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+      };
+
+      if (this.apiKey != null && this.apiKey !== '') {
+        headers.Authorization = `Bearer ${this.apiKey}`;
+      }
+
+      const response = await axios.post<t.JinaRerankerResponse | undefined>(
+        this.apiUrl,
+        requestData,
+        {
+          headers,
+          timeout: this.timeout,
+          httpAgent: this.httpAgent,
+          httpsAgent: this.httpsAgent,
+        }
+      );
+
+      this.logger.debug('Custom Reranker API Model:', response.data?.model);
+      this.logger.debug('Custom Reranker API Usage:', response.data?.usage);
+
+      if (response.data && response.data.results.length) {
+        return response.data.results.map((result) => {
+          const docIndex = result.index;
+          const score = result.relevance_score;
+          let text = '';
+
+          if (result.document != null) {
+            const doc = result.document;
+            if (typeof doc === 'object' && 'text' in doc) {
+              text = doc.text;
+            } else if (typeof doc === 'string') {
+              text = doc;
+            }
+          } else {
+            text = documents[docIndex];
+          }
+
+          return { text, score };
+        });
+      } else {
+        this.logger.warn(
+          'Unexpected response format from custom reranker API. Using default ranking.'
+        );
+        return this.getDefaultRanking(documents, topK);
+      }
+    } catch (error) {
+      this.logger.error(
+        'Error using custom reranker',
+        formatErrorForLog(error)
+      );
+      return this.getDefaultRanking(documents, topK);
+    }
+  }
+}
+
 /**
  * Creates the appropriate reranker based on type and configuration
  */
@@ -589,6 +709,9 @@ export const createReranker = (
     ragApiUrl?: string;
     ragApiTokenSupplier?: t.RagApiTokenSupplier;
     ragApiProfile?: string;
+    customRerankerApiUrl?: string;
+    customRerankerApiKey?: string;
+    customRerankerModel?: string;
     rerankerTimeout?: number;
     logger?: t.Logger;
   } & t.HttpAgentConfig
@@ -602,6 +725,9 @@ export const createReranker = (
     ragApiUrl,
     ragApiTokenSupplier,
     ragApiProfile,
+    customRerankerApiUrl,
+    customRerankerApiKey,
+    customRerankerModel,
     rerankerTimeout,
     logger,
     httpAgent,
@@ -635,6 +761,16 @@ export const createReranker = (
       baseUrl: ragApiUrl,
       tokenSupplier: ragApiTokenSupplier,
       profile: ragApiProfile,
+      timeout: rerankerTimeout,
+      logger: defaultLogger,
+      httpAgent,
+      httpsAgent,
+    });
+  case 'custom':
+    return new CustomReranker({
+      apiUrl: customRerankerApiUrl,
+      apiKey: customRerankerApiKey,
+      model: customRerankerModel,
       timeout: rerankerTimeout,
       logger: defaultLogger,
       httpAgent,
