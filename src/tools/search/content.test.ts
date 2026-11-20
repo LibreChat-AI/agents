@@ -56,7 +56,7 @@ describe('Link Processor', () => {
     expect(result.markdown).toContain('link#2');
   });
 
-  test('prefers the longest known URL at a position, including URLs with parentheses', () => {
+  test('prefers the longest known URL at a position, including URLs with parentheses @scenario:scraped-page-references-keep-their-previous-output', () => {
     const html = `
       <a href="https://w.org/wiki/Foo_(bar)">a</a>
       <a href="https://w.org/wiki/Foo_">b</a>
@@ -105,7 +105,7 @@ describe('Link Processor', () => {
     expect(elapsed).toBeLessThan(1500);
   });
 
-  test('rewrites links of many different lengths in time linear in the page', () => {
+  test('rewrites links of many different lengths in time linear in the page @scenario:link-heavy-scraped-page-is-rewritten-in-linear-time', () => {
     /** A query that grows per entry gives every link its own URL length, which
      *  defeats any scheme that tries every known length at every position. */
     let html = '<html><body>';
