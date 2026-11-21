@@ -808,3 +808,57 @@ describe('convertToConverseMessages — blank user content', () => {
     });
   });
 });
+
+describe('convertToConverseMessages — standard base64 documents', () => {
+  const documentOf = (
+    result: ConverseResult
+  ): { name?: string; format?: string; source?: { bytes?: Uint8Array } } => {
+    const block = (result.converseMessages[0].content ?? []).find(
+      (item) => 'document' in item
+    );
+    return (block as { document: ReturnType<typeof documentOf> }).document;
+  };
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  it.each([
+    [
+      'text/csv',
+      'csv',
+      Buffer.from('id,name\n1,Zoë ☕\n'.repeat(300)).subarray(0, 4099),
+    ],
+    [
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      'docx',
+      Buffer.from(Array.from({ length: 4096 }, (_, i) => (i * 151 + 17) & 255)),
+    ],
+  ])(
+    'sends a %s file as a %s document with its exact bytes',
+    (mime, format, file) => {
+      const atob = jest.spyOn(globalThis, 'atob');
+      const result = convertToConverseMessages([
+        new HumanMessage({
+          content: [
+            { type: 'text', text: 'Summarize' },
+            {
+              type: 'file',
+              source_type: 'base64',
+              mime_type: mime,
+              data: file.toString('base64'),
+              metadata: { name: 'ledger' },
+            },
+          ],
+        }),
+      ]);
+
+      const document = documentOf(result);
+      expect(document.name).toBe('ledger');
+      expect(document.format).toBe(format);
+      expect(document.source?.bytes).toBeInstanceOf(Uint8Array);
+      expect(Buffer.from(document.source?.bytes ?? []).equals(file)).toBe(true);
+      expect(atob).not.toHaveBeenCalled();
+    }
+  );
+});

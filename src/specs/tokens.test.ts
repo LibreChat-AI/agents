@@ -1065,6 +1065,35 @@ describe('estimateDocumentBlockTokens', () => {
     ); // 2 * 1500
   });
 
+  test('base64 text document is counted by its decoded text', () => {
+    const csv = 'id,name\n1,Zoë ☕\n'.repeat(50);
+    const block = {
+      type: 'file',
+      source_type: 'base64',
+      mime_type: 'text/csv',
+      data: Buffer.from(csv).toString('base64'),
+    };
+    expect(estimateDocumentBlockTokens(block, 'o200k_base', countChars)).toBe(
+      csv.length
+    );
+  });
+
+  test('base64 binary document is counted by its decoded size', () => {
+    const bytes = 40_000;
+    const block = {
+      type: 'file',
+      source_type: 'base64',
+      mime_type:
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      data: Buffer.alloc(bytes, 7).toString('base64'),
+    };
+    const count = jest.fn(countChars);
+    expect(estimateDocumentBlockTokens(block, 'o200k_base', count)).toBe(
+      bytes / 4
+    );
+    expect(count).not.toHaveBeenCalled();
+  });
+
   test('url-referenced document uses the conservative fallback', () => {
     const block = { type: 'file', source_type: 'url', url: 'https://x/y.pdf' };
     expect(estimateDocumentBlockTokens(block, 'o200k_base', countChars)).toBe(
