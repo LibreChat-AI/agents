@@ -6,6 +6,7 @@ import type {
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
 import type { ChatGenerationChunk } from '@langchain/core/outputs';
 import type { BaseMessage } from '@langchain/core/messages';
+import type { ClientOptions } from 'openai';
 import type { SeenScalarMetadata } from '@/llm/openai/streamMetadata';
 import type { PromptCacheTtl } from '@/messages/cache';
 import { dropRepeatedScalarMetadata } from '@/llm/openai/streamMetadata';
@@ -46,6 +47,8 @@ export interface ChatOpenRouterCallOptions
 export type ChatOpenRouterInput = Partial<
   ChatOpenRouterCallOptions & OpenAIChatInput
 > & {
+  /** OpenAI-compatible client options, including a custom fetch transport. */
+  configuration?: ClientOptions;
   /** Minimum delay in ms between visible streamed deltas (default 25; 0 disables). */
   _lc_stream_delay?: number;
 };
