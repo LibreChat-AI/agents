@@ -1,12 +1,18 @@
 import { expect, test, describe } from '@jest/globals';
-import { AIMessage, AIMessageChunk } from '@langchain/core/messages';
+import {
+  AIMessage,
+  AIMessageChunk,
+  ToolMessage,
+} from '@langchain/core/messages';
 import type {
   Content,
   EnhancedGenerateContentResponse,
 } from '@google/generative-ai';
 import {
   convertResponseContentToChatGenerationChunk,
+  _FUNCTION_CALL_THOUGHT_SIGNATURES_MAP_KEY,
   convertMessageContentToParts,
+  convertBaseMessagesToContent,
   dropUnsupportedModelTurnPrefill,
   rejectsModelTurnPrefill,
   isGemini3PlusModel,
@@ -17,6 +23,21 @@ import {
   GOOGLE_STREAMED_TOOL_CALL_ADAPTER,
 } from '@/tools/streamedToolCallSeals';
 import { toLangChainContent } from '@/messages/langchain';
+
+const serverToolCall = {
+  type: 'toolCall',
+  toolCall: {
+    toolType: 'GOOGLE_SEARCH_WEB',
+    args: { queries: ['go'] },
+    id: 'srv',
+  },
+  thoughtSignature: 'sig-tool-call',
+};
+const serverToolResponse = {
+  type: 'toolResponse',
+  toolResponse: { toolType: 'GOOGLE_SEARCH_WEB', response: {}, id: 'srv' },
+  thoughtSignature: 'sig-tool-response',
+};
 
 describe('convertMessageContentToParts cross-provider tool calls', () => {
   test.each([
@@ -277,5 +298,146 @@ describe('isGemini3PlusModel', () => {
     expect(isGemini3PlusModel('gemini-pro')).toBe(false);
     expect(isGemini3PlusModel('gemma-3-27b-it')).toBe(false);
     expect(isGemini3PlusModel(undefined)).toBe(false);
+  });
+});
+
+describe('convertMessageContentToParts function call order', () => {
+  const model = 'gemini-4-hydrogen';
+  const readCall = { id: 'call_read', name: 'read_file', args: { path: 'a' } };
+  const runCall = { id: 'call_run', name: 'run', args: { cmd: 'ls' } };
+
+  test('keeps function calls between server-side tool parts @scenario:gemini-server-tool-order', () => {
+    const message = new AIMessage({
+      content: toLangChainContent([
+        serverToolCall,
+        { functionCall: { name: 'read_file', args: { path: 'a' } } },
+        { functionCall: { name: 'run', args: { cmd: 'ls' } } },
+        serverToolResponse,
+      ]),
+      tool_calls: [readCall, runCall],
+      additional_kwargs: {
+        [_FUNCTION_CALL_THOUGHT_SIGNATURES_MAP_KEY]: { call_read: 'sig-read' },
+      },
+    });
+
+    const contents = convertBaseMessagesToContent(
+      [message],
+      true,
+      false,
+      model
+    ) as Content[];
+
+    expect(contents).toHaveLength(1);
+    expect(contents[0].parts).toEqual([
+      {
+        toolCall: serverToolCall.toolCall,
+        thoughtSignature: 'sig-tool-call',
+      },
+      { functionCall: readCall, thoughtSignature: 'sig-read' },
+      { functionCall: runCall },
+      {
+        toolResponse: serverToolResponse.toolResponse,
+        thoughtSignature: 'sig-tool-response',
+      },
+    ]);
+  });
+
+  test('replaces function call blocks by id when they carry one', () => {
+    const message = new AIMessage({
+      content: toLangChainContent([
+        { functionCall: { id: 'call_run', name: 'run', args: {} } },
+        { functionCall: { id: 'call_read', name: 'read_file', args: {} } },
+      ]),
+      tool_calls: [readCall, runCall],
+    });
+
+    expect(convertMessageContentToParts(message, true, [], model)).toEqual([
+      expect.objectContaining({ functionCall: runCall }),
+      expect.objectContaining({ functionCall: readCall }),
+    ]);
+  });
+
+  test('appends calls after the content when it has no function call blocks', () => {
+    const message = new AIMessage({
+      content: [{ type: 'text', text: 'Looking.' }],
+      tool_calls: [readCall, runCall],
+    });
+
+    expect(convertMessageContentToParts(message, true, [], model)).toEqual([
+      { text: 'Looking.' },
+      expect.objectContaining({ functionCall: readCall }),
+      expect.objectContaining({ functionCall: runCall }),
+    ]);
+  });
+
+  test('matches same-name function calls without ids in order', () => {
+    const message = new AIMessage({
+      content: toLangChainContent([
+        { functionCall: { name: 'read_file', args: { path: 'a' } } },
+        { text: 'between', type: 'text' },
+        { functionCall: { name: 'read_file', args: { path: 'b' } } },
+      ]),
+      tool_calls: [
+        { id: 'first', name: 'read_file', args: { path: 'a' } },
+        { id: 'second', name: 'read_file', args: { path: 'b' } },
+      ],
+    });
+
+    expect(convertMessageContentToParts(message, true, [], model)).toEqual([
+      expect.objectContaining({
+        functionCall: { id: 'first', name: 'read_file', args: { path: 'a' } },
+      }),
+      { text: 'between' },
+      expect.objectContaining({
+        functionCall: { id: 'second', name: 'read_file', args: { path: 'b' } },
+      }),
+    ]);
+  });
+
+  test('drops a function call block that matches no tool call', () => {
+    const message = new AIMessage({
+      content: toLangChainContent([
+        { type: 'text', text: 'Hi.' },
+        { functionCall: { name: 'ghost', args: {} } },
+      ]),
+      tool_calls: [readCall],
+    });
+
+    const parts = convertMessageContentToParts(message, true, [], model);
+
+    expect(parts).toEqual([
+      { text: 'Hi.' },
+      expect.objectContaining({ functionCall: readCall }),
+    ]);
+  });
+
+  test('drops function call blocks from tool message content', () => {
+    const ai = new AIMessage({ content: '', tool_calls: [readCall] });
+    const tool = new ToolMessage({
+      content: toLangChainContent([
+        { type: 'text', text: 'ok' },
+        { functionCall: { name: 'read_file', args: {} } },
+      ]),
+      name: 'read_file',
+      tool_call_id: 'call_read',
+    });
+
+    expect(convertMessageContentToParts(tool, true, [ai], model)).toEqual([
+      {
+        functionResponse: {
+          name: 'read_file',
+          response: { result: [{ text: 'ok' }] },
+          id: 'call_read',
+        },
+      },
+    ]);
+  });
+
+  test('keeps plain tool_calls-only messages unchanged', () => {
+    const message = new AIMessage({ content: '', tool_calls: [readCall] });
+
+    expect(convertMessageContentToParts(message, true, [], model)).toEqual([
+      expect.objectContaining({ functionCall: readCall }),
+    ]);
   });
 });
