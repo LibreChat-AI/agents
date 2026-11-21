@@ -104,11 +104,33 @@ function conservativeStructuredLength(limit: number): number {
   return limit >= Number.MAX_SAFE_INTEGER ? Number.MAX_SAFE_INTEGER : limit + 1;
 }
 
+const BASE64_DATA_URL =
+  /^data:[a-z0-9.+-]+\/[a-z0-9.+-]+(?:;[a-z0-9.=_-]+)*;base64,[a-z0-9+/]+={0,2}$/i;
+
+/**
+ * Base64 data URLs need no JSON escaping, so inline media within the inline
+ * payload ceiling is measured without spending the character allowance that
+ * all measurements of one tool result share.
+ */
+function isBoundedBase64DataUrl(value: string): boolean {
+  return (
+    value.length <= HARD_MAX_TOTAL_TOOL_OUTPUT_SIZE &&
+    value.startsWith('data:') &&
+    BASE64_DATA_URL.test(value)
+  );
+}
+
 function jsonStringLength(
   value: string,
   limit: number,
   work: StructuredWorkState
 ): number {
+  if (isBoundedBase64DataUrl(value)) {
+    const dataUrlLength = value.length + 2;
+    return dataUrlLength > limit
+      ? conservativeStructuredLength(limit)
+      : dataUrlLength;
+  }
   let length = 2;
   for (let i = 0; i < value.length; i++) {
     if (!consumeStructuredCharacterWork(work)) {

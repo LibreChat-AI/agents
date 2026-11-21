@@ -1866,6 +1866,43 @@ describe('formatAgentMessages', () => {
     expect(projectArtifactPayload(formatted, 200)).toBe(formatted);
   });
 
+  it('projects an inline image artifact that fits the cap', () => {
+    const imageBlock: MessageContentComplex = {
+      type: 'image_url',
+      image_url: { url: `data:image/png;base64,${'A'.repeat(600_000)}` },
+    };
+    const messages = [
+      new AIMessageChunk({
+        content: '',
+        tool_calls: [
+          {
+            id: 'call_inline_image',
+            name: 'generate_image',
+            args: {},
+            type: 'tool_call' as const,
+          },
+        ],
+      }),
+      new ToolMessage({
+        content: 'generated_image_id: "img-1"',
+        tool_call_id: 'call_inline_image',
+        artifact: { content: [imageBlock] },
+      }),
+    ];
+
+    const payload = projectArtifactPayload(messages, 8_000_000);
+    const anthropic = projectAnthropicArtifactContent(messages, 8_000_000);
+
+    const moved = payload[payload.length - 1] as HumanMessage;
+    expect(moved).toBeInstanceOf(HumanMessage);
+    expect(
+      (moved.content as MessageContentComplex[]).includes(imageBlock)
+    ).toBe(true);
+    expect(
+      (anthropic[1].content as MessageContentComplex[]).includes(imageBlock)
+    ).toBe(true);
+  });
+
   it('stamps only artifact source parts that survive the aggregate cap', () => {
     const createToolMessage = (
       toolCallId: string,
