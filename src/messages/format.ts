@@ -83,6 +83,10 @@ import {
 } from '@/common';
 import { normalizeAnthropicToolCallId } from '@/llm/anthropic/utils/message_inputs';
 import { toLangChainContent, toLangChainMessageFields } from './langchain';
+import {
+  restoreResponsesToolRound,
+  alignProviderItemsWithCall,
+} from './responsesToolRounds';
 import { flattenLegacyContent, isLegacyConvertible } from './content';
 import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
 import { isReasoningContentBlock } from './reasoningTypes';
@@ -1321,13 +1325,28 @@ function hasToolCallOutput(part: MessageContentComplex): boolean {
   return output != null && output !== '';
 }
 
+function parseStoredContentBlocks(output: string): unknown[] | undefined {
+  try {
+    const parsed: unknown = JSON.parse(output);
+    return Array.isArray(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function formatToolCallOutput(
-  output: ToolCallPart['output'] | undefined
+  output: ToolCallPart['output'] | undefined,
+  outputFormat?: ToolCallPart['outputFormat']
 ): MessageContent {
   if (output == null) {
     return '';
   }
-  return compactToolContent(output, HARD_MAX_TOOL_RESULT_CHARS).content;
+  const blocks =
+    outputFormat === 'blocks' && typeof output === 'string'
+      ? parseStoredContentBlocks(output)
+      : undefined;
+  return compactToolContent(blocks ?? output, HARD_MAX_TOOL_RESULT_CHARS)
+    .content;
 }
 
 /**
@@ -1541,6 +1560,11 @@ function formatAssistantMessage(
     formattedMessages.push(formattedMessage);
   };
   const finalizeFormattedMessages = (): typeof formattedMessages => {
+    for (const [roundMessage, items] of providerRoundItems) {
+      if (items.some((item) => item != null)) {
+        restoreResponsesToolRound(roundMessage, items);
+      }
+    }
     for (let index = 0; index < formattedMessages.length; index++) {
       const formattedMessage = formattedMessages[index];
       stampSourceMessageIdentity(
@@ -1604,6 +1628,15 @@ function formatAssistantMessage(
     );
   };
   let lastAIMessage: RoleBearingMessage<AIMessage> | null = null;
+  /** Stored provider items per restored message, one entry per tool call. */
+  const providerRoundItems = new Map<
+    AIMessage,
+    Array<ToolCallPart['providerItems']>
+  >();
+  /** Tool round the last attached call belonged to (`ToolCallPart.roundId`). */
+  let lastRound:
+    | { message: RoleBearingMessage<AIMessage>; roundId?: string }
+    | undefined;
   let hasReasoning = false;
   let pendingReasoningContent = '';
   let pendingReasoningSourcePartIndices: number[] = [];
@@ -1874,6 +1907,7 @@ function formatAssistantMessage(
         // Note: `tool_calls` list is defined when constructed by `AIMessage` class, and outputs should be excluded from it
         const {
           output,
+          outputFormat,
           args: _args,
           ..._tool_call
         } = part.tool_call as ToolCallPart;
@@ -1932,7 +1966,28 @@ function formatAssistantMessage(
           continue;
         }
 
-        if (!lastAIMessage) {
+        const roundId = (part.tool_call as ToolCallPart).roundId;
+        const startsRound =
+          lastAIMessage == null ||
+          (roundId == null
+            ? currentContent.length > 0
+            : lastRound?.message === lastAIMessage &&
+              lastRound.roundId !== roundId);
+        if (startsRound && currentContent.length > 0) {
+          appendCurrentContentProvenance(sourcePartIndices, 'model');
+          let roundText = currentContent
+            .map(getTextContent)
+            .join(preserveTextContent ? '' : '\n');
+          if (!preserveTextContent) roundText = roundText.trim();
+          lastAIMessage = appendAIMessage(
+            currentContent.every((item) => item.type === ContentTypes.TEXT)
+              ? roundText
+              : toLangChainContent(currentContent),
+            currentContentProvenance
+          );
+          currentContent = [];
+          currentContentProvenance = createProviderMessageProvenanceBuilder();
+        } else if (startsRound || lastAIMessage == null) {
           // "Heal" the payload by creating an AIMessage to precede the tool call
           lastAIMessage = appendAIMessage(
             '',
@@ -1946,6 +2001,7 @@ function formatAssistantMessage(
         const tool_call: ToolCallPart = _tool_call;
         // TODO: investigate; args as dictionary may need to be providers-or-tool-specific
         let args: any = _args;
+        let argsParsed = true;
         try {
           if (typeof _args === 'string') {
             args = JSON.parse(_args);
@@ -1953,10 +2009,23 @@ function formatAssistantMessage(
         } catch {
           if (typeof _args === 'string') {
             args = { input: _args };
+            argsParsed = false;
           }
         }
 
         tool_call.args = args;
+        delete tool_call.roundId;
+        lastRound = { message: lastAIMessage, roundId };
+        const roundItems = providerRoundItems.get(lastAIMessage) ?? [];
+        roundItems.push(
+          alignProviderItemsWithCall(tool_call.providerItems, {
+            id: tool_call.id ?? '',
+            name: tool_call.name ?? '',
+            args: argsParsed ? args : undefined,
+          })
+        );
+        providerRoundItems.set(lastAIMessage, roundItems);
+        delete tool_call.providerItems;
         if (
           compactionSemanticIndex != null &&
           semanticSourceMessageId != null &&
@@ -1997,7 +2066,7 @@ function formatAssistantMessage(
             new ToolMessage({
               tool_call_id: tool_call.id ?? '',
               name: tool_call.name,
-              content: formatToolCallOutput(output),
+              content: formatToolCallOutput(output, outputFormat),
             }),
             'tool'
           ),
