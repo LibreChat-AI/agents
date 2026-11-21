@@ -37,6 +37,8 @@ import type {
 } from '@langchain/openai';
 import type { ToolCall, ToolCallChunk } from '@langchain/core/messages/tool';
 import {
+  compactToolContent,
+  getResponsesToolOutputParts,
   getBoundedCacheControlledTextToolContent,
   getComputerCallOutputScreenshot,
   isComputerCallOutputMessage,
@@ -55,8 +57,8 @@ import {
   projectToolCallInputs,
   serializeToolCallInput,
 } from '@/messages/prune';
-import { toLangChainContent } from '@/messages/langchain';
 import { isAnthropicThinkingContentBlock } from '@/messages/reasoningTypes';
+import { toLangChainContent } from '@/messages/langchain';
 
 export type { OpenAICallOptions, OpenAIChatInput };
 
@@ -643,18 +645,28 @@ export function _convertMessagesToOpenAIResponsesParams(
           return computerCallOutput;
         }
 
+        // Bound the whole result before mapping, so native media cannot bypass
+        // the existing cap. All parts belong to ONE output for this call_id.
+        const bounded = compactToolContent(
+          toolMessage.content,
+          HARD_MAX_TOOL_RESULT_CHARS
+        ).content;
+        const output =
+          getResponsesToolOutputParts(bounded) ??
+          (typeof bounded === 'string'
+            ? bounded
+            : serializeStructuredValueBounded(
+              bounded,
+              HARD_MAX_TOOL_RESULT_CHARS
+            ).content);
         return {
           type: 'function_call_output',
           call_id: toolMessage.tool_call_id,
           id: toolMessage.id?.startsWith('fc_') ? toolMessage.id : undefined,
-          output:
-            typeof toolMessage.content !== 'string'
-              ? serializeStructuredValueBounded(
-                toolMessage.content,
-                HARD_MAX_TOOL_RESULT_CHARS
-              ).content
-              : toolMessage.content,
-        };
+          output,
+          // Older OpenAI SDK declarations only describe string output, while
+          // Responses also accepts a single array of text/image/file parts.
+        } as ResponsesInputItem;
       }
 
       if (role === 'assistant') {

@@ -20,6 +20,7 @@ const ATOMIC_CONTENT_TYPES = new Set([
   'image_url',
   'input_audio',
   'input_image',
+  'input_file',
   'media',
   'resource',
   'resource_link',
@@ -1080,7 +1081,7 @@ function isTextBlockUnchecked(value: unknown): value is TextToolContentBlock {
     const text = readOwnEnumerableDataProperty(value, 'text');
     return (
       type.found &&
-      type.value === 'text' &&
+      (type.value === 'text' || type.value === 'input_text') &&
       text.found &&
       typeof text.value === 'string'
     );
@@ -1682,6 +1683,13 @@ function isAtomicToolContentBlockUnchecked(value: unknown): boolean {
       isStringPayload
     );
   }
+  if (type === 'input_file') {
+    return hasAnyPayloadPath(
+      record,
+      [['file_data'], ['file_id'], ['file_url']],
+      isStringPayload
+    );
+  }
   if (type === 'image_url') {
     return hasAnyPayloadPath(
       record,
@@ -1772,6 +1780,7 @@ function isAtomicToolContentBlockUnchecked(value: unknown): boolean {
         ['bytes'],
         ['url'],
         ['file_data'],
+        ['file_url'],
         ['file_id'],
         ['fileId'],
         ['fileUri'],
@@ -1786,6 +1795,7 @@ function isAtomicToolContentBlockUnchecked(value: unknown): boolean {
         [nestedType, 'bytes'],
         [nestedType, 'url'],
         [nestedType, 'file_data'],
+        [nestedType, 'file_url'],
         [nestedType, 'file_id'],
         [nestedType, 'fileId'],
         [nestedType, 'fileUri'],
@@ -1956,16 +1966,16 @@ export type CompactToolContentResult = {
   originalChars: number;
 };
 
-function isProviderImageUrl(value: unknown): value is string {
+function isProviderImageUrl(
+  value: unknown,
+  maxUrlChars = MAX_PROVIDER_IMAGE_URL_CHARS
+): value is string {
   if (typeof value !== 'string' || value === '') {
     return false;
   }
   const isDataImage = value.startsWith('data:image/');
   if (
-    value.length >
-    (isDataImage
-      ? HARD_MAX_TOTAL_TOOL_OUTPUT_SIZE
-      : MAX_PROVIDER_IMAGE_URL_CHARS)
+    value.length > (isDataImage ? HARD_MAX_TOTAL_TOOL_OUTPUT_SIZE : maxUrlChars)
   ) {
     return false;
   }
@@ -2303,6 +2313,111 @@ export function getComputerCallOutputScreenshot(
   return undefined;
 }
 
+export type ResponsesToolOutputPart =
+  | { type: 'input_text'; text: string }
+  | {
+      type: 'input_image';
+      image_url?: string;
+      file_id?: string;
+      detail?: string;
+    }
+  | {
+      type: 'input_file';
+      file_data?: string;
+      file_id?: string;
+      file_url?: string;
+      filename?: string;
+    };
+
+/**
+ * Maps the shared LangChain text/image_url/file representation to Responses
+ * function output parts. Unknown JSON results deliberately use the string
+ * fallback, rather than being mistaken for provider content. Read only safe
+ * data properties; never execute result getters or serialization hooks.
+ */
+export function getResponsesToolOutputParts(
+  content: unknown
+): ResponsesToolOutputPart[] | undefined {
+  if (!isArray(content) || hasUnsafeCallableToJSON(content)) {
+    return undefined;
+  }
+  const parts: ResponsesToolOutputPart[] = [];
+  for (const block of content) {
+    if (!isRecord(block)) return undefined;
+    const type = block.type;
+    if (
+      (type === 'text' || type === 'input_text') &&
+      typeof block.text === 'string'
+    ) {
+      parts.push({ type: 'input_text', text: block.text });
+      continue;
+    }
+    if (type === 'image_url' || type === 'input_image') {
+      const image = isRecord(block.image_url) ? block.image_url : undefined;
+      const url = image?.url ?? block.image_url;
+      const detail = image?.detail ?? block.detail;
+      if (detail != null && !INPUT_IMAGE_DETAILS.has(detail as string))
+        return undefined;
+      if (isProviderImageUrl(url, HARD_MAX_TOTAL_TOOL_OUTPUT_SIZE)) {
+        parts.push({
+          type: 'input_image',
+          image_url: url,
+          ...(detail != null ? { detail: detail as string } : {}),
+        });
+      } else if (type === 'input_image' && isProviderFileId(block.file_id)) {
+        parts.push({
+          type: 'input_image',
+          file_id: block.file_id,
+          ...(detail != null ? { detail: detail as string } : {}),
+        });
+      } else {
+        throw new Error('Invalid Responses tool output image source');
+      }
+      continue;
+    }
+    if (type === 'file' || type === 'input_file') {
+      const file = isRecord(block.file) ? block.file : block;
+      const part: ResponsesToolOutputPart & { type: 'input_file' } = {
+        type: 'input_file',
+      };
+      const filename =
+        file.filename ??
+        (isRecord(block.metadata) ? block.metadata.filename : undefined);
+      if (typeof filename === 'string') {
+        part.filename = filename;
+      }
+      const data =
+        file.file_data ??
+        (block.source_type === 'base64' ? block.data : undefined);
+      const url =
+        file.file_url ?? (block.source_type === 'url' ? block.url : undefined);
+      const id =
+        file.file_id ?? (block.source_type === 'id' ? block.id : undefined);
+      if (typeof data === 'string' && data.length > 0) {
+        part.file_data =
+          data.startsWith('data:') || block.source_type !== 'base64'
+            ? data
+            : `data:${typeof block.mime_type === 'string' ? block.mime_type : 'application/octet-stream'};base64,${data}`;
+      } else if (typeof url === 'string' && /^https?:\/\//.test(url)) {
+        part.file_url = url;
+      } else if (isProviderFileId(id)) {
+        part.file_id = id;
+      } else {
+        throw new Error('Invalid Responses tool output file source');
+      }
+      parts.push(part);
+      continue;
+    }
+    if (isAtomicToolContentBlock(block)) {
+      throw new Error(
+        `Unsupported Responses tool output content type: ${String(type)}`
+      );
+    }
+    return undefined;
+  }
+  return parts;
+}
+
 /** Returns the provider image URL when a screenshot is URL-backed. */
 export function getComputerCallOutputImageUrl(
   content: unknown
@@ -2502,6 +2617,11 @@ export function compactToolContent(
         structuredWork
       );
     if (atomicBlockCount === 0) {
+      // An empty content-parts array is a valid native tool result, not JSON
+      // data to stringify. Container safety has already been checked above.
+      if (contentLength === 0) {
+        return { content: [], changed: false, originalChars: 0 };
+      }
       if (denseTextLength != null && originalChars <= normalizedMaxChars) {
         return {
           content: contentBlocks,
