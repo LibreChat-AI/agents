@@ -23,6 +23,7 @@ import {
   getBoundedCacheControlledTextToolContent,
   getBoundedSingleTextToolContent,
   getComputerCallOutputScreenshot,
+  getToolContentImageUrl,
   hasComputerCallOutputMarker,
   isComputerCallOutputMessage,
   serializeToolContentBounded,
@@ -34,7 +35,10 @@ import {
   setProviderMessageProvenance,
   stampSyntheticProviderMessage,
 } from './provenance';
-import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
+import {
+  HARD_MAX_TOOL_RESULT_CHARS,
+  HARD_MAX_TOTAL_TOOL_OUTPUT_SIZE,
+} from '@/utils/truncation';
 import { stripAnthropicCacheControl } from './cache';
 import { isReasoningContentBlock } from './reasoningTypes';
 import { ContentTypes, Providers } from '@/common';
@@ -529,6 +533,10 @@ interface BoundedContentAccumulator {
   readonly blocks: t.MessageContentComplex[];
   hasContent: boolean;
   remainingChars: number;
+  /** Image URL characters, budgeted apart from `remainingChars`: an image's
+   * context cost follows its pixel size, which the serving payload measure
+   * estimates, not the length of its base64 encoding. */
+  remainingImageChars: number;
 }
 
 function createBoundedContentAccumulator(
@@ -540,7 +548,23 @@ function createBoundedContentAccumulator(
     remainingChars: Number.isFinite(maxChars)
       ? Math.max(0, Math.floor(maxChars))
       : Number.MAX_SAFE_INTEGER,
+    remainingImageChars: HARD_MAX_TOTAL_TOOL_OUTPUT_SIZE,
   };
+}
+
+/** Appends a well-formed `image_url` block against the image budget. */
+function appendBoundedImageBlock(
+  accumulator: BoundedContentAccumulator,
+  block: unknown
+): boolean {
+  const url = getToolContentImageUrl(block);
+  if (url == null || url.length > accumulator.remainingImageChars) {
+    return false;
+  }
+  accumulator.blocks.push(block as t.MessageContentComplex);
+  accumulator.hasContent = true;
+  accumulator.remainingImageChars -= url.length;
+  return true;
 }
 
 /** Appends a segment only when at least one of its provider-visible bytes fits.
@@ -592,6 +616,10 @@ function appendBoundedContentContribution(
   const retainedContentPartIndices = new Set<number>();
   let complete = true;
   for (let index = 0; index < next.length; index++) {
+    if (appendBoundedImageBlock(accumulator, next[index])) {
+      retainedContentPartIndices.add(index);
+      continue;
+    }
     const projection = appendBoundedContentSegment(accumulator, [next[index]]);
     if (!projection.complete) {
       complete = false;
