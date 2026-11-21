@@ -402,6 +402,7 @@ const createSearXNGAPI = (
 
       const headers: Record<string, string> = {
         'Content-Type': 'application/json',
+        ...options?.headers,
       };
 
       if (config.apiKey != null && config.apiKey !== '') {

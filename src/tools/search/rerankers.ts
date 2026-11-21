@@ -142,6 +142,7 @@ export class JinaReranker extends BaseReranker {
   readonly provider = 'jina';
   private apiUrl: string;
   private timeout: number;
+  private headers?: Record<string, string>;
   private httpAgent?: t.HttpAgent;
   private httpsAgent?: t.HttpsAgent;
 
@@ -149,6 +150,7 @@ export class JinaReranker extends BaseReranker {
     apiKey = process.env.JINA_API_KEY,
     apiUrl = getDefaultJinaApiUrl(),
     timeout = DEFAULT_RERANKER_TIMEOUT,
+    headers,
     logger,
     httpAgent,
     httpsAgent,
@@ -156,12 +158,14 @@ export class JinaReranker extends BaseReranker {
     apiKey?: string;
     apiUrl?: string;
     timeout?: number;
+    headers?: Record<string, string>;
     logger?: t.Logger;
   } & t.HttpAgentConfig) {
     super(logger);
     this.apiKey = apiKey;
     this.apiUrl = apiUrl;
     this.timeout = timeout;
+    this.headers = headers;
     this.httpAgent = httpAgent;
     this.httpsAgent = httpsAgent;
   }
@@ -194,6 +198,7 @@ export class JinaReranker extends BaseReranker {
           headers: {
             'Content-Type': 'application/json',
             Authorization: `Bearer ${this.apiKey}`,
+            ...this.headers,
           },
           timeout: this.timeout,
           httpAgent: this.httpAgent,
@@ -242,6 +247,7 @@ export class CohereReranker extends BaseReranker {
   readonly provider = 'cohere';
   private apiUrl: string;
   private timeout: number;
+  private headers?: Record<string, string>;
   private httpAgent?: t.HttpAgent;
   private httpsAgent?: t.HttpsAgent;
 
@@ -249,6 +255,7 @@ export class CohereReranker extends BaseReranker {
     apiKey = process.env.COHERE_API_KEY,
     apiUrl = getDefaultCohereApiUrl(),
     timeout = DEFAULT_RERANKER_TIMEOUT,
+    headers,
     logger,
     httpAgent,
     httpsAgent,
@@ -256,12 +263,14 @@ export class CohereReranker extends BaseReranker {
     apiKey?: string;
     apiUrl?: string;
     timeout?: number;
+    headers?: Record<string, string>;
     logger?: t.Logger;
   } & t.HttpAgentConfig) {
     super(logger);
     this.apiKey = apiKey;
     this.apiUrl = apiUrl;
     this.timeout = timeout;
+    this.headers = headers;
     this.httpAgent = httpAgent;
     this.httpsAgent = httpsAgent;
   }
@@ -294,6 +303,7 @@ export class CohereReranker extends BaseReranker {
           headers: {
             'Content-Type': 'application/json',
             Authorization: `Bearer ${this.apiKey}`,
+            ...this.headers,
           },
           timeout: this.timeout,
           httpAgent: this.httpAgent,
@@ -590,6 +600,7 @@ export const createReranker = (
     ragApiTokenSupplier?: t.RagApiTokenSupplier;
     ragApiProfile?: string;
     rerankerTimeout?: number;
+    rerankerHeaders?: Record<string, string>;
     logger?: t.Logger;
   } & t.HttpAgentConfig
 ): BaseReranker | undefined => {
@@ -603,6 +614,7 @@ export const createReranker = (
     ragApiTokenSupplier,
     ragApiProfile,
     rerankerTimeout,
+    rerankerHeaders,
     logger,
     httpAgent,
     httpsAgent,
@@ -617,6 +629,7 @@ export const createReranker = (
       apiKey: jinaApiKey,
       apiUrl: jinaApiUrl,
       timeout: rerankerTimeout,
+      headers: rerankerHeaders,
       logger: defaultLogger,
       httpAgent,
       httpsAgent,
@@ -626,6 +639,7 @@ export const createReranker = (
       apiKey: cohereApiKey,
       apiUrl: cohereApiUrl,
       timeout: rerankerTimeout,
+      headers: rerankerHeaders,
       logger: defaultLogger,
       httpAgent,
       httpsAgent,
@@ -653,6 +667,7 @@ export const createReranker = (
       apiKey: jinaApiKey,
       apiUrl: jinaApiUrl,
       timeout: rerankerTimeout,
+      headers: rerankerHeaders,
       logger: defaultLogger,
       httpAgent,
       httpsAgent,

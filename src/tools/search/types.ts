@@ -194,6 +194,8 @@ export interface SearxNGSearchOptions extends HttpAgentConfig {
   timeRange?: SearxNGSearchPayload['time_range'];
   /** HTTP request timeout in ms. Defaults to 10000. */
   timeout?: number;
+  /** Extra headers sent with every SearXNG request. */
+  headers?: Record<string, string>;
 }
 
 export interface SearchConfig extends HttpAgentConfig {
@@ -535,6 +537,8 @@ export interface SearchToolConfig
   rerankerType?: RerankerType;
   /** Timeout (ms) for rerank API requests. Defaults to 10,000. */
   rerankerTimeout?: number;
+  /** Extra headers sent with Jina and Cohere rerank requests. */
+  rerankerHeaders?: Record<string, string>;
   scraperProvider?: ScraperProvider;
   scraperTimeout?: number;
   serperScraperOptions?: SerperScraperConfig;
