@@ -1,4 +1,5 @@
 import type { ProviderTextProtection } from '@/protection/providerText';
+import type { ToolResultProtection } from '@/protection/toolResult';
 import type { AttachmentResolver } from './attachments';
 // src/types/graph.ts
 import type {
@@ -411,6 +412,8 @@ export type ModelEndData =
 export type GraphTools = GenericTool[] | BindToolsInput[] | GoogleAIToolType[];
 export type StandardGraphInput = {
   providerTextProtection?: ProviderTextProtection;
+  /** Host inspection of selected tools' result text, for every graph of the run. */
+  toolResultProtection?: ToolResultProtection;
   /** Resolves attachments that messages carry by reference; see {@link AttachmentResolver}. */
   resolveAttachment?: AttachmentResolver;
   runId?: string;

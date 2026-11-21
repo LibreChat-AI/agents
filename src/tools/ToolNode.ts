@@ -50,6 +50,7 @@ import type {
 } from '@/hooks';
 import type { SettledToolBatchResult } from '@/tools/toolBatchReplay';
 import type { PreparedSubagents } from '@/tools/preparedSubagents';
+import type { ToolResultGate } from '@/protection/toolResult';
 import type { RunBreakerScope } from '@/llm/streamLimits';
 import type * as t from '@/types';
 import {
@@ -114,6 +115,12 @@ import {
   isIntentLabelProperty,
   outcomeFieldsFromResult,
 } from '@/tools/intentArg';
+import {
+  inspectToolExecuteResult,
+  createToolResultGate,
+  inspectToolOutput,
+  inspectToolText,
+} from '@/protection/toolResult';
 import {
   snapshotResolvedArgs,
   buildReferenceKey,
@@ -883,6 +890,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   private agentLangfuse?: t.LangfuseConfig;
   toolCallStepIds?: Map<string, string>;
   errorHandler?: t.ToolNodeConstructorParams['errorHandler'];
+  private toolResultGate?: ToolResultGate;
   /**
    * Fallback error-completion ownership for calls that reach `runTool`
    * outside a batch context (direct `runTool` use in tests / embedders).
@@ -1053,6 +1061,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     humanInTheLoop,
     toolOutputReferences,
     toolOutputRegistry,
+    toolResultProtection,
     toolExecution,
     fileCheckpointer,
     getBreakerSignal,
@@ -1314,6 +1323,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     this.handleToolErrors = handleToolErrors ?? this.handleToolErrors;
     this.loadRuntimeTools = loadRuntimeTools;
     this.errorHandler = errorHandler;
+    this.toolResultGate =
+      toolResultProtection == null
+        ? undefined
+        : createToolResultGate(toolResultProtection);
     this.toolUsageCount = new Map<string, number>();
     this.toolRegistry = resolveLocalToolRegistry({
       toolRegistry,
@@ -1622,7 +1635,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       this.toolRegistry?.values() ?? [],
       (toolDef) => isToolDefinitionActive(toolDef, discoveredToolNames)
     );
+    const protectedToolDefs: t.LCTool[] = [];
     for (const toolDef of executableCapabilities.codeExecutionTools) {
+      if (this.protectedResultGate(toolDef.name) != null) {
+        protectedToolDefs.push({ name: toolDef.name });
+        continue;
+      }
       if (
         this.eventDrivenMode &&
         this.directToolNames?.has(toolDef.name) !== true &&
@@ -1643,7 +1661,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       toolDefs,
       disallowedToolDefs: activeCapabilities.directOnlyTools
         .filter((toolDef) => !isProgrammaticControlTool(toolDef.name))
-        .map((toolDef) => ({ name: toolDef.name })),
+        .map((toolDef) => ({ name: toolDef.name }))
+        .concat(protectedToolDefs),
     };
   }
 
@@ -2111,10 +2130,20 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       }
 
       this.throwIfBreakerTripped(config);
-      const output = await (this.preparedSubagents?.take(
+      const returned = await (this.preparedSubagents?.take(
         this.executingAgentId ?? '',
         { ...call, args }
       ) ?? this.invokeWithRuntime(tool, invokeParams, call, config, runInput));
+      const gate = this.protectedResultGate(call.name);
+      const output =
+        gate == null
+          ? returned
+          : await inspectToolOutput(
+            gate,
+            { name: call.name, id: call.id ?? '' },
+            returned,
+            config.signal
+          );
       if (isCommand(output)) {
         return output;
       }
@@ -2195,7 +2224,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         }),
       });
     } catch (_e: unknown) {
-      const e = _e as Error;
+      let e = _e as Error;
       if (!this.handleToolErrors) {
         throw e;
       }
@@ -2213,6 +2242,18 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         e instanceof ProviderTextProtectionError
       ) {
         throw e;
+      }
+      const gate = this.protectedResultGate(call.name);
+      if (gate != null) {
+        e = new Error(
+          await inspectToolText(
+            gate,
+            { name: call.name, id: call.id ?? '' },
+            typeof e.message === 'string' ? e.message : '',
+            'error',
+            config.signal
+          )
+        );
       }
       if (this.errorHandler) {
         try {
@@ -2291,6 +2332,35 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         tool_call_id: call.id ?? '',
       });
     }
+  }
+
+  /** The gate when host result protection selects `toolName`. */
+  private protectedResultGate(toolName: string): ToolResultGate | undefined {
+    return this.toolResultGate?.toolNames.has(toolName) === true
+      ? this.toolResultGate
+      : undefined;
+  }
+
+  private inspectHostResults(
+    results: t.ToolExecuteResult[],
+    requests: ReadonlyMap<string, t.ToolCallRequest>,
+    config: RunnableConfig
+  ): Promise<t.ToolExecuteResult[]> {
+    return Promise.all(
+      results.map((result) => {
+        const request = requests.get(result.toolCallId);
+        const gate =
+          request == null ? undefined : this.protectedResultGate(request.name);
+        return gate == null || request == null
+          ? result
+          : inspectToolExecuteResult(
+            gate,
+            { name: request.name, id: request.id },
+            result,
+            config.signal
+          );
+      })
+    );
   }
 
   private unresolvedReferenceMessage(
@@ -4512,7 +4582,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             : undefined;
         if (
           request == null ||
-          earlyCompletionDispatchedIds.has(result.toolCallId)
+          earlyCompletionDispatchedIds.has(result.toolCallId) ||
+          this.protectedResultGate(request.name) != null
         ) {
           return;
         }
@@ -4663,10 +4734,22 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       const flattenedEagerResults = eagerResults.flatMap(
         (result) => result.results
       );
+      const hostResults = [...flattenedEagerResults, ...dispatchedResults];
       const results = [
         ...plan.rejectedResults,
-        ...flattenedEagerResults,
-        ...dispatchedResults,
+        ...(this.toolResultGate == null
+          ? hostResults
+          : await this.inspectHostResults(
+            hostResults,
+            requestMap,
+            config
+          ).catch((error: unknown) => {
+            this.retainCodeSessionInputsFromRequests(
+              requestMap.values(),
+              codeSessionBaselineByRequestId
+            );
+            throw error;
+          })),
       ];
       /* Hosts may lazily refresh codeSessionContext while dispatching. The
        * pre-dispatch snapshot above remains the authority for detecting those

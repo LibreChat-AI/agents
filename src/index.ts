@@ -135,6 +135,14 @@ export type {
   ProviderTextProtectionErrorCode,
   ProviderTextProtectionFailure,
 } from './protection/providerText';
+export {
+  TOOL_RESULT_PROTECTION_VERSION,
+  ToolResultProtectionError,
+} from './protection/toolResult';
+export type {
+  ToolResultProtection,
+  ToolResultProtectionResult,
+} from './protection/toolResult';
 
 export {
   GEMINI_PARTS,
