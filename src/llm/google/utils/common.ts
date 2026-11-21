@@ -88,6 +88,44 @@ function getGoogleFunctionId(id?: string): string | undefined {
   return id != null && id !== '' ? id : undefined;
 }
 
+/**
+ * `functionCall` content blocks are mirrors of `message.tool_calls`. They are
+ * converted to placeholder parts that only mark the position the model put the
+ * call at; the call itself is rebuilt from `tool_calls` and swapped in.
+ */
+const functionCallPlaceholders = new WeakSet<Part>();
+
+function isFunctionCallPart(part: Part): part is FunctionCallPart {
+  return 'functionCall' in part && part.functionCall != null;
+}
+
+function placeFunctionCalls(
+  messageParts: Part[],
+  functionCalls: FunctionCallPart[]
+): Part[] {
+  const unplaced = [...functionCalls];
+  const takeMatch = (part: FunctionCallPart): FunctionCallPart | undefined => {
+    const { id, name } = part.functionCall as GoogleFunctionCallWithId;
+    const index = unplaced.findIndex((call) => {
+      const callId = (call.functionCall as GoogleFunctionCallWithId).id;
+      return id != null ? callId === id : call.functionCall.name === name;
+    });
+    return index === -1 ? undefined : unplaced.splice(index, 1)[0];
+  };
+
+  const placed = messageParts.flatMap((part): Part[] => {
+    if (!isFunctionCallPart(part)) {
+      return [part];
+    }
+    const match = takeMatch(part);
+    if (match != null) {
+      return [match];
+    }
+    return functionCallPlaceholders.has(part) ? [] : [part];
+  });
+  return [...placed, ...unplaced];
+}
+
 function createGoogleFunctionResponsePart({
   name,
   response,
@@ -474,8 +512,10 @@ function _convertLangChainContentToPart(
       },
     };
   } else if ('functionCall' in content) {
-    // No action needed here — function calls will be added later from message.tool_calls
-    return undefined;
+    // Keeps the position of the call; it is replaced by the call rebuilt from message.tool_calls
+    const placeholder: Part = { functionCall: content.functionCall };
+    functionCallPlaceholders.add(placeholder);
+    return placeholder;
   } else {
     if ('type' in content) {
       throw new Error(`Unknown content type ${content.type}`);
@@ -504,7 +544,9 @@ export function convertMessageContentToParts(
     const result = Array.isArray(message.content)
       ? (message.content
         .map((c) => _convertLangChainContentToPart(c, isMultimodalModel))
-        .filter((p) => p !== undefined) as Part[])
+        .filter(
+          (p) => p !== undefined && !functionCallPlaceholders.has(p)
+        ) as Part[])
       : message.content;
 
     if (message.status === 'error') {
@@ -579,28 +621,7 @@ export function convertMessageContentToParts(
     });
   }
 
-  const parsedFunctionCallIds = new Set(
-    functionCalls.flatMap((part) => {
-      const functionCall = part.functionCall as GoogleFunctionCallWithId;
-      return functionCall.id != null ? [functionCall.id] : [];
-    })
-  );
-  const parsedFunctionCallNames = new Set(
-    functionCalls.map((part) => part.functionCall.name)
-  );
-  const contentWithoutParsedMirrors = messageParts.filter((part) => {
-    if (!('functionCall' in part) || part.functionCall == null) {
-      return true;
-    }
-    const functionCall = part.functionCall as GoogleFunctionCallWithId;
-    return !(
-      (functionCall.id != null && parsedFunctionCallIds.has(functionCall.id)) ||
-      (functionCall.id == null &&
-        parsedFunctionCallNames.has(functionCall.name))
-    );
-  });
-
-  return [...contentWithoutParsedMirrors, ...functionCalls];
+  return placeFunctionCalls(messageParts, functionCalls);
 }
 
 export function convertBaseMessagesToContent(
