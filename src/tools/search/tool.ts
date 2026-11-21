@@ -22,6 +22,7 @@ import { createSerperScraper } from './serper-scraper';
 import { createTavilyScraper } from './tavily-scraper';
 import { createFirecrawlScraper } from './firecrawl';
 import { INTENT_PROPERTY } from '@/tools/intentArg';
+import { createKagiScraper } from './kagi-scraper';
 import { createCrwScraper } from './crw-scraper';
 import { expandHighlights } from './highlights';
 import { createSearchMetrics } from './metrics';
@@ -497,6 +498,9 @@ export const createSearchTool = (
     keenableApiUrl,
     keenableSearchOptions,
     keenableScraperOptions,
+    kagiApiKey,
+    kagiSearchOptions,
+    kagiScraperOptions,
     rerankerType = 'cohere',
     rerankerTimeout,
     topResults = 5,
@@ -552,7 +556,11 @@ export const createSearchTool = (
     news: newsSchema,
   };
 
-  if (searchProvider === 'serper' || searchProvider === 'tavily') {
+  if (
+    searchProvider === 'serper' ||
+    searchProvider === 'tavily' ||
+    searchProvider === 'kagi'
+  ) {
     schemaProperties.country = countrySchema;
   }
 
@@ -577,6 +585,8 @@ export const createSearchTool = (
     crwApiKey,
     crwApiUrl,
     crwSearchOptions,
+    kagiApiKey,
+    kagiSearchOptions,
     httpAgent,
     httpsAgent,
   });
@@ -615,6 +625,15 @@ export const createSearchTool = (
       formats: crwScraperOptions?.formats ?? ['markdown', 'rawHtml'],
       httpAgent: httpAgent ?? crwScraperOptions?.httpAgent,
       httpsAgent: httpsAgent ?? crwScraperOptions?.httpsAgent,
+      logger,
+    });
+  } else if (scraperProvider === 'kagi') {
+    scraperInstance = createKagiScraper({
+      ...kagiScraperOptions,
+      apiKey: kagiScraperOptions?.apiKey ?? kagiApiKey,
+      timeout: scraperTimeout ?? kagiScraperOptions?.timeout,
+      httpAgent: httpAgent ?? kagiScraperOptions?.httpAgent,
+      httpsAgent: httpsAgent ?? kagiScraperOptions?.httpsAgent,
       logger,
     });
   } else if (scraperProvider === 'keenable') {
