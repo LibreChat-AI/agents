@@ -12,8 +12,8 @@ import {
 import type { BaseMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
 import { OVERFLOW_SIGNATURES } from '@/utils/__tests__/fixtures/contextOverflowSignatures';
-import { ContentTypes, GraphEvents, Providers } from '@/common';
 import { getProviderSourceMessageIds } from '@/messages/provenance';
+import { ContentTypes, GraphEvents, Providers } from '@/common';
 import * as init from '@/llm/init';
 import { Run } from '@/run';
 
@@ -194,6 +194,69 @@ async function captureFallback(
 }
 
 describe('context overflow recovery', () => {
+  it.each([false, true])(
+    'replays earlier tool images with context pressure=%s',
+    async (pressure) => {
+      const imageUrl = 'data:image/png;base64,QUFBQUFBQUFBQUFB';
+      const currentImageUrl = 'data:image/png;base64,QkJCQkJCQkJCQkJC';
+      const messages: BaseMessage[] = [
+        new HumanMessage('inspect the image and then read metadata'),
+        new AIMessage({
+          content: '',
+          tool_calls: [{ id: 'image', name: 'read', args: {} }],
+        }),
+        new ToolMessage({
+          content: 'image read',
+          tool_call_id: 'image',
+          artifact: {
+            content: [{ type: 'image_url', image_url: { url: imageUrl } }],
+          },
+        }),
+        new AIMessage({
+          content: '',
+          tool_calls: [{ id: 'metadata', name: 'read', args: {} }],
+        }),
+        new ToolMessage({
+          content: 'metadata read',
+          tool_call_id: 'metadata',
+          artifact: {
+            content: [
+              { type: 'image_url', image_url: { url: currentImageUrl } },
+            ],
+          },
+        }),
+      ];
+      const imageTokens = pressure ? 20_000 : 100;
+      const imageCounter: t.TokenCounter = (message) =>
+        JSON.stringify(message.content).includes(imageUrl) ? imageTokens : 10;
+      const run = await createRun({
+        runId: `tool-image-replay-${pressure}`,
+        maxContextTokens: 10_000,
+        provider: Providers.OPENAI,
+        tokenCounter: imageCounter,
+        indexTokenCountMap: Object.fromEntries(
+          messages.map((message, index) => [index, imageCounter(message)])
+        ),
+      });
+      if (!run.Graph) throw new Error('Expected graph');
+      const model = new OverflowThenSucceedModel({}, 0);
+      run.Graph.overrideModel = model;
+      await run.processStream({ messages }, streamConfig);
+      expect(model.calls).toHaveLength(1);
+      expect(
+        JSON.stringify(
+          model.calls[0].map((message) => message.content)
+        ).includes(imageUrl)
+      ).toBe(!pressure);
+      expect(
+        JSON.stringify(model.calls[0].map((message) => message.content))
+      ).toContain(currentImageUrl);
+      expect(
+        (messages[2] as ToolMessage).artifact.content[0].image_url.url
+      ).toBe(imageUrl);
+    }
+  );
+
   it.each([Providers.ANTHROPIC, Providers.OPENAI, Providers.GOOGLE])(
     'preserves fallback artifacts for %s',
     async (provider) => {
