@@ -84,6 +84,14 @@ User: ${userMessage[1]}
 }
 
 const _allowedTypes = ['image_url', 'text', 'tool_use', 'tool_result'];
+const ANTHROPIC_SERVER_TOOL_RESULT_TYPES = [
+  'web_search_tool_result',
+  'code_execution_tool_result',
+  'web_fetch_tool_result',
+  'bash_code_execution_tool_result',
+  'text_editor_code_execution_tool_result',
+  'tool_search_tool_result',
+];
 const allowedTypesByProvider: Record<string, string[]> = {
   default: _allowedTypes,
   [Providers.ANTHROPIC]: [
@@ -91,8 +99,8 @@ const allowedTypesByProvider: Record<string, string[]> = {
     'thinking',
     'redacted_thinking',
     'server_tool_use',
-    'web_search_tool_result',
     'web_search_result',
+    ...ANTHROPIC_SERVER_TOOL_RESULT_TYPES,
   ],
   [Providers.BEDROCK]: [..._allowedTypes, 'reasoning_content'],
   [Providers.OPENAI]: _allowedTypes,
