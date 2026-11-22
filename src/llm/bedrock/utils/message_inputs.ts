@@ -1141,13 +1141,12 @@ export interface ConvertToConverseMessagesOptions {
 }
 
 /**
- * Whether the model is an identified OpenAI model on Bedrock (`openai.*`, a geo/global
- * inference profile such as `global.openai.*`, or an ARN naming one). Missing model IDs and
- * opaque resource ARNs are not identified.
+ * The lowercased Bedrock model ID, taken from a foundation-model or inference-profile ARN when
+ * given one. Undefined for missing IDs and opaque resource ARNs.
  */
-export function isBedrockOpenAIModel(model?: string): boolean {
+function bedrockModelId(model?: string): string | undefined {
   if (model == null || model === '') {
-    return false;
+    return undefined;
   }
   let id = model.toLowerCase();
   if (id.startsWith('arn:')) {
@@ -1156,21 +1155,42 @@ export function isBedrockOpenAIModel(model?: string): boolean {
         id
       )?.[1];
     if (modelId == null) {
-      return false;
+      return undefined;
     }
     id = modelId;
   }
-  return /(?:^|\.)openai\./.test(id);
+  return id;
 }
 
 /**
- * OpenAI Bedrock models reject prior `reasoningContent`, including on Claude-to-GPT handoffs.
- * Only suppress replay for identified OpenAI targets; other model families retain the existing
- * behavior because their Bedrock reasoning-replay requirements have not been verified here.
+ * Whether the model is an identified OpenAI model on Bedrock (`openai.*`, a geo/global
+ * inference profile such as `global.openai.*`, or an ARN naming one). Missing model IDs and
+ * opaque resource ARNs are not identified.
+ */
+export function isBedrockOpenAIModel(model?: string): boolean {
+  const id = bedrockModelId(model);
+  return id != null && /(?:^|\.)openai\./.test(id);
+}
+
+/**
+ * Identifies an xAI (Grok) model on Bedrock, including cross-region inference profiles such as
+ * `us.xai.*` and ARNs naming one.
+ */
+export function isBedrockXAIModel(model?: string): boolean {
+  const id = bedrockModelId(model);
+  return id != null && /(?:^|\.)xai\./.test(id);
+}
+
+/**
+ * OpenAI and xAI Bedrock models reject prior `reasoningContent` ("This model doesn't support the
+ * reasoningContent.reasoningText.text field for assistant messages"), including their own reasoning
+ * from the previous step of a tool loop and Claude-to-GPT handoffs. Only suppress replay for
+ * identified OpenAI and xAI targets; other model families retain the existing behavior because
+ * their Bedrock reasoning-replay requirements have not been verified here.
  * Missing model IDs and opaque resource ARNs also retain the existing behavior.
  */
 export function replaysBedrockReasoning(model?: string): boolean {
-  return !isBedrockOpenAIModel(model);
+  return !isBedrockOpenAIModel(model) && !isBedrockXAIModel(model);
 }
 
 /**
@@ -1184,7 +1204,7 @@ export function convertToConverseMessages(
   converseSystem: BedrockSystemContentBlock[];
 } {
   const openAITarget = isBedrockOpenAIModel(options.model);
-  const replayReasoning = !openAITarget;
+  const replayReasoning = replaysBedrockReasoning(options.model);
   const converseSystem = messages
     .filter((msg) => msg._getType() === 'system')
     .flatMap((msg) => convertSystemMessageToConverseMessage(msg));

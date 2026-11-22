@@ -60,7 +60,10 @@ import {
 } from '@/llm/stream/smoother';
 import { modelDisallowsAssistantPrefill } from '@/llm/anthropic/utils/message_inputs';
 import { linkStreamLimitCanonical } from '@/llm/streamLimits';
-import { isBedrockOpenAIModel } from './utils/message_inputs';
+import {
+  isBedrockOpenAIModel,
+  replaysBedrockReasoning,
+} from './utils/message_inputs';
 import { neutralizeHarmonyToolConfig } from './utils/harmony';
 import { insertBedrockToolCachePoint } from './toolCache';
 
@@ -271,7 +274,7 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
     runManager?: CallbackManagerForLLMRun
   ): Promise<ChatResult> {
     if (
-      isBedrockOpenAIModel(this.model) ||
+      !replaysBedrockReasoning(this.model) ||
       modelDisallowsAssistantPrefill(this.model)
     ) {
       return this.generateWithLocalConverter(messages, options);
@@ -293,9 +296,9 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
 
   /**
    * Non-streaming Converse through this package's converter, as the stream already uses.
-   * The parent's converter replays reasoning and sends harmony control tokens as written,
-   * both of which OpenAI models on Bedrock fail on, and it cannot strip a trailing
-   * assistant prefill that Claude 4.6 and later reject.
+   * The parent's converter replays reasoning, which OpenAI and xAI models on Bedrock reject,
+   * and sends harmony control tokens as written, which OpenAI models fail on. It also cannot
+   * strip a trailing assistant prefill that Claude 4.6 and later reject.
    */
   private async generateWithLocalConverter(
     messages: BaseMessage[],

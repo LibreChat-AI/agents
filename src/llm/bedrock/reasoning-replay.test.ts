@@ -47,6 +47,20 @@ describe('Bedrock reasoning replay in streaming requests', () => {
       replayReasoning: true,
     },
     {
+      model: 'us.xai.grok-4.7',
+      replayReasoning: false,
+    },
+    {
+      model:
+        'arn:aws:bedrock:us-west-2:123456789012:inference-profile/us.xai.grok-4.7',
+      replayReasoning: false,
+    },
+    {
+      model: 'xai.grok-4.7',
+      applicationInferenceProfile: profileArn,
+      replayReasoning: false,
+    },
+    {
       model: 'deepseek.v3.2',
       replayReasoning: true,
     },
