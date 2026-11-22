@@ -35,6 +35,7 @@ import {
 import { _makeMessageChunkFromAnthropicEvent } from './utils/message_outputs';
 import { convertAnthropicStream } from './utils/stream_events';
 import { getCurrentClaudeDefaultMaxTokens } from './defaults';
+import { withCurrentTurnContainer } from './utils/container';
 import { handleToolChoice } from './utils/tools';
 
 type StreamTokenType = 'string' | 'input' | 'content';
@@ -642,7 +643,9 @@ export class CustomAnthropic extends ChatAnthropicMessages {
     options: this['ParsedCallOptions'],
     _runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatModelStreamEvent> {
-    const params = this.invocationParams(options);
+    const params = this.invocationParams(
+      withCurrentTurnContainer(messages, options)
+    );
     const formattedMessages = _convertMessagesToAnthropicPayload(messages);
     const payload = stripUnsupportedAssistantPrefill({
       ...params,
@@ -666,7 +669,9 @@ export class CustomAnthropic extends ChatAnthropicMessages {
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
     this.resetTokenEvents();
-    const params = this.invocationParams(options);
+    const params = this.invocationParams(
+      withCurrentTurnContainer(messages, options)
+    );
     const formattedMessages = _convertMessagesToAnthropicPayload(messages);
     const payload = stripUnsupportedAssistantPrefill({
       ...params,
