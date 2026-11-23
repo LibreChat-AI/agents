@@ -8,3 +8,4 @@ export * from './tokens';
 export * from './schema';
 export * from './truncation';
 export * from './errors';
+export * from './rateLimit';
