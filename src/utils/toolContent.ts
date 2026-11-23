@@ -2281,26 +2281,60 @@ export function getComputerCallOutputScreenshot(
         file_id: validFileId as string,
       };
   }
-  if (
-    type.value === 'image_url' &&
-    !fileId.found &&
-    hasOnlyEnumerableKeys(block, IMAGE_URL_KEYS)
-  ) {
-    if (hasImageUrl) {
-      return { type: 'input_image', image_url: validImageUrl };
-    }
-    if (
-      imageUrl.found &&
-      isRecord(imageUrl.value) &&
-      hasOnlyEnumerableKeys(imageUrl.value, NESTED_IMAGE_URL_KEYS)
-    ) {
-      const url = readOwnEnumerableDataProperty(imageUrl.value, 'url');
-      if (url.found && isProviderImageUrl(url.value)) {
-        return { type: 'input_image', image_url: url.value };
-      }
-    }
+  if (type.value === 'image_url') {
+    const url = readImageUrlBlockUrl(block, type, imageUrl, fileId);
+    return url != null ? { type: 'input_image', image_url: url } : undefined;
   }
   return undefined;
+}
+
+function readImageUrlBlockUrl(
+  block: Record<string, unknown>,
+  type: OwnDataProperty,
+  imageUrl: OwnDataProperty,
+  fileId: OwnDataProperty
+): string | undefined {
+  if (
+    !type.found ||
+    type.value !== 'image_url' ||
+    fileId.found ||
+    !imageUrl.found ||
+    !hasOnlyEnumerableKeys(block, IMAGE_URL_KEYS)
+  ) {
+    return undefined;
+  }
+  if (isProviderImageUrl(imageUrl.value)) {
+    return imageUrl.value;
+  }
+  if (
+    !isRecord(imageUrl.value) ||
+    !hasOnlyEnumerableKeys(imageUrl.value, NESTED_IMAGE_URL_KEYS)
+  ) {
+    return undefined;
+  }
+  const url = readOwnEnumerableDataProperty(imageUrl.value, 'url');
+  return url.found && isProviderImageUrl(url.value) ? url.value : undefined;
+}
+
+/**
+ * Returns the URL of a well-formed `image_url` block (an `http(s)` URL or a
+ * base64 image data URL within the inline image ceiling), reading only own
+ * data properties and never invoking serialization hooks.
+ */
+export function getToolContentImageUrl(block: unknown): string | undefined {
+  try {
+    if (!isRecord(block) || hasUnsafeCallableToJSON(block)) {
+      return undefined;
+    }
+    return readImageUrlBlockUrl(
+      block,
+      readOwnEnumerableDataProperty(block, 'type'),
+      readOwnEnumerableDataProperty(block, 'image_url'),
+      readOwnEnumerableDataProperty(block, 'file_id')
+    );
+  } catch {
+    return undefined;
+  }
 }
 
 /** Returns the provider image URL when a screenshot is URL-backed. */

@@ -9,11 +9,17 @@ import {
   AIMessage,
   ToolMessage,
 } from '@langchain/core/messages';
-import type { BaseMessage } from '@langchain/core/messages';
+import type {
+  MessageContentImageUrl,
+  MessageContentComplex,
+  BaseMessage,
+} from '@langchain/core/messages';
 import type * as t from '@/types';
 import { OVERFLOW_SIGNATURES } from '@/utils/__tests__/fixtures/contextOverflowSignatures';
-import { ContentTypes, GraphEvents, Providers } from '@/common';
+import { screenshotDataUrl } from '@/utils/__tests__/fixtures/screenshot';
 import { getProviderSourceMessageIds } from '@/messages/provenance';
+import { ContentTypes, GraphEvents, Providers } from '@/common';
+import { createTokenCounter } from '@/utils/tokens';
 import * as init from '@/llm/init';
 import { Run } from '@/run';
 
@@ -1220,6 +1226,80 @@ describe('context overflow recovery', () => {
     expect(toolMessage.content).toBe('rendered');
     expect(toolMessage.artifact.content[0].text).toContain(artifactSentinel);
   });
+
+  it.each([
+    [Providers.ANTHROPIC, 'claude-sonnet-4-5', 'claude'],
+    [Providers.OPENAI, 'gpt-4o', 'o200k_base'],
+  ] as const)(
+    'delivers a screenshot larger than the tool-result budget to %s',
+    async (provider, model, encoding) => {
+      const toolCallId = 'tc-screenshot';
+      const screenshot = screenshotDataUrl(1_250_000);
+      const messages: BaseMessage[] = [
+        new HumanMessage('take a screenshot'),
+        new AIMessageChunk({
+          content: '',
+          tool_calls: [
+            {
+              id: toolCallId,
+              name: 'browser_take_screenshot',
+              args: {},
+              type: 'tool_call',
+            },
+          ],
+        }),
+        new ToolMessage({
+          content: 'Took the viewport screenshot.',
+          tool_call_id: toolCallId,
+          name: 'browser_take_screenshot',
+          artifact: {
+            content: [
+              { type: ContentTypes.IMAGE_URL, image_url: { url: screenshot } },
+            ],
+          },
+        }),
+      ];
+      const realTokenCounter = await createTokenCounter(encoding);
+      const run = await createRun({
+        runId: `screenshot-${provider}`,
+        maxContextTokens: 200_000,
+        provider,
+        model,
+        tokenCounter: realTokenCounter,
+        indexTokenCountMap: Object.fromEntries(
+          messages.map((message, index) => [index, realTokenCounter(message)])
+        ),
+        tools: [
+          tool(async () => 'unused', {
+            name: 'browser_take_screenshot',
+            description: 'Takes a screenshot',
+            schema: z.object({}),
+          }),
+        ],
+      });
+      if (!run.Graph) {
+        throw new Error('Expected graph to be initialized');
+      }
+      const capture = new OverflowThenSucceedModel({}, 0);
+      run.Graph.overrideModel = capture;
+
+      await run.processStream({ messages }, streamConfig);
+
+      expect(capture.calls).toHaveLength(1);
+      const imageUrlLengths = capture.calls[0].flatMap((message) =>
+        Array.isArray(message.content)
+          ? (message.content as MessageContentComplex[])
+            .filter((block) => block.type === ContentTypes.IMAGE_URL)
+            .map((block) => {
+              const imageUrl = (block as MessageContentImageUrl).image_url;
+              return (typeof imageUrl === 'string' ? imageUrl : imageUrl.url)
+                .length;
+            })
+          : []
+      );
+      expect(imageUrlLengths).toEqual([screenshot.length]);
+    }
+  );
 
   it('rechecks artifact expansion after provider message transforms', async () => {
     const toolCallId = 'tc-artifact-final-transform';
