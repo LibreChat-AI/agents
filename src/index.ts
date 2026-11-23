@@ -75,6 +75,15 @@ export type { Interrupt } from '@langchain/langgraph';
 
 /* LLM */
 export { markTokenCounterCacheCompatible } from './llm/tokenCounterCacheCompatibility';
+export { createOpenAIPhysicalAttemptFetch } from './llm/openai/attemptObservation';
+export type {
+  OpenAIPhysicalAttemptCharge,
+  OpenAIPhysicalAttemptErrorCode,
+  OpenAIPhysicalAttemptEvent,
+  OpenAIPhysicalAttemptObserver,
+  OpenAIPhysicalAttemptProvider,
+  OpenAIPhysicalAttemptUsage,
+} from './llm/openai/attemptObservation';
 /** Provider chat-model classes moved off the root barrel: importing any of them here
  *  forced every host to pay that provider SDK's module init at boot. They remain
  *  available from their own entries, e.g. `@librechat/agents/llm/openai`. */
