@@ -101,6 +101,9 @@ jobs:
       - name: Build declarations
         run: npm run build:types
 
+      - name: Test declaration specifier rewriting
+        run: npm run test:declaration-extensions
+
       - name: Test light entry points
         run: npm run test:light-entries
 
