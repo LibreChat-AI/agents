@@ -57,7 +57,7 @@ it('preserves the normal Anthropic tool prefix and thinking options on summaries
 });
 
 it.each(['auto', 'none', 'calculate'])(
-  'preserves the normal Anthropic binding with an unbound client tool_choice of %s',
+  'preserves the normal Anthropic binding with an unbound client tool_choice of %s @scenario:anthropic-binding-unchanged',
   (tool_choice) => {
     const clientOptions = {
       apiKey: 'offline-test',
@@ -324,7 +324,7 @@ describe('client tool call options on OpenAI-compatible providers', () => {
     } as t.OpenAIClientOptions;
   }
 
-  it('sends tool_choice and parallel_tool_calls when tools are bound', async () => {
+  it('sends tool_choice and parallel_tool_calls when tools are bound @scenario:configured-tool-choice-reaches-request', async () => {
     const capture = createCapture();
     const model = initializeModel({
       provider: Providers.OPENAI,
@@ -343,7 +343,7 @@ describe('client tool call options on OpenAI-compatible providers', () => {
     expect(capture.requests[0].tools).toEqual(tools);
   });
 
-  it('forwards a named function tool_choice', async () => {
+  it('forwards a named function tool_choice @scenario:named-function-tool-choice-reaches-request', async () => {
     const capture = createCapture();
     const model = initializeModel({
       provider: Providers.OPENAI,
@@ -362,7 +362,7 @@ describe('client tool call options on OpenAI-compatible providers', () => {
     expect(capture.requests[0]).not.toHaveProperty('parallel_tool_calls');
   });
 
-  it('keeps tool_choice none when tool calling is disabled', async () => {
+  it('keeps tool_choice none when tool calling is disabled @scenario:summary-keeps-tool-choice-none', async () => {
     const capture = createCapture();
     const model = initializeModel({
       provider: Providers.OPENAI,
@@ -381,7 +381,7 @@ describe('client tool call options on OpenAI-compatible providers', () => {
     expect(capture.requests[0].tools).toEqual(tools);
   });
 
-  it('sends neither option on a tool-less call', async () => {
+  it('sends neither option on a tool-less call @scenario:tool-less-call-sends-neither-option', async () => {
     const capture = createCapture();
     const model = initializeModel({
       provider: Providers.OPENAI,
@@ -398,7 +398,7 @@ describe('client tool call options on OpenAI-compatible providers', () => {
     expect(capture.requests[0]).not.toHaveProperty('tools');
   });
 
-  it('ignores malformed values', () => {
+  it('ignores malformed values @scenario:malformed-values-are-ignored', () => {
     const model = new ChatOpenAI({
       apiKey: 'offline-test',
       model: 'gpt-4.1-mini',
