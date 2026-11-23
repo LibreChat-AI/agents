@@ -9,13 +9,13 @@ import {
 } from '@langchain/core/messages';
 import type { ContentBlock as LangChainContentBlock } from '@langchain/core/messages';
 import type { ToolCall, ToolCallChunk } from '@langchain/core/messages/tool';
-import type { ProviderMessageProvenancePart } from './provenance';
-import type * as t from '@/types';
 import type {
   ResponsesReplayPosition,
   ToolHistoryPreparation,
   OrderedToolHistoryProjection,
 } from './toolHistoryProjection';
+import type { ProviderMessageProvenancePart } from './provenance';
+import type * as t from '@/types';
 import {
   cloneToolMessageWithContent,
   compactToolContent,
@@ -28,6 +28,13 @@ import {
   serializeToolContentBounded,
 } from '@/utils/toolContent';
 import {
+  OPENAI_RESPONSES_REPLAY_POSITIONS_KEY,
+  createToolHistoryPreparation,
+  getGeneratedImageMimeType,
+  getResponsesHistorySource,
+  isResponsesReplayPosition,
+} from './toolHistoryProjection';
+import {
   getProviderMessageProvenance,
   getProviderSourceMessageIds,
   hasBijectiveProviderContentPartMapping,
@@ -35,17 +42,10 @@ import {
   stampSyntheticProviderMessage,
 } from './provenance';
 import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
-import { stripAnthropicCacheControl } from './cache';
 import { isReasoningContentBlock } from './reasoningTypes';
+import { stripAnthropicCacheControl } from './cache';
 import { ContentTypes, Providers } from '@/common';
 import { toLangChainContent } from './langchain';
-import {
-  OPENAI_RESPONSES_REPLAY_POSITIONS_KEY,
-  createToolHistoryPreparation,
-  getGeneratedImageMimeType,
-  getResponsesHistorySource,
-  isResponsesReplayPosition,
-} from './toolHistoryProjection';
 
 type ReasoningSummary = { summary?: Array<{ text?: string }> };
 type ReasoningDetail = { type?: string; text?: string };
@@ -2619,7 +2619,8 @@ export function formatAnthropicArtifactContent(messages: BaseMessage[]): void {
 
 export function projectArtifactPayload(
   messages: BaseMessage[],
-  maxChars = HARD_MAX_TOOL_RESULT_CHARS
+  maxChars = HARD_MAX_TOOL_RESULT_CHARS,
+  replayImages = true
 ): BaseMessage[] {
   const lastMessageY = messages[messages.length - 1];
   if (!(lastMessageY instanceof ToolMessage)) return messages;
@@ -2717,7 +2718,104 @@ export function projectArtifactPayload(
     setProviderMessageProvenance(artifactPayload, artifactProvenanceParts);
     formattedMessages?.push(artifactPayload);
   }
-  return formattedMessages ?? messages;
+  const projected = formattedMessages ?? messages;
+  return replayImages
+    ? projectEarlierToolImages(
+      messages,
+      projected,
+      latestAIParentIndex,
+      aggregate.remainingChars
+    )
+    : projected;
+}
+
+/** Replay only images from completed tool calls in the current user turn.
+ * Newest images consume the remaining artifact budget first. The projection
+ * never writes image bytes back into graph state or persisted messages. */
+function projectEarlierToolImages(
+  source: BaseMessage[],
+  projected: BaseMessage[],
+  end: number,
+  maxChars: number
+): BaseMessage[] {
+  if (maxChars <= 0) {
+    return projected;
+  }
+  const eligible = new Set<number>();
+  let pending = new Set<string>();
+  for (let i = 0; i < end; i++) {
+    const message = source[i];
+    if (message instanceof HumanMessage) {
+      eligible.clear();
+      pending.clear();
+    } else if (
+      message instanceof AIMessage ||
+      message instanceof AIMessageChunk
+    ) {
+      pending = new Set(
+        message.tool_calls?.flatMap((call) =>
+          call.id == null ? [] : [call.id]
+        )
+      );
+    } else if (
+      message instanceof ToolMessage &&
+      pending.delete(message.tool_call_id)
+    ) {
+      eligible.add(i);
+    }
+  }
+  if (eligible.size === 0) {
+    return projected;
+  }
+  const aggregate = createBoundedContentAccumulator(maxChars);
+  const payloads: HumanMessage[] = [];
+  for (let i = end - 1; i >= 0 && aggregate.remainingChars > 0; i--) {
+    const message = source[i];
+    if (
+      !eligible.has(i) ||
+      !(message instanceof ToolMessage) ||
+      isComputerCallOutputMessage(message) ||
+      !Array.isArray(message.artifact?.content)
+    ) {
+      continue;
+    }
+    const images: t.MessageContentComplex[] = [];
+    for (const block of message.artifact.content) {
+      const image = getComputerCallOutputScreenshot([block]);
+      if (image == null || !('image_url' in image)) {
+        continue;
+      }
+      const normalized = {
+        type: 'image_url',
+        image_url: {
+          url: image.image_url,
+          ...('detail' in image &&
+            image.detail != null && { detail: image.detail }),
+        },
+      };
+      const chars = getToolContentCharLength([normalized]) + 1;
+      if (chars > aggregate.remainingChars) {
+        continue;
+      }
+      images.push(normalized);
+      aggregate.remainingChars -= chars;
+    }
+    if (images.length === 0) {
+      continue;
+    }
+    const payload = new HumanMessage({ content: toLangChainContent(images) });
+    setProviderMessageProvenance(payload, [
+      projectUnindexedProviderMessageAttribution(message, 'tool'),
+    ]);
+    payloads.push(payload);
+  }
+  return payloads.length === 0
+    ? projected
+    : [
+      ...projected.slice(0, source.length),
+      ...payloads.reverse(),
+      ...projected.slice(source.length),
+    ];
 }
 
 /**
