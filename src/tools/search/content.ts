@@ -8,17 +8,23 @@ interface ReferenceTarget {
   idx: number;
 }
 
+interface ReferenceEntry extends ReferenceTarget {
+  url: string;
+}
+
 /**
- * Aho-Corasick automaton over `(` followed by every referenced URL. Edges live in
- * one map keyed by `node * EDGE_STRIDE + charCode`, so memory stays proportional
- * to the URL text, and a single scan of the markdown finds every occurrence.
+ * Aho-Corasick automaton over `(` followed by every referenced URL, held in
+ * typed arrays: 18 bytes per node and no object per node. Nodes are numbered
+ * breadth first, so the children of `node` are the nodes from
+ * `firstChild[node]` up to `firstChild[node + 1]`, sorted by `code`.
  */
-interface ReferenceMatcher {
-  edges: Map<number, number>;
-  depth: number[];
-  fail: number[];
+export interface ReferenceMatcher {
+  firstChild: Int32Array;
+  code: Uint16Array;
+  depth: Int32Array;
+  fail: Int32Array;
   /** Nearest node on the fail chain, itself included, that ends a URL, or -1. */
-  output: number[];
+  output: Int32Array;
   targets: Map<number, ReferenceTarget>;
 }
 
@@ -27,78 +33,143 @@ interface ReferenceClose {
   title?: string;
 }
 
-const EDGE_STRIDE = 0x10000;
+/**
+ * Largest automaton built for one page. Nodes are the distinct URL prefixes, at
+ * most the URL characters on the page: 2^21 of them measured 36 MiB and 0.15 s
+ * to build, about 100 times a long Wikipedia article. A page above the cap
+ * keeps its markdown as is.
+ */
+export const MAX_MATCHER_NODES = 1 << 21;
 const OPEN_PAREN = 0x28;
 const CLOSE_PAREN = 0x29;
 const QUOTE = 0x22;
 const WHITESPACE = /\s/;
 
+function compareUrls(a: ReferenceEntry, b: ReferenceEntry): number {
+  if (a.url === b.url) {
+    return 0;
+  }
+  return a.url < b.url ? -1 : 1;
+}
+
+function sharedPrefixLength(a: string, b: string): number {
+  const limit = Math.min(a.length, b.length);
+  let length = 0;
+  while (length < limit && a.charCodeAt(length) === b.charCodeAt(length)) {
+    length++;
+  }
+  return length;
+}
+
 /**
- * Indexes every referenced URL once. A URL listed under several types keeps the
+ * Indexes every referenced URL once, or returns `undefined` when the automaton
+ * would exceed `MAX_MATCHER_NODES`. A URL listed under several types keeps the
  * first, in image, video, iframe, link order, which is the order the replacement
- * has always preferred.
+ * has always preferred. Sorting the URLs gives the exact node count before
+ * anything is allocated, and lets each node take its children from one
+ * contiguous run of URLs.
  */
-function buildMatcher(
+export function buildMatcher(
   groups: ReadonlyArray<[ReferenceType, Map<string, MediaReference>]>
-): ReferenceMatcher {
-  const edges = new Map<number, number>();
-  const depth = [0];
-  const charOf = [0];
-  const children: number[][] = [[]];
-  const targets = new Map<number, ReferenceTarget>();
-  const advance = (node: number, code: number): number => {
-    const key = node * EDGE_STRIDE + code;
-    const existing = edges.get(key);
-    if (existing != null) {
-      return existing;
-    }
-    const next = depth.length;
-    edges.set(key, next);
-    depth.push(depth[node] + 1);
-    charOf.push(code);
-    children.push([]);
-    children[node].push(next);
-    return next;
-  };
+): ReferenceMatcher | undefined {
+  const entries: ReferenceEntry[] = [];
   for (const [type, references] of groups) {
     let idx = 0;
     for (const url of references.keys()) {
-      idx++;
-      let node = advance(0, OPEN_PAREN);
-      for (let i = 0; i < url.length; i++) {
-        node = advance(node, url.charCodeAt(i));
-      }
-      if (!targets.has(node)) {
-        targets.set(node, { type, idx });
-      }
+      entries.push({ url, type, idx: ++idx });
     }
+  }
+  entries.sort(compareUrls);
+  let size = 2;
+  for (let i = 0; i < entries.length; i++) {
+    const { url } = entries[i];
+    size +=
+      url.length - (i === 0 ? 0 : sharedPrefixLength(entries[i - 1].url, url));
+  }
+  if (size > MAX_MATCHER_NODES) {
+    return undefined;
   }
 
-  const fail = new Array<number>(depth.length).fill(0);
-  const output = new Array<number>(depth.length).fill(-1);
-  const queue = [...children[0]];
-  for (let head = 0; head < queue.length; head++) {
-    const node = queue[head];
-    output[node] = targets.has(node) ? node : output[fail[node]];
-    for (const child of children[node]) {
-      fail[child] = transition(edges, fail, fail[node], charOf[child]);
-      queue.push(child);
+  const matcher: ReferenceMatcher = {
+    firstChild: new Int32Array(size + 1),
+    code: new Uint16Array(size),
+    depth: new Int32Array(size),
+    fail: new Int32Array(size),
+    output: new Int32Array(size).fill(-1),
+    targets: new Map<number, ReferenceTarget>(),
+  };
+  const { firstChild, code, depth, fail, output, targets } = matcher;
+  /** Nodes awaiting their children span two trie levels, each at most one node per URL. */
+  const pending = 2 * entries.length + 2;
+  const from = new Int32Array(pending);
+  const to = new Int32Array(pending);
+  firstChild[0] = 1;
+  code[1] = OPEN_PAREN;
+  depth[1] = 1;
+  to[1] = entries.length;
+  let next = 2;
+  for (let node = 1; node < next; node++) {
+    const consumed = depth[node] - 1;
+    const end = to[node % pending];
+    let i = from[node % pending];
+    const endsUrl = i < end && entries[i].url.length === consumed;
+    if (endsUrl) {
+      targets.set(node, entries[i]);
+    }
+    while (i < end && entries[i].url.length === consumed) {
+      i++;
+    }
+    output[node] = endsUrl ? node : output[fail[node]];
+    firstChild[node] = next;
+    while (i < end) {
+      const charCode = entries[i].url.charCodeAt(consumed);
+      code[next] = charCode;
+      depth[next] = consumed + 2;
+      fail[next] = transition(matcher, fail[node], charCode);
+      from[next % pending] = i;
+      do {
+        i++;
+      } while (i < end && entries[i].url.charCodeAt(consumed) === charCode);
+      to[next % pending] = i;
+      next++;
     }
   }
-  return { edges, depth, fail, output, targets };
+  firstChild[next] = next;
+  return matcher;
+}
+
+function childOf(
+  matcher: ReferenceMatcher,
+  node: number,
+  charCode: number
+): number {
+  const { firstChild, code } = matcher;
+  const end = firstChild[node + 1];
+  let low = firstChild[node];
+  let high = end;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (code[middle] < charCode) {
+      low = middle + 1;
+    } else {
+      high = middle;
+    }
+  }
+  return low < end && code[low] === charCode ? low : -1;
 }
 
 function transition(
-  edges: Map<number, number>,
-  fail: number[],
+  matcher: ReferenceMatcher,
   from: number,
-  code: number
+  charCode: number
 ): number {
   let state = from;
-  while (state !== 0 && !edges.has(state * EDGE_STRIDE + code)) {
-    state = fail[state];
+  let next = childOf(matcher, state, charCode);
+  while (next === -1 && state !== 0) {
+    state = matcher.fail[state];
+    next = childOf(matcher, state, charCode);
   }
-  return edges.get(state * EDGE_STRIDE + code) ?? 0;
+  return next === -1 ? 0 : next;
 }
 
 /**
@@ -164,12 +235,12 @@ function replaceReferences(
   if (matcher.targets.size === 0) {
     return markdown;
   }
-  const { edges, depth, fail, output, targets } = matcher;
+  const { depth, fail, output, targets } = matcher;
   const closeAt = createCloser(markdown);
   const longest = new Map<number, { node: number; close: ReferenceClose }>();
   let state = 0;
   for (let i = 0; i < markdown.length; i++) {
-    state = transition(edges, fail, state, markdown.charCodeAt(i));
+    state = transition(matcher, state, markdown.charCodeAt(i));
     let node = output[state];
     if (node === -1) {
       continue;
@@ -270,15 +341,14 @@ export function processContent(
     }
   });
 
-  const result = replaceReferences(
-    markdown,
-    buildMatcher([
-      ['image', imageMap],
-      ['video', videoMap],
-      ['iframe', iframeMap],
-      ['link', linkMap],
-    ])
-  );
+  const matcher = buildMatcher([
+    ['image', imageMap],
+    ['video', videoMap],
+    ['iframe', iframeMap],
+    ['link', linkMap],
+  ]);
+  const result =
+    matcher == null ? markdown : replaceReferences(markdown, matcher);
 
   iframeMap.clear();
   const links = Array.from(linkMap.values());

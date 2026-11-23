@@ -2,7 +2,9 @@
 /* eslint-disable no-console */
 // content.test.ts
 import * as fs from 'fs';
-import { processContent } from './content';
+import type { ReferenceMatcher } from './content';
+import type { MediaReference } from './types';
+import { MAX_MATCHER_NODES, processContent, buildMatcher } from './content';
 
 describe('Link Processor', () => {
   afterAll(() => {
@@ -163,6 +165,58 @@ describe('Link Processor', () => {
     expect(elapsed).toBeLessThan(1500);
   });
 
+  test('stores 6,000 long URLs that share no path in 18 bytes per node', () => {
+    /** An array per node and a map entry per edge retained 116 MB for these URLs.
+     *  Node count and buffer sizes are exact, where heap readings are not. */
+    const urls = longDistinctUrls(6000, 270);
+    const nodes = 2 + 20 + (6 + 60 + 600 + 6000) + 6000 * 246;
+    const html = urls.map((url, i) => `<a href="${url}">l${i}</a>`).join('');
+    const markdown = urls.map((url, i) => `[l${i}](${url})`).join('\n');
+
+    const { targets, ...buffers } = linkMatcher(urls);
+    const result = processContent(html, markdown);
+
+    expect(buffers.depth).toHaveLength(nodes);
+    expect(
+      Object.values(buffers).reduce((sum, buffer) => sum + buffer.byteLength, 0)
+    ).toBe(18 * nodes + 4);
+    expect(targets.size).toBe(6000);
+    expect(result.links).toHaveLength(6000);
+    expect(result.markdown).toBe(
+      urls.map((_, i) => `[l${i}](link#${i + 1})`).join('\n')
+    );
+  });
+
+  test('leaves the whole page unchanged when its URLs exceed the matcher cap', () => {
+    const urls = longDistinctUrls(6000, 400);
+    const html =
+      '<img src="https://x.io/a.png" alt="i"><video src="https://x.io/v.mp4"></video>' +
+      urls.map((url, i) => `<a href="${url}">l${i}</a>`).join('');
+    const markdown =
+      '![i](https://x.io/a.png) [v](https://x.io/v.mp4)\n' +
+      urls.map((url, i) => `[l${i}](${url})`).join('\n');
+
+    const result = processContent(html, markdown);
+
+    expect(buildMatcher([['link', referenceMap(urls)]])).toBeUndefined();
+    expect(result.markdown).toBe(markdown);
+    expect(result.links).toHaveLength(6000);
+    expect(result.links[5999].originalUrl).toBe(urls[5999]);
+    expect(result.images).toEqual([
+      { originalUrl: 'https://x.io/a.png', title: 'i' },
+    ]);
+    expect(result.videos).toEqual([{ originalUrl: 'https://x.io/v.mp4' }]);
+  });
+
+  test('builds a matcher of exactly the node cap and none above it', () => {
+    const atCap = 'a'.repeat(MAX_MATCHER_NODES - 2);
+
+    expect(linkMatcher([atCap]).depth).toHaveLength(MAX_MATCHER_NODES);
+    expect(
+      buildMatcher([['link', referenceMap([atCap + 'a'])]])
+    ).toBeUndefined();
+  });
+
   // Performance test with large files
   test('should process large files efficiently', () => {
     const html = fs.readFileSync('src/tools/search/test.html', 'utf-8');
@@ -235,6 +289,30 @@ describe('Link Processor', () => {
     }
   });
 });
+
+/** `count` URLs of `length` characters that share only their 20-character origin. */
+function longDistinctUrls(count: number, length: number): string[] {
+  return Array.from({ length: count }, (_, i) => {
+    const head = `https://example.com/${String(i).padStart(4, '0')}/`;
+    return (
+      head + String.fromCharCode(97 + (i % 26)).repeat(length - head.length)
+    );
+  });
+}
+
+function referenceMap(urls: string[]): Map<string, MediaReference> {
+  return new Map<string, MediaReference>(
+    urls.map((url) => [url, { originalUrl: url }])
+  );
+}
+
+function linkMatcher(urls: string[]): ReferenceMatcher {
+  const matcher = buildMatcher([['link', referenceMap(urls)]]);
+  if (matcher == null) {
+    throw new Error('Expected the URLs to fit the matcher cap');
+  }
+  return matcher;
+}
 
 // Helper function to generate large HTML test data
 function generateLargeHtml(linkCount: number): string {
