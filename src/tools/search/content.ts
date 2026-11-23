@@ -1,6 +1,209 @@
 import * as cheerio from 'cheerio';
 import type { References, MediaReference } from './types';
 
+type ReferenceType = 'image' | 'video' | 'iframe' | 'link';
+
+interface ReferenceTarget {
+  type: ReferenceType;
+  idx: number;
+}
+
+/**
+ * Aho-Corasick automaton over `(` followed by every referenced URL. Edges live in
+ * one map keyed by `node * EDGE_STRIDE + charCode`, so memory stays proportional
+ * to the URL text, and a single scan of the markdown finds every occurrence.
+ */
+interface ReferenceMatcher {
+  edges: Map<number, number>;
+  depth: number[];
+  fail: number[];
+  /** Nearest node on the fail chain, itself included, that ends a URL, or -1. */
+  output: number[];
+  targets: Map<number, ReferenceTarget>;
+}
+
+interface ReferenceClose {
+  end: number;
+  title?: string;
+}
+
+const EDGE_STRIDE = 0x10000;
+const OPEN_PAREN = 0x28;
+const CLOSE_PAREN = 0x29;
+const QUOTE = 0x22;
+const WHITESPACE = /\s/;
+
+/**
+ * Indexes every referenced URL once. A URL listed under several types keeps the
+ * first, in image, video, iframe, link order, which is the order the replacement
+ * has always preferred.
+ */
+function buildMatcher(
+  groups: ReadonlyArray<[ReferenceType, Map<string, MediaReference>]>
+): ReferenceMatcher {
+  const edges = new Map<number, number>();
+  const depth = [0];
+  const charOf = [0];
+  const children: number[][] = [[]];
+  const targets = new Map<number, ReferenceTarget>();
+  const advance = (node: number, code: number): number => {
+    const key = node * EDGE_STRIDE + code;
+    const existing = edges.get(key);
+    if (existing != null) {
+      return existing;
+    }
+    const next = depth.length;
+    edges.set(key, next);
+    depth.push(depth[node] + 1);
+    charOf.push(code);
+    children.push([]);
+    children[node].push(next);
+    return next;
+  };
+  for (const [type, references] of groups) {
+    let idx = 0;
+    for (const url of references.keys()) {
+      idx++;
+      let node = advance(0, OPEN_PAREN);
+      for (let i = 0; i < url.length; i++) {
+        node = advance(node, url.charCodeAt(i));
+      }
+      if (!targets.has(node)) {
+        targets.set(node, { type, idx });
+      }
+    }
+  }
+
+  const fail = new Array<number>(depth.length).fill(0);
+  const output = new Array<number>(depth.length).fill(-1);
+  const queue = [...children[0]];
+  for (let head = 0; head < queue.length; head++) {
+    const node = queue[head];
+    output[node] = targets.has(node) ? node : output[fail[node]];
+    for (const child of children[node]) {
+      fail[child] = transition(edges, fail, fail[node], charOf[child]);
+      queue.push(child);
+    }
+  }
+  return { edges, depth, fail, output, targets };
+}
+
+function transition(
+  edges: Map<number, number>,
+  fail: number[],
+  from: number,
+  code: number
+): number {
+  let state = from;
+  while (state !== 0 && !edges.has(state * EDGE_STRIDE + code)) {
+    state = fail[state];
+  }
+  return edges.get(state * EDGE_STRIDE + code) ?? 0;
+}
+
+/**
+ * Closes a reference whose URL ends just before `urlEnd` with `)` or
+ * ` "title")`. Whitespace runs and quote pairs are resolved once each and
+ * cached, so checking many URL ends never rescans the same text.
+ */
+function createCloser(
+  markdown: string
+): (urlEnd: number) => ReferenceClose | undefined {
+  const closingQuote = new Map<number, number>();
+  let nonSpaceFrom: Int32Array | undefined;
+  const firstNonSpace = (index: number): number => {
+    if (nonSpaceFrom == null) {
+      nonSpaceFrom = new Int32Array(markdown.length + 1);
+      nonSpaceFrom[markdown.length] = markdown.length;
+      for (let i = markdown.length - 1; i >= 0; i--) {
+        nonSpaceFrom[i] = WHITESPACE.test(markdown[i])
+          ? nonSpaceFrom[i + 1]
+          : i;
+      }
+    }
+    return nonSpaceFrom[index];
+  };
+  return (urlEnd) => {
+    const next = markdown.charCodeAt(urlEnd);
+    if (next === CLOSE_PAREN) {
+      return { end: urlEnd + 1 };
+    }
+    if (!WHITESPACE.test(markdown[urlEnd] ?? '')) {
+      return undefined;
+    }
+    const open = firstNonSpace(urlEnd);
+    if (markdown.charCodeAt(open) !== QUOTE) {
+      return undefined;
+    }
+    let close = closingQuote.get(open);
+    if (close == null) {
+      close = markdown.indexOf('"', open + 1);
+      closingQuote.set(open, close);
+    }
+    if (close === -1 || markdown.charCodeAt(close + 1) !== CLOSE_PAREN) {
+      return undefined;
+    }
+    return { end: close + 2, title: markdown.slice(open + 1, close) };
+  };
+}
+
+/**
+ * Rewrites every markdown reference to a known URL. One scan finds each
+ * `(url` occurrence that is closed as a reference; the longest at each opening
+ * parenthesis is applied left to right. The work is linear in the markdown
+ * plus the occurrences found, where one regex per URL over the whole page grew
+ * with links times page size and blocked the event loop for seconds.
+ * Occurrences exceed the markdown length only when URLs are suffixes of one
+ * another; n such URLs need about n * n characters of HTML, so the worst case
+ * stays near the input size to the power 1.5.
+ */
+function replaceReferences(
+  markdown: string,
+  matcher: ReferenceMatcher
+): string {
+  if (matcher.targets.size === 0) {
+    return markdown;
+  }
+  const { edges, depth, fail, output, targets } = matcher;
+  const closeAt = createCloser(markdown);
+  const longest = new Map<number, { node: number; close: ReferenceClose }>();
+  let state = 0;
+  for (let i = 0; i < markdown.length; i++) {
+    state = transition(edges, fail, state, markdown.charCodeAt(i));
+    let node = output[state];
+    if (node === -1) {
+      continue;
+    }
+    const close = closeAt(i + 1);
+    if (close == null) {
+      continue;
+    }
+    for (; node !== -1; node = output[fail[node]]) {
+      const start = i - depth[node] + 1;
+      const current = longest.get(start);
+      if (current == null || depth[current.node] < depth[node]) {
+        longest.set(start, { node, close });
+      }
+    }
+  }
+
+  let result = '';
+  let copied = 0;
+  const ordered = Array.from(longest.entries()).sort((a, b) => a[0] - b[0]);
+  for (const [start, { node, close }] of ordered) {
+    const target = targets.get(node);
+    if (start < copied || target == null) {
+      continue;
+    }
+    const label = `${target.type}#${target.idx}`;
+    const text =
+      close.title == null ? `(${label})` : `(${label} "${close.title}")`;
+    result += markdown.slice(copied, start) + text;
+    copied = close.end;
+  }
+  return result + markdown.slice(copied);
+}
+
 export function processContent(
   html: string,
   markdown: string
@@ -67,68 +270,15 @@ export function processContent(
     }
   });
 
-  // Create lookup maps with indices
-  const linkIndexMap = new Map<string, number>();
-  const imageIndexMap = new Map<string, number>();
-  const videoIndexMap = new Map<string, number>();
-  const iframeIndexMap = new Map<string, number>();
-
-  Array.from(linkMap.keys()).forEach((url, i) => linkIndexMap.set(url, i + 1));
-  Array.from(imageMap.keys()).forEach((url, i) =>
-    imageIndexMap.set(url, i + 1)
+  const result = replaceReferences(
+    markdown,
+    buildMatcher([
+      ['image', imageMap],
+      ['video', videoMap],
+      ['iframe', iframeMap],
+      ['link', linkMap],
+    ])
   );
-  Array.from(videoMap.keys()).forEach((url, i) =>
-    videoIndexMap.set(url, i + 1)
-  );
-  Array.from(iframeMap.keys()).forEach((url, i) =>
-    iframeIndexMap.set(url, i + 1)
-  );
-
-  // Process the markdown
-  let result = markdown;
-
-  // Replace each URL one by one, starting with the longest URLs first to avoid partial matches
-  const allUrls = [
-    ...Array.from(imageMap.keys()).map((url) => ({
-      url,
-      type: 'image',
-      idx: imageIndexMap.get(url),
-    })),
-    ...Array.from(videoMap.keys()).map((url) => ({
-      url,
-      type: 'video',
-      idx: videoIndexMap.get(url),
-    })),
-    ...Array.from(iframeMap.keys()).map((url) => ({
-      url,
-      type: 'iframe',
-      idx: iframeIndexMap.get(url),
-    })),
-    ...Array.from(linkMap.keys()).map((url) => ({
-      url,
-      type: 'link',
-      idx: linkIndexMap.get(url),
-    })),
-  ].sort((a, b) => b.url.length - a.url.length);
-
-  // Create a function to escape special characters in URLs for regex
-  function escapeRegex(string: string): string {
-    return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  }
-
-  // Replace each URL in the markdown
-  for (const { url, type, idx } of allUrls) {
-    // Create a regex that captures URLs in markdown links
-    const regex = new RegExp(`\\(${escapeRegex(url)}(?:\\s+"[^"]*")?\\)`, 'g');
-
-    result = result.replace(regex, (match) => {
-      // Keep any title attribute that might exist
-      const titleMatch = match.match(/\s+"([^"]*)"/);
-      const titlePart = titleMatch ? ` "${titleMatch[1]}"` : '';
-
-      return `(${type}#${idx}${titlePart})`;
-    });
-  }
 
   iframeMap.clear();
   const links = Array.from(linkMap.values());

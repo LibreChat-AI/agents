@@ -56,6 +56,113 @@ describe('Link Processor', () => {
     expect(result.markdown).toContain('link#2');
   });
 
+  test('prefers the longest known URL at a position, including URLs with parentheses @scenario:scraped-page-references-keep-their-previous-output', () => {
+    const html = `
+      <a href="https://w.org/wiki/Foo_(bar)">a</a>
+      <a href="https://w.org/wiki/Foo_">b</a>
+      <a href="https://w.org/wiki/Foo_(bar)_baz">c</a>
+    `;
+    const markdown =
+      '[a](https://w.org/wiki/Foo_(bar)) [b](https://w.org/wiki/Foo_) [c](https://w.org/wiki/Foo_(bar)_baz "T x") (https://w.org/wiki/Foo_';
+
+    const result = processContent(html, markdown);
+
+    expect(result.markdown).toBe(
+      '[a](link#1) [b](link#2) [c](link#3 "T x") (https://w.org/wiki/Foo_'
+    );
+  });
+
+  test('handles a URL whose prefix repeats without a quadratic rescan or a regex limit', () => {
+    /** A trie walk restarted at every inner parenthesis took ~6 s here, and one
+     *  regex per URL threw "Invalid regular expression" for a URL this long. */
+    const prefix = 'https://x/(';
+    const html = `<a href="${prefix.repeat(5000)}a">x</a>`;
+    const markdown = `(${prefix.repeat(5000)}b) [x](${prefix.repeat(5000)}a)`;
+
+    const start = performance.now();
+    const result = processContent(html, markdown);
+    const elapsed = performance.now() - start;
+
+    expect(result.markdown).toBe(`(${prefix.repeat(5000)}b) [x](link#1)`);
+    expect(elapsed).toBeLessThan(1500);
+  });
+
+  test('stays fast when many URLs are suffixes of one another', () => {
+    /** Each URL ends with the previous one, so every segment end reports several
+     *  nested references; only the outermost one at each opening is applied. */
+    const url = (k: number) => 'https://x/' + ')(https://x/'.repeat(k - 1);
+    let html = '';
+    for (let k = 1; k <= 200; k++) {
+      html += `<a href="${url(k)}">x</a>`;
+    }
+    const markdown = Array.from({ length: 200 }, () => `[x](${url(200)})`).join(
+      '\n'
+    );
+
+    const start = performance.now();
+    const result = processContent(html, markdown);
+    const elapsed = performance.now() - start;
+
+    expect(result.markdown.split('\n')).toEqual(
+      Array.from({ length: 200 }, () => '[x](link#200)')
+    );
+    expect(elapsed).toBeLessThan(1500);
+  });
+
+  test('keeps the image reference when a URL is both an image and a link', () => {
+    const html =
+      '<a href="https://x.io/a.png">a</a><img src="https://x.io/a.png" alt="i">';
+    const markdown = '![i](https://x.io/a.png) [a](https://x.io/a.png "t")';
+
+    const result = processContent(html, markdown);
+
+    expect(result.markdown).toBe('![i](image#1) [a](image#1 "t")');
+    expect(result.links).toHaveLength(1);
+    expect(result.images).toHaveLength(1);
+  });
+
+  test('rewrites a link-heavy page in time linear in its size', () => {
+    /** One regex per URL over the whole page grew with links times page size (4,000
+     *  links took ~3 s, doubling the page quintupled it) and blocked the event loop. */
+    let html = '<html><body>';
+    let markdown = '';
+    for (let i = 0; i < 6000; i++) {
+      const url = `https://example.com/docs/section-${i}/page-${i * 7}`;
+      html += `<p><a href="${url}">l${i}</a> <img src="${url}.png" alt="i${i}"></p>`;
+      markdown += `text [l${i}](${url}) ![i${i}](${url}.png)\n`;
+    }
+
+    const start = performance.now();
+    const result = processContent(html, markdown);
+    const elapsed = performance.now() - start;
+
+    expect(result.links).toHaveLength(6000);
+    expect(result.images).toHaveLength(6000);
+    expect(result.markdown).not.toMatch(/\]\(https:\/\/example\.com\//);
+    expect(elapsed).toBeLessThan(1500);
+  });
+
+  test('rewrites links of many different lengths in time linear in the page @scenario:link-heavy-scraped-page-is-rewritten-in-linear-time', () => {
+    /** A query that grows per entry gives every link its own URL length, which
+     *  defeats any scheme that tries every known length at every position. */
+    let html = '<html><body>';
+    let markdown = '';
+    for (let i = 0; i < 2000; i++) {
+      const url = `https://example.com/search?q=${'a'.repeat(i)}`;
+      html += `<p><a href="${url}">l${i}</a></p>`;
+      markdown += `text [l${i}](${url} "t${i}")\n`;
+    }
+
+    const start = performance.now();
+    const result = processContent(html, markdown);
+    const elapsed = performance.now() - start;
+
+    expect(result.links).toHaveLength(2000);
+    expect(result.markdown).toContain('[l1999](link#2000 "t1999")');
+    expect(result.markdown).not.toMatch(/\]\(https:\/\/example\.com\//);
+    expect(elapsed).toBeLessThan(1500);
+  });
+
   // Performance test with large files
   test('should process large files efficiently', () => {
     const html = fs.readFileSync('src/tools/search/test.html', 'utf-8');
