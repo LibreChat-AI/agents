@@ -141,6 +141,8 @@ import {
   pickSubagentHostArgInput,
   getSubagentHostArgsDigest,
 } from './hostArgs';
+import { buildSubagentTypeAliases, resolveSubagentType } from './typeAliases';
+import type { SubagentTypeAliases } from './typeAliases';
 import {
   executeHooks,
   HookRegistry,
@@ -1238,6 +1240,8 @@ type DurableExecutionRecord = SubagentExecutionRecord<
 
 export class SubagentExecutor {
   private readonly configs: ReadonlyMap<string, ExecutableSubagentConfigEntry>;
+  /** Readable names advertised by the subagent tool, mapped back to configured types. */
+  private readonly typeAliases: SubagentTypeAliases;
   private readonly parentSignal?: AbortSignal;
   /** Aborted when a child trips a stream circuit breaker: parallel sibling
    * subagents run concurrently on the parent's signal, and rejecting the
@@ -1281,6 +1285,7 @@ export class SubagentExecutor {
 
   constructor(options: SubagentExecutorOptions) {
     this.configs = options.configs;
+    this.typeAliases = buildSubagentTypeAliases(this.configs.values());
     this.parentSignal = options.parentSignal;
     this.breakerScope = options.breakerScope;
     this.hookRegistry = options.hookRegistry;
@@ -1357,7 +1362,15 @@ export class SubagentExecutor {
    * is not registered on the parent graph, so end-of-turn cleanup cannot
    * invalidate or clear a child that intentionally outlives that turn.
    */
+  /** Every entry point resolves advertised names here; all later code sees configured types. */
+  private resolveType(type: string): string;
+  private resolveType(type: string | undefined): string | undefined;
+  private resolveType(type: string | undefined): string | undefined {
+    return resolveSubagentType(this.typeAliases, type);
+  }
+
   executeInBackground(params: SubagentExecuteParams): string {
+    params = { ...params, subagentType: this.resolveType(params.subagentType) };
     if (this.taskConfig == null) {
       return JSON.stringify({
         status: 'rejected',
@@ -2451,10 +2464,11 @@ export class SubagentExecutor {
       const persistedSubagentType = getSubagentTypeFromArgs(
         inProcessSettledOutput.resolvedArgs
       );
-      const subagentType =
+      const subagentType = this.resolveType(
         persistedSubagentType ??
-        execution.binding?.subagentType ??
-        getSubagentType(call);
+          execution.binding?.subagentType ??
+          getSubagentType(call)
+      );
       const executableConfig =
         subagentType == null ? undefined : this.configs.get(subagentType);
       if (
@@ -2483,10 +2497,11 @@ export class SubagentExecutor {
     let persistedSubagentType = getSubagentTypeFromArgs(
       marker?.settledOutput?.resolvedArgs
     );
-    let subagentType =
+    let subagentType = this.resolveType(
       persistedSubagentType ??
-      resumeExecution?.subagentType ??
-      getSubagentType(call);
+        resumeExecution?.subagentType ??
+        getSubagentType(call)
+    );
     let executableConfig =
       subagentType == null ? undefined : this.configs.get(subagentType);
     if (
@@ -2514,7 +2529,7 @@ export class SubagentExecutor {
         marker?.settledOutput?.resolvedArgs
       );
       if (persistedSubagentType != null) {
-        subagentType = persistedSubagentType;
+        subagentType = this.resolveType(persistedSubagentType);
         executableConfig = this.configs.get(subagentType);
       }
       if (
@@ -2628,10 +2643,11 @@ export class SubagentExecutor {
       resolvedDescription ??
       getSubagentDescriptionFromArgs(call.args) ??
       DEFAULT_SUBAGENT_DESCRIPTION;
-    const subagentType =
+    const subagentType = this.resolveType(
       resolvedSubagentType ??
-      execution.binding?.subagentType ??
-      getSubagentType(call);
+        execution.binding?.subagentType ??
+        getSubagentType(call)
+    );
     const executableConfig =
       subagentType == null ? undefined : this.configs.get(subagentType);
     const configId =
@@ -2770,9 +2786,12 @@ export class SubagentExecutor {
   }
 
   execute(params: SubagentExecuteParams): Promise<SubagentExecuteResult> {
+    params = { ...params, subagentType: this.resolveType(params.subagentType) };
     const executableConfig = this.configs.get(params.subagentType);
     if (executableConfig == null) {
-      const available = [...this.configs.keys()].join(', ');
+      const available = [...this.configs.keys()]
+        .map((type) => this.typeAliases.toName.get(type) ?? type)
+        .join(', ');
       return Promise.resolve(
         createSubagentFailure(
           `Error: Unknown subagent type "${params.subagentType}". Available types: ${available}`
@@ -2891,10 +2910,11 @@ export class SubagentExecutor {
     signal: AbortSignal,
     error: unknown
   ): SubagentResolutionError {
-    const selectedType =
+    const selectedType = this.resolveType(
       execution.binding?.subagentType ??
-      execution.resumeExecution?.subagentType ??
-      getSubagentType(call);
+        execution.resumeExecution?.subagentType ??
+        getSubagentType(call)
+    );
     const threadId = config.configurable?.thread_id;
     const failure = this.createResolutionFailure(
       'identity',

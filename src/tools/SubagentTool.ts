@@ -1,6 +1,7 @@
 import type { JsonSchemaType, LCTool } from '@/types/tools';
 import type { SubagentConfig } from '@/types';
 import { buildSubagentHostArgProperties } from '@/tools/subagent/hostArgs';
+import { buildSubagentTypeAliases } from '@/tools/subagent/typeAliases';
 import { INTENT_PROPERTY } from '@/tools/intentArg';
 import { Constants } from '@/common';
 
@@ -63,6 +64,8 @@ export const SubagentToolDefinition: LCTool = {
  * Build the name, schema, and description params for `tool()` from available configs.
  * Used by `Graph.createAgentNode()` when constructing the runtime tool instance.
  * Extends `SubagentToolSchema` by populating `subagent_type.enum` dynamically.
+ * Opaque types are advertised under readable names (see `buildSubagentTypeAliases`);
+ * the configured types stay valid, so earlier calls in the history still resolve.
  */
 export function buildSubagentToolParams(
   configs: SubagentConfig[],
@@ -72,12 +75,17 @@ export function buildSubagentToolParams(
   schema: JsonSchemaType;
   description: string;
 } {
-  const types = configs.map((c) => c.type);
+  const { toName } = buildSubagentTypeAliases(configs);
+  const types = configs.map((c) => toName.get(c.type) ?? c.type);
+  const accepted = [
+    ...types,
+    ...configs.map((c) => c.type).filter((type) => !types.includes(type)),
+  ];
   const hostArgs = buildSubagentHostArgProperties(configs);
   const typeDescriptions = configs
     .map((c) => {
       const summary = hostArgs.summaries.get(c.type);
-      const line = `- "${c.type}" (${c.name}): ${c.description}`;
+      const line = `- "${toName.get(c.type) ?? c.type}" (${c.name}): ${c.description}`;
       return summary == null ? line : `${line} [optional ${summary}]`;
     })
     .join('\n');
@@ -94,7 +102,7 @@ export function buildSubagentToolParams(
         },
         subagent_type: {
           type: 'string',
-          enum: types,
+          enum: accepted,
           description: `${SUBAGENT_TYPE_PROP_DESCRIPTION} Available: ${types.join(', ')}.`,
         },
         ...(options.background === true
