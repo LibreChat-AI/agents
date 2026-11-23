@@ -30,9 +30,9 @@ export type ToolResultProtectionResult = ProviderTextProtectionResult;
  * Trust boundary: the tool's text is untrusted data; code running in the host
  * process is trusted. Tools, hooks, event handlers, callbacks and checkpoint
  * savers are not defended against, text they author is not inspected, and
- * history the host supplies is the host's to have inspected. Tracing callbacks
- * attached to a direct tool observe its raw return; redact those with the
- * tracing configuration.
+ * history the host supplies is the host's to have inspected. Tracing observes
+ * a selected tool's raw result; redact those tools with the tracing
+ * configuration.
  *
  * Selected tools must return plain text. A structured result, an artifact or a
  * `Command` fails as `unsupported`. Selected tools are not offered to

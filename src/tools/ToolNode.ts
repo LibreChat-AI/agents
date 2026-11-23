@@ -317,6 +317,20 @@ function withSubagentReplayBatch(
   };
 }
 
+/**
+ * A stream circuit breaker or protection failure raised under a tool (for
+ * example by a subagent's run) is a safety abort, not a tool failure to
+ * report back to the model. It passes through like an interrupt so the whole
+ * run rejects.
+ */
+function isRunSafetyError(error: unknown): boolean {
+  return (
+    error instanceof StreamLimitExceededError ||
+    error instanceof PreparedSubagentError ||
+    error instanceof ProviderTextProtectionError
+  );
+}
+
 type SettledDirectToolResult = SettledToolBatchResult;
 
 /** Positional identity is safe within the immutable full-proposal batch key. */
@@ -1807,7 +1821,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       this.humanInTheLoop?.enabled === true ||
       this.hookRegistry?.hasResultAlteringHooks(runId) === true ||
       this.eagerEventToolExecution?.excludeToolNames?.includes(call.name) ===
-        true
+        true ||
+      this.protectedResultGate(call.name) != null
     ) {
       return;
     }
@@ -2224,36 +2239,33 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         }),
       });
     } catch (_e: unknown) {
-      let e = _e as Error;
+      const thrown = _e as Error;
+      /** Control flow and safety aborts pass through; any other failure of a
+       * protected tool is inspected before it can leave, rethrown or not. */
+      const gate =
+        isGraphInterrupt(thrown) || isRunSafetyError(thrown)
+          ? undefined
+          : this.protectedResultGate(call.name);
+      const e =
+        gate == null
+          ? thrown
+          : new Error(
+            await inspectToolText(
+              gate,
+              { name: call.name, id: call.id ?? '' },
+              typeof thrown.message === 'string' ? thrown.message : '',
+              'error',
+              config.signal
+            )
+          );
       if (!this.handleToolErrors) {
         throw e;
       }
       if (isGraphInterrupt(e)) {
         throw e;
       }
-      /**
-       * A stream circuit breaker tripped by a child run (subagent) is a
-       * safety abort, not a tool failure to report back to the model. It
-       * passes through like an interrupt so the whole run rejects.
-       */
-      if (
-        e instanceof StreamLimitExceededError ||
-        e instanceof PreparedSubagentError ||
-        e instanceof ProviderTextProtectionError
-      ) {
+      if (isRunSafetyError(e)) {
         throw e;
-      }
-      const gate = this.protectedResultGate(call.name);
-      if (gate != null) {
-        e = new Error(
-          await inspectToolText(
-            gate,
-            { name: call.name, id: call.id ?? '' },
-            typeof e.message === 'string' ? e.message : '',
-            'error',
-            config.signal
-          )
-        );
       }
       if (this.errorHandler) {
         try {

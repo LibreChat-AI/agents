@@ -33,6 +33,8 @@ the error handler, run-step completion events, the tool output reference
 registry, checkpoints and every later model request receive the inspected text.
 This holds for tools the SDK runs in process, tools the host runs through
 `ON_TOOL_EXECUTE`, error text from either, and the same tools inside subagents.
+A `ToolNode` built with `handleToolErrors: false` still rethrows a selected
+tool's failure, as a plain `Error` carrying the inspected message.
 
 If inspection does not succeed, the run ends with a
 `ToolResultProtectionError` and the model is not called again. Its `code` is
@@ -62,7 +64,8 @@ checkpoint savers that misbehave, and it does not inspect text they author:
 - Message history the host supplies to a run is not inspected. The host only
   ever received inspected text for selected tools, so stored history is already
   inspected; history that predates the policy is the host's to handle.
-- Tracing callbacks attached to an in-process tool observe its raw return. Use
+- Tracing observes a selected tool's raw result: LangChain callbacks attached
+  to an in-process tool, and host-result tracing for a host-executed one. Use
   the tool-output tracing configuration to redact those tools in traces.
 
 ## Limits
@@ -72,8 +75,9 @@ checkpoint savers that misbehave, and it does not inspect text they author:
 - Selected tools are not offered to programmatic tool calling, and are listed
   as disallowed for it. When the host runs programmatic tool calling itself,
   the host is responsible for the nested calls.
-- Selected tools are never started eagerly and do not use the per-call early
-  completion path; their completion is published once, after inspection.
+- Selected tools are never started eagerly, a selected `subagent` tool
+  included, and do not use the per-call early completion path; their
+  completion is published once, after inspection.
 - A selected tool cannot also be client delegated, and remote SDK runs reject a
   policy. Both fail when the run is created.
 - Tools the policy does not name are untouched, whatever they return.

@@ -148,6 +148,46 @@ describe('ToolNode tool result protection: in-process tools', () => {
     expect(result.messages[0].content).not.toContain('alice');
   });
 
+  it('inspects a selected tool error before a fail-fast rethrow', async () => {
+    const { policy, inspected } = recordingPolicy();
+    const node = new ToolNode({
+      tools: [
+        lookupTool(() => {
+          throw new TypeError(RAW);
+        }),
+      ],
+      toolResultProtection: policy,
+      handleToolErrors: false,
+    });
+    const error = await failure(node.invoke(callsFor('lookup')));
+
+    expect(inspected).toEqual([RAW]);
+    expect(error.message).toBe(SAFE);
+    expect(error.stack).not.toContain('alice');
+    expect(error).not.toBeInstanceOf(TypeError);
+  });
+
+  it('rethrows an unselected tool error unchanged in fail-fast mode', async () => {
+    const { policy, inspected } = recordingPolicy();
+    const thrown = new TypeError(RAW);
+    const node = new ToolNode({
+      tools: [
+        tool(
+          async () => {
+            throw thrown;
+          },
+          { name: 'other', description: 'Not selected.', schema: z.object({}) }
+        ),
+      ],
+      toolResultProtection: policy,
+      handleToolErrors: false,
+    });
+    const error = await failure(node.invoke(callsFor('other')));
+
+    expect(error).toBe(thrown);
+    expect(inspected).toEqual([]);
+  });
+
   it.each([
     [
       'an artifact',
