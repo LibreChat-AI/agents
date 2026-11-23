@@ -120,6 +120,11 @@ export function _makeMessageChunkFromAnthropicEvent(
       'document',
       'server_tool_use',
       'web_search_tool_result',
+      'code_execution_tool_result',
+      'web_fetch_tool_result',
+      'bash_code_execution_tool_result',
+      'text_editor_code_execution_tool_result',
+      'tool_search_tool_result',
     ].includes(data.content_block.type)
   ) {
     const contentBlock = data.content_block;
