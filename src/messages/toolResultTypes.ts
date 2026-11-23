@@ -5,6 +5,10 @@ import type {
   ToolMessage,
 } from '@langchain/core/messages';
 import type { ProviderName } from '@/types/llm';
+import {
+  ANTHROPIC_SERVER_TOOL_NAMES_BY_RESULT_TYPE,
+  isAnthropicServerToolResultType,
+} from './anthropicServerTools';
 import { getProviderFamily } from '@/llm/providers';
 
 export type ProviderToolCallKind =
@@ -61,16 +65,6 @@ const MCP_CALL_KINDS = ['mcp'] as const;
 const GOOGLE_CALL_KINDS = ['google'] as const;
 const BEDROCK_CALL_KINDS = ['bedrock', 'tool'] as const;
 
-const ADVISOR_TOOL_NAMES = ['advisor'] as const;
-const BASH_TOOL_NAMES = ['bash_code_execution'] as const;
-const CODE_EXECUTION_TOOL_NAMES = ['code_execution'] as const;
-const TEXT_EDITOR_TOOL_NAMES = ['text_editor_code_execution'] as const;
-const TOOL_SEARCH_TOOL_NAMES = [
-  'tool_search_tool_regex',
-  'tool_search_tool_bm25',
-] as const;
-const WEB_FETCH_TOOL_NAMES = ['web_fetch'] as const;
-const WEB_SEARCH_TOOL_NAMES = ['web_search'] as const;
 const ANTHROPIC_SERVER_TOOL_ID_PREFIX = 'srvtoolu_';
 
 function stringSet(values: readonly string[]): ReadonlySet<string> {
@@ -95,15 +89,9 @@ const PROVIDER_TOOL_CALL_KINDS = stringSet([
   'server',
   'tool',
 ]);
-const ANTHROPIC_SERVER_TOOL_NAMES = stringSet([
-  ...ADVISOR_TOOL_NAMES,
-  ...BASH_TOOL_NAMES,
-  ...CODE_EXECUTION_TOOL_NAMES,
-  ...TEXT_EDITOR_TOOL_NAMES,
-  ...TOOL_SEARCH_TOOL_NAMES,
-  ...WEB_FETCH_TOOL_NAMES,
-  ...WEB_SEARCH_TOOL_NAMES,
-]);
+const ANTHROPIC_SERVER_TOOL_NAMES = stringSet(
+  Object.values(ANTHROPIC_SERVER_TOOL_NAMES_BY_RESULT_TYPE).flat()
+);
 
 function getRecord(value: unknown): Record<string, unknown> | undefined {
   if (value == null || typeof value !== 'object') {
@@ -399,17 +387,6 @@ function hasValidProviderMetadata(record: Record<string, unknown>): boolean {
   );
 }
 
-const ANTHROPIC_STRUCTURED_RESULT_TOOL_NAMES: Readonly<
-  Partial<Record<string, readonly string[]>>
-> = {
-  advisor_tool_result: ADVISOR_TOOL_NAMES,
-  bash_code_execution_tool_result: BASH_TOOL_NAMES,
-  code_execution_tool_result: CODE_EXECUTION_TOOL_NAMES,
-  text_editor_code_execution_tool_result: TEXT_EDITOR_TOOL_NAMES,
-  tool_search_tool_result: TOOL_SEARCH_TOOL_NAMES,
-  web_fetch_tool_result: WEB_FETCH_TOOL_NAMES,
-};
-
 /** Designated provider output is opaque once its exact envelope and matching
  * call establish authorship. Only its container size/proxy identity is read;
  * nested values are deliberately not walked on the formatting hot path. */
@@ -601,42 +578,36 @@ const LOCAL_RESULT_METADATA_FIELDS = [
   'agentId',
   'groupId',
 ] as const;
-const TOOL_RESULT_ENVELOPE_FIELDS: Readonly<Record<string, readonly string[]>> =
-  {
-    advisor_tool_result: ANTHROPIC_RESULT_FIELDS,
-    bash_code_execution_tool_result: ANTHROPIC_RESULT_FIELDS,
-    code_execution_tool_result: ANTHROPIC_RESULT_FIELDS,
-    mcp_tool_result: ANTHROPIC_GENERIC_RESULT_FIELDS,
-    text_editor_code_execution_tool_result: ANTHROPIC_RESULT_FIELDS,
-    tool_search_tool_result: ANTHROPIC_RESULT_FIELDS,
-    tool_result: ANTHROPIC_GENERIC_RESULT_FIELDS,
-    web_fetch_tool_result: ANTHROPIC_SERVER_RESULT_FIELDS,
-    web_search_tool_result: ANTHROPIC_SERVER_RESULT_FIELDS,
-    server_tool_call_result: [
-      'type',
-      'toolCallId',
-      'status',
-      'output',
-      ...LOCAL_RESULT_METADATA_FIELDS,
-    ],
-    server_tool_result: [
-      'type',
-      'tool_call_id',
-      'status',
-      'output',
-      ...LOCAL_RESULT_METADATA_FIELDS,
-    ],
-    codeExecutionResult: ['type', 'codeExecutionResult', 'agentId', 'groupId'],
-    toolResponse: [
-      'type',
-      'toolResponse',
-      'thought',
-      'thoughtSignature',
-      'agentId',
-      'groupId',
-    ],
-    toolResult: ['type', 'toolResult', 'agentId', 'groupId'],
-  };
+const TOOL_RESULT_ENVELOPE_FIELDS: Readonly<
+  Partial<Record<string, readonly string[]>>
+> = {
+  mcp_tool_result: ANTHROPIC_GENERIC_RESULT_FIELDS,
+  tool_result: ANTHROPIC_GENERIC_RESULT_FIELDS,
+  server_tool_call_result: [
+    'type',
+    'toolCallId',
+    'status',
+    'output',
+    ...LOCAL_RESULT_METADATA_FIELDS,
+  ],
+  server_tool_result: [
+    'type',
+    'tool_call_id',
+    'status',
+    'output',
+    ...LOCAL_RESULT_METADATA_FIELDS,
+  ],
+  codeExecutionResult: ['type', 'codeExecutionResult', 'agentId', 'groupId'],
+  toolResponse: [
+    'type',
+    'toolResponse',
+    'thought',
+    'thoughtSignature',
+    'agentId',
+    'groupId',
+  ],
+  toolResult: ['type', 'toolResult', 'agentId', 'groupId'],
+};
 
 function anthropicDescriptor(
   record: Record<string, unknown>,
@@ -663,10 +634,18 @@ export function getProviderToolResultPartDescriptor(
     return undefined;
   }
   const type = readString(record, 'type');
-  const allowedFields =
-    type == null ? undefined : TOOL_RESULT_ENVELOPE_FIELDS[type];
+  if (type == null) {
+    return undefined;
+  }
+  const isAnthropicResult = isAnthropicServerToolResultType(type);
+  let allowedFields = TOOL_RESULT_ENVELOPE_FIELDS[type];
+  if (isAnthropicResult) {
+    allowedFields =
+      type === 'web_search_tool_result' || type === 'web_fetch_tool_result'
+        ? ANTHROPIC_SERVER_RESULT_FIELDS
+        : ANTHROPIC_RESULT_FIELDS;
+  }
   if (
-    type == null ||
     allowedFields == null ||
     !hasOnlyOwnDataProperties(record, allowedFields) ||
     !hasValidProviderMetadata(record) ||
@@ -675,9 +654,12 @@ export function getProviderToolResultPartDescriptor(
   ) {
     return undefined;
   }
-  const structuredToolNames = ANTHROPIC_STRUCTURED_RESULT_TOOL_NAMES[type];
-  if (structuredToolNames != null) {
-    return anthropicDescriptor(record, type, structuredToolNames);
+  if (isAnthropicResult && type !== 'web_search_tool_result') {
+    return anthropicDescriptor(
+      record,
+      type,
+      ANTHROPIC_SERVER_TOOL_NAMES_BY_RESULT_TYPE[type]
+    );
   }
   if (type === 'web_search_tool_result') {
     const toolCallId = readPairingString(record, 'tool_use_id');
@@ -689,7 +671,7 @@ export function getProviderToolResultPartDescriptor(
         type,
         toolCallId,
         compatibleCallKinds: ANTHROPIC_SERVER_CALL_KINDS,
-        expectedToolNames: WEB_SEARCH_TOOL_NAMES,
+        expectedToolNames: ANTHROPIC_SERVER_TOOL_NAMES_BY_RESULT_TYPE[type],
       }
       : undefined;
   }
@@ -776,7 +758,8 @@ export function isProviderToolContentPart(part: unknown): boolean {
   return (
     type != null &&
     (PROVIDER_TOOL_CALL_CONTENT_TYPES.has(type) ||
-      Object.prototype.hasOwnProperty.call(TOOL_RESULT_ENVELOPE_FIELDS, type))
+      isAnthropicServerToolResultType(type) ||
+      Object.hasOwn(TOOL_RESULT_ENVELOPE_FIELDS, type))
   );
 }
 
@@ -846,6 +829,10 @@ const STANDARD_CALL_FIELDS = [
   'args',
   'index',
   ...LOCAL_CALL_METADATA_FIELDS,
+] as const;
+const STANDARD_CALL_WITH_CALLER_FIELDS = [
+  ...STANDARD_CALL_FIELDS,
+  'caller',
 ] as const;
 const LIBRECHAT_CALL_FIELDS = [
   'type',
@@ -927,7 +914,8 @@ export function getProviderToolCallPartDescriptor(
         ['type', 'tool_call', 'agentId', 'groupId'],
         ['tool_call']
       )
-      : hasExactCallShape(record, STANDARD_CALL_FIELDS, ['id', 'name', 'args']);
+      : hasExactCallShape(record, STANDARD_CALL_WITH_CALLER_FIELDS, ['id', 'name', 'args']) &&
+        hasValidCallerProperty(record);
     const callIsValid = nested.found
       ? call != null &&
         hasExactCallShape(call, LIBRECHAT_CALL_FIELDS, [
@@ -993,23 +981,27 @@ export function getProviderToolCallPartDescriptor(
       };
   }
   if (type === 'server_tool_call') {
+    const callId = readPairingString(record, 'id');
+    const name = optionalName(record);
+    if (callId == null || name == null) {
+      return undefined;
+    }
+    const isAnthropic = isAnthropicServerToolCall(callId, name.name);
+    const fields = isAnthropic
+      ? STANDARD_CALL_WITH_CALLER_FIELDS
+      : STANDARD_CALL_FIELDS;
     if (
-      !hasExactCallShape(record, STANDARD_CALL_FIELDS, ['id', 'name', 'args'])
+      !hasExactCallShape(record, fields, ['id', 'name', 'args']) ||
+      !hasValidCallerProperty(record)
     ) {
       return undefined;
     }
-    const callId = readPairingString(record, 'id');
-    const name = optionalName(record);
-    return callId == null || name == null
-      ? undefined
-      : {
-        callId,
-        kind: isAnthropicServerToolCall(callId, name.name)
-          ? 'anthropic-server'
-          : 'server',
-        sourceType: type,
-        ...name,
-      };
+    return {
+      callId,
+      kind: isAnthropic ? 'anthropic-server' : 'server',
+      sourceType: type,
+      ...name,
+    };
   }
   if (type === 'toolCall' || type === 'toolUse') {
     const outerFields =
