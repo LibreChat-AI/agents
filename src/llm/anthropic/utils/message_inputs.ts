@@ -28,7 +28,6 @@ import {
   AnthropicThinkingBlockParam,
   AnthropicRedactedThinkingBlockParam,
   AnthropicServerToolUseBlockParam,
-  AnthropicWebSearchToolResultBlockParam,
   isAnthropicImageBlockParam,
   AnthropicSearchResultBlockParam,
   AnthropicCompactionBlockParam,
@@ -38,6 +37,7 @@ import {
   cloneToolMessageWithContent,
   serializeStructuredValueBounded,
 } from '@/utils/toolContent';
+import { isAnthropicServerToolResultType } from '@/messages/anthropicServerTools';
 import { isReasoningContentBlock } from '@/messages/reasoningTypes';
 import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
 import { Constants } from '@/common';
@@ -167,9 +167,10 @@ function hoistToolResultCacheControl(
     return { content, cacheControl: undefined };
   }
   let cacheControl: unknown;
-  const stripped = content.map((block) => {
+  const stripped = content.map((part) => {
+    const block = part as MessageContentComplex | null;
     if (typeof block !== 'object' || block == null || isProxy(block)) {
-      return block;
+      return part;
     }
     try {
       const descriptors = Object.getOwnPropertyDescriptors(block);
@@ -210,7 +211,7 @@ function unwrapToolMessageResultContent(content: ToolMessage['content']): {
     return { content, cacheControl: undefined, isError: undefined };
   }
 
-  const block = content[0];
+  const block = content[0] as MessageContentComplex | null;
   if (typeof block !== 'object' || block == null || isProxy(block)) {
     return { content, cacheControl: undefined, isError: undefined };
   }
@@ -650,7 +651,6 @@ function _formatContent(message: BaseMessage) {
     'tool_result',
     'input_json_delta',
     'server_tool_use',
-    'web_search_tool_result',
     'web_search_result',
   ];
   const textTypes = ['text', 'text_delta'];
@@ -694,46 +694,60 @@ function _formatContent(message: BaseMessage) {
         const corrected: AnthropicServerToolUseBlockParam = {
           type: 'server_tool_use',
           id: rawPart.id as string,
-          name: (rawPart.name ?? 'web_search') as 'web_search',
+          name: (rawPart.name ??
+            'web_search') as AnthropicServerToolUseBlockParam['name'],
           input: coerceAnthropicToolUseInput(rawPart.input ?? rawPart.args),
+          ...(rawPart.caller != null
+            ? {
+              caller:
+                  rawPart.caller as AnthropicServerToolUseBlockParam['caller'],
+            }
+            : {}),
+          ...(rawPart.cache_control != null
+            ? {
+              cache_control:
+                  rawPart.cache_control as AnthropicServerToolUseBlockParam['cache_control'],
+            }
+            : {}),
         };
         return corrected;
       }
 
-      /**
-       * Normalize web_search_tool_result blocks into a clean shape.
-       * Same rationale as above — the block may carry extra properties from
-       * streaming (input, index, etc.) that the API rejects. Rebuild cleanly.
-       */
+      const isServerResult = isAnthropicServerToolResultType(contentPart.type);
       if (
+        isServerResult ||
+        ((contentPart.type === 'text' || contentPart.type === 'tool_result') &&
         'tool_use_id' in contentPart &&
-        typeof (contentPart as Record<string, unknown>).tool_use_id ===
-          'string' &&
-        (
-          (contentPart as Record<string, unknown>).tool_use_id as string
-        ).startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX) &&
-        'content' in contentPart
+          typeof contentPart.tool_use_id === 'string' &&
+          contentPart.tool_use_id.startsWith(
+            Constants.ANTHROPIC_SERVER_TOOL_PREFIX
+          ))
       ) {
-        const rawPart = contentPart as Record<string, unknown>;
-        const content = rawPart.content;
-        const isValidContent =
-          Array.isArray(content) ||
-          (content != null &&
-            typeof content === 'object' &&
-            'type' in content &&
-            (content as Record<string, unknown>).type ===
-              'web_search_tool_result_error');
-
-        if (isValidContent) {
-          const corrected: AnthropicWebSearchToolResultBlockParam = {
-            type: 'web_search_tool_result',
-            tool_use_id: rawPart.tool_use_id as string,
-            content:
-              content as AnthropicWebSearchToolResultBlockParam['content'],
-          };
-          return corrected;
+        const { tool_use_id, content, caller, cache_control } =
+          contentPart as Record<string, unknown>;
+        const type = isServerResult
+          ? contentPart.type
+          : 'web_search_tool_result';
+        if (
+          typeof tool_use_id !== 'string' ||
+          !tool_use_id.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX) ||
+          content == null ||
+          typeof content !== 'object' ||
+          (type === 'web_search_tool_result'
+            ? !Array.isArray(content) &&
+              (!('type' in content) ||
+                content.type !== 'web_search_tool_result_error')
+            : Array.isArray(content))
+        ) {
+          return null;
         }
-        return null;
+        return {
+          type,
+          tool_use_id,
+          content,
+          ...(caller != null ? { caller } : {}),
+          ...(cache_control != null ? { cache_control } : {}),
+        };
       }
 
       /**
@@ -749,22 +763,14 @@ function _formatContent(message: BaseMessage) {
         typeof contentPart.name === 'string' &&
         'args' in contentPart
       ) {
-        let args = contentPart.args;
-        if (typeof args === 'string') {
-          try {
-            args = JSON.parse(args);
-          } catch {
-            args = {};
-          }
-        }
-        if (args == null || typeof args !== 'object' || Array.isArray(args)) {
-          args = {};
-        }
-        return _convertLangChainToolCallToAnthropic({
-          id: contentPart.id,
+        const caller = 'caller' in contentPart ? contentPart.caller : undefined;
+        return {
+          type: 'tool_use' as const,
+          id: normalizeAnthropicToolCallId(contentPart.id),
           name: contentPart.name,
-          args: args as Record<string, unknown>,
-        });
+          input: coerceAnthropicToolUseInput(contentPart.args),
+          ...(caller != null ? { caller } : {}),
+        };
       }
 
       /**
