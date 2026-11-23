@@ -1,3 +1,4 @@
+import type { ChatOpenAICallOptions } from '@langchain/openai';
 import type { Runnable } from '@langchain/core/runnables';
 import type * as t from '@/types';
 import {
@@ -101,7 +102,38 @@ export function initializeModel<P extends t.ProviderName>({
     family === 'openai' ||
     family === 'google' ||
     provider === Providers.MOONSHOT;
-  if (disableToolCalling !== true || !canDisableTools)
-    return model.bindTools(tools);
-  return model.bindTools(tools, { tool_choice: 'none' });
+  if (disableToolCalling === true && canDisableTools)
+    return model.bindTools(tools, { tool_choice: 'none' });
+  const options =
+    disableToolCalling !== true && isOpenAILike(provider)
+      ? getToolCallOptions(clientOptions)
+      : undefined;
+  if (!options) return model.bindTools(tools);
+  return model.bindTools(tools, options);
+}
+
+type ToolCallOptions = Pick<
+  ChatOpenAICallOptions,
+  'tool_choice' | 'parallel_tool_calls'
+>;
+
+/**
+ * Reads `tool_choice` and `parallel_tool_calls` from OpenAI-compatible client
+ * options. `ChatOpenAI` only honors them as call options, so constructor
+ * fields would otherwise be dropped from the request.
+ */
+function getToolCallOptions(
+  clientOptions: unknown
+): ToolCallOptions | undefined {
+  if (clientOptions == null || typeof clientOptions !== 'object') return;
+  const { tool_choice: choice, parallel_tool_calls: parallel } =
+    clientOptions as Record<string, unknown>;
+  const options: ToolCallOptions = {};
+  if (
+    typeof choice === 'string' ||
+    (choice != null && typeof choice === 'object' && !Array.isArray(choice))
+  )
+    options.tool_choice = choice as ToolCallOptions['tool_choice'];
+  if (typeof parallel === 'boolean') options.parallel_tool_calls = parallel;
+  return Object.keys(options).length > 0 ? options : undefined;
 }
