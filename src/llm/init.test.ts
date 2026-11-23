@@ -269,3 +269,152 @@ it('leaves a tool-less model untouched', () => {
     })
   ).toBe(model);
 });
+
+describe('client tool call options on OpenAI-compatible providers', () => {
+  const completion = {
+    id: 'openai-test',
+    object: 'chat.completion',
+    created: 0,
+    model: 'custom-model',
+    choices: [
+      {
+        index: 0,
+        message: { role: 'assistant', content: 'ok' },
+        finish_reason: 'stop',
+      },
+    ],
+  };
+
+  type Capture = {
+    requests: OpenAI.Chat.ChatCompletionCreateParamsNonStreaming[];
+    fetch: typeof fetch;
+  };
+
+  function createCapture(): Capture {
+    const requests: OpenAI.Chat.ChatCompletionCreateParamsNonStreaming[] = [];
+    const capturingFetch: typeof fetch = async (_input, init) => {
+      if (typeof init?.body !== 'string')
+        throw new Error('Expected a JSON request body');
+      requests.push(
+        JSON.parse(
+          init.body
+        ) as OpenAI.Chat.ChatCompletionCreateParamsNonStreaming
+      );
+      return new Response(JSON.stringify(completion), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    };
+    return { requests, fetch: capturingFetch };
+  }
+
+  function createOptions(
+    capturingFetch: typeof fetch,
+    extra: Record<string, unknown>
+  ): t.OpenAIClientOptions {
+    return {
+      apiKey: 'offline-test',
+      model: 'custom-model',
+      streaming: false,
+      maxRetries: 0,
+      configuration: {
+        baseURL: 'https://custom.example/v1',
+        fetch: capturingFetch,
+      },
+      ...extra,
+    } as t.OpenAIClientOptions;
+  }
+
+  it('sends tool_choice and parallel_tool_calls when tools are bound', async () => {
+    const capture = createCapture();
+    const model = initializeModel({
+      provider: Providers.OPENAI,
+      clientOptions: createOptions(capture.fetch, {
+        tool_choice: 'required',
+        parallel_tool_calls: false,
+      }),
+      tools,
+    });
+
+    await model.invoke('Calculate 2 + 2');
+
+    expect(capture.requests).toHaveLength(1);
+    expect(capture.requests[0].tool_choice).toBe('required');
+    expect(capture.requests[0].parallel_tool_calls).toBe(false);
+    expect(capture.requests[0].tools).toEqual(tools);
+  });
+
+  it('forwards a named function tool_choice', async () => {
+    const capture = createCapture();
+    const model = initializeModel({
+      provider: Providers.OPENAI,
+      clientOptions: createOptions(capture.fetch, {
+        tool_choice: { type: 'function', function: { name: 'calculate' } },
+      }),
+      tools,
+    });
+
+    await model.invoke('Calculate 2 + 2');
+
+    expect(capture.requests[0].tool_choice).toEqual({
+      type: 'function',
+      function: { name: 'calculate' },
+    });
+    expect(capture.requests[0]).not.toHaveProperty('parallel_tool_calls');
+  });
+
+  it('keeps tool_choice none when tool calling is disabled', async () => {
+    const capture = createCapture();
+    const model = initializeModel({
+      provider: Providers.OPENAI,
+      clientOptions: createOptions(capture.fetch, {
+        tool_choice: 'required',
+        parallel_tool_calls: false,
+      }),
+      tools,
+      disableToolCalling: true,
+    });
+
+    await model.invoke('Summarize the conversation');
+
+    expect(capture.requests[0].tool_choice).toBe('none');
+    expect(capture.requests[0]).not.toHaveProperty('parallel_tool_calls');
+    expect(capture.requests[0].tools).toEqual(tools);
+  });
+
+  it('sends neither option on a tool-less call', async () => {
+    const capture = createCapture();
+    const model = initializeModel({
+      provider: Providers.OPENAI,
+      clientOptions: createOptions(capture.fetch, {
+        tool_choice: 'required',
+        parallel_tool_calls: false,
+      }),
+    });
+
+    await model.invoke('Write a title');
+
+    expect(capture.requests[0]).not.toHaveProperty('tool_choice');
+    expect(capture.requests[0]).not.toHaveProperty('parallel_tool_calls');
+    expect(capture.requests[0]).not.toHaveProperty('tools');
+  });
+
+  it('ignores malformed values', () => {
+    const model = new ChatOpenAI({
+      apiKey: 'offline-test',
+      model: 'gpt-4.1-mini',
+    });
+    const bindTools = jest.spyOn(model, 'bindTools');
+    initializeModel({
+      provider: Providers.OPENAI,
+      clientOptions: {
+        tool_choice: 42,
+        parallel_tool_calls: 'false',
+      } as unknown as t.OpenAIClientOptions,
+      override: model,
+      tools,
+    });
+
+    expect(bindTools).toHaveBeenCalledWith(tools);
+    bindTools.mockRestore();
+  });
+});
