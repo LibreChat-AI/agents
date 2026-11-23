@@ -1,11 +1,16 @@
 import { expect, test, describe } from '@jest/globals';
-import { AIMessage, AIMessageChunk } from '@langchain/core/messages';
+import {
+  AIMessage,
+  AIMessageChunk,
+  ToolMessage,
+} from '@langchain/core/messages';
 import type {
   Content,
   EnhancedGenerateContentResponse,
 } from '@google/generative-ai';
 import {
   convertResponseContentToChatGenerationChunk,
+  mapGenerateContentResultToChatResult,
   convertMessageContentToParts,
   dropUnsupportedModelTurnPrefill,
   rejectsModelTurnPrefill,
@@ -16,6 +21,7 @@ import {
   STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY,
   GOOGLE_STREAMED_TOOL_CALL_ADAPTER,
 } from '@/tools/streamedToolCallSeals';
+import { GEMINI_PARTS, GEMINI_REPLAY_UNSUPPORTED } from './signatures';
 import { toLangChainContent } from '@/messages/langchain';
 
 describe('convertMessageContentToParts cross-provider tool calls', () => {
@@ -96,6 +102,242 @@ function asAIMessageChunk(message: unknown): AIMessageChunk {
   expect(message).toBeInstanceOf(AIMessageChunk);
   return message as AIMessageChunk;
 }
+
+const gemini4 = 'gemini-4-hydrogen';
+const serverCall = {
+  toolCall: { id: 'grounding', name: 'google_search', args: {} },
+  thoughtSignature: 'server-call-signature',
+};
+const serverResponse = {
+  toolResponse: { id: 'grounding', name: 'google_search', response: {} },
+  thoughtSignature: 'server-response-signature',
+};
+const separator = { type: 'text' as const, text: 'Between calls.' };
+
+function clientCall(path: string, id?: string) {
+  return { name: 'read_file', args: { path }, ...(id != null ? { id } : {}) };
+}
+
+function clientPart(path: string, id?: string) {
+  return { functionCall: clientCall(path, id) };
+}
+
+describe('Gemini fallback function-call order', () => {
+  test.each(['complete', 'split stream'])(
+    'replays native server and client parts in wire order after a %s response',
+    (mode) => {
+      const signed = {
+        ...clientPart('one', 'signed'),
+        thoughtSignature: 'client-signature',
+      };
+      const native = [serverCall, signed, clientPart('two'), serverResponse];
+      let message: AIMessage;
+      if (mode === 'complete') {
+        message = mapGenerateContentResultToChatResult(buildResponse(native), {
+          model: gemini4,
+          usageMetadata: undefined,
+        }).generations[0].message as AIMessage;
+      } else {
+        let combined = new AIMessageChunk('');
+        for (const [index, part] of native.entries()) {
+          const chunk = convertResponseContentToChatGenerationChunk(
+            buildResponse([part]),
+            { index, model: gemini4 }
+          );
+          combined = combined.concat(asAIMessageChunk(chunk?.message));
+        }
+        message = combined;
+      }
+
+      expect(message.additional_kwargs[GEMINI_REPLAY_UNSUPPORTED]).toBe(true);
+      expect(message.tool_calls).toHaveLength(2);
+      const generatedId = message.tool_calls?.[1].id;
+      expect(typeof generatedId).toBe('string');
+      expect(convertMessageContentToParts(message, false, [], gemini4)).toEqual(
+        [serverCall, signed, clientPart('two', generatedId), serverResponse]
+      );
+    }
+  );
+
+  test.each([
+    {
+      label: 'explicit IDs',
+      ids: ['a', 'b'],
+      calls: [clientCall('two', 'b'), clientCall('one', 'a')],
+      expected: [clientPart('one', 'a'), clientPart('two', 'b')],
+    },
+    {
+      label: 'no IDs',
+      ids: [undefined, ''],
+      calls: [clientCall('one'), clientCall('two')],
+      expected: [clientPart('one'), clientPart('two')],
+    },
+    {
+      label: 'a later explicit ID',
+      ids: [undefined, 'a'],
+      calls: [clientCall('two', 'a'), clientCall('one')],
+      expected: [clientPart('one'), clientPart('two', 'a')],
+    },
+  ])(
+    'matches repeated names one to one with $label',
+    ({ ids, calls, expected }) => {
+      const message = new AIMessage({
+        content: toLangChainContent([
+          serverCall,
+          clientPart('stale', ids[0]),
+          separator,
+          clientPart('stale', ids[1]),
+          serverResponse,
+        ]),
+        tool_calls: calls,
+      });
+      expect(convertMessageContentToParts(message, false, [])).toEqual([
+        serverCall,
+        expected[0],
+        { text: separator.text },
+        expected[1],
+        serverResponse,
+      ]);
+    }
+  );
+
+  test('drops unmatched and duplicate ID mirrors and appends unused parsed calls in order', () => {
+    const matched = clientCall('parsed', 'match');
+    const remaining = [
+      clientCall('first tail'),
+      clientCall('second tail', 'b'),
+    ];
+    const message = new AIMessage({
+      content: toLangChainContent([
+        serverCall,
+        clientPart('stale', 'missing'),
+        clientPart('stale', 'match'),
+        separator,
+        clientPart('duplicate', 'match'),
+        serverResponse,
+      ]),
+      tool_calls: [remaining[0], matched, remaining[1]],
+    });
+    expect(convertMessageContentToParts(message, false, [])).toEqual([
+      serverCall,
+      { functionCall: matched },
+      { text: separator.text },
+      serverResponse,
+      ...remaining.map((functionCall) => ({ functionCall })),
+    ]);
+  });
+
+  test('drops excess id-less mirrors instead of repeating the parsed call', () => {
+    const message = new AIMessage({
+      content: toLangChainContent([
+        serverCall,
+        clientPart('stale'),
+        separator,
+        clientPart('extra'),
+        serverResponse,
+      ]),
+      tool_calls: [clientCall('parsed')],
+    });
+    expect(convertMessageContentToParts(message, false, [])).toEqual([
+      serverCall,
+      clientPart('parsed'),
+      { text: separator.text },
+      serverResponse,
+    ]);
+  });
+
+  test('leaves exact replay and its signed text boundaries intact', () => {
+    const native = [
+      { text: 'Before.', thoughtSignature: 'text-signature' },
+      { ...clientPart('one', 'a'), thoughtSignature: 'client-signature' },
+      { text: 'After.' },
+    ];
+    const { message } = mapGenerateContentResultToChatResult(
+      buildResponse(native),
+      { model: gemini4, usageMetadata: undefined }
+    ).generations[0];
+    expect(message.additional_kwargs[GEMINI_PARTS]).toBeDefined();
+    expect(convertMessageContentToParts(message, false, [], gemini4)).toEqual(
+      native
+    );
+  });
+
+  test('does not trust inline-only signatures or change the unsigned fallback policy', () => {
+    const tool_calls = [clientCall('one', 'a')];
+    const plain = new AIMessage({ content: 'Text only.', tool_calls });
+    const message = new AIMessage({
+      content: toLangChainContent([
+        serverCall,
+        { ...clientPart('stale', 'a'), thoughtSignature: 'stale-signature' },
+        serverResponse,
+      ]),
+      tool_calls,
+    });
+    const [text, rebuilt] = convertMessageContentToParts(
+      plain,
+      false,
+      [],
+      gemini4
+    );
+    expect(text).toEqual({ text: 'Text only.' });
+    expect(rebuilt).toEqual({
+      ...clientPart('one', 'a'),
+      thoughtSignature: expect.any(String),
+    });
+    expect(rebuilt).not.toHaveProperty('thoughtSignature', 'stale-signature');
+    expect(convertMessageContentToParts(message, false, [], gemini4)).toEqual([
+      serverCall,
+      rebuilt,
+      serverResponse,
+    ]);
+  });
+
+  test('does not emit native mirrors from tool response content', () => {
+    const message = new ToolMessage({
+      content: toLangChainContent([clientPart('stale'), separator]),
+      name: 'read_file',
+      tool_call_id: 'a',
+    });
+    expect(convertMessageContentToParts(message, false, [], gemini4)).toEqual([
+      {
+        functionResponse: {
+          name: 'read_file',
+          id: 'a',
+          response: { result: [{ text: separator.text }] },
+        },
+      },
+    ]);
+  });
+
+  test('leaves cross-provider deduplication, unmatched calls and append order unchanged', () => {
+    const parsed = clientCall('parsed', 'mirror');
+    const message = new AIMessage({
+      content: toLangChainContent([
+        {
+          type: 'tool_use',
+          id: 'mirror',
+          name: 'read_file',
+          input: { path: 'duplicate' },
+        },
+        { type: 'tool_use', id: 'mirror', name: 'read_file', input: {} },
+        { type: 'tool_use', name: 'read_file', input: {} },
+        {
+          type: 'tool_use',
+          id: 'unmatched',
+          name: 'read_file',
+          input: { path: 'foreign' },
+        },
+        separator,
+      ]),
+      tool_calls: [parsed],
+    });
+    expect(convertMessageContentToParts(message, false, [])).toEqual([
+      clientPart('foreign', 'unmatched'),
+      { text: separator.text },
+      { functionCall: parsed },
+    ]);
+  });
+});
 
 describe('convertResponseContentToChatGenerationChunk seal metadata', () => {
   test('stamps an on-arrival seal on function call chunks', () => {
