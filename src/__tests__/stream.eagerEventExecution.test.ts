@@ -5437,6 +5437,66 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
     expect(graph.eagerEventToolExecutions.has('call_code')).toBe(false);
   });
 
+  it('does not prestart a tool whose result is protected, and still prestarts its siblings', async () => {
+    const graph = createGraph({
+      eagerEventToolExecution: { enabled: true },
+      toolResultProtection: {
+        version: 1,
+        toolNames: ['create_file'],
+        timeoutMs: 1000,
+        maxAttemptBytes: 4096,
+        maxBufferedBytes: 4096,
+        classify: () => 'prose',
+        inspect: ({ content }) => ({
+          version: 1,
+          ok: true,
+          value: { content, replacements: 0, categories: [] },
+        }),
+      },
+    });
+    const prestarted: string[] = [];
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data): Promise<void> => {
+        if (event !== GraphEvents.ON_TOOL_EXECUTE) {
+          return;
+        }
+        const batch = data as t.ToolExecuteBatchRequest;
+        prestarted.push(...batch.toolCalls.map((call) => call.name));
+        batch.resolve(
+          batch.toolCalls.map((call) => ({
+            toolCallId: call.id,
+            status: 'success',
+            content: 'ok',
+          }))
+        );
+      });
+
+    await new ChatModelStreamHandler().handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_calls: [
+            {
+              id: 'call_file',
+              name: 'create_file',
+              args: { path: '/mnt/data/x.py', content: 'print(1)' },
+            },
+            { id: 'call_weather', name: 'weather', args: { city: 'NYC' } },
+          ],
+          response_metadata: finalToolCallResponseMetadata,
+        } as unknown as t.StreamChunk,
+      },
+      { langgraph_node: 'agent' },
+      graph
+    );
+
+    expect(prestarted).toEqual(['weather']);
+    expect(graph.eagerEventToolExecutions.has('call_file')).toBe(false);
+    expect(graph.eagerEventToolExecutions.has('call_weather')).toBe(true);
+  });
+
   it('does not prestart codeSessionToolNames tools even without excludeToolNames', async () => {
     // A declared session-writing host tool is side-effecting, so it must not be
     // eagerly prestarted even when the host didn't also list it in excludeToolNames.

@@ -164,6 +164,10 @@ import {
   serializeToolContentBounded,
 } from '@/utils/toolContent';
 import {
+  createToolResultGate,
+  ToolResultProtectionError,
+} from '@/protection/toolResult';
+import {
   appendCallbacks,
   findCallback,
   type CallbackEntry,
@@ -1440,6 +1444,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   streamLimits: ResolvedStreamLimits;
   /** Default-off mandatory provider prose release. */
   providerTextProtection?: t.StandardGraphInput['providerTextProtection'];
+  /** Default-off host inspection of selected tools' result text. */
+  toolResultProtection?: t.StandardGraphInput['toolResultProtection'];
   /** Host lookup for attachments carried by reference; read while a provider request is prepared. */
   resolveAttachment?: t.StandardGraphInput['resolveAttachment'];
   /**
@@ -1622,6 +1628,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       preemption,
       streamLimits,
       providerTextProtection,
+      toolResultProtection,
       resolveAttachment,
       toolExecution,
       clientDelegatedToolNames,
@@ -1655,6 +1662,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     if (providerTextProtection != null)
       validateProviderTextProtection(providerTextProtection);
     this.providerTextProtection = providerTextProtection;
+    const toolResultGate =
+      toolResultProtection == null
+        ? undefined
+        : createToolResultGate(toolResultProtection);
+    this.toolResultProtection = toolResultProtection;
     this.resolveAttachment = resolveAttachment;
     this.toolExecution = toolExecution;
     if (
@@ -1666,6 +1678,13 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       }
       if (clientDelegatedToolNames.some((name) => !name.trim())) {
         throw new Error('Client delegated tool names must be nonempty');
+      }
+      if (
+        clientDelegatedToolNames.some(
+          (name) => toolResultGate?.toolNames.has(name) === true
+        )
+      ) {
+        throw new ToolResultProtectionError('unsupported');
       }
       this.clientDelegatedToolNames = new Set(clientDelegatedToolNames);
     }
@@ -3031,6 +3050,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         maxContextTokens: agentContext?.maxContextTokens,
         maxToolResultChars: agentContext?.maxToolResultChars,
         toolOutputRegistry: this.getOrCreateToolOutputRegistry(),
+        toolResultProtection: this.toolResultProtection,
         fileCheckpointer: this.getOrCreateFileCheckpointer(),
         getBreakerSignal: (): AbortSignal => this.breakerAbort.signal,
         getRunScope: (): RunBreakerScope => this.runScope,
@@ -3114,6 +3134,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       maxContextTokens: agentContext?.maxContextTokens,
       maxToolResultChars: agentContext?.maxToolResultChars,
       toolOutputRegistry: this.getOrCreateToolOutputRegistry(),
+      toolResultProtection: this.toolResultProtection,
       fileCheckpointer: this.getOrCreateFileCheckpointer(),
       getBreakerSignal: (): AbortSignal => this.breakerAbort.signal,
       getRunScope: (): RunBreakerScope => this.runScope,
@@ -5449,6 +5470,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           onResolutionFailure: this.onSubagentResolutionFailure,
           streamLimits: this.streamLimits,
           providerTextProtection: this.providerTextProtection,
+          toolResultProtection: this.toolResultProtection,
           resolveAttachment: this.resolveAttachment,
           humanInTheLoop: this.humanInTheLoop,
           checkpointer: this.compileOptions?.checkpointer,
