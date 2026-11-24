@@ -397,8 +397,9 @@ export class ProviderTextAttempt {
     this.charge(128);
   }
 
-  async wait<T>(work: Promise<T>): Promise<T> {
-    this.pending.add(work);
+  /** Approved-text callbacks can stop blocking cleanup without retaining raw capacity. */
+  async wait<T>(work: Promise<T>, retain = true): Promise<T> {
+    if (retain) this.pending.add(work);
     return new Promise<T>((resolve, reject) => {
       const abort = (): void => {
         this.signal.removeEventListener('abort', abort);
@@ -408,7 +409,7 @@ export class ProviderTextAttempt {
       if (this.signal.aborted) abort();
       const settle = (): void => {
         this.signal.removeEventListener('abort', abort);
-        this.pending.delete(work);
+        if (retain) this.pending.delete(work);
       };
       void work.then(
         (value) => {

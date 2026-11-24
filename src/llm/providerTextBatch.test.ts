@@ -1,4 +1,5 @@
 import { createServer } from 'node:http';
+import { MemorySaver } from '@langchain/langgraph';
 import { ChatGenerationChunk } from '@langchain/core/outputs';
 import { FakeListChatModel } from '@langchain/core/utils/testing';
 import { AIMessageChunk, HumanMessage } from '@langchain/core/messages';
@@ -12,6 +13,8 @@ import type {
 } from '@/protection/providerText';
 import { ProviderTextProtectionError } from '@/protection/providerText';
 import { withProviderTextBoundary } from '@/llm/providerTextBoundary';
+import { createRemoteSdkRun } from '@/runtime/client';
+import { createGraph } from '@/graphs/createGraph';
 import { GraphEvents, Providers } from '@/common';
 import { attemptInvoke } from '@/llm/invoke';
 import { ChatOpenAI } from '@/llm/openai';
@@ -469,4 +472,114 @@ it('does not divide a UTF-16 surrogate pair at the commit boundary', async () =>
   );
   expect(seen[0]).toBe('abcdefgh');
   expect(seen.join('')).toBe('abcdefgh🧪tail');
+});
+
+it('rejects required batching before remote transport even with a whole-reply host service', async () => {
+  const protect = policy();
+  const host = jest.fn();
+  await expect(
+    createRemoteSdkRun({
+      config: {
+        runId: 'remote-batch',
+        graphConfig: {
+          type: 'standard',
+          llmConfig: { provider: Providers.OPENAI },
+        },
+        providerTextProtection: protect,
+      },
+      identity: {
+        runtimeId: 'worker',
+        agentId: 'agent',
+        userId: 'user',
+        conversationId: 'thread',
+        runId: 'remote-batch',
+      },
+      remote: {
+        url: 'ws://127.0.0.1:9000',
+        secret: 'test-only-fixture',
+      },
+      hostServices: {
+        providerText: {
+          descriptor: {
+            version: 1,
+            timeoutMs: protect.timeoutMs,
+            maxAttemptBytes: protect.maxAttemptBytes,
+            maxBufferedBytes: protect.maxBufferedBytes,
+          },
+          service: { version: 1, inspect: host },
+        },
+      },
+    })
+  ).rejects.toMatchObject({ code: 'unsupported' });
+  expect(host).not.toHaveBeenCalled();
+});
+
+it('settles on timeout and releases raw capacity when an approved callback stalls', async () => {
+  const stalled = Promise.withResolvers<void>();
+  const started = Promise.withResolvers<void>();
+  const protect = policy({
+    timeoutMs: 120,
+    maxAttemptBytes: 4_096,
+    maxBufferedBytes: 4_096,
+    batching: {
+      version: 1,
+      batchBytes: 16,
+      flushMs: 10,
+      maxMatchChars: marker.length,
+    },
+  });
+  const frames = 'safe '.repeat(50);
+  async function* producer(): AsyncGenerator<string> {
+    yield frames;
+    const signal = model.signal;
+    if (signal?.aborted === false) {
+      await new Promise<void>((resolve) =>
+        signal.addEventListener('abort', () => resolve(), { once: true })
+      );
+    }
+  }
+  const model = new Model(producer());
+  const run = attemptInvoke({
+    model,
+    provider: Providers.OPENAI,
+    messages: [],
+    providerTextProtection: protect,
+    onChunk() {
+      started.resolve();
+      return stalled.promise;
+    },
+  });
+  const result = expect(run).rejects.toMatchObject({ code: 'timeout' });
+  try {
+    await started.promise;
+    await result;
+    expect(model.signal?.reason).toMatchObject({ code: 'timeout' });
+    const seen: string[] = [];
+    await drain(
+      new Model(
+        (async function* () {
+          yield frames;
+        })()
+      ),
+      protect,
+      seen
+    );
+    expect(seen.join('')).toBe(frames);
+  } finally {
+    stalled.resolve();
+  }
+});
+
+it('rejects batching with a checkpointer when using the public graph factory', () => {
+  const graph = createGraph({
+    kind: 'standard',
+    input: {
+      agents: [{ agentId: 'text', provider: Providers.OPENAI }],
+      providerTextProtection: policy(),
+    },
+  });
+  graph.compileOptions = { checkpointer: new MemorySaver() };
+  expect(() => graph.createWorkflow()).toThrow(
+    expect.objectContaining({ code: 'unsupported' })
+  );
 });

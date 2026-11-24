@@ -28,6 +28,7 @@ import type { SdkAgentIdentity } from './identity';
 import {
   Run,
   ToolResultProtectionError,
+  ProviderTextProtectionError,
   executeHooks,
   GraphEvents,
   HOOK_EVENTS,
@@ -67,6 +68,8 @@ export async function createRemoteSdkRun({
     );
   if (config.toolResultProtection != null)
     throw new ToolResultProtectionError('unsupported');
+  if (config.providerTextProtection?.batching != null)
+    throw new ProviderTextProtectionError('unsupported');
   if (config.providerTextProtection && !hostServices?.providerText)
     throw new Error(
       'Remote SDK provider protection requires a supported policy adapter'

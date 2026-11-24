@@ -115,10 +115,9 @@ export class ProviderTextBatch {
     const approved = await this.attempt.inspect(text);
     if (approved !== text)
       throw new ProviderTextProtectionError('incompatible');
-    let end = final
-      ? text.length
-      : Math.max(0, text.length - (this.options.maxMatchChars - 1));
-    if (!final && end > 0) {
+    if (final) return text;
+    let end = Math.max(0, text.length - (this.options.maxMatchChars - 1));
+    if (end > 0) {
       const previous = text.charCodeAt(end - 1);
       if (previous >= 0xd800 && previous <= 0xdbff) end--;
     }

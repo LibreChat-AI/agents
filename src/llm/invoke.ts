@@ -7,9 +7,9 @@ import type { RunnableConfig } from '@langchain/core/runnables';
 import type { ChatGeneration } from '@langchain/core/outputs';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type { BaseMessage } from '@langchain/core/messages';
+import type { ProviderTextProtection, ProviderTextAttempt } from '@/protection/providerText';
 import type { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import type { PreparedProviderRequest } from '@/llm/prepareProviderRequest';
-import type { ProviderTextProtection } from '@/protection/providerText';
 import type { ContextOverflowContext } from '@/utils/errors';
 import type { StreamLimitState } from '@/llm/streamLimits';
 import type { PreemptAction } from '@/llm/preempt';
@@ -679,12 +679,16 @@ export async function attemptInvoke(
     },
   };
   const preparedRequest = resolveAttemptRequest(params, providerStampedConfig);
+  let batchAttempt: ProviderTextAttempt | undefined;
+  const onBatchAttempt = policy?.batching == null ? undefined : (attempt: ProviderTextAttempt): void => {
+    batchAttempt = attempt;
+  };
   const request =
     policy == null
       ? preparedRequest
       : {
         ...preparedRequest,
-        model: withProviderTextBoundary(preparedRequest.model, policy, provider),
+        model: withProviderTextBoundary(preparedRequest.model, policy, provider, onBatchAttempt),
       };
   const configuredModel =
     providerStampedConfig.metadata?.[Constants.INVOKED_MODEL];
@@ -743,6 +747,7 @@ export async function attemptInvoke(
         onModelComplete: params.onModelComplete,
         preemptAgentId: params.preemptAgentId,
         providerTextProtection: policy,
+        ...(onBatchAttempt != null && { batchAttempt: (): ProviderTextAttempt | undefined => batchAttempt }),
       },
       stampedConfig
     );
@@ -786,6 +791,7 @@ async function attemptInvokeBody(
     onModelComplete,
     preemptAgentId,
     providerTextProtection,
+    batchAttempt,
   }: Pick<
     AttemptInvokeCommonParams,
     | 'context'
@@ -795,6 +801,7 @@ async function attemptInvokeBody(
     | 'providerTextProtection'
   > & {
     request: PreparedProviderRequest;
+    batchAttempt?: () => ProviderTextAttempt | undefined;
   },
   config: RunnableConfig
 ): Promise<Partial<t.BaseGraphState>> {
@@ -1118,7 +1125,11 @@ async function attemptInvokeBody(
                 chunk,
               });
             }
-            await onChunk(chunk, attemptMetadata);
+            const attempt = batchAttempt?.();
+            attempt?.check();
+            const dispatch = onChunk(chunk, attemptMetadata);
+            if (attempt != null && dispatch != null) await attempt.wait(dispatch, false);
+            else await dispatch;
             finalChunk = appendStreamChunk({
               current: finalChunk,
               next: chunk,
@@ -1153,12 +1164,16 @@ async function attemptInvokeBody(
             if (handlingChunk != null) {
               dispatchingChunk = true;
               try {
-                await streamHandler.handle(
+                const attempt = batchAttempt?.();
+                attempt?.check();
+                const dispatch = streamHandler.handle(
                   GraphEvents.CHAT_MODEL_STREAM,
                   { chunk: handlingChunk },
                   metadata,
                   context
                 );
+                if (attempt != null) await attempt.wait(dispatch, false);
+                else await dispatch;
               } finally {
                 dispatchingChunk = false;
               }
@@ -1279,12 +1294,16 @@ async function attemptInvokeBody(
                 ...(metadata ?? {}),
                 [STREAM_LIMIT_REDISPATCH_KEY]: true,
               };
-              await registeredStreamHandler.handle(
+              const attempt = batchAttempt?.();
+              attempt?.check();
+              const dispatch = registeredStreamHandler.handle(
                 GraphEvents.CHAT_MODEL_STREAM,
                 { chunk: handlingChunk },
                 redispatchMetadata,
                 context
               );
+              if (attempt != null && dispatch != null) await attempt.wait(dispatch, false);
+              else await dispatch;
             }
             finalChunk = appendStreamChunk({
               current: finalChunk,

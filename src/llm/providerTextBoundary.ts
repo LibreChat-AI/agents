@@ -331,13 +331,16 @@ function usesInternalStreaming(
 export function withProviderTextBoundary(
   model: ChatModel,
   policy: ProviderTextProtection,
-  provider?: ProviderName
+  provider?: ProviderName,
+  onBatchAttempt?: (attempt: ProviderTextAttempt) => void
 ): ChatModel {
   const protectedModel = clone(model);
   if (model instanceof RunnableBinding) {
     assertBindingShell(model);
     Object.defineProperty(protectedModel, 'bound', {
-      value: withProviderTextBoundary(model.bound as ChatModel, policy, provider),
+      value: withProviderTextBoundary(
+        model.bound as ChatModel, policy, provider, onBatchAttempt
+      ),
     });
     return protectedModel;
   }
@@ -354,7 +357,8 @@ export function withProviderTextBoundary(
       value: withProviderTextBoundary(
         steps[steps.length - 1] as ChatModel,
         policy,
-        provider
+        provider,
+        onBatchAttempt
       ),
     });
     return protectedModel;
@@ -393,6 +397,7 @@ export function withProviderTextBoundary(
     let completed = false;
     let source: AsyncGenerator<ChatGenerationChunk> | undefined;
     try {
+      if (batch != null) onBatchAttempt?.(attempt);
       source = model._streamResponseChunks(
         messages,
         preserveModelInvocationContext(
@@ -413,7 +418,7 @@ export function withProviderTextBoundary(
         attempt.check();
         yield chunk;
         if (batch != null) attempt.check();
-        await runManager?.handleLLMNewToken(
+        const notification = runManager?.handleLLMNewToken(
           chunk.text,
           undefined,
           undefined,
@@ -421,13 +426,15 @@ export function withProviderTextBoundary(
           undefined,
           { chunk }
         );
+        if (batch != null && notification != null) await attempt.wait(notification, false);
+        else await notification;
       }
       const canonical = batch == null ? await candidate.canonical() : batchChunk(await batch.flush(true));
       attempt.check();
       if (canonical != null) {
         yield canonical;
         attempt.check();
-        await runManager?.handleLLMNewToken(
+        const notification = runManager?.handleLLMNewToken(
           canonical.text,
           undefined,
           undefined,
@@ -435,6 +442,8 @@ export function withProviderTextBoundary(
           undefined,
           { chunk: canonical }
         );
+        if (batch != null && notification != null) await attempt.wait(notification, false);
+        else await notification;
       }
       completed = true;
     } catch (error) {
