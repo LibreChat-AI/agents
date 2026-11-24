@@ -1136,11 +1136,14 @@ async function attemptInvokeBody(
               provider,
             });
           }
-        } else if (registeredStreamHandler == null) {
+        } else if (registeredStreamHandler == null || batchAttempt != null) {
           const metadata = config.metadata as
             | Record<string, unknown>
             | undefined;
-          const streamHandler = new ChatModelStreamHandler();
+          const streamHandler = registeredStreamHandler ?? new ChatModelStreamHandler();
+          const observer = batchAttempt != null && registeredStreamHandler == null
+            ? context?.handlerRegistry?.getHandler(GraphEvents.CHAT_MODEL_STREAM)
+            : undefined;
           for await (const rawChunk of stream) {
             throwIfBreakerTripped();
             const chunk = snapshotValidatedModelChunk(rawChunk);
@@ -1172,8 +1175,15 @@ async function attemptInvokeBody(
                   metadata,
                   context
                 );
-                if (attempt != null) await attempt.wait(dispatch, false);
+                if (attempt != null && dispatch != null) await attempt.wait(dispatch, false);
                 else await dispatch;
+                if (attempt != null && observer != null) {
+                  attempt.check();
+                  const observed = observer.handle(
+                    GraphEvents.CHAT_MODEL_STREAM, { chunk: handlingChunk }, metadata, context
+                  );
+                  if (observed != null) await attempt.wait(observed, false);
+                }
               } finally {
                 dispatchingChunk = false;
               }
@@ -1294,16 +1304,12 @@ async function attemptInvokeBody(
                 ...(metadata ?? {}),
                 [STREAM_LIMIT_REDISPATCH_KEY]: true,
               };
-              const attempt = batchAttempt?.();
-              attempt?.check();
-              const dispatch = registeredStreamHandler.handle(
+              await registeredStreamHandler.handle(
                 GraphEvents.CHAT_MODEL_STREAM,
                 { chunk: handlingChunk },
                 redispatchMetadata,
                 context
               );
-              if (attempt != null && dispatch != null) await attempt.wait(dispatch, false);
-              else await dispatch;
             }
             finalChunk = appendStreamChunk({
               current: finalChunk,

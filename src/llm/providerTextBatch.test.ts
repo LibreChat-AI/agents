@@ -11,11 +11,13 @@ import type {
   ProviderTextProtection,
   ProviderTextProtectionResult,
 } from '@/protection/providerText';
+import type { EventHandler, MessageDeltaEvent } from '@/types';
 import { ProviderTextProtectionError } from '@/protection/providerText';
 import { withProviderTextBoundary } from '@/llm/providerTextBoundary';
 import { createRemoteSdkRun } from '@/runtime/client';
 import { createGraph } from '@/graphs/createGraph';
 import { GraphEvents, Providers } from '@/common';
+import { ChatModelStreamHandler } from '@/stream';
 import { attemptInvoke } from '@/llm/invoke';
 import { ChatOpenAI } from '@/llm/openai';
 import { Run } from '@/run';
@@ -582,4 +584,128 @@ it('rejects batching with a checkpointer when using the public graph factory', (
   expect(() => graph.createWorkflow()).toThrow(
     expect.objectContaining({ code: 'unsupported' })
   );
+});
+
+it.each([false, true])(
+  'awaits registered model deltas once under the attempt timeout (stall=%s)',
+  async (stall) => {
+    const text = 'An approved first batch. And the rest.';
+    const stalled = Promise.withResolvers<void>();
+    const unblockProvider = Promise.withResolvers<void>();
+    const protect = policy({
+      timeoutMs: 180,
+      batching: {
+        version: 1,
+        batchBytes: 16,
+        flushMs: 20,
+        maxMatchChars: marker.length,
+      },
+    });
+    const model = new Model(
+      (async function* () {
+        yield text.slice(0, 25);
+        await unblockProvider.promise;
+        yield text.slice(25);
+      })()
+    );
+    const seen: string[] = [];
+    const dispatch = new ChatModelStreamHandler();
+    const handle = jest.fn<
+      ReturnType<EventHandler['handle']>,
+      Parameters<EventHandler['handle']>
+    >((_event, data) => {
+      const { delta } = data as MessageDeltaEvent;
+      for (const part of delta.content ?? []) {
+        if (part.type === 'text') seen.push(part.text);
+      }
+      if (stall) return stalled.promise;
+      unblockProvider.resolve();
+    });
+    const run = await Run.create({
+      runId: 'registered-batch',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: { provider: Providers.OPENAI },
+      },
+      customHandlers: {
+        [GraphEvents.CHAT_MODEL_STREAM]: dispatch,
+        [GraphEvents.ON_MESSAGE_DELTA]: { handle },
+      },
+      providerTextProtection: protect,
+    });
+    run.Graph!.overrideModel = model;
+    try {
+      const result = run.processStream(
+        { messages: [new HumanMessage('go')] },
+        { version: 'v2' }
+      );
+      if (stall) {
+        await expect(result).rejects.toMatchObject({ code: 'timeout' });
+        expect(seen).toHaveLength(1);
+        expect(model.signal?.reason).toMatchObject({ code: 'timeout' });
+      } else {
+        await result;
+        expect(seen.join('')).toBe(text);
+      }
+    } finally {
+      stalled.resolve();
+      unblockProvider.resolve();
+    }
+  }
+);
+
+it.each(['reasoning', 'metadata'])(
+  'rejects out-of-scope or oversized %s before staging a read-ahead frame',
+  async (kind) => {
+    const stalled = Promise.withResolvers<void>();
+    const entered = Promise.withResolvers<void>();
+    const protect = policy({
+      maxAttemptBytes: 4_096,
+      maxBufferedBytes: 4_096,
+      async inspect({ content }) {
+        entered.resolve();
+        await stalled.promise;
+        return allowed(content);
+      },
+    });
+    const marker = 'x'.repeat(8192);
+    const model = new Model(
+      (async function* () {
+        yield 'An approved first batch.';
+        await entered.promise;
+        yield new AIMessageChunk({
+          content: '',
+          ...(kind === 'reasoning'
+            ? { additional_kwargs: { reasoning_content: marker } }
+            : { response_metadata: { model_name: marker } }),
+        });
+      })()
+    );
+    const seen: string[] = [];
+    try {
+      await expect(drain(model, protect, seen)).rejects.toMatchObject({
+        code: kind === 'reasoning' ? 'unsupported' : 'overflow',
+      });
+      expect(seen).toEqual([]);
+      expect(model.signal?.aborted).toBe(true);
+    } finally {
+      stalled.resolve();
+    }
+  }
+);
+
+it('rejects batching on a standard Run with more than one configured agent', async () => {
+  await expect(
+    Run.create({
+      runId: 'multi-entry-batch',
+      graphConfig: {
+        type: 'standard',
+        agents: [
+          { provider: Providers.OPENAI, agentId: 'first' },
+          { provider: Providers.OPENAI, agentId: 'second' },
+        ],
+      },
+      providerTextProtection: policy(),
+    })
+  ).rejects.toMatchObject({ code: 'unsupported' });
 });

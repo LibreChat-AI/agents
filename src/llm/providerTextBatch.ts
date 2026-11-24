@@ -1,5 +1,6 @@
 import { Buffer } from 'node:buffer';
 import { performance } from 'node:perf_hooks';
+import { AIMessageChunk } from '@langchain/core/messages';
 import type { ChatGenerationChunk } from '@langchain/core/outputs';
 import type {
   ProviderTextAttempt,
@@ -12,7 +13,8 @@ export class ProviderTextBatch {
   private parts: string[] = [];
   private freshBytes = 0;
   private bytes = 0;
-  private staged = 0;
+  private stagedText = 0;
+  private stagedControl = 0;
   private reading = false;
   private next?: IteratorResult<ChatGenerationChunk>;
   private timer?: ReturnType<typeof setTimeout>;
@@ -22,7 +24,8 @@ export class ProviderTextBatch {
 
   constructor(
     private readonly attempt: ProviderTextAttempt,
-    private readonly options: ProviderTextBatching
+    private readonly options: ProviderTextBatching,
+    private readonly admit: (chunk: ChatGenerationChunk) => number
   ) {}
 
   private prefetch(source: AsyncGenerator<ChatGenerationChunk>): void {
@@ -36,11 +39,16 @@ export class ProviderTextBatch {
         this.attempt.check();
         if (next.done !== true) {
           const { content } = next.value.message;
-          if (typeof content !== 'string')
+          if (
+            typeof content !== 'string' ||
+            !(next.value.message instanceof AIMessageChunk)
+          ) {
             throw new ProviderTextProtectionError('unsupported');
+          }
+          this.stagedControl = this.admit(next.value);
           // Raw fragments, their joined copy, and detached prefix/tail during a split.
-          this.staged = content.length * 8 + 256;
-          this.attempt.retain(this.staged);
+          this.stagedText = content === '' ? 0 : content.length * 8 + 256;
+          this.attempt.retain(this.stagedText + this.stagedControl);
         }
         this.next = next;
         this.wake?.();
@@ -88,12 +96,11 @@ export class ProviderTextBatch {
   }
 
   append(text: string): void {
-    const bytes = this.staged;
-    this.staged = 0;
-    if (text === '') {
-      this.attempt.releaseWindow(bytes);
-      return;
-    }
+    const bytes = this.stagedText;
+    this.stagedText = 0;
+    this.attempt.releaseWindow(this.stagedControl);
+    this.stagedControl = 0;
+    if (text === '') return;
     this.parts.push(text);
     this.freshBytes += text.length * 2;
     this.bytes += bytes;

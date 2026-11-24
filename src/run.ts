@@ -637,7 +637,8 @@ export class Run<_T extends t.BaseGraphState> {
 
     if (
       this.providerTextProtection?.batching != null &&
-      config.humanInTheLoop?.enabled === true
+      (config.humanInTheLoop?.enabled === true ||
+        ('agents' in config.graphConfig && config.graphConfig.agents.length !== 1))
     ) {
       throw new ProviderTextProtectionError('unsupported');
     }
@@ -1635,6 +1636,11 @@ export class Run<_T extends t.BaseGraphState> {
         for await (const event of stream) {
           const { data, metadata, ...info } = event;
           const eventName: t.EventName = info.event;
+          // The provider attempt owns batched dispatch and its timeout; ignore the native echo.
+          if (
+            eventName === GraphEvents.CHAT_MODEL_STREAM &&
+            this.providerTextProtection?.batching != null
+          ) continue;
 
           if (CUSTOM_GRAPH_EVENTS.has(eventName)) {
             continue;
