@@ -8,6 +8,7 @@ import { StreamLimitExceededError } from '@/llm/streamLimits';
 
 export const PROVIDER_TEXT_PROTECTION_VERSION = 1;
 export const PROVIDER_TEXT_BATCHING_VERSION = 1;
+export const BATCHED_PROVIDER_EVENT_OWNER = 'librechat:batched-provider-event-owner';
 
 /**
  * Opt in only when every rule is substring-local with a certified maximum match width.
@@ -267,6 +268,8 @@ export class ProviderTextAttempt {
   private readonly timer: ReturnType<typeof setTimeout>;
   private readonly abort: () => void;
   private finished = false;
+  private finishHeld = false;
+  private finishPending = false;
   private readonly admission?: ProviderTextAdmissionLease;
 
   constructor(
@@ -466,8 +469,21 @@ export class ProviderTextAttempt {
     return canonical;
   }
 
+  /** Native prefetch can end the iterator while the invocation still dispatches its final chunk. */
+  holdFinish(): () => void {
+    this.finishHeld = true;
+    return (): void => {
+      this.finishHeld = false;
+      if (this.finishPending) this.finish();
+    };
+  }
+
   finish(): void {
     if (this.finished) return;
+    if (this.finishHeld) {
+      this.finishPending = true;
+      return;
+    }
     this.finished = true;
     clearTimeout(this.timer);
     try {

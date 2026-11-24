@@ -368,7 +368,7 @@ export function withProviderTextBoundary(
   model: ChatModel,
   policy: ProviderTextProtection,
   provider?: ProviderName,
-  onBatchAttempt?: (attempt: ProviderTextAttempt) => void
+  onBatchAttempt?: (attempt: ProviderTextAttempt) => void | Promise<void>
 ): ChatModel {
   const protectedModel = clone(model);
   if (model instanceof RunnableBinding) {
@@ -433,7 +433,10 @@ export function withProviderTextBoundary(
     let completed = false;
     let source: AsyncGenerator<ChatGenerationChunk> | undefined;
     try {
-      if (batch != null) onBatchAttempt?.(attempt);
+      if (batch != null) {
+        const ready = onBatchAttempt?.(attempt);
+        if (ready != null) await ready;
+      }
       source = model._streamResponseChunks(
         messages,
         preserveModelInvocationContext(

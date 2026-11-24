@@ -25,6 +25,7 @@ import {
   STREAM_LIMIT_ATTEMPT_KEY,
 } from '@/llm/streamLimits';
 import {
+  BATCHED_PROVIDER_EVENT_OWNER,
   validateProviderTextProtection,
   ProviderTextProtectionError,
   createProviderTextRestartCancellation,
@@ -205,6 +206,54 @@ function withModelStartHandler({
     callbacks: appendCallbacks(config.callbacks, [
       createModelStartHandler({ config, mode, provider, captureRunId }),
     ]),
+  };
+}
+
+/** Publication errors must not start a second attempt after text was committed. */
+async function dispatchBatchEvent(
+  attempt: ProviderTextAttempt,
+  dispatch: () => void | Promise<void>
+): Promise<void> {
+  attempt.check();
+  try {
+    const pending = dispatch();
+    if (pending != null) await attempt.wait(pending, false);
+    attempt.check();
+  } catch (error) {
+    attempt.check();
+    if (error instanceof StreamLimitExceededError || error instanceof PreparedSubagentError) {
+      throw error;
+    }
+    const failure = new ProviderTextProtectionError('unavailable');
+    attempt.stop(failure);
+    throw failure;
+  }
+}
+
+function captureBatchStart(context: InvokeContext | undefined): {
+  callback: BaseCallbackHandler;
+  dispatch: (attempt: ProviderTextAttempt) => Promise<void>;
+} | undefined {
+  const handler = context?.handlerRegistry?.getHandler(GraphEvents.CHAT_MODEL_START);
+  if (handler == null) return;
+  let start: { messages: BaseMessage[][]; metadata?: Record<string, unknown> } | undefined;
+  const callback = BaseCallbackHandler.fromMethods({
+    handleChatModelStart(_llm, messages, _runId, _parentId, _extra, _tags, metadata): void {
+      start = { messages, metadata };
+    },
+  });
+  callback.name = 'batched-provider-start';
+  callback.awaitHandlers = true;
+  return {
+    callback,
+    dispatch: (attempt): Promise<void> => {
+      const event = start;
+      start = undefined;
+      if (event == null) throw new ProviderTextProtectionError('incompatible');
+      return dispatchBatchEvent(attempt, () => handler.handle(
+        GraphEvents.CHAT_MODEL_START, { input: { messages: event.messages } }, event.metadata, context
+      ));
+    },
   };
 }
 
@@ -679,9 +728,13 @@ export async function attemptInvoke(
     },
   };
   const preparedRequest = resolveAttemptRequest(params, providerStampedConfig);
+  const batchStart = policy?.batching == null ? undefined : captureBatchStart(params.context);
   let batchAttempt: ProviderTextAttempt | undefined;
-  const onBatchAttempt = policy?.batching == null ? undefined : (attempt: ProviderTextAttempt): void => {
+  let releaseBatch: (() => void) | undefined;
+  const onBatchAttempt = policy?.batching == null ? undefined : (attempt: ProviderTextAttempt): void | Promise<void> => {
     batchAttempt = attempt;
+    releaseBatch = attempt.holdFinish();
+    return batchStart?.dispatch(attempt);
   };
   const request =
     policy == null
@@ -697,6 +750,7 @@ export async function attemptInvoke(
     (typeof configuredModel === 'string' ? configuredModel : undefined);
   const stampedConfig: RunnableConfig = {
     ...providerStampedConfig,
+    ...(batchStart != null && { callbacks: appendCallbacks(providerStampedConfig.callbacks, [batchStart.callback]) }),
     metadata: {
       ...providerStampedConfig.metadata,
       ...(modelId == null
@@ -715,6 +769,7 @@ export async function attemptInvoke(
        * rebuild that already attributes the serving provider.
        */
       [STREAM_LIMIT_ATTEMPT_KEY]: ++streamLimitAttemptSeq,
+      ...(onBatchAttempt != null && { [BATCHED_PROVIDER_EVENT_OWNER]: true }),
     },
   };
   const rawLeaseTarget = params.context ?? params.streamLimitState;
@@ -768,6 +823,7 @@ export async function attemptInvoke(
     prepared?.finish(preparedAttempt, undefined, error);
     throw error;
   } finally {
+    releaseBatch?.();
     const chunks = params.context?.eagerEventToolCallChunks;
     if (prepared != null && chunks != null) {
       const prefix = `prepared:${preparedAttempt}\u0000`;
@@ -1126,10 +1182,8 @@ async function attemptInvokeBody(
               });
             }
             const attempt = batchAttempt?.();
-            attempt?.check();
-            const dispatch = onChunk(chunk, attemptMetadata);
-            if (attempt != null && dispatch != null) await attempt.wait(dispatch, false);
-            else await dispatch;
+            if (attempt == null) await onChunk(chunk, attemptMetadata);
+            else await dispatchBatchEvent(attempt, () => onChunk(chunk, attemptMetadata));
             finalChunk = appendStreamChunk({
               current: finalChunk,
               next: chunk,
@@ -1168,21 +1222,14 @@ async function attemptInvokeBody(
               dispatchingChunk = true;
               try {
                 const attempt = batchAttempt?.();
-                attempt?.check();
-                const dispatch = streamHandler.handle(
-                  GraphEvents.CHAT_MODEL_STREAM,
-                  { chunk: handlingChunk },
-                  metadata,
-                  context
-                );
-                if (attempt != null && dispatch != null) await attempt.wait(dispatch, false);
-                else await dispatch;
-                if (attempt != null && observer != null) {
-                  attempt.check();
-                  const observed = observer.handle(
-                    GraphEvents.CHAT_MODEL_STREAM, { chunk: handlingChunk }, metadata, context
-                  );
-                  if (observed != null) await attempt.wait(observed, false);
+                if (attempt == null) {
+                  await streamHandler.handle(GraphEvents.CHAT_MODEL_STREAM, { chunk: handlingChunk }, metadata, context);
+                } else {
+                  const data = { chunk: handlingChunk };
+                  await dispatchBatchEvent(attempt, () => streamHandler.handle(GraphEvents.CHAT_MODEL_STREAM, data, metadata, context));
+                  if (observer != null) {
+                    await dispatchBatchEvent(attempt, () => observer.handle(GraphEvents.CHAT_MODEL_STREAM, data, metadata, context));
+                  }
                 }
               } finally {
                 dispatchingChunk = false;

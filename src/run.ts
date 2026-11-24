@@ -95,6 +95,7 @@ import {
   findCallback,
   type CallbackEntry,
 } from '@/utils/callbacks';
+import { BATCHED_PROVIDER_EVENT_OWNER, ProviderTextProtectionError } from '@/protection/providerText';
 import {
   resolveLangfuseRuntimeScope,
   withLangfuseRuntimeScope,
@@ -108,7 +109,6 @@ import {
   createTitleRunnable,
 } from '@/utils/title';
 import { applyGraphRuntimeConfig } from '@/graphs/applyGraphRuntimeConfig';
-import { ProviderTextProtectionError } from '@/protection/providerText';
 import { LANGFUSE_OPERATION_METADATA_KEY } from '@/langfuseOperation';
 import { createTokenCounter, encodingForModel } from '@/utils/tokens';
 import { stampSyntheticProviderMessage } from '@/messages/provenance';
@@ -1636,10 +1636,11 @@ export class Run<_T extends t.BaseGraphState> {
         for await (const event of stream) {
           const { data, metadata, ...info } = event;
           const eventName: t.EventName = info.event;
-          // The provider attempt owns batched dispatch and its timeout; ignore the native echo.
+          // The batched attempt owns start and delta delivery and their deadline.
           if (
-            eventName === GraphEvents.CHAT_MODEL_STREAM &&
-            this.providerTextProtection?.batching != null
+            this.providerTextProtection?.batching != null &&
+            (eventName === GraphEvents.CHAT_MODEL_START || eventName === GraphEvents.CHAT_MODEL_STREAM) &&
+            metadata[BATCHED_PROVIDER_EVENT_OWNER] === true
           ) continue;
 
           if (CUSTOM_GRAPH_EVENTS.has(eventName)) {

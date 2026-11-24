@@ -709,3 +709,153 @@ it('rejects batching on a standard Run with more than one configured agent', asy
     })
   ).rejects.toMatchObject({ code: 'unsupported' });
 });
+
+it.each([false, true])(
+  'runs the registered start once before any batched delta (stall=%s)',
+  async (stall) => {
+    const entered = Promise.withResolvers<void>();
+    const start = Promise.withResolvers<void>();
+    const model = new Model(
+      (async function* () {
+        yield 'An approved first batch.';
+      })()
+    );
+    const handleStart = jest.fn(async () => {
+      entered.resolve();
+      await start.promise;
+    });
+    const handleDelta = jest.fn();
+    const run = await Run.create({
+      runId: 'batched-start',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: { provider: Providers.OPENAI },
+      },
+      customHandlers: {
+        [GraphEvents.CHAT_MODEL_START]: { handle: handleStart },
+        [GraphEvents.CHAT_MODEL_STREAM]: new ChatModelStreamHandler(),
+        [GraphEvents.ON_MESSAGE_DELTA]: { handle: handleDelta },
+      },
+      providerTextProtection: policy({
+        timeoutMs: 180,
+        batching: {
+          version: 1,
+          batchBytes: 16,
+          flushMs: 20,
+          maxMatchChars: marker.length,
+        },
+      }),
+    });
+    run.Graph!.overrideModel = model;
+    const task = run.processStream(
+      { messages: [new HumanMessage('go')] },
+      { version: 'v2' }
+    );
+    const result = stall
+      ? expect(task).rejects.toMatchObject({ code: 'timeout' })
+      : task;
+    try {
+      await entered.promise;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(handleStart).toHaveBeenCalledTimes(1);
+      expect(handleStart).toHaveBeenCalledWith(
+        GraphEvents.CHAT_MODEL_START,
+        { input: { messages: [[expect.objectContaining({ content: 'go' })]] } },
+        expect.objectContaining({ provider: Providers.OPENAI }),
+        run.Graph
+      );
+      expect(model.reads).toBe(0);
+      expect(handleDelta).not.toHaveBeenCalled();
+      if (!stall) start.resolve();
+      await result;
+      expect(handleStart).toHaveBeenCalledTimes(1);
+      if (stall) expect(handleDelta).not.toHaveBeenCalled();
+      else expect(handleDelta).toHaveBeenCalled();
+    } finally {
+      start.resolve();
+    }
+  }
+);
+
+it('does not retry or start a fallback when a registered delta handler rejects', async () => {
+  const fallback = jest.fn(() =>
+    Promise.resolve(new Response('', { status: 500 }))
+  );
+  const model = new Model(
+    (async function* () {
+      yield 'An approved first batch.';
+    })()
+  );
+  const handle = jest.fn(() => Promise.reject(new Error('host-only details')));
+  const run = await Run.create({
+    runId: 'batched-handler-error',
+    graphConfig: {
+      type: 'standard',
+      llmConfig: {
+        provider: Providers.OPENAI,
+        fallbacks: [
+          {
+            provider: Providers.OPENAI,
+            clientOptions: {
+              apiKey: 'test-only-fixture',
+              model: 'gpt-4o-mini',
+              configuration: { fetch: fallback },
+            },
+          },
+        ],
+      },
+    },
+    customHandlers: {
+      [GraphEvents.CHAT_MODEL_STREAM]: new ChatModelStreamHandler(),
+      [GraphEvents.ON_MESSAGE_DELTA]: { handle },
+    },
+    providerTextProtection: policy(),
+  });
+  run.Graph!.overrideModel = model;
+  const error: unknown = await run
+    .processStream({ messages: [new HumanMessage('go')] }, { version: 'v2' })
+    .catch((error: unknown) => error);
+  expect(error).toMatchObject({
+    code: 'unavailable',
+    message: 'Provider text protection: unavailable',
+  });
+  expect(handle).toHaveBeenCalledTimes(1);
+  expect(fallback).not.toHaveBeenCalled();
+  expect(model.signal?.reason).toMatchObject({ code: 'unavailable' });
+});
+
+it('still enforces the callback deadline after the provider reaches EOF', async () => {
+  const stalled = Promise.withResolvers<void>();
+  const eof = jest.fn();
+  const model = new Model(
+    (async function* () {
+      yield 'Approved final text.';
+      eof();
+    })()
+  );
+  const onChunk = jest.fn(() => stalled.promise);
+  try {
+    await expect(
+      attemptInvoke({
+        model,
+        provider: Providers.OPENAI,
+        messages: [],
+        providerTextProtection: policy({
+          timeoutMs: 160,
+          batching: {
+            version: 1,
+            batchBytes: 128,
+            flushMs: 80,
+            maxMatchChars: marker.length,
+          },
+        }),
+        onChunk,
+      })
+    ).rejects.toMatchObject({ code: 'timeout' });
+    expect(eof).toHaveBeenCalledTimes(1);
+    expect(onChunk).toHaveBeenCalledTimes(1);
+    expect(model.signal?.reason).toMatchObject({ code: 'timeout' });
+  } finally {
+    stalled.resolve();
+  }
+});
