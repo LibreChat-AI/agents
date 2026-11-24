@@ -16,6 +16,7 @@ export interface ProviderTextAdmissionSnapshot {
 /** Internal ownership lease; only the attempt that acquires it may release it. */
 export interface ProviderTextAdmissionLease {
   charge(bytes: number): void;
+  uncharge(bytes: number): void;
   retain(): void;
   release(): void;
 }
@@ -65,6 +66,11 @@ export class ProviderTextAdmission {
         this.bufferedBytes += amount;
         bytes += amount;
         if (retained) this.retainedBytes += amount;
+      },
+      uncharge: (amount): void => {
+        this.bufferedBytes -= amount;
+        bytes -= amount;
+        if (retained) this.retainedBytes -= amount;
       },
       retain: (): void => {
         if (retained || released) return;

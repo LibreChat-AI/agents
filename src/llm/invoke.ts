@@ -665,6 +665,9 @@ export async function attemptInvoke(
   const policy =
     params.providerTextProtection ?? params.context?.providerTextProtection;
   if (policy != null) validateProviderTextProtection(policy);
+  if (policy?.batching != null && params.context?.preemption != null) {
+    throw new ProviderTextProtectionError('unsupported');
+  }
   const provider = resolveAttemptProvider(params);
   const providerStampedConfig: RunnableConfig = {
     ...config,

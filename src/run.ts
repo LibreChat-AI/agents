@@ -635,6 +635,30 @@ export class Run<_T extends t.BaseGraphState> {
       throw new ToolResultProtectionError('incompatible');
     }
 
+    if (this.providerTextProtection?.batching != null) {
+      const graph = config.graphConfig;
+      const agents = 'agents' in graph ? graph.agents : [graph];
+      const agent = agents[0];
+      if (
+        graph.type === 'multi-agent' ||
+        agents.length !== 1 ||
+        config.preemption != null ||
+        config.humanInTheLoop?.enabled === true ||
+        graph.compileOptions?.checkpointer != null ||
+        (config.clientDelegatedToolNames?.length ?? 0) > 0 ||
+        (agent.tools?.length ?? 0) > 0 ||
+        (agent.graphTools?.length ?? 0) > 0 ||
+        (agent.toolDefinitions?.length ?? 0) > 0 ||
+        (agent.toolRegistry?.size ?? 0) > 0 ||
+        (agent.subagentConfigs?.length ?? 0) > 0 ||
+        agent.summarizationEnabled === true ||
+        agent.summarizeOnly === true ||
+        agent.initialSummary != null
+      ) {
+        throw new ProviderTextProtectionError('unsupported');
+      }
+    }
+
     /** Handle different graph types */
     if (config.graphConfig.type === 'multi-agent') {
       if (

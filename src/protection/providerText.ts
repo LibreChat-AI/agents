@@ -7,6 +7,20 @@ import { PreparedSubagentError } from '@/tools/preparedSubagents';
 import { StreamLimitExceededError } from '@/llm/streamLimits';
 
 export const PROVIDER_TEXT_PROTECTION_VERSION = 1;
+export const PROVIDER_TEXT_BATCHING_VERSION = 1;
+
+/**
+ * Opt in only when every rule is substring-local with a certified maximum match width.
+ * No anchors, surrounding-context assertions, or partial rewrites. Classification and
+ * inspection must be valid over overlapping UTF-16 windows. Omit this option to inspect
+ * the whole reply without releasing any prose early.
+ */
+export interface ProviderTextBatching {
+  readonly version: 1;
+  readonly batchBytes: number;
+  readonly flushMs: number;
+  readonly maxMatchChars: number;
+}
 
 export type ProviderTextProtectionErrorCode =
   | 'blocked'
@@ -43,6 +57,7 @@ export interface ProviderTextProtection {
   readonly maxAttemptBytes: number;
   /** Shared across all attempts using this policy, including child graphs. */
   readonly maxBufferedBytes: number;
+  readonly batching?: ProviderTextBatching;
   readonly classify: (content: string) => 'prose' | 'unsupported';
   readonly inspect: (input: {
     readonly version: 1;
@@ -214,6 +229,25 @@ export function validateProviderTextProtection(
   ) {
     throw new ProviderTextProtectionError('incompatible');
   }
+  const batch = policy.batching as
+    | (Omit<ProviderTextBatching, 'version'> & { version: number })
+    | null
+    | undefined;
+  if (
+    batch !== undefined &&
+    (batch == null ||
+      batch.version !== 1 ||
+      !Number.isSafeInteger(batch.batchBytes) ||
+      batch.batchBytes < 2 ||
+      !Number.isSafeInteger(batch.maxMatchChars) ||
+      batch.maxMatchChars < 1 ||
+      (batch.maxMatchChars - 1) * 2 > batch.batchBytes ||
+      batch.batchBytes > policy.maxAttemptBytes ||
+      !Number.isSafeInteger(batch.flushMs) ||
+      batch.flushMs < 1 ||
+      batch.flushMs > policy.timeoutMs)
+  )
+    throw new ProviderTextProtectionError('incompatible');
 }
 
 export interface ProviderTextAttemptOptions {
@@ -347,6 +381,17 @@ export class ProviderTextAttempt {
     this.charge(bytes);
   }
 
+  /** Release staged window charges after its raw references and inspector have settled. */
+  releaseWindow(bytes: number): void {
+    this.admission?.uncharge(bytes);
+    this.bytes -= bytes;
+    this.budget.bytes -= bytes;
+  }
+
+  stop(error: ProviderTextProtectionError): void {
+    this.controller.abort(error);
+  }
+
   observeChunk(): void {
     this.check();
     this.charge(128);
@@ -378,9 +423,8 @@ export class ProviderTextAttempt {
     });
   }
 
-  async release(): Promise<string> {
+  async inspect(content: string): Promise<string> {
     this.check();
-    const content = this.fragments.join('');
     if (!content) return '';
     let result: ProviderTextProtectionResult;
     try {
@@ -409,7 +453,15 @@ export class ProviderTextAttempt {
     this.check();
     const canonical = validateResult(result);
     this.check();
-    this.charge(canonical.length * 2);
+    return canonical;
+  }
+
+  async release(): Promise<string> {
+    this.check();
+    const content = this.fragments.join('');
+    if (!content) return '';
+    const canonical = await this.inspect(content);
+    this.retain(canonical.length * 2);
     return canonical;
   }
 

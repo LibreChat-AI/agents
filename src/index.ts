@@ -125,11 +125,13 @@ export * from './rerank';
 
 export {
   PROVIDER_TEXT_PROTECTION_VERSION,
+  PROVIDER_TEXT_BATCHING_VERSION,
   ProviderTextProtectionError,
   serializeProviderTextProtectionError,
   deserializeProviderTextProtectionError,
 } from './protection/providerText';
 export type {
+  ProviderTextBatching,
   ProviderTextProtection,
   ProviderTextProtectionResult,
   ProviderTextProtectionErrorCode,
