@@ -759,6 +759,7 @@ export async function attemptInvoke(
     getAttempt(signal?: AbortSignal): ProviderTextAttempt {
       const attempt = batchAttempt;
       if (attempt == null || batchEntered) throw new ProviderTextProtectionError('incompatible');
+      attempt.signal.throwIfAborted();
       attempt.check();
       unbindBatchSignal = attempt.followSignal(signal);
       batchEntered = true;

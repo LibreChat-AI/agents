@@ -1016,7 +1016,11 @@ it.each([false, true])(
 it('times out a stalled native start without opening the provider', async () => {
   const start = Promise.withResolvers<void>();
   const handleChatModelStart = jest.fn(() => start.promise);
-  const observer = BaseCallbackHandler.fromMethods({ handleChatModelStart });
+  const handleLLMError = jest.fn<void, [unknown]>();
+  const observer = BaseCallbackHandler.fromMethods({
+    handleChatModelStart,
+    handleLLMError,
+  });
   observer.awaitHandlers = true;
   const model = new Model(
     (async function* () {
@@ -1051,4 +1055,6 @@ it('times out a stalled native start without opening the provider', async () => 
   }
   await new Promise<void>((resolve) => setImmediate(resolve));
   expect(model.reads).toBe(0);
+  expect(handleLLMError).toHaveBeenCalledTimes(1);
+  expect(handleLLMError.mock.calls[0][0]).toMatchObject({ code: 'timeout' });
 });
