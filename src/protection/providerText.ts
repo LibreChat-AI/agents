@@ -323,6 +323,17 @@ export class ProviderTextAttempt {
     return this.controller.signal;
   }
 
+  followSignal(signal?: AbortSignal): (() => void) | undefined {
+    if (signal == null || signal === this.signal || signal === this.parent) return;
+    const abort = (): void => this.controller.abort(protectionAbortError(signal));
+    if (signal.aborted) {
+      abort();
+      this.check();
+    }
+    signal.addEventListener('abort', abort, { once: true });
+    return (): void => signal.removeEventListener('abort', abort);
+  }
+
   get hasPublishedText(): boolean {
     return this.publishedText;
   }

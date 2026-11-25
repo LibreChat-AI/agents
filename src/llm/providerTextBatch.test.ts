@@ -956,21 +956,74 @@ it('preserves a pre-publication block when a native error callback rejects', asy
   expect(model.signal?.reason).toMatchObject({ code: 'blocked' });
 });
 
-it('does not accept late native completion after the batch deadline', async () => {
-  const release = Promise.withResolvers<void>();
-  const handleLLMEnd = jest.fn(() => release.promise);
-  const observer = BaseCallbackHandler.fromMethods({ handleLLMEnd });
+it.each([false, true])(
+  'rejects late native completion (final delta stalled: %s)',
+  async (stallDelta) => {
+    const release = Promise.withResolvers<void>();
+    const handleLLMEnd = jest.fn(() => release.promise);
+    const observer = BaseCallbackHandler.fromMethods({ handleLLMEnd });
+    observer.awaitHandlers = true;
+    const model = new Model(
+      (async function* () {
+        yield 'Approved final text.';
+      })()
+    );
+    const onChunk = jest.fn(() => (stallDelta ? release.promise : undefined));
+    const onModelComplete = jest.fn();
+    // Settle the host callback only after the attempt is observed to time out.
+    // The watchdog bounds the regression on implementations that hang instead.
+    const watchdog = setTimeout(() => {
+      watchdogFired = true;
+      release.resolve();
+    }, 600);
+    let watchdogFired = false;
+    try {
+      await expect(
+        attemptInvoke(
+          {
+            model,
+            provider: Providers.OPENAI,
+            messages: [],
+            onChunk,
+            onModelComplete,
+            providerTextProtection: policy({
+              timeoutMs: 120,
+              batching: {
+                version: 1,
+                batchBytes: 128,
+                flushMs: 60,
+                maxMatchChars: marker.length,
+              },
+            }),
+          },
+          { callbacks: [observer] }
+        )
+      ).rejects.toMatchObject({ code: 'timeout' });
+      expect(watchdogFired).toBe(false);
+      expect(onChunk).toHaveBeenCalledTimes(1);
+      expect(handleLLMEnd).toHaveBeenCalledTimes(1);
+      expect(onModelComplete).not.toHaveBeenCalled();
+      expect(model.signal?.reason).toMatchObject({ code: 'timeout' });
+    } finally {
+      clearTimeout(watchdog);
+      release.resolve();
+    }
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(onModelComplete).not.toHaveBeenCalled();
+  }
+);
+
+it('times out a stalled native start without opening the provider', async () => {
+  const start = Promise.withResolvers<void>();
+  const handleChatModelStart = jest.fn(() => start.promise);
+  const observer = BaseCallbackHandler.fromMethods({ handleChatModelStart });
   observer.awaitHandlers = true;
   const model = new Model(
     (async function* () {
-      yield 'Approved final text.';
+      yield 'Approved text.';
     })()
   );
-  const onChunk = jest.fn();
-  const onModelComplete = jest.fn();
-  // Settle the host callback only after the attempt is observed to time out.
-  // The watchdog bounds the regression on implementations that hang instead.
-  const watchdog = setTimeout(release.resolve, 600);
+  const watchdog = setTimeout(start.resolve, 600);
   try {
     await expect(
       attemptInvoke(
@@ -978,8 +1031,6 @@ it('does not accept late native completion after the batch deadline', async () =
           model,
           provider: Providers.OPENAI,
           messages: [],
-          onChunk,
-          onModelComplete,
           providerTextProtection: policy({
             timeoutMs: 120,
             batching: {
@@ -993,14 +1044,11 @@ it('does not accept late native completion after the batch deadline', async () =
         { callbacks: [observer] }
       )
     ).rejects.toMatchObject({ code: 'timeout' });
-    expect(onChunk).toHaveBeenCalledTimes(1);
-    expect(handleLLMEnd).toHaveBeenCalledTimes(1);
-    expect(onModelComplete).not.toHaveBeenCalled();
-    expect(model.signal?.reason).toMatchObject({ code: 'timeout' });
+    expect(handleChatModelStart).toHaveBeenCalledTimes(1);
   } finally {
     clearTimeout(watchdog);
-    release.resolve();
+    start.resolve();
   }
   await new Promise<void>((resolve) => setImmediate(resolve));
-  expect(onModelComplete).not.toHaveBeenCalled();
+  expect(model.reads).toBe(0);
 });

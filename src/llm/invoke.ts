@@ -1,7 +1,7 @@
 import { concat } from '@langchain/core/utils/stream';
 import { AIMessageChunk } from '@langchain/core/messages';
 import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
-import { getCallbackManagerForConfig } from '@langchain/core/runnables';
+import { ensureConfig, getCallbackManagerForConfig } from '@langchain/core/runnables';
 import type { Serialized } from '@langchain/core/load/serializable';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { ChatGeneration } from '@langchain/core/outputs';
@@ -229,6 +229,26 @@ async function dispatchBatchEvent(
     attempt.stop(failure);
     throw failure;
   }
+}
+
+function withBatchCloseDeadline(
+  stream: AsyncIterable<AIMessageChunk>,
+  attempt: ProviderTextAttempt
+): AsyncIterable<AIMessageChunk> {
+  return {
+    [Symbol.asyncIterator](): AsyncIterator<AIMessageChunk> {
+      const iterator = stream[Symbol.asyncIterator]();
+      return {
+        next: iterator.next.bind(iterator),
+        async return(): Promise<IteratorResult<AIMessageChunk>> {
+          // LangChain's iterator close can wait on an in-flight native callback.
+          const closing = iterator.return?.();
+          if (closing != null) await attempt.wait(closing, false).catch(() => {});
+          return { done: true, value: undefined };
+        },
+      };
+    },
+  };
 }
 
 function captureBatchStart(context: InvokeContext | undefined): {
@@ -729,35 +749,24 @@ export async function attemptInvoke(
     },
   };
   const preparedRequest = resolveAttemptRequest(params, providerStampedConfig);
-  const batchController = policy?.batching == null ? undefined : new AbortController();
-  const batchStart = batchController == null ? undefined : captureBatchStart(params.context);
+  const batchConfig = policy?.batching == null ? undefined : ensureConfig(providerStampedConfig);
+  const batchStart = batchConfig == null ? undefined : captureBatchStart(params.context);
   let batchAttempt: ProviderTextAttempt | undefined;
-  let releaseBatch: (() => void) | undefined;
-  const batchInvocation =
-    batchController == null || policy == null
-      ? undefined
-      : {
-        createAttempt(parent?: AbortSignal): ProviderTextAttempt {
-          let attempt: ProviderTextAttempt;
-          try {
-            attempt = new ProviderTextAttempt(policy, parent);
-          } catch (error) {
-            batchController.abort(error);
-            throw error;
-          }
-          batchAttempt = attempt;
-          // Native runnable callbacks can outlive the provider iterator.
-          const finish = attempt.holdFinish();
-          const abort = (): void => batchController.abort(attempt.signal.reason);
-          attempt.signal.addEventListener('abort', abort, { once: true });
-          releaseBatch = (): void => {
-            attempt.signal.removeEventListener('abort', abort);
-            finish();
-          };
-          return attempt;
-        },
-        dispatchStart: batchStart?.dispatch,
-      };
+  let unbindBatchSignal: (() => void) | undefined;
+  let batchEntered = false;
+  let finishBatch: (() => void) | undefined;
+  const batchInvocation = batchConfig == null ? undefined : {
+    getAttempt(signal?: AbortSignal): ProviderTextAttempt {
+      const attempt = batchAttempt;
+      if (attempt == null || batchEntered) throw new ProviderTextProtectionError('incompatible');
+      attempt.check();
+      unbindBatchSignal = attempt.followSignal(signal);
+      batchEntered = true;
+      finishBatch = attempt.holdFinish();
+      return attempt;
+    },
+    dispatchStart: batchStart?.dispatch,
+  };
   const request =
     policy == null
       ? preparedRequest
@@ -776,16 +785,10 @@ export async function attemptInvoke(
     request.modelId ??
     (typeof configuredModel === 'string' ? configuredModel : undefined);
   const stampedConfig: RunnableConfig = {
-    ...providerStampedConfig,
-    ...(batchController != null && {
-      signal: composeAbortSignals(
-        providerStampedConfig.signal,
-        batchController.signal
-      ),
-    }),
-    ...(batchStart != null && { callbacks: appendCallbacks(providerStampedConfig.callbacks, [batchStart.callback]) }),
+    ...(batchConfig ?? providerStampedConfig),
+    ...(batchStart != null && { callbacks: appendCallbacks(batchConfig?.callbacks, [batchStart.callback]) }),
     metadata: {
-      ...providerStampedConfig.metadata,
+      ...(batchConfig ?? providerStampedConfig).metadata,
       ...(modelId == null
         ? {}
         : {
@@ -827,6 +830,12 @@ export async function attemptInvoke(
   const preparedAttempt = resolveGenerationKey(stampedConfig.metadata);
   prepared?.begin(preparedAttempt, stampedConfig);
   try {
+    if (batchConfig != null && policy != null) {
+      batchAttempt = new ProviderTextAttempt(policy, batchConfig.signal);
+      const attempt = batchAttempt;
+      finishBatch = (): void => attempt.finish();
+      stampedConfig.signal = attempt.signal;
+    }
     const result = await attemptInvokeBody(
       {
         request,
@@ -839,6 +848,7 @@ export async function attemptInvoke(
       },
       stampedConfig
     );
+    batchAttempt?.check();
     const calls = collectAttemptToolCalls(result.messages);
     prepared?.finish(preparedAttempt, calls);
     return result;
@@ -859,21 +869,24 @@ export async function attemptInvoke(
       !(error instanceof PreparedSubagentError)
     ) {
       // An awaited native error callback can replace the provider's error.
-      if (batchController?.signal.aborted === true) {
-        failure = batchController.signal.reason;
-      } else if (
-        batchAttempt?.hasPublishedText === true &&
-        !(error instanceof ProviderTextProtectionError)
-      ) {
-        const unavailable = new ProviderTextProtectionError('unavailable');
-        batchAttempt.stop(unavailable);
-        failure = unavailable;
+      if (batchAttempt != null) {
+        try {
+          batchAttempt.check();
+          if (batchAttempt.hasPublishedText && !(error instanceof ProviderTextProtectionError)) {
+            const unavailable = new ProviderTextProtectionError('unavailable');
+            batchAttempt.stop(unavailable);
+            failure = unavailable;
+          }
+        } catch (abort) {
+          failure = abort;
+        }
       }
     }
     prepared?.finish(preparedAttempt, undefined, failure);
     throw failure;
   } finally {
-    releaseBatch?.();
+    unbindBatchSignal?.();
+    finishBatch?.();
     const chunks = params.context?.eagerEventToolCallChunks;
     if (prepared != null && chunks != null) {
       const prefix = `prepared:${preparedAttempt}\u0000`;
@@ -1211,7 +1224,11 @@ async function attemptInvokeBody(
        * close below is conditional.
        */
       if (!evaluatePreemptRestart()) {
-        const stream = await model.stream(messagesForProvider, streamConfig);
+        const nativeStream = await model.stream(messagesForProvider, streamConfig);
+        const attempt = batchAttempt?.();
+        const stream = attempt == null
+          ? nativeStream
+          : withBatchCloseDeadline(nativeStream, attempt);
         if (onChunk) {
           const attemptMetadata = config.metadata as
             | Record<string, unknown>

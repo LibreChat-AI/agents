@@ -364,7 +364,7 @@ function usesInternalStreaming(
 }
 
 interface BatchInvocation {
-  createAttempt: (parent?: AbortSignal) => ProviderTextAttempt;
+  getAttempt: (signal?: AbortSignal) => ProviderTextAttempt;
   dispatchStart?: (attempt: ProviderTextAttempt) => void | Promise<void>;
 }
 
@@ -433,7 +433,7 @@ export function withProviderTextBoundary(
     runManager
   ): AsyncGenerator<ChatGenerationChunk> {
     const attempt =
-      batchInvocation?.createAttempt(options.signal) ??
+      batchInvocation?.getAttempt(options.signal) ??
       new ProviderTextAttempt(policy, options.signal);
     const candidate = new Candidate(attempt, provider);
     const batch = policy.batching == null ? undefined : new ProviderTextBatch(attempt, policy.batching, batchControls);
