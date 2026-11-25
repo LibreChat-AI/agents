@@ -590,7 +590,7 @@ const SKILL_MESSAGE_SOURCE = 'skill';
  * them; only the *adding* of new markers is suppressed. Detected via
  * `additional_kwargs.isMeta === true` or `additional_kwargs.source === 'skill'`.
  */
-function isSyntheticMetaMessage(message: MessageWithContent): boolean {
+export function isSyntheticMetaMessage(message: MessageWithContent): boolean {
   const { additional_kwargs: kwargs } = message as {
     additional_kwargs?: { isMeta?: unknown; source?: unknown };
   };

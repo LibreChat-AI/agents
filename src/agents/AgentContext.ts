@@ -26,6 +26,7 @@ import {
 } from '@/tools/CallerCapabilities';
 import {
   addTailCacheControl,
+  isSyntheticMetaMessage,
   stripAnthropicCacheControl,
   addCacheControlToStablePrefixMessages,
   buildAnthropicCacheControl,
@@ -47,6 +48,7 @@ import {
   ORIGINAL_CONTENT_MAX_CHARS,
   clampCalibrationRatio,
   createPruneMessages,
+  findLastIndex,
   syncBudgetDerivedFields,
 } from '@/messages';
 import {
@@ -1041,9 +1043,10 @@ export class AgentContext {
     }
 
     const promptCacheProvider = this.getPromptCacheProvider();
+    const anchorsOnUser = this.anchorsPromptCacheOnUser(promptCacheProvider);
     const shouldMoveDynamicInstructions =
       promptCacheProvider != null &&
-      stableInstructions !== '' &&
+      (stableInstructions !== '' || anchorsOnUser) &&
       dynamicInstructions !== '';
     const systemMessage = this.buildSystemMessage({
       stableInstructions,
@@ -1071,6 +1074,20 @@ export class AgentContext {
         this._summaryLocation === 'user_message' &&
         this.summaryText != null &&
         this.summaryText !== '';
+
+      if (anchorsOnUser && (shouldMoveDynamicInstructions || hasSummaryBody)) {
+        return [
+          ...prefix,
+          ...this.buildUserAnchoredPromptCacheBody({
+            messages,
+            dynamicInstructions: shouldMoveDynamicInstructions
+              ? dynamicInstructions
+              : '',
+            hasSummaryBody,
+            ttl: this.getPromptCacheTtl(promptCacheProvider),
+          }),
+        ];
+      }
 
       const bodyWithSummary =
         hasSummaryBody && promptCacheProvider == null
@@ -1175,6 +1192,61 @@ export class AgentContext {
     );
 
     return [...cacheablePrefix, ...tail, ...cacheableTrailingMessages];
+  }
+
+  /**
+   * OpenAI models behind OpenRouter read a cached prefix back only from a
+   * system, user or tool breakpoint (observed in live probes; an assistant
+   * breakpoint gives nothing to read), so their volatile context follows the
+   * latest user message, which carries the conversation breakpoint.
+   */
+  private anchorsPromptCacheOnUser(
+    promptCacheProvider: PromptCacheProvider | undefined
+  ): boolean {
+    if (promptCacheProvider !== Providers.OPENROUTER) {
+      return false;
+    }
+    const model = (this.clientOptions as { model?: string } | undefined)?.model;
+    return (
+      typeof model === 'string' && model.toLowerCase().startsWith('openai/')
+    );
+  }
+
+  private buildUserAnchoredPromptCacheBody({
+    messages,
+    dynamicInstructions,
+    hasSummaryBody,
+    ttl,
+  }: {
+    messages: BaseMessage[];
+    dynamicInstructions: string;
+    hasSummaryBody: boolean;
+    ttl?: PromptCacheTtl;
+  }): BaseMessage[] {
+    const summary = hasSummaryBody
+      ? [this.buildSummaryHumanMessage(undefined)]
+      : [];
+    const dynamic =
+      dynamicInstructions !== '' ? [new HumanMessage(dynamicInstructions)] : [];
+    const anchorIndex = findLastIndex(
+      messages,
+      (message) =>
+        message.getType() === 'human' && !isSyntheticMetaMessage(message)
+    );
+
+    if (anchorIndex < 0) {
+      return [...summary, ...addTailCacheControl(messages, ttl), ...dynamic];
+    }
+
+    const summaryFirst = this.summaryPrecedesMessages;
+    return [
+      ...(summaryFirst ? summary : []),
+      ...stripAnthropicCacheControl(messages.slice(0, anchorIndex)),
+      ...(!summaryFirst ? summary : []),
+      ...addTailCacheControl([messages[anchorIndex]], ttl),
+      ...dynamic,
+      ...addTailCacheControl(messages.slice(anchorIndex + 1), ttl),
+    ];
   }
 
   private getPromptCacheDynamicTailIndex(
@@ -1315,6 +1387,9 @@ export class AgentContext {
     }
 
     if (promptCacheProvider === Providers.OPENROUTER && !stableInstructions) {
+      if (shouldMoveDynamicInstructions) {
+        return undefined;
+      }
       return new SystemMessage(dynamicInstructions);
     }
 

@@ -16,17 +16,19 @@ const ttls = ['5m', '1h'] as const;
 function createContext(
   provider: (typeof providers)[number],
   ttl: PromptCacheTtl = '1h',
-  dynamicInstructions = 'Current timestamp: Monday'
+  dynamicInstructions = 'Current timestamp: Monday',
+  model = 'claude-sonnet-4-5',
+  instructions = 'Stable instructions'
 ): AgentContext {
   return AgentContext.fromConfig({
     agentId: 'cache-test',
     provider,
     clientOptions: {
-      model: 'claude-sonnet-4-5',
+      model,
       promptCache: true,
       promptCacheTtl: ttl,
     },
-    instructions: 'Stable instructions',
+    instructions,
     additional_instructions: dynamicInstructions,
   });
 }
@@ -49,6 +51,32 @@ function markedBlocks(message: BaseMessage): MessageContentComplex[] {
 
 function markedMessages(messages: BaseMessage[]): BaseMessage[] {
   return messages.filter((message) => markedBlocks(message).length > 0);
+}
+
+function shape(messages: BaseMessage[]): string[] {
+  return messages.map((message) => {
+    const marker = markedBlocks(message).length > 0 ? '*' : '';
+    const text = message.text === '' ? '' : `:${message.text.split('\n')[0]}`;
+    return `${message.getType()}${marker}${text}`;
+  });
+}
+
+async function openRouterPrompt(
+  model: string,
+  history: BaseMessage[],
+  instructions = 'Stable instructions'
+): Promise<BaseMessage[]> {
+  const runnable = createContext(
+    Providers.OPENROUTER,
+    '1h',
+    'Current timestamp: Monday',
+    model,
+    instructions
+  ).systemRunnable;
+  if (!runnable) {
+    throw new Error('Missing system runnable');
+  }
+  return runnable.invoke(history);
 }
 
 describe.each(providers)('%s dynamic prompt caching', (provider) => {
@@ -258,6 +286,222 @@ describe.each(providers)('%s dynamic prompt caching', (provider) => {
       'Result call_1'
     );
     expect(markedBlocks(result.at(-1)!)).toHaveLength(0);
+  });
+});
+
+describe('OpenRouter prompt-cache layout for OpenAI models', () => {
+  const model = 'openai/gpt-6-luna';
+
+  it('anchors the opening and latest user messages before dynamic context', async () => {
+    const opening = await openRouterPrompt('OPENAI/gpt-6-luna', [
+      new HumanMessage('Q1'),
+    ]);
+    expect(shape(opening)).toEqual([
+      'system*:Stable instructions',
+      'human*:Q1',
+      'human:Current timestamp: Monday',
+    ]);
+
+    const later = await openRouterPrompt(model, [
+      new HumanMessage('Q1'),
+      new AIMessage('A1'),
+      new HumanMessage('Q2'),
+    ]);
+    expect(shape(later)).toEqual([
+      'system*:Stable instructions',
+      'human:Q1',
+      'ai:A1',
+      'human*:Q2',
+      'human:Current timestamp: Monday',
+    ]);
+  });
+
+  it('keeps inherited markers off earlier messages and the breakpoint off assistants', async () => {
+    const history = [
+      new HumanMessage({
+        content: [
+          {
+            type: 'text',
+            text: 'Earlier',
+            cache_control: { type: 'ephemeral' },
+          },
+        ],
+      }),
+      new AIMessage({
+        content: [
+          {
+            type: 'text',
+            text: 'Earlier answer',
+            cache_control: { type: 'ephemeral' },
+          },
+        ],
+      }),
+      new HumanMessage('Latest'),
+      ...toolExchange('call_1'),
+    ];
+    const result = await openRouterPrompt(model, history);
+
+    expect(shape(result)).toEqual([
+      'system*:Stable instructions',
+      'human:Earlier',
+      'ai:Earlier answer',
+      'human*:Latest',
+      'human:Current timestamp: Monday',
+      'ai',
+      'tool*:Result call_1',
+    ]);
+    expect(markedMessages(result).map((message) => message.text)).toEqual([
+      'Stable instructions',
+      'Latest',
+      'Result call_1',
+    ]);
+  });
+
+  it('skips synthetic human messages when choosing the conversation breakpoint', async () => {
+    const result = await openRouterPrompt(model, [
+      new HumanMessage('User task'),
+      new HumanMessage({
+        content: 'Skill context',
+        additional_kwargs: { source: 'skill' },
+      }),
+      new HumanMessage({
+        content: 'Meta context',
+        additional_kwargs: { isMeta: true },
+      }),
+    ]);
+
+    expect(shape(result)).toEqual([
+      'system*:Stable instructions',
+      'human*:User task',
+      'human:Current timestamp: Monday',
+      'human:Skill context',
+      'human:Meta context',
+    ]);
+    expect(markedMessages(result).map((message) => message.text)).toEqual([
+      'Stable instructions',
+      'User task',
+    ]);
+  });
+
+  it('moves dynamic instructions out of the system slot without stable instructions', async () => {
+    const result = await openRouterPrompt(
+      model,
+      [new HumanMessage('Q1'), new AIMessage('A1'), new HumanMessage('Q2')],
+      ''
+    );
+
+    expect(shape(result)).toEqual([
+      'human:Q1',
+      'ai:A1',
+      'human*:Q2',
+      'human:Current timestamp: Monday',
+    ]);
+    expect(result.some((message) => message.getType() === 'system')).toBe(
+      false
+    );
+  });
+
+  it.each([true, false])(
+    'places a compaction summary according to precedesMessages=%s',
+    async (precedesMessages) => {
+      const ctx = createContext(
+        Providers.OPENROUTER,
+        '1h',
+        'Current timestamp: Monday',
+        model
+      );
+      ctx.setSummary('Compacted history', 10, { precedesMessages });
+      const result = await ctx.systemRunnable!.invoke([
+        new HumanMessage('Q1'),
+        new AIMessage('A1'),
+        new HumanMessage('Q2'),
+      ]);
+      const summaryIndex = result.findIndex((message) =>
+        message.text.includes('Compacted history')
+      );
+      const anchorIndex = result.findIndex((message) => message.text === 'Q2');
+
+      expect(summaryIndex).toBe(precedesMessages ? 1 : anchorIndex - 1);
+      expect(markedBlocks(result[anchorIndex])).toHaveLength(1);
+      expect(result[anchorIndex + 1].text).toBe('Current timestamp: Monday');
+    }
+  );
+
+  it('puts a summary before messages and dynamic context when history has no user message', async () => {
+    const ctx = createContext(
+      Providers.OPENROUTER,
+      '1h',
+      'Current timestamp: Monday',
+      model
+    );
+    ctx.setSummary('Compacted history', 10, { precedesMessages: false });
+    const history = [
+      new AIMessage('Earlier response'),
+      ...toolExchange('call_1'),
+    ];
+    const result = await ctx.systemRunnable!.invoke(history);
+    const body = result.slice(1);
+
+    expect(body[0].text).toContain('Compacted history');
+    expect(body.slice(1, -1).map((message) => message.text)).toEqual(
+      history.map((message) => message.text)
+    );
+    expect(markedBlocks(body.at(-2)!)).toHaveLength(1);
+    expect(body.at(-1)!.text).toBe('Current timestamp: Monday');
+    expect(markedMessages(result).map((message) => message.text)).toEqual([
+      'Stable instructions',
+      'Result call_1',
+    ]);
+  });
+
+  it('repeats the previous turn\'s prompt prefix through its marked user message', async () => {
+    const previous = await openRouterPrompt(model, [
+      new HumanMessage('Q1'),
+      new AIMessage('A1'),
+      new HumanMessage('Q2'),
+    ]);
+    const next = await openRouterPrompt(model, [
+      new HumanMessage('Q1'),
+      new AIMessage('A1'),
+      new HumanMessage('Q2'),
+      new AIMessage('A2'),
+      new HumanMessage('Q3'),
+    ]);
+    const anchor = previous.findIndex((message) => message.text === 'Q2');
+
+    expect(markedBlocks(previous[anchor])).toHaveLength(1);
+    expect(JSON.stringify(next.slice(0, anchor))).toBe(
+      JSON.stringify(previous.slice(0, anchor))
+    );
+    expect(next[anchor].getType()).toBe('human');
+    expect(next[anchor].text).toBe('Q2');
+  });
+
+  it('keeps other OpenRouter models on their existing layouts', async () => {
+    const claude = await openRouterPrompt('anthropic/claude-haiku-5.5', [
+      new HumanMessage('Q1'),
+      new AIMessage('A1'),
+      new HumanMessage('Q2'),
+    ]);
+    expect(shape(claude)).toEqual([
+      'system*:Stable instructions',
+      'human:Q1',
+      'ai*:A1',
+      'human:Current timestamp: Monday',
+      'human*:Q2',
+    ]);
+
+    const gemini = await openRouterPrompt(
+      'google/gemini-4-neon',
+      [new HumanMessage('Q1'), new AIMessage('A1'), new HumanMessage('Q2')],
+      ''
+    );
+    expect(shape(gemini)).toEqual([
+      'system:Current timestamp: Monday',
+      'human:Q1',
+      'ai:A1',
+      'human*:Q2',
+    ]);
   });
 });
 
