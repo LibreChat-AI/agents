@@ -737,27 +737,27 @@ export async function attemptInvoke(
     batchController == null || policy == null
       ? undefined
       : {
-          createAttempt(parent?: AbortSignal): ProviderTextAttempt {
-            let attempt: ProviderTextAttempt;
-            try {
-              attempt = new ProviderTextAttempt(policy, parent);
-            } catch (error) {
-              batchController.abort(error);
-              throw error;
-            }
-            batchAttempt = attempt;
-            // Native runnable callbacks can outlive the provider iterator.
-            const finish = attempt.holdFinish();
-            const abort = (): void => batchController.abort(attempt.signal.reason);
-            attempt.signal.addEventListener('abort', abort, { once: true });
-            releaseBatch = (): void => {
-              attempt.signal.removeEventListener('abort', abort);
-              finish();
-            };
-            return attempt;
-          },
-          dispatchStart: batchStart?.dispatch,
-        };
+        createAttempt(parent?: AbortSignal): ProviderTextAttempt {
+          let attempt: ProviderTextAttempt;
+          try {
+            attempt = new ProviderTextAttempt(policy, parent);
+          } catch (error) {
+            batchController.abort(error);
+            throw error;
+          }
+          batchAttempt = attempt;
+          // Native runnable callbacks can outlive the provider iterator.
+          const finish = attempt.holdFinish();
+          const abort = (): void => batchController.abort(attempt.signal.reason);
+          attempt.signal.addEventListener('abort', abort, { once: true });
+          releaseBatch = (): void => {
+            attempt.signal.removeEventListener('abort', abort);
+            finish();
+          };
+          return attempt;
+        },
+        dispatchStart: batchStart?.dispatch,
+      };
   const request =
     policy == null
       ? preparedRequest
