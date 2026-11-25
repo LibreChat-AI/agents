@@ -859,7 +859,9 @@ it.each(['registered delta', 'native end'])(
     }
     expect(model.signal?.reason).toMatchObject({ code: 'unavailable' });
     expect(
-      run.Graph!.getRunMessages()?.some((message) => message._getType() === 'ai')
+      run
+        .Graph!.getRunMessages()
+        ?.some((message) => message._getType() === 'ai')
     ).not.toBe(true);
   }
 );
@@ -898,4 +900,107 @@ it('still enforces the callback deadline after the provider reaches EOF', async 
   } finally {
     stalled.resolve();
   }
+});
+
+it('preserves a pre-publication block when a native error callback rejects', async () => {
+  const fallback = jest.fn(() =>
+    Promise.resolve(new Response('', { status: 500 }))
+  );
+  const handle = jest.fn();
+  const handleLLMError = jest.fn(() =>
+    Promise.reject(new Error('host-only details'))
+  );
+  const observer = BaseCallbackHandler.fromMethods({ handleLLMError });
+  observer.raiseError = true;
+  observer.awaitHandlers = true;
+  const model = new Model(
+    (async function* () {
+      yield marker;
+    })()
+  );
+  const run = await Run.create({
+    runId: 'batched-error-handler',
+    graphConfig: {
+      type: 'standard',
+      llmConfig: {
+        provider: Providers.OPENAI,
+        fallbacks: [
+          {
+            provider: Providers.OPENAI,
+            clientOptions: {
+              apiKey: 'test-only-fixture',
+              model: 'gpt-4o-mini',
+              maxRetries: 0,
+              configuration: { fetch: fallback },
+            },
+          },
+        ],
+      },
+    },
+    customHandlers: {
+      [GraphEvents.CHAT_MODEL_STREAM]: new ChatModelStreamHandler(),
+      [GraphEvents.ON_MESSAGE_DELTA]: { handle },
+    },
+    providerTextProtection: policy(),
+  });
+  run.Graph!.overrideModel = model;
+  await expect(
+    run.processStream(
+      { messages: [new HumanMessage('go')] },
+      { version: 'v2', callbacks: [observer] }
+    )
+  ).rejects.toMatchObject({ code: 'blocked' });
+  expect(handleLLMError).toHaveBeenCalledTimes(1);
+  expect(fallback).not.toHaveBeenCalled();
+  expect(handle).not.toHaveBeenCalled();
+  expect(model.signal?.reason).toMatchObject({ code: 'blocked' });
+});
+
+it('does not accept late native completion after the batch deadline', async () => {
+  const release = Promise.withResolvers<void>();
+  const handleLLMEnd = jest.fn(() => release.promise);
+  const observer = BaseCallbackHandler.fromMethods({ handleLLMEnd });
+  observer.awaitHandlers = true;
+  const model = new Model(
+    (async function* () {
+      yield 'Approved final text.';
+    })()
+  );
+  const onChunk = jest.fn();
+  const onModelComplete = jest.fn();
+  // Settle the host callback only after the attempt is observed to time out.
+  // The watchdog bounds the regression on implementations that hang instead.
+  const watchdog = setTimeout(release.resolve, 600);
+  try {
+    await expect(
+      attemptInvoke(
+        {
+          model,
+          provider: Providers.OPENAI,
+          messages: [],
+          onChunk,
+          onModelComplete,
+          providerTextProtection: policy({
+            timeoutMs: 120,
+            batching: {
+              version: 1,
+              batchBytes: 128,
+              flushMs: 60,
+              maxMatchChars: marker.length,
+            },
+          }),
+        },
+        { callbacks: [observer] }
+      )
+    ).rejects.toMatchObject({ code: 'timeout' });
+    expect(onChunk).toHaveBeenCalledTimes(1);
+    expect(handleLLMEnd).toHaveBeenCalledTimes(1);
+    expect(onModelComplete).not.toHaveBeenCalled();
+    expect(model.signal?.reason).toMatchObject({ code: 'timeout' });
+  } finally {
+    clearTimeout(watchdog);
+    release.resolve();
+  }
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  expect(onModelComplete).not.toHaveBeenCalled();
 });

@@ -7,9 +7,9 @@ import type { RunnableConfig } from '@langchain/core/runnables';
 import type { ChatGeneration } from '@langchain/core/outputs';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type { BaseMessage } from '@langchain/core/messages';
-import type { ProviderTextProtection, ProviderTextAttempt } from '@/protection/providerText';
 import type { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import type { PreparedProviderRequest } from '@/llm/prepareProviderRequest';
+import type { ProviderTextProtection } from '@/protection/providerText';
 import type { ContextOverflowContext } from '@/utils/errors';
 import type { StreamLimitState } from '@/llm/streamLimits';
 import type { PreemptAction } from '@/llm/preempt';
@@ -28,6 +28,7 @@ import {
   BATCHED_PROVIDER_EVENT_OWNER,
   validateProviderTextProtection,
   ProviderTextProtectionError,
+  ProviderTextAttempt,
   createProviderTextRestartCancellation,
   isProviderTextRestartCancellation,
 } from '@/protection/providerText';
@@ -728,20 +729,46 @@ export async function attemptInvoke(
     },
   };
   const preparedRequest = resolveAttemptRequest(params, providerStampedConfig);
-  const batchStart = policy?.batching == null ? undefined : captureBatchStart(params.context);
+  const batchController = policy?.batching == null ? undefined : new AbortController();
+  const batchStart = batchController == null ? undefined : captureBatchStart(params.context);
   let batchAttempt: ProviderTextAttempt | undefined;
   let releaseBatch: (() => void) | undefined;
-  const onBatchAttempt = policy?.batching == null ? undefined : (attempt: ProviderTextAttempt): void | Promise<void> => {
-    batchAttempt = attempt;
-    releaseBatch = attempt.holdFinish();
-    return batchStart?.dispatch(attempt);
-  };
+  const batchInvocation =
+    batchController == null || policy == null
+      ? undefined
+      : {
+          createAttempt(parent?: AbortSignal): ProviderTextAttempt {
+            let attempt: ProviderTextAttempt;
+            try {
+              attempt = new ProviderTextAttempt(policy, parent);
+            } catch (error) {
+              batchController.abort(error);
+              throw error;
+            }
+            batchAttempt = attempt;
+            // Native runnable callbacks can outlive the provider iterator.
+            const finish = attempt.holdFinish();
+            const abort = (): void => batchController.abort(attempt.signal.reason);
+            attempt.signal.addEventListener('abort', abort, { once: true });
+            releaseBatch = (): void => {
+              attempt.signal.removeEventListener('abort', abort);
+              finish();
+            };
+            return attempt;
+          },
+          dispatchStart: batchStart?.dispatch,
+        };
   const request =
     policy == null
       ? preparedRequest
       : {
         ...preparedRequest,
-        model: withProviderTextBoundary(preparedRequest.model, policy, provider, onBatchAttempt),
+        model: withProviderTextBoundary(
+          preparedRequest.model,
+          policy,
+          provider,
+          batchInvocation
+        ),
       };
   const configuredModel =
     providerStampedConfig.metadata?.[Constants.INVOKED_MODEL];
@@ -750,6 +777,12 @@ export async function attemptInvoke(
     (typeof configuredModel === 'string' ? configuredModel : undefined);
   const stampedConfig: RunnableConfig = {
     ...providerStampedConfig,
+    ...(batchController != null && {
+      signal: composeAbortSignals(
+        providerStampedConfig.signal,
+        batchController.signal
+      ),
+    }),
     ...(batchStart != null && { callbacks: appendCallbacks(providerStampedConfig.callbacks, [batchStart.callback]) }),
     metadata: {
       ...providerStampedConfig.metadata,
@@ -769,7 +802,7 @@ export async function attemptInvoke(
        * rebuild that already attributes the serving provider.
        */
       [STREAM_LIMIT_ATTEMPT_KEY]: ++streamLimitAttemptSeq,
-      ...(onBatchAttempt != null && { [BATCHED_PROVIDER_EVENT_OWNER]: true }),
+      ...(batchInvocation != null && { [BATCHED_PROVIDER_EVENT_OWNER]: true }),
     },
   };
   const rawLeaseTarget = params.context ?? params.streamLimitState;
@@ -802,7 +835,7 @@ export async function attemptInvoke(
         onModelComplete: params.onModelComplete,
         preemptAgentId: params.preemptAgentId,
         providerTextProtection: policy,
-        ...(onBatchAttempt != null && { batchAttempt: (): ProviderTextAttempt | undefined => batchAttempt }),
+        ...(batchInvocation != null && { batchAttempt: (): ProviderTextAttempt | undefined => batchAttempt }),
       },
       stampedConfig
     );
@@ -821,20 +854,19 @@ export async function attemptInvoke(
       throw cancelled;
     }
     let failure = error;
-    // Native completion can fail outside the guarded iterator, after publication.
     if (
-      batchAttempt?.hasPublishedText === true &&
-      !(error instanceof ProviderTextProtectionError) &&
       !(error instanceof StreamLimitExceededError) &&
       !(error instanceof PreparedSubagentError)
     ) {
-      try {
-        batchAttempt.check();
-        const unavailable = new ProviderTextProtectionError('unavailable');
-        batchAttempt.stop(unavailable);
-        failure = unavailable;
-      } catch (abort) {
-        failure = abort;
+      // An awaited native error callback can replace the provider's error.
+      if (batchController?.signal.aborted === true) {
+        failure = batchController.signal.reason;
+      } else if (
+        batchAttempt?.hasPublishedText === true &&
+        !(error instanceof ProviderTextProtectionError)
+      ) {
+        failure = new ProviderTextProtectionError('unavailable');
+        batchAttempt.stop(failure);
       }
     }
     prepared?.finish(preparedAttempt, undefined, failure);
@@ -1548,6 +1580,7 @@ async function attemptInvokeBody(
       );
     }
 
+    batchAttempt?.()?.check();
     if (finalChunk == null) {
       throw new Error(EMPTY_PROVIDER_RESPONSE_MESSAGE);
     }

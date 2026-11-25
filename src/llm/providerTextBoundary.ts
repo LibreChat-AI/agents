@@ -363,19 +363,24 @@ function usesInternalStreaming(
   return false;
 }
 
+interface BatchInvocation {
+  createAttempt: (parent?: AbortSignal) => ProviderTextAttempt;
+  dispatchStart?: (attempt: ProviderTextAttempt) => void | Promise<void>;
+}
+
 /** Clone only known runnable shells. Never mutate a shared provider or its callback configuration. */
 export function withProviderTextBoundary(
   model: ChatModel,
   policy: ProviderTextProtection,
   provider?: ProviderName,
-  onBatchAttempt?: (attempt: ProviderTextAttempt) => void | Promise<void>
+  batchInvocation?: BatchInvocation
 ): ChatModel {
   const protectedModel = clone(model);
   if (model instanceof RunnableBinding) {
     assertBindingShell(model);
     Object.defineProperty(protectedModel, 'bound', {
       value: withProviderTextBoundary(
-        model.bound as ChatModel, policy, provider, onBatchAttempt
+        model.bound as ChatModel, policy, provider, batchInvocation
       ),
     });
     return protectedModel;
@@ -427,14 +432,16 @@ export function withProviderTextBoundary(
     options,
     runManager
   ): AsyncGenerator<ChatGenerationChunk> {
-    const attempt = new ProviderTextAttempt(policy, options.signal);
+    const attempt =
+      batchInvocation?.createAttempt(options.signal) ??
+      new ProviderTextAttempt(policy, options.signal);
     const candidate = new Candidate(attempt, provider);
     const batch = policy.batching == null ? undefined : new ProviderTextBatch(attempt, policy.batching, batchControls);
     let completed = false;
     let source: AsyncGenerator<ChatGenerationChunk> | undefined;
     try {
       if (batch != null) {
-        const ready = onBatchAttempt?.(attempt);
+        const ready = batchInvocation?.dispatchStart?.(attempt);
         if (ready != null) await ready;
       }
       source = model._streamResponseChunks(
