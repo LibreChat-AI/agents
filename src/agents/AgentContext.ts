@@ -34,6 +34,7 @@ import {
   resolvePromptCacheTtl,
   resolveBedrockPromptCacheTtl,
   cloneMessage,
+  getCacheControl,
   type PromptCacheTtl,
 } from '@/messages/cache';
 import {
@@ -50,6 +51,7 @@ import {
   createPruneMessages,
   findLastIndex,
   getProviderMessageProvenance,
+  isSyntheticProviderContextMessage,
   syncBudgetDerivedFields,
 } from '@/messages';
 import {
@@ -98,10 +100,39 @@ type ProgrammaticToolInstructionTarget = {
  */
 const MAX_SUMMARIZATION_FAILURES = 3;
 
-/** A user-role carrier of tool output, such as the payload `projectArtifactPayload` appends. */
-function isToolPayloadMessage(message: BaseMessage): boolean {
+/**
+ * User-role context the SDK builds, such as tool history folded for an agent
+ * without tools or the payload `projectArtifactPayload` appends for a tool's
+ * images. Provenance survives the copies legacy formatting makes: a fold's
+ * starts with a synthetic part, and a tool payload's names no user part.
+ */
+function isProviderContextMessage(message: BaseMessage): boolean {
+  if (isSyntheticProviderContextMessage(message)) {
+    return true;
+  }
   const parts = getProviderMessageProvenance(message)?.parts ?? [];
-  return parts.length > 0 && parts.every((part) => part.attribution === 'tool');
+  return (
+    parts.length > 0 &&
+    (parts.some((part) => part.attribution === 'synthetic') ||
+      !parts.some((part) => part.attribution === 'user'))
+  );
+}
+
+/** The user's own message: not a cue, a skill prime or context the SDK built. */
+function isUserMessage(message: BaseMessage): boolean {
+  return (
+    message.getType() === 'human' &&
+    !isSyntheticMetaMessage(message) &&
+    !isProviderContextMessage(message)
+  );
+}
+
+/** Whether a message carries a cache breakpoint. */
+function hasCacheMarker(message: BaseMessage): boolean {
+  return (
+    Array.isArray(message.content) &&
+    message.content.some((block) => getCacheControl(block) != null)
+  );
 }
 
 /**
@@ -1082,7 +1113,7 @@ export class AgentContext {
         this.summaryText != null &&
         this.summaryText !== '';
 
-      if (anchorsOnUser && (shouldMoveDynamicInstructions || hasSummaryBody)) {
+      if (anchorsOnUser) {
         return [
           ...prefix,
           ...this.buildUserAnchoredPromptCacheBody({
@@ -1235,13 +1266,7 @@ export class AgentContext {
       : [];
     const dynamic =
       dynamicInstructions !== '' ? [new HumanMessage(dynamicInstructions)] : [];
-    const anchorIndex = findLastIndex(
-      messages,
-      (message) =>
-        message.getType() === 'human' &&
-        !isSyntheticMetaMessage(message) &&
-        !isToolPayloadMessage(message)
-    );
+    const anchorIndex = findLastIndex(messages, isUserMessage);
 
     if (anchorIndex < 0) {
       return [...summary, ...this.markPromptCacheTail(messages, ttl), ...dynamic];
@@ -1259,21 +1284,30 @@ export class AgentContext {
   }
 
   /**
-   * Assistant breakpoints give these models nothing to read, so a tail that
-   * ends on an assistant message, such as a predecessor agent's reply before
-   * a handoff cue, carries none.
+   * Marks the last message these models can read a cached prefix back from.
+   * Assistant breakpoints give them nothing to read, so the marker passes
+   * over assistant messages, such as a predecessor agent's reply before a
+   * handoff cue, and a tail with nothing else to mark carries none.
    */
   private markPromptCacheTail(
     messages: BaseMessage[],
     ttl?: PromptCacheTtl
   ): BaseMessage[] {
-    const index = findLastIndex(
-      messages,
-      (message) => !isSyntheticMetaMessage(message)
-    );
-    return index >= 0 && messages[index].getType() === 'ai'
-      ? stripAnthropicCacheControl(messages)
-      : addTailCacheControl(messages, ttl);
+    const stripped = stripAnthropicCacheControl(messages);
+    for (let index = stripped.length - 1; index >= 0; index--) {
+      if (stripped[index].getType() === 'ai') {
+        continue;
+      }
+      const [marked] = addTailCacheControl([stripped[index]], ttl);
+      if (hasCacheMarker(marked)) {
+        return [
+          ...stripped.slice(0, index),
+          marked,
+          ...stripped.slice(index + 1),
+        ];
+      }
+    }
+    return stripped;
   }
 
   private getPromptCacheDynamicTailIndex(

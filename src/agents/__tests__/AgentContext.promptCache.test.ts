@@ -7,6 +7,8 @@ import type { PromptCacheTtl } from '@/messages/cache';
 import { _convertMessagesToAnthropicPayload } from '@/llm/anthropic/utils/message_inputs';
 import { partitionAndMarkAnthropicToolCache } from '@/messages/anthropicToolCache';
 import { _convertMessagesToOpenAIParams } from '@/llm/openai/utils';
+import { foldToolBlocksForToollessAgent } from '@/messages/format';
+import { formatContentStrings } from '@/messages/content';
 import { projectArtifactPayload } from '@/messages/core';
 import { AgentContext } from '../AgentContext';
 import { Providers } from '@/common';
@@ -65,12 +67,13 @@ function shape(messages: BaseMessage[]): string[] {
 async function openRouterPrompt(
   model: string,
   history: BaseMessage[],
-  instructions = 'Stable instructions'
+  instructions = 'Stable instructions',
+  dynamicInstructions = 'Current timestamp: Monday'
 ): Promise<BaseMessage[]> {
   const runnable = createContext(
     Providers.OPENROUTER,
     '1h',
-    'Current timestamp: Monday',
+    dynamicInstructions,
     model,
     instructions
   ).systemRunnable;
@@ -415,22 +418,112 @@ describe('OpenRouter prompt-cache layout for OpenAI models', () => {
     ]);
   });
 
+  it('anchors on the user message rather than tool history folded for a tool-less agent', async () => {
+    const expected = [
+      'system*:Stable instructions',
+      'human*:Q1',
+      'human:Current timestamp: Monday',
+      'human*:[Previous tool interaction]',
+    ];
+    const histories = [
+      [new HumanMessage('Q1'), ...toolExchange('call_1')],
+      [
+        new HumanMessage('Q1'),
+        toolExchange('call_1')[0],
+        /** Anthropic-shaped history carries the result on a user-role message. */
+        new HumanMessage({
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'call_1',
+              content: 'Result call_1',
+            },
+          ],
+        }),
+      ],
+    ];
+
+    for (const history of histories) {
+      const folded = foldToolBlocksForToollessAgent(history);
+      expect(shape(await openRouterPrompt(model, folded))).toEqual(expected);
+      /** Legacy content formatting copies the folded message. */
+      expect(
+        shape(await openRouterPrompt(model, formatContentStrings(folded)))
+      ).toEqual(expected);
+    }
+  });
+
   it('leaves an assistant tail before a handoff cue unmarked', async () => {
-    const result = await openRouterPrompt(model, [
+    const history = [
       new HumanMessage('Q1'),
       new AIMessage('Predecessor answer'),
       new HumanMessage({
         content: 'Continue as the receiving agent.',
         additional_kwargs: { isMeta: true, source: 'routing' },
       }),
-    ]);
+    ];
 
-    expect(shape(result)).toEqual([
+    expect(shape(await openRouterPrompt(model, history))).toEqual([
       'system*:Stable instructions',
       'human*:Q1',
       'human:Current timestamp: Monday',
       'ai:Predecessor answer',
       'human:Continue as the receiving agent.',
+    ]);
+    expect(
+      shape(await openRouterPrompt(model, history, 'Stable instructions', ''))
+    ).toEqual([
+      'system*:Stable instructions',
+      'human*:Q1',
+      'ai:Predecessor answer',
+      'human:Continue as the receiving agent.',
+    ]);
+  });
+
+  it('never marks an assistant message when the newest tool result is empty', async () => {
+    const call = (id: string, content = ''): AIMessage =>
+      new AIMessage({
+        content,
+        tool_calls: [{ id, name: 'search', args: {} }],
+      });
+    const empty = (id: string): ToolMessage =>
+      new ToolMessage({ content: '', tool_call_id: id });
+
+    const handoff = await openRouterPrompt(model, [
+      new HumanMessage('Q1'),
+      new AIMessage('Predecessor answer'),
+      new HumanMessage({
+        content: 'Continue as the receiving agent.',
+        additional_kwargs: { isMeta: true, source: 'routing' },
+      }),
+      call('call_1'),
+      empty('call_1'),
+    ]);
+    expect(shape(handoff)).toEqual([
+      'system*:Stable instructions',
+      'human*:Q1',
+      'human:Current timestamp: Monday',
+      'ai:Predecessor answer',
+      'human:Continue as the receiving agent.',
+      'ai',
+      'tool',
+    ]);
+
+    const steps = await openRouterPrompt(model, [
+      new HumanMessage('Q1'),
+      call('call_1', 'Checking'),
+      new ToolMessage({ content: 'Result 1', tool_call_id: 'call_1' }),
+      call('call_2', 'One more'),
+      empty('call_2'),
+    ]);
+    expect(shape(steps)).toEqual([
+      'system*:Stable instructions',
+      'human*:Q1',
+      'human:Current timestamp: Monday',
+      'ai:Checking',
+      'tool*:Result 1',
+      'ai:One more',
+      'tool',
     ]);
   });
 
