@@ -162,6 +162,24 @@ describe('Vertex Hydrogen native history', () => {
     }
   );
 
+  test.each([
+    ['role-only', { role: 'model' }, 'STOP'],
+    ['empty', {}, 'MALFORMED_FUNCTION_CALL'],
+  ])(
+    'streams an empty chunk for %s content without parts @scenario:vertex-partless-content',
+    (_label, content, finishReason) => {
+      const partless = structuredClone(response);
+      if (!('candidates' in partless.data))
+        throw new Error('Invalid response fixture');
+      Object.assign(partless.data.candidates[0], { content, finishReason });
+      const generation = createModel().decodeGeneration(partless);
+      expect(generation?.text).toBe('');
+      expect(generation?.generationInfo?.usage_metadata).toMatchObject({
+        total_tokens: 9,
+      });
+    }
+  );
+
   test.each([false, true])(
     'retains signed text and unsigned parallel calls from stream=%s through request formatting @scenario:vertex-native-history',
     async (stream) => {
