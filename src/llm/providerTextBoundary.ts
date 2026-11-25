@@ -455,6 +455,7 @@ export function withProviderTextBoundary(
           : candidate.strip(next.value, batch);
         if (chunk == null) continue;
         attempt.check();
+        if (batch != null && chunk.text !== '') attempt.markTextPublished();
         yield chunk;
         if (batch != null) attempt.check();
         const notification = runManager?.handleLLMNewToken(
@@ -471,6 +472,7 @@ export function withProviderTextBoundary(
       const canonical = batch == null ? await candidate.canonical() : batchChunk(await batch.flush(true));
       attempt.check();
       if (canonical != null) {
+        if (batch != null) attempt.markTextPublished();
         yield canonical;
         attempt.check();
         const notification = runManager?.handleLLMNewToken(

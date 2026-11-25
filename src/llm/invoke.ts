@@ -820,8 +820,25 @@ export async function attemptInvoke(
       prepared?.finish(preparedAttempt, undefined, cancelled);
       throw cancelled;
     }
-    prepared?.finish(preparedAttempt, undefined, error);
-    throw error;
+    let failure = error;
+    // Native completion can fail outside the guarded iterator, after publication.
+    if (
+      batchAttempt?.hasPublishedText === true &&
+      !(error instanceof ProviderTextProtectionError) &&
+      !(error instanceof StreamLimitExceededError) &&
+      !(error instanceof PreparedSubagentError)
+    ) {
+      try {
+        batchAttempt.check();
+        const unavailable = new ProviderTextProtectionError('unavailable');
+        batchAttempt.stop(unavailable);
+        failure = unavailable;
+      } catch (abort) {
+        failure = abort;
+      }
+    }
+    prepared?.finish(preparedAttempt, undefined, failure);
+    throw failure;
   } finally {
     releaseBatch?.();
     const chunks = params.context?.eagerEventToolCallChunks;

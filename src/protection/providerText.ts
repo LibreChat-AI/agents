@@ -268,6 +268,7 @@ export class ProviderTextAttempt {
   private readonly timer: ReturnType<typeof setTimeout>;
   private readonly abort: () => void;
   private finished = false;
+  private publishedText = false;
   private finishHeld = false;
   private finishPending = false;
   private readonly admission?: ProviderTextAdmissionLease;
@@ -320,6 +321,14 @@ export class ProviderTextAttempt {
 
   get signal(): AbortSignal {
     return this.controller.signal;
+  }
+
+  get hasPublishedText(): boolean {
+    return this.publishedText;
+  }
+
+  markTextPublished(): void {
+    this.publishedText = true;
   }
 
   check(): void {

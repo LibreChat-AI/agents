@@ -2,6 +2,7 @@ import { createServer } from 'node:http';
 import { MemorySaver } from '@langchain/langgraph';
 import { ChatGenerationChunk } from '@langchain/core/outputs';
 import { FakeListChatModel } from '@langchain/core/utils/testing';
+import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
 import { AIMessageChunk, HumanMessage } from '@langchain/core/messages';
 import { BaseChatModel } from '@langchain/core/language_models/chat_models';
 import type { BaseMessage } from '@langchain/core/messages';
@@ -777,52 +778,91 @@ it.each([false, true])(
   }
 );
 
-it('does not retry or start a fallback when a registered delta handler rejects', async () => {
-  const fallback = jest.fn(() =>
-    Promise.resolve(new Response('', { status: 500 }))
-  );
-  const model = new Model(
-    (async function* () {
-      yield 'An approved first batch.';
-    })()
-  );
-  const handle = jest.fn(() => Promise.reject(new Error('host-only details')));
-  const run = await Run.create({
-    runId: 'batched-handler-error',
-    graphConfig: {
-      type: 'standard',
-      llmConfig: {
-        provider: Providers.OPENAI,
-        fallbacks: [
-          {
-            provider: Providers.OPENAI,
-            clientOptions: {
-              apiKey: 'test-only-fixture',
-              model: 'gpt-4o-mini',
-              configuration: { fetch: fallback },
+it.each(['registered delta', 'native end'])(
+  'does not retry or start a fallback when a %s callback rejects',
+  async (kind) => {
+    const fallback = jest.fn(() =>
+      Promise.resolve(new Response('', { status: 500 }))
+    );
+    const text = 'An approved first batch.';
+    const model = new Model(
+      (async function* () {
+        yield text;
+      })()
+    );
+    const handle = jest.fn<
+      ReturnType<EventHandler['handle']>,
+      Parameters<EventHandler['handle']>
+    >();
+    const handleLLMEnd = jest.fn(() =>
+      Promise.reject(new Error('host-only details'))
+    );
+    const observer = BaseCallbackHandler.fromMethods({ handleLLMEnd });
+    observer.raiseError = true;
+    observer.awaitHandlers = true;
+    if (kind === 'registered delta') {
+      handle.mockRejectedValue(new Error('host-only details'));
+    }
+    const run = await Run.create({
+      runId: 'batched-handler-error',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: Providers.OPENAI,
+          fallbacks: [
+            {
+              provider: Providers.OPENAI,
+              clientOptions: {
+                apiKey: 'test-only-fixture',
+                model: 'gpt-4o-mini',
+                maxRetries: 0,
+                configuration: { fetch: fallback },
+              },
             },
-          },
-        ],
+          ],
+        },
       },
-    },
-    customHandlers: {
-      [GraphEvents.CHAT_MODEL_STREAM]: new ChatModelStreamHandler(),
-      [GraphEvents.ON_MESSAGE_DELTA]: { handle },
-    },
-    providerTextProtection: policy(),
-  });
-  run.Graph!.overrideModel = model;
-  const error: unknown = await run
-    .processStream({ messages: [new HumanMessage('go')] }, { version: 'v2' })
-    .catch((error: unknown) => error);
-  expect(error).toMatchObject({
-    code: 'unavailable',
-    message: 'Provider text protection: unavailable',
-  });
-  expect(handle).toHaveBeenCalledTimes(1);
-  expect(fallback).not.toHaveBeenCalled();
-  expect(model.signal?.reason).toMatchObject({ code: 'unavailable' });
-});
+      customHandlers: {
+        [GraphEvents.CHAT_MODEL_STREAM]: new ChatModelStreamHandler(),
+        [GraphEvents.ON_MESSAGE_DELTA]: { handle },
+      },
+      providerTextProtection: policy(),
+    });
+    run.Graph!.overrideModel = model;
+    const error: unknown = await run
+      .processStream(
+        { messages: [new HumanMessage('go')] },
+        {
+          version: 'v2',
+          ...(kind === 'native end' && { callbacks: [observer] }),
+        }
+      )
+      .catch((error: unknown) => error);
+    expect(fallback).not.toHaveBeenCalled();
+    expect(error).toMatchObject({
+      code: 'unavailable',
+      message: 'Provider text protection: unavailable',
+    });
+    expect(handle).toHaveBeenCalledTimes(kind === 'native end' ? 2 : 1);
+    expect(handleLLMEnd).toHaveBeenCalledTimes(kind === 'native end' ? 1 : 0);
+    if (kind === 'native end') {
+      const visible = handle.mock.calls.flatMap(([, data]) => {
+        const { delta } = data as MessageDeltaEvent;
+        return (delta.content ?? []).map((part) =>
+          part.type === 'text' ? part.text : ''
+        );
+      });
+      expect(visible.join('')).toBe(text);
+      expect(handle.mock.invocationCallOrder[0]).toBeLessThan(
+        handleLLMEnd.mock.invocationCallOrder[0]
+      );
+    }
+    expect(model.signal?.reason).toMatchObject({ code: 'unavailable' });
+    expect(
+      run.Graph!.getRunMessages()?.some((message) => message._getType() === 'ai')
+    ).not.toBe(true);
+  }
+);
 
 it('still enforces the callback deadline after the provider reaches EOF', async () => {
   const stalled = Promise.withResolvers<void>();
