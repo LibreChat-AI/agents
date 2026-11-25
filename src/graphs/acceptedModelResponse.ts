@@ -262,6 +262,25 @@ function snapshotToolRecords(
   return result;
 }
 
+function snapshotMessageKwargs(value: unknown): object {
+  if (value === null || typeof value !== 'object' || types.isProxy(value)) {
+    throw new InvalidModelToolCallError('Invalid model response metadata');
+  }
+  const copy: object = Object.create(Object.getPrototypeOf(value));
+  for (const key of Reflect.ownKeys(value)) {
+    const field = Object.getOwnPropertyDescriptor(value, key)!;
+    if (typeof key === 'string') {
+      if (!('value' in field)) {
+        throw new InvalidModelToolCallError('Invalid model response metadata');
+      }
+      field.configurable = true;
+      field.writable = true;
+    }
+    Object.defineProperty(copy, key, field);
+  }
+  return copy;
+}
+
 /** Providers can mutate and re-yield records. Inspect a per-emission snapshot,
  * leaving their originals intact, but keep producer/consumer charge identity.
  */
@@ -274,33 +293,21 @@ export function snapshotValidatedModelChunk(
       'Accepted model response contains non-serializable tool calls'
     );
   }
-  const descriptors = Object.getOwnPropertyDescriptors(message);
-  // Object.freeze on the provider result must not freeze the SDK's own
-  // envelope. LangChain updates IDs, lc_kwargs and response metadata later.
-  for (const descriptor of Object.values(descriptors)) {
-    descriptor.configurable = true;
-    if ('value' in descriptor) descriptor.writable = true;
-  }
-  const kwargs = descriptors.lc_kwargs;
-  if (Object.hasOwn(descriptors, 'lc_kwargs') && 'value' in kwargs) {
-    const value: unknown = kwargs.value;
-    if (value === null || typeof value !== 'object' || types.isProxy(value)) {
-      throw new InvalidModelToolCallError('Invalid model response metadata');
-    }
-    const fields = Object.getOwnPropertyDescriptors(value);
-    for (const field of Object.values(fields)) {
-      if (!('value' in field)) {
-        throw new InvalidModelToolCallError('Invalid model response metadata');
-      }
+  const copy = Object.create(Object.getPrototypeOf(message)) as AIMessageChunk;
+  const source: object = Object(message);
+  // Thaw string-keyed fields for LangChain; preserve symbol descriptors as-is.
+  for (const key of Reflect.ownKeys(source)) {
+    const field = Object.getOwnPropertyDescriptor(source, key)!;
+    if (typeof key === 'string') {
       field.configurable = true;
-      field.writable = true;
+      if ('value' in field) {
+        field.writable = true;
+        if (key === 'lc_kwargs')
+          field.value = snapshotMessageKwargs(field.value);
+      }
     }
-    kwargs.value = Object.create(Object.getPrototypeOf(value), fields);
+    Object.defineProperty(copy, key, field);
   }
-  const copy = Object.create(
-    Object.getPrototypeOf(message),
-    descriptors
-  ) as AIMessageChunk;
   detachValidatedModelToolCalls(copy, partial);
   if (partial) linkStreamLimitCanonical(copy, message);
   return copy;
