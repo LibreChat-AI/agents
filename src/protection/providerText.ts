@@ -7,6 +7,21 @@ import { PreparedSubagentError } from '@/tools/preparedSubagents';
 import { StreamLimitExceededError } from '@/llm/streamLimits';
 
 export const PROVIDER_TEXT_PROTECTION_VERSION = 1;
+export const PROVIDER_TEXT_BATCHING_VERSION = 1;
+export const BATCHED_PROVIDER_EVENT_OWNER = 'librechat:batched-provider-event-owner';
+
+/**
+ * Opt in only when every rule is substring-local with a certified maximum match width.
+ * No anchors, surrounding-context assertions, or partial rewrites. Classification and
+ * inspection must be valid over overlapping UTF-16 windows. Omit this option to inspect
+ * the whole reply without releasing any prose early.
+ */
+export interface ProviderTextBatching {
+  readonly version: 1;
+  readonly batchBytes: number;
+  readonly flushMs: number;
+  readonly maxMatchChars: number;
+}
 
 export type ProviderTextProtectionErrorCode =
   | 'blocked'
@@ -43,6 +58,7 @@ export interface ProviderTextProtection {
   readonly maxAttemptBytes: number;
   /** Shared across all attempts using this policy, including child graphs. */
   readonly maxBufferedBytes: number;
+  readonly batching?: ProviderTextBatching;
   readonly classify: (content: string) => 'prose' | 'unsupported';
   readonly inspect: (input: {
     readonly version: 1;
@@ -214,6 +230,25 @@ export function validateProviderTextProtection(
   ) {
     throw new ProviderTextProtectionError('incompatible');
   }
+  const batch = policy.batching as
+    | (Omit<ProviderTextBatching, 'version'> & { version: number })
+    | null
+    | undefined;
+  if (
+    batch !== undefined &&
+    (batch == null ||
+      batch.version !== 1 ||
+      !Number.isSafeInteger(batch.batchBytes) ||
+      batch.batchBytes < 2 ||
+      !Number.isSafeInteger(batch.maxMatchChars) ||
+      batch.maxMatchChars < 1 ||
+      (batch.maxMatchChars - 1) * 2 > batch.batchBytes ||
+      batch.batchBytes > policy.maxAttemptBytes ||
+      !Number.isSafeInteger(batch.flushMs) ||
+      batch.flushMs < 1 ||
+      batch.flushMs > policy.timeoutMs)
+  )
+    throw new ProviderTextProtectionError('incompatible');
 }
 
 export interface ProviderTextAttemptOptions {
@@ -233,6 +268,9 @@ export class ProviderTextAttempt {
   private readonly timer: ReturnType<typeof setTimeout>;
   private readonly abort: () => void;
   private finished = false;
+  private publishedText = false;
+  private finishHeld = false;
+  private finishPending = false;
   private readonly admission?: ProviderTextAdmissionLease;
 
   constructor(
@@ -283,6 +321,25 @@ export class ProviderTextAttempt {
 
   get signal(): AbortSignal {
     return this.controller.signal;
+  }
+
+  followSignal(signal?: AbortSignal): (() => void) | undefined {
+    if (signal == null || signal === this.signal || signal === this.parent) return;
+    const abort = (): void => this.controller.abort(protectionAbortError(signal));
+    if (signal.aborted) {
+      abort();
+      this.check();
+    }
+    signal.addEventListener('abort', abort, { once: true });
+    return (): void => signal.removeEventListener('abort', abort);
+  }
+
+  get hasPublishedText(): boolean {
+    return this.publishedText;
+  }
+
+  markTextPublished(): void {
+    this.publishedText = true;
   }
 
   check(): void {
@@ -347,13 +404,25 @@ export class ProviderTextAttempt {
     this.charge(bytes);
   }
 
+  /** Release staged window charges after its raw references and inspector have settled. */
+  releaseWindow(bytes: number): void {
+    this.admission?.uncharge(bytes);
+    this.bytes -= bytes;
+    this.budget.bytes -= bytes;
+  }
+
+  stop(error: ProviderTextProtectionError): void {
+    this.controller.abort(error);
+  }
+
   observeChunk(): void {
     this.check();
     this.charge(128);
   }
 
-  async wait<T>(work: Promise<T>): Promise<T> {
-    this.pending.add(work);
+  /** Approved-text callbacks can stop blocking cleanup without retaining raw capacity. */
+  async wait<T>(work: Promise<T>, retain = true): Promise<T> {
+    if (retain) this.pending.add(work);
     return new Promise<T>((resolve, reject) => {
       const abort = (): void => {
         this.signal.removeEventListener('abort', abort);
@@ -363,7 +432,7 @@ export class ProviderTextAttempt {
       if (this.signal.aborted) abort();
       const settle = (): void => {
         this.signal.removeEventListener('abort', abort);
-        this.pending.delete(work);
+        if (retain) this.pending.delete(work);
       };
       void work.then(
         (value) => {
@@ -378,9 +447,8 @@ export class ProviderTextAttempt {
     });
   }
 
-  async release(): Promise<string> {
+  async inspect(content: string): Promise<string> {
     this.check();
-    const content = this.fragments.join('');
     if (!content) return '';
     let result: ProviderTextProtectionResult;
     try {
@@ -409,12 +477,33 @@ export class ProviderTextAttempt {
     this.check();
     const canonical = validateResult(result);
     this.check();
-    this.charge(canonical.length * 2);
     return canonical;
+  }
+
+  async release(): Promise<string> {
+    this.check();
+    const content = this.fragments.join('');
+    if (!content) return '';
+    const canonical = await this.inspect(content);
+    this.retain(canonical.length * 2);
+    return canonical;
+  }
+
+  /** Native prefetch can end the iterator while the invocation still dispatches its final chunk. */
+  holdFinish(): () => void {
+    this.finishHeld = true;
+    return (): void => {
+      this.finishHeld = false;
+      if (this.finishPending) this.finish();
+    };
   }
 
   finish(): void {
     if (this.finished) return;
+    if (this.finishHeld) {
+      this.finishPending = true;
+      return;
+    }
     this.finished = true;
     clearTimeout(this.timer);
     try {

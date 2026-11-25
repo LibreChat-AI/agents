@@ -66,6 +66,7 @@ export function createHostProviderTextService(options: {
   const identity = boundIdentity(options.identity);
   const policy = options.policy;
   validateProviderTextProtection(policy);
+  if (policy.batching != null) throw new ProviderTextProtectionError('unsupported');
   const { admission, inspectionTimeoutMs } = options;
   if (inspectionTimeoutMs !== undefined)
     validateProviderTextTimeout(inspectionTimeoutMs);

@@ -95,6 +95,7 @@ import {
   findCallback,
   type CallbackEntry,
 } from '@/utils/callbacks';
+import { BATCHED_PROVIDER_EVENT_OWNER, ProviderTextProtectionError } from '@/protection/providerText';
 import {
   resolveLangfuseRuntimeScope,
   withLangfuseRuntimeScope,
@@ -108,7 +109,6 @@ import {
   createTitleRunnable,
 } from '@/utils/title';
 import { applyGraphRuntimeConfig } from '@/graphs/applyGraphRuntimeConfig';
-import { ProviderTextProtectionError } from '@/protection/providerText';
 import { LANGFUSE_OPERATION_METADATA_KEY } from '@/langfuseOperation';
 import { createTokenCounter, encodingForModel } from '@/utils/tokens';
 import { stampSyntheticProviderMessage } from '@/messages/provenance';
@@ -633,6 +633,14 @@ export class Run<_T extends t.BaseGraphState> {
       config.graphConfig.toolResultProtection != null
     ) {
       throw new ToolResultProtectionError('incompatible');
+    }
+
+    if (
+      this.providerTextProtection?.batching != null &&
+      (config.humanInTheLoop?.enabled === true ||
+        ('agents' in config.graphConfig && config.graphConfig.agents.length !== 1))
+    ) {
+      throw new ProviderTextProtectionError('unsupported');
     }
 
     /** Handle different graph types */
@@ -1628,6 +1636,12 @@ export class Run<_T extends t.BaseGraphState> {
         for await (const event of stream) {
           const { data, metadata, ...info } = event;
           const eventName: t.EventName = info.event;
+          // The batched attempt owns start and delta delivery and their deadline.
+          if (
+            this.providerTextProtection?.batching != null &&
+            (eventName === GraphEvents.CHAT_MODEL_START || eventName === GraphEvents.CHAT_MODEL_STREAM) &&
+            metadata[BATCHED_PROVIDER_EVENT_OWNER] === true
+          ) continue;
 
           if (CUSTOM_GRAPH_EVENTS.has(eventName)) {
             continue;

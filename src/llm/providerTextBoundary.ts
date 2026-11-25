@@ -21,6 +21,7 @@ import {
 import { isProviderTextInput } from '@/protection/providerTextInput';
 import { createProviderTextChunk } from '@/llm/providerTextChunk';
 import { preserveModelInvocationContext } from '@/llm/invocation';
+import { ProviderTextBatch } from '@/llm/providerTextBatch';
 import { getChatModelClass } from '@/llm/providers';
 import { Providers } from '@/common';
 
@@ -136,6 +137,52 @@ function validateMetadata(metadata: AIMessageChunk['response_metadata'], google 
   }
 }
 
+/** The staged frame may contain provider controls as well as raw prose. */
+function batchControls(generation: ChatGenerationChunk): number {
+  const message = generation.message as AIMessageChunk;
+  if (
+    (message.tool_calls?.length ?? 0) > 0 ||
+    (message.tool_call_chunks?.length ?? 0) > 0 ||
+    (message.invalid_tool_calls?.length ?? 0) > 0 ||
+    Object.hasOwn(message.response_metadata, 'output') ||
+    generation.text !== message.content
+  ) throw new ProviderTextProtectionError('unsupported');
+
+  for (const key of Object.keys(message.additional_kwargs)) {
+    if (!Object.hasOwn(additionalControls, key) || additionalControls[key]?.(message.additional_kwargs[key]) !== true) {
+      throw new ProviderTextProtectionError('unsupported');
+    }
+  }
+  validateMetadata(message.response_metadata);
+  validateMetadata(generation.generationInfo ?? {});
+  if (!numericMetadata(message.usage_metadata)) throw new ProviderTextProtectionError('unsupported');
+
+  let bytes = 256 + ((message.id?.length ?? 0) + (message.name?.length ?? 0)) * 2;
+  for (const record of [message.additional_kwargs, message.response_metadata, generation.generationInfo]) {
+    if (record == null) continue;
+    for (const [key, value] of Object.entries(record)) {
+      bytes += key.length * 2 + metadataBytes(value);
+    }
+  }
+  return bytes + metadataBytes(message.usage_metadata);
+}
+
+/** Called only for already validated scalar or bounded numeric metadata. */
+function metadataBytes(value: unknown): number {
+  if (typeof value === 'string') return value.length * 2 + 16;
+  if (typeof value !== 'object' || value == null) return 16;
+  let bytes = 64;
+  for (const [key, entry] of Object.entries(value)) bytes += key.length * 2 + metadataBytes(entry);
+  return bytes;
+}
+
+function batchChunk(text: string): ChatGenerationChunk | undefined {
+  return text === '' ? undefined : new ChatGenerationChunk({
+    text,
+    message: new AIMessageChunk({ content: text }),
+  });
+}
+
 class Candidate {
   private block?: TextBlock;
   private stringContent = false;
@@ -144,10 +191,23 @@ class Candidate {
 
   constructor(private readonly attempt: ProviderTextAttempt, private readonly provider?: ProviderName) { this.responses = new ResponsesTextProjection(attempt); }
 
-  strip(generation: ChatGenerationChunk): ChatGenerationChunk {
+  strip(generation: ChatGenerationChunk): ChatGenerationChunk;
+  strip(generation: ChatGenerationChunk, batch: ProviderTextBatch | undefined): ChatGenerationChunk | undefined;
+  strip(generation: ChatGenerationChunk, batch?: ProviderTextBatch): ChatGenerationChunk | undefined {
     const message = generation.message;
     if (!(message instanceof AIMessageChunk))
       throw new ProviderTextProtectionError('unsupported');
+    if (batch != null) {
+      if (typeof message.content !== 'string') throw new ProviderTextProtectionError('unsupported');
+      batch.append(message.content);
+      if (message.id == null && message.name == null && message.usage_metadata == null &&
+          Object.keys(message.additional_kwargs).length === 0 &&
+          Object.keys(message.response_metadata).length === 0 &&
+          Object.keys(generation.generationInfo ?? {}).length === 0) return undefined;
+      return new ChatGenerationChunk({
+        text: '', message: copyMessage(message, ''), generationInfo: generation.generationInfo,
+      });
+    }
     this.attempt.observeChunk();
     for (const key of Object.keys(message.additional_kwargs)) {
       if (additionalKeys.has(key)) continue;
@@ -303,17 +363,25 @@ function usesInternalStreaming(
   return false;
 }
 
+interface BatchInvocation {
+  getAttempt: (signal?: AbortSignal) => ProviderTextAttempt;
+  dispatchStart?: (attempt: ProviderTextAttempt) => void | Promise<void>;
+}
+
 /** Clone only known runnable shells. Never mutate a shared provider or its callback configuration. */
 export function withProviderTextBoundary(
   model: ChatModel,
   policy: ProviderTextProtection,
-  provider?: ProviderName
+  provider?: ProviderName,
+  batchInvocation?: BatchInvocation
 ): ChatModel {
   const protectedModel = clone(model);
   if (model instanceof RunnableBinding) {
     assertBindingShell(model);
     Object.defineProperty(protectedModel, 'bound', {
-      value: withProviderTextBoundary(model.bound as ChatModel, policy, provider),
+      value: withProviderTextBoundary(
+        model.bound as ChatModel, policy, provider, batchInvocation
+      ),
     });
     return protectedModel;
   }
@@ -330,7 +398,8 @@ export function withProviderTextBoundary(
       value: withProviderTextBoundary(
         steps[steps.length - 1] as ChatModel,
         policy,
-        provider
+        provider,
+        batchInvocation
       ),
     });
     return protectedModel;
@@ -354,16 +423,27 @@ export function withProviderTextBoundary(
   if (model.disableStreaming && usesInternalStreaming(model)) {
     throw new ProviderTextProtectionError('unsupported');
   }
+  if (policy.batching != null && provider !== Providers.OPENAI) {
+    throw new ProviderTextProtectionError('unsupported');
+  }
   const protectedChat = clone(model);
   protectedChat._streamResponseChunks = async function* (
     messages,
     options,
     runManager
   ): AsyncGenerator<ChatGenerationChunk> {
-    const attempt = new ProviderTextAttempt(policy, options.signal);
+    const attempt =
+      batchInvocation?.getAttempt(options.signal) ??
+      new ProviderTextAttempt(policy, options.signal);
     const candidate = new Candidate(attempt, provider);
+    const batch = policy.batching == null ? undefined : new ProviderTextBatch(attempt, policy.batching, batchControls);
+    let completed = false;
     let source: AsyncGenerator<ChatGenerationChunk> | undefined;
     try {
+      if (batch != null) {
+        const ready = batchInvocation?.dispatchStart?.(attempt);
+        if (ready != null) await ready;
+      }
       source = model._streamResponseChunks(
         messages,
         preserveModelInvocationContext(
@@ -374,26 +454,35 @@ export function withProviderTextBoundary(
         undefined
       );
       for (;;) {
-        const next = await attempt.wait(source.next());
+        const next = batch == null ? await attempt.wait(source.next()) : await batch.read(source);
         attempt.check();
-        if (next.done === true) break;
-        const chunk = candidate.strip(next.value);
+        if (next !== 'flush' && next.done === true) break;
+        const chunk = next === 'flush'
+          ? batchChunk(await batch!.flush(false))
+          : candidate.strip(next.value, batch);
+        if (chunk == null) continue;
+        attempt.check();
+        if (batch != null && chunk.text !== '') attempt.markTextPublished();
         yield chunk;
-        await runManager?.handleLLMNewToken(
-          '',
+        if (batch != null) attempt.check();
+        const notification = runManager?.handleLLMNewToken(
+          chunk.text,
           undefined,
           undefined,
           undefined,
           undefined,
           { chunk }
         );
+        if (batch != null && notification != null) await attempt.wait(notification, false);
+        else await notification;
       }
-      const canonical = await candidate.canonical();
+      const canonical = batch == null ? await candidate.canonical() : batchChunk(await batch.flush(true));
       attempt.check();
       if (canonical != null) {
+        if (batch != null) attempt.markTextPublished();
         yield canonical;
         attempt.check();
-        await runManager?.handleLLMNewToken(
+        const notification = runManager?.handleLLMNewToken(
           canonical.text,
           undefined,
           undefined,
@@ -401,8 +490,23 @@ export function withProviderTextBoundary(
           undefined,
           { chunk: canonical }
         );
+        if (batch != null && notification != null) await attempt.wait(notification, false);
+        else await notification;
       }
+      completed = true;
+    } catch (error) {
+      if (batch == null) throw error;
+      attempt.check();
+      const safe = error instanceof ProviderTextProtectionError
+        ? error
+        : new ProviderTextProtectionError('unavailable');
+      attempt.stop(safe);
+      throw safe;
     } finally {
+      if (batch != null) {
+        batch.close();
+        if (!completed) attempt.stop(new ProviderTextProtectionError('cancelled'));
+      }
       try {
         if (source != null) void attempt.wait(source.return(undefined)).catch(() => {});
       } finally {
@@ -413,7 +517,9 @@ export function withProviderTextBoundary(
   protectedChat._streamChatModelEvents =
     BaseChatModel.prototype._streamChatModelEvents;
   protectedChat._generate = async function (messages, options, runManager): Promise<ChatResult> {
-    if (usesInternalStreaming(model, options)) throw new ProviderTextProtectionError('unsupported');
+    if (policy.batching != null || usesInternalStreaming(model, options)) {
+      throw new ProviderTextProtectionError('unsupported');
+    }
     const attempt = new ProviderTextAttempt(policy, options.signal);
     try {
       const result = await attempt.wait(

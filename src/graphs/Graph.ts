@@ -1661,6 +1661,25 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     this.streamLimits = resolveStreamLimits(streamLimits);
     if (providerTextProtection != null)
       validateProviderTextProtection(providerTextProtection);
+    if (providerTextProtection?.batching != null) {
+      const agent = agents[0];
+      if (
+        this.isMultiAgentGraph() ||
+        agents.length !== 1 ||
+        preemption != null ||
+        (clientDelegatedToolNames?.length ?? 0) > 0 ||
+        (agent.tools?.length ?? 0) > 0 ||
+        (agent.graphTools?.length ?? 0) > 0 ||
+        (agent.toolDefinitions?.length ?? 0) > 0 ||
+        (agent.toolRegistry?.size ?? 0) > 0 ||
+        (agent.subagentConfigs?.length ?? 0) > 0 ||
+        agent.summarizationEnabled === true ||
+        agent.summarizeOnly === true ||
+        agent.initialSummary != null
+      ) {
+        throw new ProviderTextProtectionError('unsupported');
+      }
+    }
     this.providerTextProtection = providerTextProtection;
     const toolResultGate =
       toolResultProtection == null
@@ -5951,6 +5970,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
   createWorkflow(): t.CompiledStateWorkflow {
     this.hasCompiledCheckpointer = this.compileOptions?.checkpointer != null;
+    if (this.hasCompiledCheckpointer && this.providerTextProtection?.batching != null) {
+      throw new ProviderTextProtectionError('unsupported');
+    }
     const agentNode = this.createAgentNode(this.defaultAgentId);
     const StateAnnotation = Annotation.Root({
       messages: Annotation<BaseMessage[]>({
