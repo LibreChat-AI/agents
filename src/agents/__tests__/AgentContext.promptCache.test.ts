@@ -7,6 +7,7 @@ import type { PromptCacheTtl } from '@/messages/cache';
 import { _convertMessagesToAnthropicPayload } from '@/llm/anthropic/utils/message_inputs';
 import { partitionAndMarkAnthropicToolCache } from '@/messages/anthropicToolCache';
 import { _convertMessagesToOpenAIParams } from '@/llm/openai/utils';
+import { projectArtifactPayload } from '@/messages/core';
 import { AgentContext } from '../AgentContext';
 import { Providers } from '@/common';
 
@@ -380,6 +381,56 @@ describe('OpenRouter prompt-cache layout for OpenAI models', () => {
     expect(markedMessages(result).map((message) => message.text)).toEqual([
       'Stable instructions',
       'User task',
+    ]);
+  });
+
+  it('anchors on the user message rather than a tool artifact payload', async () => {
+    const history = projectArtifactPayload([
+      new HumanMessage('Q1'),
+      new AIMessage({
+        content: '',
+        tool_calls: [{ id: 'call_1', name: 'chart', args: {} }],
+      }),
+      new ToolMessage({
+        content: 'Chart 1',
+        tool_call_id: 'call_1',
+        artifact: {
+          content: [
+            {
+              type: 'image_url',
+              image_url: { url: 'data:image/png;base64,AAAA' },
+            },
+          ],
+        },
+      }),
+    ]);
+
+    expect(shape(await openRouterPrompt(model, history))).toEqual([
+      'system*:Stable instructions',
+      'human*:Q1',
+      'human:Current timestamp: Monday',
+      'ai',
+      'tool:Tool response is included in the next message as a Human message',
+      'human*:Chart 1',
+    ]);
+  });
+
+  it('leaves an assistant tail before a handoff cue unmarked', async () => {
+    const result = await openRouterPrompt(model, [
+      new HumanMessage('Q1'),
+      new AIMessage('Predecessor answer'),
+      new HumanMessage({
+        content: 'Continue as the receiving agent.',
+        additional_kwargs: { isMeta: true, source: 'routing' },
+      }),
+    ]);
+
+    expect(shape(result)).toEqual([
+      'system*:Stable instructions',
+      'human*:Q1',
+      'human:Current timestamp: Monday',
+      'ai:Predecessor answer',
+      'human:Continue as the receiving agent.',
     ]);
   });
 

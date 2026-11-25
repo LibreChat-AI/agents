@@ -49,6 +49,7 @@ import {
   clampCalibrationRatio,
   createPruneMessages,
   findLastIndex,
+  getProviderMessageProvenance,
   syncBudgetDerivedFields,
 } from '@/messages';
 import {
@@ -96,6 +97,12 @@ type ProgrammaticToolInstructionTarget = {
  * bounds spend as much as it bounds the compaction loop.
  */
 const MAX_SUMMARIZATION_FAILURES = 3;
+
+/** A user-role carrier of tool output, such as the payload `projectArtifactPayload` appends. */
+function isToolPayloadMessage(message: BaseMessage): boolean {
+  const parts = getProviderMessageProvenance(message)?.parts ?? [];
+  return parts.length > 0 && parts.every((part) => part.attribution === 'tool');
+}
 
 /**
  * Encapsulates agent-specific state that can vary between agents in a multi-agent system
@@ -1231,11 +1238,13 @@ export class AgentContext {
     const anchorIndex = findLastIndex(
       messages,
       (message) =>
-        message.getType() === 'human' && !isSyntheticMetaMessage(message)
+        message.getType() === 'human' &&
+        !isSyntheticMetaMessage(message) &&
+        !isToolPayloadMessage(message)
     );
 
     if (anchorIndex < 0) {
-      return [...summary, ...addTailCacheControl(messages, ttl), ...dynamic];
+      return [...summary, ...this.markPromptCacheTail(messages, ttl), ...dynamic];
     }
 
     const summaryFirst = this.summaryPrecedesMessages;
@@ -1245,8 +1254,26 @@ export class AgentContext {
       ...(!summaryFirst ? summary : []),
       ...addTailCacheControl([messages[anchorIndex]], ttl),
       ...dynamic,
-      ...addTailCacheControl(messages.slice(anchorIndex + 1), ttl),
+      ...this.markPromptCacheTail(messages.slice(anchorIndex + 1), ttl),
     ];
+  }
+
+  /**
+   * Assistant breakpoints give these models nothing to read, so a tail that
+   * ends on an assistant message, such as a predecessor agent's reply before
+   * a handoff cue, carries none.
+   */
+  private markPromptCacheTail(
+    messages: BaseMessage[],
+    ttl?: PromptCacheTtl
+  ): BaseMessage[] {
+    const index = findLastIndex(
+      messages,
+      (message) => !isSyntheticMetaMessage(message)
+    );
+    return index >= 0 && messages[index].getType() === 'ai'
+      ? stripAnthropicCacheControl(messages)
+      : addTailCacheControl(messages, ttl);
   }
 
   private getPromptCacheDynamicTailIndex(
