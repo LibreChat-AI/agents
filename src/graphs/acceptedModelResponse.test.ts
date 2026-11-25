@@ -224,6 +224,21 @@ describe('execution descriptor validation without projection budgets', () => {
 });
 
 describe('stream chunk envelope snapshots', () => {
+  it('keeps legacy descriptor coercion for primitive callback payloads', () => {
+    const snapshot = (value: unknown): object =>
+      Reflect.apply(snapshotValidatedModelChunk, undefined, [value]);
+    const copy = snapshot('legacy');
+    expect(Object.getPrototypeOf(copy)).toBe(String.prototype);
+    expect(Object.getOwnPropertyDescriptor(copy, '0')).toEqual({
+      value: 'l',
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
+    expect(() => snapshot(null)).toThrow(TypeError);
+    expect(() => snapshot(undefined)).toThrow(TypeError);
+  });
+
   it('thaws string fields and preserves symbol descriptors without reading getters', () => {
     const original = new AIMessageChunk('Original text');
     const symbol = Symbol('provider metadata');

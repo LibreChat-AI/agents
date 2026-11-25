@@ -294,9 +294,10 @@ export function snapshotValidatedModelChunk(
     );
   }
   const copy = Object.create(Object.getPrototypeOf(message)) as AIMessageChunk;
+  const source: object = Object(message);
   // Thaw string-keyed fields for LangChain; preserve symbol descriptors as-is.
-  for (const key of Reflect.ownKeys(message)) {
-    const field = Object.getOwnPropertyDescriptor(message, key)!;
+  for (const key of Reflect.ownKeys(source)) {
+    const field = Object.getOwnPropertyDescriptor(source, key)!;
     if (typeof key === 'string') {
       field.configurable = true;
       if ('value' in field) {
