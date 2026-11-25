@@ -399,7 +399,7 @@ export function withProviderTextBoundary(
         steps[steps.length - 1] as ChatModel,
         policy,
         provider,
-        onBatchAttempt
+        batchInvocation
       ),
     });
     return protectedModel;

@@ -865,8 +865,9 @@ export async function attemptInvoke(
         batchAttempt?.hasPublishedText === true &&
         !(error instanceof ProviderTextProtectionError)
       ) {
-        failure = new ProviderTextProtectionError('unavailable');
-        batchAttempt.stop(failure);
+        const unavailable = new ProviderTextProtectionError('unavailable');
+        batchAttempt.stop(unavailable);
+        failure = unavailable;
       }
     }
     prepared?.finish(preparedAttempt, undefined, failure);
