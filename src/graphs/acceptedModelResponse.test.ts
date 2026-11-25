@@ -223,6 +223,61 @@ describe('execution descriptor validation without projection budgets', () => {
   );
 });
 
+describe('stream chunk envelope snapshots', () => {
+  it('thaws string fields and preserves symbol descriptors without reading getters', () => {
+    const original = new AIMessageChunk('Original text');
+    const symbol = Symbol('provider metadata');
+    const getter = jest.fn();
+    Object.defineProperty(original, 'providerField', { get: getter });
+    Object.defineProperty(original, symbol, { value: 'provider' });
+    Object.defineProperty(original.lc_kwargs, 'hidden', { value: 'metadata' });
+    Object.defineProperty(original.lc_kwargs, symbol, { get: getter });
+    Object.freeze(original.lc_kwargs);
+    Object.freeze(original);
+
+    const copy = snapshotValidatedModelChunk(original);
+    expect(Object.getPrototypeOf(copy)).toBe(Object.getPrototypeOf(original));
+    expect(copy.lc_kwargs).not.toBe(original.lc_kwargs);
+    expect(Object.getOwnPropertyDescriptor(copy, 'providerField')).toEqual({
+      get: getter,
+      set: undefined,
+      enumerable: false,
+      configurable: true,
+    });
+    expect(Object.getOwnPropertyDescriptor(copy.lc_kwargs, 'hidden')).toEqual({
+      value: 'metadata',
+      enumerable: false,
+      configurable: true,
+      writable: true,
+    });
+    expect(Object.getOwnPropertyDescriptor(copy, symbol)).toEqual(
+      Object.getOwnPropertyDescriptor(original, symbol)
+    );
+    expect(Object.getOwnPropertyDescriptor(copy.lc_kwargs, symbol)).toEqual(
+      Object.getOwnPropertyDescriptor(original.lc_kwargs, symbol)
+    );
+    copy._updateId('snapshot');
+    expect(copy.id).toBe('snapshot');
+    expect(copy.lc_kwargs.id).toBe('snapshot');
+    expect(original.id).toBeUndefined();
+    expect(original.lc_kwargs.id).toBeUndefined();
+    expect(getter).not.toHaveBeenCalled();
+  });
+
+  it('rejects unsafe metadata without invoking accessors or proxy traps', () => {
+    const getter = jest.fn();
+    const accessor = Object.defineProperty({}, 'field', { get: getter });
+    for (const value of [null, accessor, new Proxy({}, { ownKeys: getter })]) {
+      const message = new AIMessageChunk('Text');
+      Object.defineProperty(message, 'lc_kwargs', { value });
+      expect(() => snapshotValidatedModelChunk(message)).toThrow(
+        'Invalid model response metadata'
+      );
+    }
+    expect(getter).not.toHaveBeenCalled();
+  });
+});
+
 describe('snapshot emission identity', () => {
   it('keeps nested copies on the original producer/consumer charge identity', () => {
     const original = new AIMessageChunk('');
