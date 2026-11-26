@@ -394,7 +394,7 @@ describe('Gemini native part replay', () => {
     expect(restoreGeminiReplayParts(edited)).toBeUndefined();
   });
 
-  test('restores signed text after citation anchors were added to the saved answer', () => {
+  test('restores signed text after citation anchors were added to the saved answer @scenario:gemini-cited-history', () => {
     const message = mapGenerateContentResultToChatResult(response(parts))
       .generations[0].message as AIMessage;
     const cited = plain(message);

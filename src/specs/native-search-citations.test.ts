@@ -5,6 +5,7 @@ import type * as t from '@/types';
 import { CustomChatGoogleGenerativeAI } from '@/llm/google';
 import { createContentAggregator } from '@/stream';
 import { GraphEvents, Providers } from '@/common';
+import { ChatVertexAI } from '@/llm/vertexai';
 import { Run } from '@/run';
 
 const A = 'https://www.wetter.example/osnabrueck';
@@ -180,7 +181,7 @@ describe('Anthropic web search citations', () => {
     ];
   }
 
-  it('streams an anchor after each cited block and keeps it in the saved text', async () => {
+  it('streams an anchor after each cited block and keeps it in the saved text @scenario:anthropic-cited-blocks-stream-anchors', async () => {
     const response = eventStream(
       frames([
         {
@@ -254,89 +255,100 @@ describe('Gemini grounding citations', () => {
 
   afterEach(() => jest.restoreAllMocks());
 
-  function respond(): void {
-    jest.spyOn(globalThis, 'fetch').mockImplementation(async () =>
-      eventStream(
-        [
-          {
-            candidates: [
-              {
-                content: { role: 'model', parts: [{ text: `${first} ` }] },
-                index: 0,
-              },
+  const frames = [
+    {
+      candidates: [
+        {
+          content: { role: 'model', parts: [{ text: `${first} ` }] },
+          index: 0,
+        },
+      ],
+    },
+    {
+      candidates: [
+        {
+          content: { role: 'model', parts: [{ text: second }] },
+          finishReason: 'STOP',
+          index: 0,
+          groundingMetadata: {
+            webSearchQueries: ['mensa schlossgarten heute'],
+            groundingChunks: [
+              { web: { uri: A, title: 'studentenwerk.example' } },
+              { web: { uri: B, title: 'mensa.example' } },
             ],
-          },
-          {
-            candidates: [
+            groundingSupports: [
               {
-                content: { role: 'model', parts: [{ text: second }] },
-                finishReason: 'STOP',
-                index: 0,
-                groundingMetadata: {
-                  webSearchQueries: ['mensa schlossgarten heute'],
-                  groundingChunks: [
-                    { web: { uri: A, title: 'studentenwerk.example' } },
-                    { web: { uri: B, title: 'mensa.example' } },
-                  ],
-                  groundingSupports: [
-                    {
-                      segment: {
-                        startIndex: 0,
-                        endIndex: bytes(first),
-                        text: first,
-                      },
-                      groundingChunkIndices: [0],
-                    },
-                    {
-                      segment: {
-                        startIndex: bytes(`${first} `),
-                        endIndex: bytes(`${first} ${second}`),
-                        text: second,
-                      },
-                      groundingChunkIndices: [0, 1],
-                    },
-                  ],
+                segment: {
+                  startIndex: 0,
+                  endIndex: bytes(first),
+                  text: first,
                 },
+                groundingChunkIndices: [0],
+              },
+              {
+                segment: {
+                  startIndex: bytes(`${first} `),
+                  endIndex: bytes(`${first} ${second}`),
+                  text: second,
+                },
+                groundingChunkIndices: [0, 1],
               },
             ],
-            usageMetadata: {
-              promptTokenCount: 10,
-              candidatesTokenCount: 12,
-              totalTokenCount: 22,
-            },
           },
-        ],
-        false
-      )
+        },
+      ],
+      usageMetadata: {
+        promptTokenCount: 10,
+        candidatesTokenCount: 12,
+        totalTokenCount: 22,
+      },
+    },
+  ];
+
+  function respond(vertex: boolean): void {
+    jest.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+      vertex
+        ? new Response(JSON.stringify(frames), {
+          headers: { 'content-type': 'application/json' },
+        })
+        : eventStream(frames, false)
     );
   }
 
-  async function run(runId: string, tools?: t.GraphTools): Promise<Collected> {
-    respond();
+  async function run(
+    runId: string,
+    { tools, vertex = false }: { tools?: t.GraphTools; vertex?: boolean } = {}
+  ): Promise<Collected> {
+    respond(vertex);
     const collected = collect();
     const graphRun = await Run.create<t.IState>({
       runId,
       graphConfig: {
         type: 'standard',
-        llmConfig: { provider: Providers.GOOGLE },
+        llmConfig: { provider: vertex ? Providers.VERTEXAI : Providers.GOOGLE },
         tools,
       },
       returnContent: true,
       skipCleanup: true,
       customHandlers: collected.handlers,
     });
-    graphRun.Graph!.overrideModel = new CustomChatGoogleGenerativeAI({
-      model: 'gemini-2.5-flash',
-      apiKey: 'synthetic-test-key',
-      streaming: true,
-    });
+    graphRun.Graph!.overrideModel = vertex
+      ? new ChatVertexAI({
+        model: 'gemini-2.5-flash',
+        apiKey: 'synthetic-test-key',
+        location: 'global',
+        maxRetries: 0,
+      })
+      : new CustomChatGoogleGenerativeAI({
+        model: 'gemini-2.5-flash',
+        apiKey: 'synthetic-test-key',
+        streaming: true,
+      });
     await stream(graphRun, runId);
     return collected;
   }
 
-  it('adds the grounding sources and anchors each grounded segment', async () => {
-    const collected = await run('gemini-grounding-citations');
-
+  function expectGrounded(collected: Collected): void {
     expect(getText(collected)).toBe(
       `${first}\ue202turn0search0 ${second}\ue200\ue202turn0search0\ue202turn0search1\ue201`
     );
@@ -361,16 +373,26 @@ describe('Gemini grounding citations', () => {
         },
       },
     ]);
+  }
+
+  it('adds the grounding sources and anchors each grounded segment @scenario:gemini-grounding-adds-sources-and-anchors', async () => {
+    expectGrounded(await run('gemini-grounding-citations'));
   });
 
-  it('leaves the answer alone when the SDK search tool numbers the turns', async () => {
+  it('reads Vertex AI grounding from the response metadata @scenario:vertex-grounding-adds-sources-and-anchors', async () => {
+    expectGrounded(await run('vertex-grounding-citations', { vertex: true }));
+  });
+
+  it('leaves the answer alone when the SDK search tool numbers the turns @scenario:gemini-grounding-skips-own-search-agents', async () => {
     const webSearch = new DynamicStructuredTool({
       name: 'web_search',
       description: 'Search the web.',
       schema: z.object({ query: z.string() }),
       func: async (): Promise<string> => 'unused',
     });
-    const collected = await run('gemini-grounding-own-search', [webSearch]);
+    const collected = await run('gemini-grounding-own-search', {
+      tools: [webSearch],
+    });
 
     expect(getText(collected)).toBe(`${first} ${second}`);
     expect(collected.artifacts).toEqual([]);

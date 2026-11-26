@@ -1,4 +1,11 @@
-import { describe, it, expect, beforeEach, afterEach, jest } from '@jest/globals';
+import {
+  describe,
+  it,
+  expect,
+  beforeEach,
+  afterEach,
+  jest,
+} from '@jest/globals';
 import type { ToolCall, ToolCallChunk } from '@langchain/core/messages/tool';
 import type { AgentContext } from '@/agents/AgentContext';
 import type { StandardGraph } from '@/graphs';
@@ -9,6 +16,7 @@ import {
   handleServerToolResult,
 } from '../handlers';
 import { StepTypes, ToolCallTypes, Providers, GraphEvents } from '@/common';
+import { SearchCitations } from '@/tools/search/citations';
 
 type MockGraph = {
   getStepKey: jest.Mock;
@@ -22,6 +30,7 @@ type MockGraph = {
   messageIdsByStepKey: Map<string, string>;
   prelimMessageIdsByStepKey: Map<string, string>;
   invokedToolIds?: Set<string>;
+  searchCitations: SearchCitations;
   handlerRegistry?: {
     getHandler: jest.Mock;
   };
@@ -47,6 +56,7 @@ function createMockGraph(overrides?: Partial<MockGraph>): MockGraph {
     messageIdsByStepKey: new Map(),
     prelimMessageIdsByStepKey: new Map(),
     invokedToolIds: undefined,
+    searchCitations: new SearchCitations(),
     handlerRegistry: undefined,
     ...overrides,
   };
