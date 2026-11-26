@@ -124,22 +124,6 @@ export function byteToCharOffset(
   return consumed === bytes ? index : undefined;
 }
 
-/** Converts a count of code points after `from` into a UTF-16 index of `text`. */
-export function codePointToCharOffset(
-  text: string,
-  from: number,
-  codePoints: number
-): number | undefined {
-  let index = from;
-  for (let count = 0; count < codePoints; count++) {
-    if (index >= text.length) {
-      return undefined;
-    }
-    index += (text.codePointAt(index) ?? 0) > 0xffff ? 2 : 1;
-  }
-  return index;
-}
-
 function getUrlCitations(part: CitedPart): UrlCitation[] {
   if (!Array.isArray(part.annotations)) {
     return [];

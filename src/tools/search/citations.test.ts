@@ -1,6 +1,5 @@
 import type * as t from '@/types';
 import {
-  codePointToCharOffset,
   formatSearchAnchors,
   stripSearchAnchors,
   byteToCharOffset,
@@ -90,13 +89,6 @@ describe('offset conversion', () => {
     expect(byteToCharOffset(text, 7)).toBeUndefined();
     expect(byteToCharOffset(text, 16)).toBeUndefined();
     expect(byteToCharOffset(text, 999)).toBeUndefined();
-  });
-
-  it('reads code point counts from an offset', () => {
-    const text = 'xx🍝 ok';
-    expect(codePointToCharOffset(text, 2, 1)).toBe(4);
-    expect(codePointToCharOffset(text, 2, 3)).toBe(6);
-    expect(codePointToCharOffset(text, 2, 9)).toBeUndefined();
   });
 });
 
