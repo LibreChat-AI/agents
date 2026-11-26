@@ -55,7 +55,7 @@ describe('FirecrawlScraper authorization', () => {
     }
   });
 
-  it('scrapes without an API key and sends no Authorization header', async () => {
+  it('scrapes without an API key and sends no Authorization header @scenario:firecrawl-keyless-scrape-sends-no-authorization', async () => {
     const scraper = createFirecrawlScraper({ apiUrl, logger });
     const [url, response] = await scraper.scrapeUrl('https://example.com/page');
 
@@ -68,7 +68,7 @@ describe('FirecrawlScraper authorization', () => {
     expect(logger.warn).not.toHaveBeenCalled();
   });
 
-  it('treats an empty key as no key even when FIRECRAWL_API_KEY is set', async () => {
+  it('treats an empty key as no key even when FIRECRAWL_API_KEY is set @scenario:firecrawl-empty-key-overrides-environment-key', async () => {
     process.env.FIRECRAWL_API_KEY = 'environment-key';
     const scraper = createFirecrawlScraper({ apiKey: '', apiUrl, logger });
     await scraper.scrapeUrl('https://example.com/page');
@@ -78,7 +78,7 @@ describe('FirecrawlScraper authorization', () => {
     ]);
   });
 
-  it('sends a configured key as a bearer token', async () => {
+  it('sends a configured key as a bearer token @scenario:firecrawl-configured-key-sent-as-bearer', async () => {
     const scraper = createFirecrawlScraper({
       apiKey: 'fc-key',
       apiUrl,
