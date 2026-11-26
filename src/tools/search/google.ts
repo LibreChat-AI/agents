@@ -30,9 +30,11 @@ export function getGoogleGroundingMetadata(
 
 /**
  * Finds where a grounded segment ends in the call text. The API measures
- * offsets in UTF-8 bytes of one response part, so the byte offset is trusted
- * only for the first part and when the segment text sits right before it;
- * otherwise the segment text is searched from the previous segment's end.
+ * offsets in UTF-8 bytes of one response part, and streamed text carries no
+ * part boundaries, so the byte offset is trusted only for the first part and
+ * when the segment text sits right before it. A first-part segment is
+ * otherwise searched from the previous segment's end; a later part's segment
+ * is placed only when its text occurs once, never at a guessed occurrence.
  */
 function locateSegmentEnd(
   text: string,
@@ -40,8 +42,9 @@ function locateSegmentEnd(
   cursor: number
 ): number | undefined {
   const value = segment.text;
+  const firstPart = (segment.partIndex ?? 0) === 0;
   const end =
-    (segment.partIndex ?? 0) === 0 && typeof segment.endIndex === 'number'
+    firstPart && typeof segment.endIndex === 'number'
       ? byteToCharOffset(text, segment.endIndex)
       : undefined;
   if (value == null || value === '') {
@@ -49,6 +52,12 @@ function locateSegmentEnd(
   }
   if (end != null && text.slice(end - value.length, end) === value) {
     return end;
+  }
+  if (!firstPart) {
+    const index = text.indexOf(value);
+    return index !== -1 && text.indexOf(value, index + 1) === -1
+      ? index + value.length
+      : undefined;
   }
   let index = text.indexOf(value, cursor);
   if (index === -1) {

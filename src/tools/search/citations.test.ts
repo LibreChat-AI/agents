@@ -275,27 +275,29 @@ describe('coerceGoogleGroundingResults', () => {
     ]);
   });
 
-  it('anchors the same sentence once per response part', () => {
+  it('anchors a later response part only where its text is unambiguous', () => {
     const repeated = `${second} ${second}`;
-    const segment = (partIndex: number) => ({
+    const segment = (partIndex: number, value = second) => ({
       partIndex,
       startIndex: 0,
-      endIndex: bytes(second),
-      text: second,
+      endIndex: bytes(value),
+      text: value,
     });
     const results = coerceGoogleGroundingResults(
       {
         groundingChunks: [{ web: { uri: A } }, { web: { uri: B } }],
         groundingSupports: [
-          { segment: segment(0), groundingChunkIndices: [0] },
           { segment: segment(1), groundingChunkIndices: [1] },
+          {
+            segment: segment(1, `${second} ${second}`),
+            groundingChunkIndices: [0],
+          },
         ],
       },
       repeated
     );
     expect(results?.spans).toEqual([
-      { start: second.length, end: second.length, sources: [0] },
-      { start: repeated.length, end: repeated.length, sources: [1] },
+      { start: repeated.length, end: repeated.length, sources: [0] },
     ]);
   });
 
