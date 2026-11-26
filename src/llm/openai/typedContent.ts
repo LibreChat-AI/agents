@@ -9,17 +9,17 @@ type StreamChoice = Omit<Choice, 'delta'> & { delta?: Delta };
 type Message = Completion['choices'][number]['message'] & {
   reasoning_content?: string;
 };
-type TypedPart = { type?: unknown; text?: unknown; thinking?: unknown };
-
+type TextPart = { type: 'text'; text?: string };
 /**
  * Mistral reasoning models send Chat Completions `content` as a list of typed
  * parts instead of a string: `thinking` parts, each holding a list of `text`
- * parts, carry the reasoning, and `text` parts carry the answer.
+ * parts, carry the reasoning, and `text` parts carry the answer. Other part
+ * types are read as neither.
  */
-function readTypedContent(content: TypedPart[]): {
-  text: string;
-  reasoning: string;
-} {
+type ContentPart = TextPart | { type: 'thinking'; thinking?: TextPart[] };
+type TypedText = { text: string; reasoning: string };
+
+function readTypedContent(content: ContentPart[]): TypedText {
   let text = '';
   let reasoning = '';
   for (const part of content) {
@@ -30,7 +30,7 @@ function readTypedContent(content: TypedPart[]): {
     if (part.type !== 'thinking' || !Array.isArray(part.thinking)) {
       continue;
     }
-    for (const thought of part.thinking as TypedPart[]) {
+    for (const thought of part.thinking) {
       if (typeof thought.text === 'string') {
         reasoning += thought.text;
       }
