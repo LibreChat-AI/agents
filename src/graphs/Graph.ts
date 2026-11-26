@@ -2518,13 +2518,18 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     await this.closeRunStep(stepId, 'completed', { metadata, at: closeAt });
   }
 
-  /** Gemini grounding arrives after the text it cites. */
+  /** Gemini grounding and OpenAI url_citation arrive after the text they cite. */
   private tracksSearchText(metadata?: Record<string, unknown>): boolean {
     if (metadata == null) {
       return false;
     }
     try {
-      return isGoogleLike(this.getAgentContext(metadata).provider);
+      const { provider } = this.getAgentContext(metadata);
+      return (
+        isGoogleLike(provider) ||
+        provider === Providers.OPENAI ||
+        provider === Providers.AZURE
+      );
     } catch (_e) {
       return false;
     }

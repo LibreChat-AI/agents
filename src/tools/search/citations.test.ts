@@ -1,5 +1,6 @@
 import type * as t from '@/types';
 import {
+  codePointToCharOffset,
   formatSearchAnchors,
   stripSearchAnchors,
   byteToCharOffset,
@@ -7,6 +8,7 @@ import {
   applyTextEdits,
 } from './citations';
 import { coerceGoogleGroundingResults } from './google';
+import { coerceOpenAICitationResults } from './openai';
 import { ContentTypes } from '@/common';
 
 const A = 'https://a.example/weather';
@@ -88,6 +90,13 @@ describe('offset conversion', () => {
     expect(byteToCharOffset(text, 7)).toBeUndefined();
     expect(byteToCharOffset(text, 16)).toBeUndefined();
     expect(byteToCharOffset(text, 999)).toBeUndefined();
+  });
+
+  it('reads code point counts from an offset', () => {
+    const text = 'xx🍝 ok';
+    expect(codePointToCharOffset(text, 2, 1)).toBe(4);
+    expect(codePointToCharOffset(text, 2, 3)).toBe(6);
+    expect(codePointToCharOffset(text, 2, 9)).toBeUndefined();
   });
 });
 
@@ -186,6 +195,12 @@ describe('SearchCitations late edits', () => {
     ]);
     const call = citations.take('');
     expect(call?.text).toBe('First.Second.');
+    expect(call?.blocks).toEqual(
+      new Map([
+        [0, 0],
+        [1, 6],
+      ])
+    );
     const byStep = citations.locate(call!, [
       { start: 6, end: 6, text: '[a]' },
       { start: 13, end: 13, text: '[b]' },
@@ -197,6 +212,32 @@ describe('SearchCitations late edits', () => {
         ['two', [{ start: 7, end: 7, text: '[b]' }]],
       ])
     );
+  });
+
+  it('collects url citations from annotation parts', () => {
+    const citations = new SearchCitations();
+    citations.track('', 'step', [
+      { type: ContentTypes.TEXT, index: 0, text: 'Sunny.' },
+      {
+        type: ContentTypes.TEXT,
+        index: 0,
+        text: '',
+        annotations: [
+          {
+            type: 'citation',
+            source: 'url_citation',
+            url: A,
+            title: 'Weather',
+            startIndex: 0,
+            endIndex: 6,
+          },
+          { type: 'citation', source: 'file_citation', title: 'a.pdf' },
+        ],
+      },
+    ]);
+    expect(citations.take('')?.citations).toEqual([
+      { block: 0, url: A, title: 'Weather', start: 0, end: 6 },
+    ]);
   });
 });
 
@@ -305,5 +346,78 @@ describe('coerceGoogleGroundingResults', () => {
     expect(
       coerceGoogleGroundingResults({ groundingChunks: [{}] }, text)
     ).toBeUndefined();
+  });
+});
+
+describe('coerceOpenAICitationResults', () => {
+  const url = 'https://weather.example/today?utm_source=openai';
+  const link = `([weather.example](${url}))`;
+
+  it('replaces the cited markdown link of each block', () => {
+    const text = `Intro. It is sunny ${link}. Dry ([dry.example](${B})).`;
+    const blockStart = 'Intro. '.length;
+    const block = text.slice(blockStart);
+    const results = coerceOpenAICitationResults(
+      [
+        {
+          block: 1,
+          url,
+          title: 'Today',
+          start: block.indexOf(link),
+          end: block.indexOf(link) + link.length,
+        },
+        {
+          block: 1,
+          url: B,
+          start: block.indexOf('[dry'),
+          end: block.indexOf('[dry') + `[dry.example](${B})`.length - 1,
+        },
+        { block: 1, url, start: 0, end: 5 },
+      ],
+      text,
+      new Map([[1, blockStart]])
+    );
+    expect(results?.organic).toEqual([
+      {
+        link: url,
+        position: 1,
+        title: 'Today',
+        attribution: 'weather.example',
+      },
+      { link: B, position: 2, title: undefined, attribution: 'b.example' },
+    ]);
+    const edits = results!.spans.map(({ start, end, sources }) => ({
+      start,
+      end,
+      text: `[${sources.join(',')}]`,
+    }));
+    expect(applyTextEdits(text, edits)).toBe(
+      'Intro. It is sunny [0]. Dry [1].'
+    );
+  });
+
+  it('reads code point offsets after astral characters', () => {
+    const text = `🌞 Sunny ${link}`;
+    const results = coerceOpenAICitationResults(
+      [{ block: 0, url, start: 8, end: 8 + link.length }],
+      text,
+      new Map([[0, 0]])
+    );
+    expect(results?.spans).toEqual([
+      { start: 9, end: 9 + link.length, sources: [0] },
+    ]);
+  });
+
+  it('keeps a citation as a source when its span is not a link', () => {
+    const results = coerceOpenAICitationResults(
+      [
+        { block: 0, url, start: 0, end: 5 },
+        { block: 7, url: B },
+      ],
+      'Sunny today.',
+      new Map([[0, 0]])
+    );
+    expect(results?.organic.map(({ link }) => link)).toEqual([url, B]);
+    expect(results?.spans).toEqual([]);
   });
 });

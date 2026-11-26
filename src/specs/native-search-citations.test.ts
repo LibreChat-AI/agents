@@ -6,6 +6,7 @@ import { CustomChatGoogleGenerativeAI } from '@/llm/google';
 import { createContentAggregator } from '@/stream';
 import { GraphEvents, Providers } from '@/common';
 import { ChatVertexAI } from '@/llm/vertexai';
+import { ChatOpenAI } from '@/llm/openai';
 import { Run } from '@/run';
 
 const A = 'https://www.wetter.example/osnabrueck';
@@ -395,6 +396,172 @@ describe('Gemini grounding citations', () => {
     });
 
     expect(getText(collected)).toBe(`${first} ${second}`);
+    expect(collected.artifacts).toEqual([]);
+  });
+});
+
+describe('OpenAI url_citation', () => {
+  const url = 'https://weather.example/rome?utm_source=openai';
+  const link = `([weather.example](${url}))`;
+  const lead = 'It is sunny in Rome today ';
+  const text = `${lead}${link}.`;
+  const response = {
+    id: 'resp_cited',
+    created_at: 1,
+    object: 'response',
+    model: 'synthetic-model',
+    status: 'completed',
+    error: null,
+    output: [
+      {
+        id: 'ws_weather',
+        type: 'web_search_call',
+        status: 'completed',
+        action: { type: 'search', query: 'weather rome today' },
+      },
+      {
+        id: 'msg_cited',
+        type: 'message',
+        role: 'assistant',
+        status: 'completed',
+        content: [
+          {
+            type: 'output_text',
+            text,
+            annotations: [
+              {
+                type: 'url_citation',
+                start_index: lead.length,
+                end_index: lead.length + link.length,
+                url,
+                title: 'Rome weather',
+              },
+            ],
+          },
+        ],
+      },
+    ],
+    incomplete_details: null,
+    instructions: null,
+    metadata: {},
+    tools: [],
+    tool_choice: 'auto',
+    text: { format: { type: 'text' } },
+    parallel_tool_calls: true,
+    temperature: 1,
+    top_p: 1,
+    truncation: 'disabled',
+    store: false,
+    usage: {
+      input_tokens: 10,
+      output_tokens: 5,
+      total_tokens: 15,
+      input_tokens_details: { cached_tokens: 0 },
+      output_tokens_details: { reasoning_tokens: 0 },
+    },
+  };
+  const message = { output_index: 1, item_id: 'msg_cited', content_index: 0 };
+  const frames = [
+    {
+      type: 'response.created',
+      response: { ...response, status: 'in_progress', output: [] },
+    },
+    {
+      type: 'response.output_item.added',
+      output_index: 0,
+      item: { ...response.output[0], status: 'in_progress' },
+    },
+    {
+      type: 'response.output_item.done',
+      output_index: 0,
+      item: response.output[0],
+    },
+    {
+      type: 'response.output_item.added',
+      output_index: 1,
+      item: { ...response.output[1], content: [], status: 'in_progress' },
+    },
+    { type: 'response.output_text.delta', ...message, delta: lead },
+    { type: 'response.output_text.delta', ...message, delta: link },
+    {
+      type: 'response.output_text.annotation.added',
+      ...message,
+      annotation_index: 0,
+      annotation: response.output[1].content![0].annotations[0],
+    },
+    { type: 'response.output_text.delta', ...message, delta: '.' },
+    { type: 'response.completed', response },
+  ].map((frame, sequence_number) => ({ ...frame, sequence_number }));
+
+  function model(): ChatOpenAI {
+    return new ChatOpenAI({
+      model: 'synthetic-model',
+      apiKey: 'synthetic-test-key',
+      useResponsesApi: true,
+      streaming: true,
+      configuration: {
+        apiKey: 'synthetic-test-key',
+        fetch: async () => eventStream(frames),
+      },
+    });
+  }
+
+  it('replaces the cited link with an anchor to the new search source @scenario:openai-url-citation-anchored', async () => {
+    const collected = collect();
+    const run = await Run.create<t.IState>({
+      runId: 'openai-url-citations',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: { provider: Providers.OPENAI },
+      },
+      returnContent: true,
+      skipCleanup: true,
+      customHandlers: collected.handlers,
+    });
+    run.Graph!.overrideModel = model();
+    await stream(run, 'openai-url-citations');
+
+    expect(getText(collected)).toBe(`${lead}\ue202turn0search0.`);
+    expect(collected.artifacts).toEqual([
+      {
+        web_search: {
+          turn: 0,
+          organic: [
+            {
+              link: url,
+              position: 1,
+              title: 'Rome weather',
+              attribution: 'weather.example',
+            },
+          ],
+        },
+      },
+    ]);
+  });
+
+  it('leaves the link alone when the SDK search tool numbers the turns @scenario:openai-url-citation-skips-own-search-agents', async () => {
+    const collected = collect();
+    const webSearch = new DynamicStructuredTool({
+      name: 'web_search',
+      description: 'Search the web.',
+      schema: z.object({ query: z.string() }),
+      func: async (): Promise<string> => 'unused',
+    });
+    const run = await Run.create<t.IState>({
+      runId: 'openai-url-citations-own-search',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: { provider: Providers.OPENAI },
+        tools: [webSearch],
+      },
+      returnContent: true,
+      skipCleanup: true,
+      customHandlers: collected.handlers,
+    });
+    run.Graph!.overrideModel = model();
+    await stream(run, 'openai-url-citations-own-search');
+
+    expect(getText(collected)).toBe(text);
     expect(collected.artifacts).toEqual([]);
   });
 });

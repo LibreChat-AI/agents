@@ -27,10 +27,21 @@ export type NativeSearchResults = {
   queries?: string[];
 };
 
+export type UrlCitation = {
+  block?: number;
+  url: string;
+  title?: string;
+  start?: number;
+  end?: number;
+};
+
 export type NativeSearchCall = {
   text: string;
   /** Where each step's text starts, in `text` and in the step's content part. */
   steps: { id: string; start: number; base: number }[];
+  /** Offset in `text` where each provider text block starts. */
+  blocks: Map<number, number>;
+  citations: UrlCitation[];
   grounding?: GoogleGroundingMetadata;
   metadata?: Record<string, unknown>;
 };
@@ -46,6 +57,7 @@ type CitedPart = {
   text?: unknown;
   index?: unknown;
   citations?: unknown;
+  annotations?: unknown;
 };
 
 export function formatSearchAnchors(refs: readonly SearchRef[]): string {
@@ -110,6 +122,49 @@ export function byteToCharOffset(
     index += code > 0xffff ? 2 : 1;
   }
   return consumed === bytes ? index : undefined;
+}
+
+/** Converts a count of code points after `from` into a UTF-16 index of `text`. */
+export function codePointToCharOffset(
+  text: string,
+  from: number,
+  codePoints: number
+): number | undefined {
+  let index = from;
+  for (let count = 0; count < codePoints; count++) {
+    if (index >= text.length) {
+      return undefined;
+    }
+    index += (text.codePointAt(index) ?? 0) > 0xffff ? 2 : 1;
+  }
+  return index;
+}
+
+function getUrlCitations(part: CitedPart): UrlCitation[] {
+  if (!Array.isArray(part.annotations)) {
+    return [];
+  }
+  const block = typeof part.index === 'number' ? part.index : undefined;
+  const citations: UrlCitation[] = [];
+  for (const annotation of part.annotations as Record<string, unknown>[]) {
+    const isUrlCitation =
+      annotation.source === 'url_citation' ||
+      annotation.type === 'url_citation';
+    if (!isUrlCitation || typeof annotation.url !== 'string') {
+      continue;
+    }
+    const start = annotation.startIndex ?? annotation.start_index;
+    const end = annotation.endIndex ?? annotation.end_index;
+    citations.push({
+      block,
+      url: annotation.url,
+      title:
+        typeof annotation.title === 'string' ? annotation.title : undefined,
+      start: typeof start === 'number' ? start : undefined,
+      end: typeof end === 'number' ? end : undefined,
+    });
+  }
+  return citations;
 }
 
 /**
@@ -215,7 +270,7 @@ export class SearchCitations {
     };
   }
 
-  /** Records a step's streamed text for edits made when the model call ends. */
+  /** Records a step's streamed text and url citations for edits made when the model call ends. */
   track(
     lane: string,
     stepId: string,
@@ -224,20 +279,28 @@ export class SearchCitations {
   ): void {
     for (const item of content) {
       const part = item as CitedPart;
-      if (
-        part.type !== ContentTypes.TEXT ||
-        typeof part.text !== 'string' ||
-        part.text === ''
-      ) {
+      if (part.type !== ContentTypes.TEXT) {
+        continue;
+      }
+      const text = typeof part.text === 'string' ? part.text : '';
+      const citations = getUrlCitations(part);
+      if (text === '' && citations.length === 0) {
         continue;
       }
       const call = this.open(lane, metadata);
+      call.citations.push(...citations);
+      if (text === '') {
+        continue;
+      }
       const base = this.lengths.get(stepId) ?? 0;
       if (call.steps.at(-1)?.id !== stepId) {
         call.steps.push({ id: stepId, start: call.text.length, base });
       }
-      call.text += part.text;
-      this.lengths.set(stepId, base + part.text.length);
+      if (typeof part.index === 'number' && !call.blocks.has(part.index)) {
+        call.blocks.set(part.index, call.text.length);
+      }
+      call.text += text;
+      this.lengths.set(stepId, base + text.length);
     }
   }
 
@@ -294,7 +357,13 @@ export class SearchCitations {
   ): NativeSearchCall {
     let call = this.calls.get(lane);
     if (call == null) {
-      call = { text: '', steps: [], metadata };
+      call = {
+        text: '',
+        steps: [],
+        blocks: new Map(),
+        citations: [],
+        metadata,
+      };
       this.calls.set(lane, call);
     }
     return call;
