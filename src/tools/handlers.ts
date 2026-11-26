@@ -3,21 +3,29 @@
 import { nanoid } from 'nanoid';
 import { ToolMessage } from '@langchain/core/messages';
 import type { ToolCall, ToolCallChunk } from '@langchain/core/messages/tool';
+import type {
+  NativeSearchResults,
+  NativeSearchCall,
+} from '@/tools/search/citations';
 import type { AnthropicWebSearchResultBlockParam } from '@/llm/anthropic/types';
 import type { Graph, MultiAgentGraph, StandardGraph } from '@/graphs';
+import type { SearchResultData } from '@/tools/search/types';
 import type { AgentContext } from '@/agents/AgentContext';
 import type * as t from '@/types';
 import {
-  coerceAnthropicSearchResults,
-  isAnthropicWebSearchResult,
-} from '@/tools/search/anthropic';
-import {
   ToolCallTypes,
+  ContentTypes,
   GraphEvents,
   StepTypes,
   Providers,
   Constants,
 } from '@/common';
+import {
+  coerceAnthropicSearchResults,
+  isAnthropicWebSearchResult,
+} from '@/tools/search/anthropic';
+import { coerceGoogleGroundingResults } from '@/tools/search/google';
+import { formatSearchAnchors } from '@/tools/search/citations';
 import { formatResultsForLLM } from '@/tools/search/format';
 import { getMessageId } from '@/messages';
 
@@ -353,11 +361,12 @@ async function handleAnthropicSearchResults({
     return;
   }
 
-  const turn = graph.invokedToolIds?.size ?? 0;
+  const turn = graph.searchCitations.turn(graph.invokedToolIds?.size ?? 0);
   const searchResultData = coerceAnthropicSearchResults({
     turn,
     results: contentPart.content as AnthropicWebSearchResultBlockParam[],
   });
+  graph.searchCitations.register(searchResultData);
 
   const name = toolCall.name;
   const input = toolCall.args ?? {};
@@ -387,4 +396,84 @@ async function handleAnthropicSearchResults({
   }
 
   graph.invokedToolIds.add(toolCall.id!);
+}
+
+/**
+ * The SDK's own search tool numbers its turns per tool, apart from native
+ * searches, so an agent that binds it keeps provider citations as they are
+ * rather than risk two results sharing a turn.
+ */
+function bindsSearchTool(agentContext?: AgentContext): boolean {
+  return (
+    agentContext?.toolDefinitions?.some(
+      (definition) => definition.name === Constants.WEB_SEARCH
+    ) === true ||
+    agentContext?.tools?.some(
+      (tool) => 'name' in tool && tool.name === Constants.WEB_SEARCH
+    ) === true
+  );
+}
+
+function getNativeSearchResults(
+  call: NativeSearchCall,
+  agentContext?: AgentContext
+): NativeSearchResults | undefined {
+  if (call.grounding == null || bindsSearchTool(agentContext)) {
+    return undefined;
+  }
+  return coerceGoogleGroundingResults(call.grounding, call.text);
+}
+
+/**
+ * Settles the web search citations Gemini grounding attaches to a finished
+ * model call. They arrive after the text they cite has streamed, so the
+ * sources reach TOOL_END handlers as one `web_search` turn (as Anthropic
+ * results do) and the cited spans are rewritten into `turnNsearchM` anchors
+ * through `edits` on the steps that hold the text.
+ */
+export async function handleNativeSearchCitations({
+  graph,
+  call,
+  metadata,
+  agentContext,
+}: {
+  graph: StandardGraph | MultiAgentGraph;
+  call: NativeSearchCall;
+  metadata?: Record<string, unknown>;
+  agentContext?: AgentContext;
+}): Promise<void> {
+  const results = getNativeSearchResults(call, agentContext);
+  const stepId = call.steps.at(0)?.id;
+  if (results == null || stepId == null) {
+    return;
+  }
+  const turn = graph.searchCitations.claimTurn(graph.invokedToolIds?.size ?? 0);
+  const data: SearchResultData = { turn, organic: results.organic };
+  const output = new ToolMessage({
+    name: Constants.WEB_SEARCH,
+    artifact: { [Constants.WEB_SEARCH]: data },
+    content: formatResultsForLLM(turn, data).output,
+    tool_call_id: `${Constants.WEB_SEARCH}_${stepId}`,
+  });
+  await graph.handlerRegistry
+    ?.getHandler(GraphEvents.TOOL_END)
+    ?.handle(
+      GraphEvents.TOOL_END,
+      { input: { queries: results.queries ?? [] }, output },
+      metadata,
+      graph
+    );
+
+  const edits = results.spans.map(({ start, end, sources }) => ({
+    start,
+    end,
+    text: formatSearchAnchors(sources.map((index) => ({ turn, index }))),
+  }));
+  for (const [id, stepEdits] of graph.searchCitations.locate(call, edits)) {
+    await graph.dispatchMessageDelta(
+      id,
+      { content: [{ type: ContentTypes.TEXT, edits: stepEdits }] },
+      metadata
+    );
+  }
 }

@@ -95,7 +95,10 @@ import {
   findCallback,
   type CallbackEntry,
 } from '@/utils/callbacks';
-import { BATCHED_PROVIDER_EVENT_OWNER, ProviderTextProtectionError } from '@/protection/providerText';
+import {
+  BATCHED_PROVIDER_EVENT_OWNER,
+  ProviderTextProtectionError,
+} from '@/protection/providerText';
 import {
   resolveLangfuseRuntimeScope,
   withLangfuseRuntimeScope,
@@ -638,7 +641,8 @@ export class Run<_T extends t.BaseGraphState> {
     if (
       this.providerTextProtection?.batching != null &&
       (config.humanInTheLoop?.enabled === true ||
-        ('agents' in config.graphConfig && config.graphConfig.agents.length !== 1))
+        ('agents' in config.graphConfig &&
+          config.graphConfig.agents.length !== 1))
     ) {
       throw new ProviderTextProtectionError('unsupported');
     }
@@ -1639,9 +1643,11 @@ export class Run<_T extends t.BaseGraphState> {
           // The batched attempt owns start and delta delivery and their deadline.
           if (
             this.providerTextProtection?.batching != null &&
-            (eventName === GraphEvents.CHAT_MODEL_START || eventName === GraphEvents.CHAT_MODEL_STREAM) &&
+            (eventName === GraphEvents.CHAT_MODEL_START ||
+              eventName === GraphEvents.CHAT_MODEL_STREAM) &&
             metadata[BATCHED_PROVIDER_EVENT_OWNER] === true
-          ) continue;
+          )
+            continue;
 
           if (CUSTOM_GRAPH_EVENTS.has(eventName)) {
             continue;
@@ -1686,6 +1692,7 @@ export class Run<_T extends t.BaseGraphState> {
           }
 
           if (eventName === GraphEvents.CHAT_MODEL_END && this.Graph != null) {
+            await this.Graph.settleSearchCitations(metadata);
             await this.Graph.closeOpenMessageStep(metadata, modelEndAt);
           }
 

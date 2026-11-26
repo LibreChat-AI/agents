@@ -37,6 +37,7 @@ import type {
   GraphFactoryRequest,
 } from '@/graphs/graphFactory';
 import type { OverflowRecoveryPlan } from '@/llm/contextOverflowRecovery';
+import type { GoogleGroundingMetadata } from '@/tools/search/types';
 import type { FallbackErrorContext } from '@/llm/invoke';
 import type { HandoffRouting } from './handoff';
 import type { HookRegistry } from '@/hooks';
@@ -184,6 +185,7 @@ import {
   isThinkingEnabled,
   getConfiguredCompletionTokens,
 } from '@/llm/request';
+import { handleNativeSearchCitations, handleToolCalls } from '@/tools/handlers';
 import { createToolHistoryPreparation } from '@/messages/toolHistoryProjection';
 import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
 import { shouldTraceToolNodeForLangfuse } from '@/langfuseToolOutputTracing';
@@ -203,11 +205,11 @@ import { isRunStepResumeState } from '@/tools/runStepResume';
 import { resolveLocalToolsForBinding } from '@/tools/local';
 import { createSummarizeNode } from '@/summarization/node';
 import { getTruncationStopReason } from '@/llm/truncation';
+import { SearchCitations } from '@/tools/search/citations';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { AgentContext } from '@/agents/AgentContext';
 import { createFakeStreamingLLM } from '@/llm/fake';
 import { handoffStateAnnotation } from './handoff';
-import { handleToolCalls } from '@/tools/handlers';
 import { resolveMaxSeals } from '@/llm/preempt';
 import { initializeModel } from '@/llm/init';
 import { HandlerRegistry } from '@/events';
@@ -847,6 +849,8 @@ export abstract class Graph<
   callerSignal?: AbortSignal;
   /** Set of invoked tool call IDs from non-message run steps completed mid-run, if any */
   invokedToolIds?: Set<string>;
+  /** Provider-native web search sources and the anchors still owed to their citations. */
+  searchCitations = new SearchCitations();
   /** Explicit host policy. Never inferred from missing ToolNode claims. */
   clientDelegatedToolNames?: ReadonlySet<string>;
   handlerRegistry: HandlerRegistry | undefined;
@@ -955,6 +959,7 @@ export abstract class Graph<
     this.messageStepHasToolCalls = new Map();
     this.prelimMessageIdsByStepKey = new Map();
     this.invokedToolIds = undefined;
+    this.searchCitations = new SearchCitations();
     this.handlerRegistry = undefined;
     this.parentToolHandlerRegistry = undefined;
     this.hookRegistry = undefined;
@@ -1873,6 +1878,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       new Map()
     );
     this.invokedToolIds = resetIfNotEmpty(this.invokedToolIds, undefined);
+    this.searchCitations = new SearchCitations();
     this.resetPreemptTurnState();
     this.resetPreemptTotals();
     const hasScopedCheckpoint =
@@ -2375,6 +2381,15 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       return false;
     }
 
+    const anchors = this.searchCitations.release(stepId);
+    if (anchors != null && this.config != null) {
+      await this.dispatchMessageDelta(
+        stepId,
+        { content: [{ type: ContentTypes.TEXT, text: anchors.text }] },
+        anchors.metadata ?? options?.metadata
+      );
+    }
+
     const closedAt = options?.at ?? Date.now();
     runStep.status = status;
     if (status === 'completed') {
@@ -2501,6 +2516,54 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       return;
     }
     await this.closeRunStep(stepId, 'completed', { metadata, at: closeAt });
+  }
+
+  /** Gemini grounding arrives after the text it cites. */
+  private tracksSearchText(metadata?: Record<string, unknown>): boolean {
+    if (metadata == null) {
+      return false;
+    }
+    try {
+      return isGoogleLike(this.getAgentContext(metadata).provider);
+    } catch (_e) {
+      return false;
+    }
+  }
+
+  /** Keeps a Gemini chunk's grounding for the lane's model call. */
+  groundSearchCitations(
+    metadata: Record<string, unknown> | undefined,
+    grounding: GoogleGroundingMetadata
+  ): void {
+    this.searchCitations.ground(
+      this.getStepAgentKey(metadata),
+      grounding,
+      metadata
+    );
+  }
+
+  /**
+   * Turns the web search citations a finished agent model call carried into
+   * a `web_search` result and anchors in its text. Model calls outside an
+   * agent node (summaries, tool internals) never own the lane's text.
+   */
+  async settleSearchCitations(
+    metadata?: Record<string, unknown>
+  ): Promise<void> {
+    const node = metadata?.langgraph_node;
+    if (typeof node !== 'string' || !node.startsWith(AGENT)) {
+      return;
+    }
+    const call = this.searchCitations.take(this.getStepAgentKey(metadata));
+    if (call == null) {
+      return;
+    }
+    await handleNativeSearchCitations({
+      graph: this,
+      call,
+      metadata,
+      agentContext: this.getAgentContext(metadata),
+    });
   }
 
   /**
@@ -5970,7 +6033,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
   createWorkflow(): t.CompiledStateWorkflow {
     this.hasCompiledCheckpointer = this.compileOptions?.checkpointer != null;
-    if (this.hasCompiledCheckpointer && this.providerTextProtection?.batching != null) {
+    if (
+      this.hasCompiledCheckpointer &&
+      this.providerTextProtection?.batching != null
+    ) {
       throw new ProviderTextProtectionError('unsupported');
     }
     const agentNode = this.createAgentNode(this.defaultAgentId);
@@ -6340,11 +6406,23 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     if (!this.config) {
       throw new Error('No config provided');
     }
+    const content = Array.isArray(delta.content)
+      ? (this.searchCitations.anchor(id, delta.content, metadata) ??
+        delta.content)
+      : delta.content;
     const messageDelta: t.MessageDeltaEvent = {
       id,
-      delta,
+      delta: content === delta.content ? delta : { ...delta, content },
     };
-    if (hasTextDeltaContent(delta.content)) {
+    if (content != null && this.tracksSearchText(metadata)) {
+      this.searchCitations.track(
+        this.getStepAgentKey(metadata),
+        id,
+        content,
+        metadata
+      );
+    }
+    if (hasTextDeltaContent(content)) {
       this.messageStepHasTextDeltas.add(id);
     }
     const handler = this.handlerRegistry?.getHandler(
