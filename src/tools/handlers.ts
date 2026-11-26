@@ -366,7 +366,9 @@ async function handleAnthropicSearchResults({
     turn,
     results: contentPart.content as AnthropicWebSearchResultBlockParam[],
   });
-  graph.searchCitations.register(searchResultData);
+  if (!bindsSearchTool(graph)) {
+    graph.searchCitations.register(searchResultData);
+  }
 
   const name = toolCall.name;
   const input = toolCall.args ?? {};
@@ -399,26 +401,36 @@ async function handleAnthropicSearchResults({
 }
 
 /**
- * The SDK's own search tool numbers its turns per tool, apart from native
- * searches, so an agent that binds it keeps provider citations as they are
- * rather than risk two results sharing a turn.
+ * The SDK's own search tool numbers its turns per agent and tool, apart from
+ * native searches, so a run where any agent binds it keeps provider citations
+ * as they are rather than risk two results sharing a turn. Provider server
+ * tools (`{ type: 'web_search_20250305', name: 'web_search' }`) carry a
+ * `type`; the SDK tool and its definitions never do.
  */
-function bindsSearchTool(agentContext?: AgentContext): boolean {
-  return (
-    agentContext?.toolDefinitions?.some(
-      (definition) => definition.name === Constants.WEB_SEARCH
-    ) === true ||
-    agentContext?.tools?.some(
-      (tool) => 'name' in tool && tool.name === Constants.WEB_SEARCH
-    ) === true
-  );
+function bindsSearchTool(graph: StandardGraph | MultiAgentGraph): boolean {
+  for (const context of graph.agentContexts.values()) {
+    if (
+      context.toolDefinitions?.some(
+        ({ name }) => name === Constants.WEB_SEARCH
+      ) === true ||
+      context.tools?.some(
+        (tool) =>
+          'name' in tool &&
+          tool.name === Constants.WEB_SEARCH &&
+          !('type' in tool)
+      ) === true
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function getNativeSearchResults(
-  call: NativeSearchCall,
-  agentContext?: AgentContext
+  graph: StandardGraph | MultiAgentGraph,
+  call: NativeSearchCall
 ): NativeSearchResults | undefined {
-  if (call.grounding == null || bindsSearchTool(agentContext)) {
+  if (call.grounding == null || bindsSearchTool(graph)) {
     return undefined;
   }
   return coerceGoogleGroundingResults(call.grounding, call.text);
@@ -435,14 +447,12 @@ export async function handleNativeSearchCitations({
   graph,
   call,
   metadata,
-  agentContext,
 }: {
   graph: StandardGraph | MultiAgentGraph;
   call: NativeSearchCall;
   metadata?: Record<string, unknown>;
-  agentContext?: AgentContext;
 }): Promise<void> {
-  const results = getNativeSearchResults(call, agentContext);
+  const results = getNativeSearchResults(graph, call);
   const stepId = call.steps.at(0)?.id;
   if (results == null || stepId == null) {
     return;

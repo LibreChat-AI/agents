@@ -2558,12 +2558,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     if (call == null) {
       return;
     }
-    await handleNativeSearchCitations({
-      graph: this,
-      call,
-      metadata,
-      agentContext: this.getAgentContext(metadata),
-    });
+    await handleNativeSearchCitations({ graph: this, call, metadata });
   }
 
   /**
