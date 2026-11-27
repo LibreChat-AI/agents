@@ -1,14 +1,25 @@
-import { describe, it, expect, beforeEach, afterEach, jest } from '@jest/globals';
+import { z } from 'zod';
+import { DynamicStructuredTool } from '@langchain/core/tools';
+import {
+  describe,
+  it,
+  expect,
+  beforeEach,
+  afterEach,
+  jest,
+} from '@jest/globals';
 import type { ToolCall, ToolCallChunk } from '@langchain/core/messages/tool';
 import type { AgentContext } from '@/agents/AgentContext';
 import type { StandardGraph } from '@/graphs';
 import type * as t from '@/types';
 import {
+  handleNativeSearchCitations,
+  handleServerToolResult,
   handleToolCallChunks,
   handleToolCalls,
-  handleServerToolResult,
 } from '../handlers';
 import { StepTypes, ToolCallTypes, Providers, GraphEvents } from '@/common';
+import { SearchCitations } from '@/tools/search/citations';
 
 type MockGraph = {
   getStepKey: jest.Mock;
@@ -22,6 +33,9 @@ type MockGraph = {
   messageIdsByStepKey: Map<string, string>;
   prelimMessageIdsByStepKey: Map<string, string>;
   invokedToolIds?: Set<string>;
+  searchCitations: SearchCitations;
+  agentContexts: Map<string, Partial<AgentContext>>;
+  dispatchMessageDelta: jest.Mock;
   handlerRegistry?: {
     getHandler: jest.Mock;
   };
@@ -47,6 +61,11 @@ function createMockGraph(overrides?: Partial<MockGraph>): MockGraph {
     messageIdsByStepKey: new Map(),
     prelimMessageIdsByStepKey: new Map(),
     invokedToolIds: undefined,
+    searchCitations: new SearchCitations(),
+    agentContexts: new Map(),
+    dispatchMessageDelta: jest
+      .fn<() => Promise<void>>()
+      .mockResolvedValue(undefined),
     handlerRegistry: undefined,
     ...overrides,
   };
@@ -903,6 +922,77 @@ describe('handleServerToolResult', () => {
     expect(graph.invokedToolIds!.has('tu-1')).toBe(true);
   });
 
+  it.each([false, true])(
+    'registers results for citation anchors unless an agent binds the SDK search tool (bound=%s)',
+    async (bound) => {
+      graph.agentContexts.set('anthropic', {
+        tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+      });
+      graph.handlerRegistry = {
+        getHandler: jest.fn().mockReturnValue({
+          handle: jest
+            .fn<(...args: unknown[]) => Promise<void>>()
+            .mockResolvedValue(undefined),
+        }),
+      };
+      if (bound) {
+        graph.agentContexts.set('researcher', {
+          toolDefinitions: [{ name: 'web_search' }],
+        });
+      }
+      graph.toolCallStepIds.set('tu-1', 'step-1');
+      graph.getRunStep.mockReturnValue(
+        makeRunStep(StepTypes.TOOL_CALLS, {
+          tool_calls: [
+            {
+              id: 'tu-1',
+              name: 'web_search',
+              args: {},
+              type: 'tool_call',
+            } as t.AgentToolCall,
+          ],
+        })
+      );
+      await handleServerToolResult({
+        graph: graph as unknown as StandardGraph,
+        content: [
+          {
+            type: 'web_search_tool_result',
+            tool_use_id: 'tu-1',
+            content: [
+              {
+                type: 'web_search_result',
+                url: 'https://example.com',
+                title: 'Example',
+                encrypted_content: 'abc',
+                page_age: null,
+              },
+            ],
+          },
+        ] as t.MessageContentComplex[],
+        metadata: defaultMetadata,
+        agentContext: anthropicContext,
+      });
+
+      const anchored = graph.searchCitations.anchor('message-step', [
+        {
+          type: 'text',
+          index: 1,
+          citations: [
+            {
+              type: 'web_search_result_location',
+              url: 'https://example.com',
+            },
+          ],
+        },
+        { type: 'text', index: 2, text: '.' },
+      ]);
+      expect(anchored?.[1]).toEqual(
+        bound ? undefined : { type: 'text', text: '\ue202turn0search0' }
+      );
+    }
+  );
+
   it('initializes invokedToolIds set when null', async () => {
     const mockToolEndHandle = jest
       .fn<(...args: unknown[]) => Promise<void>>()
@@ -1021,5 +1111,101 @@ describe('handleServerToolResult', () => {
       )
     );
     warnSpy.mockRestore();
+  });
+});
+
+describe('handleNativeSearchCitations', () => {
+  const sentence = 'Pasta today.';
+  const metadata = { langgraph_node: 'agent=gemini', run_id: 'run-1' };
+
+  function settle(graph: MockGraph): Promise<void> {
+    graph.searchCitations.track('', 'step-text', [
+      { type: 'text', text: sentence },
+    ]);
+    graph.searchCitations.ground('', {
+      groundingChunks: [
+        { web: { uri: 'https://mensa.example', title: 'mensa' } },
+      ],
+      groundingSupports: [
+        {
+          segment: { endIndex: sentence.length, text: sentence },
+          groundingChunkIndices: [0],
+        },
+      ],
+    });
+    return handleNativeSearchCitations({
+      graph: graph as unknown as StandardGraph,
+      call: graph.searchCitations.take('')!,
+      metadata,
+    });
+  }
+
+  it('sends one web_search result and anchors the grounded text', async () => {
+    const handle = jest
+      .fn<(...args: unknown[]) => Promise<void>>()
+      .mockResolvedValue(undefined);
+    const graph = createMockGraph({
+      handlerRegistry: { getHandler: jest.fn().mockReturnValue({ handle }) },
+    });
+    await settle(graph);
+
+    expect(handle).toHaveBeenCalledWith(
+      GraphEvents.TOOL_END,
+      expect.objectContaining({
+        output: expect.objectContaining({
+          artifact: {
+            web_search: expect.objectContaining({
+              turn: 0,
+              organic: [
+                expect.objectContaining({ link: 'https://mensa.example' }),
+              ],
+            }),
+          },
+        }),
+      }),
+      metadata,
+      graph
+    );
+    expect(graph.dispatchMessageDelta).toHaveBeenCalledWith(
+      'step-text',
+      {
+        content: [
+          {
+            type: 'text',
+            edits: [
+              {
+                start: sentence.length,
+                end: sentence.length,
+                text: '\ue202turn0search0',
+              },
+            ],
+          },
+        ],
+      },
+      metadata
+    );
+  });
+
+  it('keeps grounding as it is when another agent binds the SDK search tool @scenario:search-tool-run-keeps-native-citations', async () => {
+    const handle = jest
+      .fn<(...args: unknown[]) => Promise<void>>()
+      .mockResolvedValue(undefined);
+    const graph = createMockGraph({
+      handlerRegistry: { getHandler: jest.fn().mockReturnValue({ handle }) },
+    });
+    graph.agentContexts.set('researcher', {
+      tools: [
+        new DynamicStructuredTool({
+          name: 'web_search',
+          description: 'Search the web.',
+          schema: z.object({ query: z.string() }),
+          func: async (): Promise<string> => '',
+        }),
+      ],
+    });
+    await settle(graph);
+
+    expect(handle).not.toHaveBeenCalled();
+    expect(graph.dispatchMessageDelta).not.toHaveBeenCalled();
   });
 });
