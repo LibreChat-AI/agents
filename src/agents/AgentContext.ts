@@ -127,6 +127,7 @@ export class AgentContext {
       maxContextTokens,
       reasoningKey,
       useLegacyContent,
+      vision,
       discoveredTools,
       summarizationEnabled,
       summarizeOnly,
@@ -163,6 +164,7 @@ export class AgentContext {
       instructionTokens: 0,
       tokenCounter,
       useLegacyContent,
+      vision,
       discoveredTools,
       summarizationEnabled,
       summarizeOnly,
@@ -414,6 +416,8 @@ export class AgentContext {
   tokenCalculationPromise?: Promise<void>;
   /** Format content blocks as strings (for legacy compatibility) */
   useLegacyContent: boolean = false;
+  /** `false` when this agent's model cannot read images (see `AgentInputs.vision`) */
+  vision?: boolean;
   /** Enables graph-level summarization for this agent */
   summarizationEnabled?: boolean;
   /** Summarize-only run: request a summary on the first model step and end after it */
@@ -478,7 +482,11 @@ export class AgentContext {
   private correctedContextBudgetMode?: t.ContextBudgetMode;
 
   get summarizationBudgetMode(): t.ContextBudgetMode {
-    return this.correctedContextBudgetMode ?? this.summarizationConfig?.contextBudgetMode ?? 'input';
+    return (
+      this.correctedContextBudgetMode ??
+      this.summarizationConfig?.contextBudgetMode ??
+      'input'
+    );
   }
   /**
    * Prompt size, normalized into the local counter's uncalibrated units, at
@@ -520,6 +528,7 @@ export class AgentContext {
     toolEnd,
     instructionTokens,
     useLegacyContent,
+    vision,
     discoveredTools,
     summarizationEnabled,
     summarizeOnly,
@@ -549,6 +558,7 @@ export class AgentContext {
     toolEnd?: boolean;
     instructionTokens?: number;
     useLegacyContent?: boolean;
+    vision?: boolean;
     discoveredTools?: string[];
     summarizationEnabled?: boolean;
     summarizeOnly?: boolean;
@@ -595,6 +605,7 @@ export class AgentContext {
     }
 
     this.useLegacyContent = useLegacyContent ?? false;
+    this.vision = vision;
     this.summarizationEnabled = summarizationEnabled;
     this.summarizeOnly = summarizeOnly;
     this.summarizationConfig = summarizationConfig;
@@ -1061,45 +1072,47 @@ export class AgentContext {
         : 0;
     }
 
-    return markProviderTextInput(RunnableLambda.from((messages: BaseMessage[]) => {
-      const prefix: BaseMessage[] = systemMessage ? [systemMessage] : [];
+    return markProviderTextInput(
+      RunnableLambda.from((messages: BaseMessage[]) => {
+        const prefix: BaseMessage[] = systemMessage ? [systemMessage] : [];
 
-      // Build the non-system portion (summary + conversation), then apply
-      // cache markers separately so addCacheControl doesn't strip the
-      // SystemMessage's own cache_control breakpoint set above.
-      const hasSummaryBody =
-        this._summaryLocation === 'user_message' &&
-        this.summaryText != null &&
-        this.summaryText !== '';
+        // Build the non-system portion (summary + conversation), then apply
+        // cache markers separately so addCacheControl doesn't strip the
+        // SystemMessage's own cache_control breakpoint set above.
+        const hasSummaryBody =
+          this._summaryLocation === 'user_message' &&
+          this.summaryText != null &&
+          this.summaryText !== '';
 
-      const bodyWithSummary =
-        hasSummaryBody && promptCacheProvider == null
-          ? [this.buildSummaryHumanMessage(promptCacheProvider), ...messages]
-          : messages;
-      const dynamicTail = this.buildPromptCacheDynamicTail({
-        dynamicInstructions,
-        hasSummaryBody,
-        promptCacheProvider,
-        shouldMoveDynamicInstructions,
-      });
-      let body = this.buildBodyWithPromptCacheDynamicTail(
-        bodyWithSummary,
-        dynamicTail,
-        promptCacheProvider
-      );
-
-      if (
-        promptCacheProvider != null &&
-        dynamicTail.length === 0 &&
-        body.length >= 2
-      ) {
-        body = addTailCacheControl(
-          body,
-          this.getPromptCacheTtl(promptCacheProvider)
+        const bodyWithSummary =
+          hasSummaryBody && promptCacheProvider == null
+            ? [this.buildSummaryHumanMessage(promptCacheProvider), ...messages]
+            : messages;
+        const dynamicTail = this.buildPromptCacheDynamicTail({
+          dynamicInstructions,
+          hasSummaryBody,
+          promptCacheProvider,
+          shouldMoveDynamicInstructions,
+        });
+        let body = this.buildBodyWithPromptCacheDynamicTail(
+          bodyWithSummary,
+          dynamicTail,
+          promptCacheProvider
         );
-      }
-      return [...prefix, ...body];
-    })).withConfig({ runName: 'prompt' });
+
+        if (
+          promptCacheProvider != null &&
+          dynamicTail.length === 0 &&
+          body.length >= 2
+        ) {
+          body = addTailCacheControl(
+            body,
+            this.getPromptCacheTtl(promptCacheProvider)
+          );
+        }
+        return [...prefix, ...body];
+      })
+    ).withConfig({ runName: 'prompt' });
   }
 
   private buildSummaryHumanMessage(

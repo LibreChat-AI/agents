@@ -19,6 +19,7 @@ import { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import { _convertMessagesToOpenAIParams } from '@/llm/openai/utils';
 import { createContextPressureMeter } from './contextPressureMeter';
 import { foldToolBlocksForToollessAgent } from '@/messages/format';
+import { OMITTED_IMAGE_TEXT } from '@/messages/vision';
 import { attemptInvoke } from '@/llm/invoke';
 import { Providers } from '@/common';
 
@@ -790,5 +791,87 @@ describe('prepareProviderRequest', () => {
       )
     ).rejects.toThrow('does not match invocation options');
     expect(invocations).toHaveLength(0);
+  });
+
+  describe('for a model without image input', () => {
+    const image = {
+      type: 'image_url',
+      image_url: { url: 'data:image/png;base64,AA==' },
+    };
+    const question = { type: 'text', text: 'What does the chart show?' };
+    const marker = { type: 'text', text: OMITTED_IMAGE_TEXT };
+
+    it('@scenario:text-only-request sends and measures a marker in place of each image', () => {
+      const { model } = createCapturingModel();
+      const source = new HumanMessage({ content: [question, image] });
+      const measure = jest.fn((messages: BaseMessage[]) => ({
+        fits: true,
+        projectedMessageTokens: messages.length,
+      }));
+
+      const request = prepareProviderRequest({
+        model: model as t.ChatModel,
+        messages: [source],
+        provider: Providers.OPENAI,
+        measure,
+        vision: false,
+      });
+
+      expect(request.messages[0].content).toEqual([question, marker]);
+      expect(measure).toHaveBeenCalledWith(request.messages);
+      expect(source.content).toEqual([question, image]);
+    });
+
+    it('replaces an image that an attachment reference resolves to', () => {
+      const { model } = createCapturingModel();
+      const reference = {
+        type: 'image' as const,
+        source_type: 'id' as const,
+        id: 'image-1',
+        mime_type: 'image/png',
+      };
+      const resolveAttachment = jest.fn<t.AttachmentResolver>(() => image);
+
+      const request = prepareProviderRequest({
+        model: model as t.ChatModel,
+        messages: [new HumanMessage({ content: [question, reference] })],
+        provider: Providers.ANTHROPIC,
+        context: { resolveAttachment },
+        vision: false,
+      });
+
+      expect(resolveAttachment).toHaveBeenCalledTimes(1);
+      expect(request.messages[0].content).toEqual([question, marker]);
+    });
+
+    it('flattens a turn left with only text for a legacy-content agent', () => {
+      const { model } = createCapturingModel();
+
+      const request = prepareProviderRequest({
+        model: model as t.ChatModel,
+        messages: [new HumanMessage({ content: [question, image] })],
+        provider: Providers.OPENAI,
+        vision: false,
+        useLegacyContent: true,
+      });
+
+      expect(request.messages[0].content).toBe(
+        `${question.text}\n${OMITTED_IMAGE_TEXT}`
+      );
+    });
+
+    it.each([undefined, true])('keeps images when vision is %s', (vision) => {
+      const { model } = createCapturingModel();
+      const source = new HumanMessage({ content: [question, image] });
+
+      const request = prepareProviderRequest({
+        model: model as t.ChatModel,
+        messages: [source],
+        provider: Providers.OPENAI,
+        vision,
+      });
+
+      expect(request.messages[0]).toBe(source);
+    });
   });
 });

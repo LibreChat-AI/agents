@@ -12,8 +12,9 @@ import {
 import type { BaseMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
 import { OVERFLOW_SIGNATURES } from '@/utils/__tests__/fixtures/contextOverflowSignatures';
-import { ContentTypes, GraphEvents, Providers } from '@/common';
 import { getProviderSourceMessageIds } from '@/messages/provenance';
+import { ContentTypes, GraphEvents, Providers } from '@/common';
+import { OMITTED_IMAGE_TEXT } from '@/messages/vision';
 import * as init from '@/llm/init';
 import { Run } from '@/run';
 
@@ -160,7 +161,10 @@ const streamConfig = {
 async function captureFallback(
   messages: BaseMessage[],
   fallbackConfig: t.FallbackConfig,
-  options: Partial<Parameters<typeof createRun>[0]> & { legacy?: boolean } = {}
+  options: Partial<Parameters<typeof createRun>[0]> & {
+    legacy?: boolean;
+    textOnly?: boolean;
+  } = {}
 ): Promise<BaseMessage[]> {
   const run = await createRun({
     runId: 'fallback-serving-pipeline',
@@ -176,6 +180,9 @@ async function captureFallback(
   const context = run.Graph.agentContexts.get('default');
   if (context != null && options.legacy === true) {
     context.useLegacyContent = true;
+  }
+  if (context != null && options.textOnly === true) {
+    context.vision = false;
   }
   const primary = new OverflowThenSucceedModel({ message: '503 unavailable' });
   const fallback = new OverflowThenSucceedModel({}, 0);
@@ -243,6 +250,25 @@ describe('context overflow recovery', () => {
       true
     );
     expect(result[0].content).toContain('legacy question');
+  });
+
+  it('@scenario:text-only-fallback gives a text-only fallback the marker in legacy string content', async () => {
+    const result = await captureFallback(
+      [
+        new HumanMessage({
+          content: [
+            { type: 'text', text: 'legacy question' },
+            {
+              type: 'image_url',
+              image_url: { url: 'data:image/png;base64,aW1hZ2U=' },
+            },
+          ],
+        }),
+      ],
+      { provider: Providers.OPENAI, maxContextTokens: 1_000_000 },
+      { legacy: true, textOnly: true }
+    );
+    expect(result[0].content).toBe(`legacy question\n${OMITTED_IMAGE_TEXT}`);
   });
 
   it('omits optional artifact expansion when the fallback budget cannot fit it', async () => {

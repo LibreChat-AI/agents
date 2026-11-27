@@ -38,6 +38,7 @@ import { isAnthropicLike, isGoogleLike, isOpenAILike } from '@/utils/llm';
 import { annotateMessagesForLLM } from '@/tools/toolOutputReferences';
 import { providerRequiresStrictAlternation } from '@/llm/providers';
 import { getProviderFamily } from '@/llm/providerRegistry';
+import { replaceImageContent } from '@/messages/vision';
 import { Providers } from '@/common';
 
 const preparedProviderRequestBrand = Symbol('PreparedProviderRequest');
@@ -132,6 +133,10 @@ export interface PrepareProviderRequestParams {
   maxToolResultChars?: number;
   measure?: (messages: BaseMessage[]) => ProviderPayloadMeasurement;
   toolHistory?: ToolHistoryPreparation;
+  /** `false` replaces images with a text marker for a model without image input. */
+  vision?: boolean;
+  /** Flattens messages the image replacement leaves text-only, as `formatContentStrings` does. */
+  useLegacyContent?: boolean;
 }
 
 export function usesNativeOpenAIResponses(
@@ -736,6 +741,8 @@ export function prepareProviderRequest({
   maxToolResultChars,
   measure,
   toolHistory = createToolHistoryPreparation(),
+  vision,
+  useLegacyContent,
 }: PrepareProviderRequestParams): PreparedProviderRequest {
   const projectionMode = resolveProviderMessageProjectionMode(
     model,
@@ -764,9 +771,13 @@ export function prepareProviderRequest({
     },
     projectionMode
   );
+  const readable =
+    vision === false
+      ? replaceImageContent(projected, useLegacyContent === true)
+      : projected;
   const registry = context?.getOrCreateToolOutputRegistry?.();
   const runId = config?.configurable?.run_id as string | undefined;
-  const annotated = annotateMessagesForLLM(projected, registry, runId);
+  const annotated = annotateMessagesForLLM(readable, registry, runId);
   const isRunProduced = context?.isRunProducedMessage;
   const handoffGrounded = appendInstructionlessHandoffCue(annotated, config);
   const cued = isAnthropicLike(provider, {

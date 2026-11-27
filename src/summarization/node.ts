@@ -1238,6 +1238,7 @@ async function runSummarizationAttempts(
               provider,
               context: graph,
               config,
+              vision: agentContext.vision,
             });
             fallbackIdentity = {
               provider,
@@ -2554,6 +2555,7 @@ async function summarizeWithCacheHit({
         provider,
         context: graph,
         config: signalConfig,
+        vision: agentContext.vision,
       });
       result = await attemptInvoke(
         {

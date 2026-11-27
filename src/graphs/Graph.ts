@@ -4335,6 +4335,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         config,
         maxToolResultChars: maxProviderToolResultChars,
         toolHistory,
+        vision: agentContext.vision,
+        useLegacyContent: agentContext.useLegacyContent,
         measure: (preparedMessages) =>
           measureProviderPayload(
             trackProviderMessageOrigins(
@@ -4896,6 +4898,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                       config: fallbackConfig,
                       maxToolResultChars: fallbackToolResultChars,
                       toolHistory: fallbackToolHistory,
+                      vision: agentContext.vision,
+                      useLegacyContent: agentContext.useLegacyContent,
                       measure: (prepared) => {
                         projection = measureFallback(
                           trackProviderMessageOrigins(cached, prepared)
