@@ -20,6 +20,7 @@ import type {
   RunStepDeltaEvent,
   RunStepResumeState,
   RunStepClosedEvent,
+  ProviderOutputItemsEvent,
   ToolCallsDispatchedEvent,
   MessageDeltaEvent,
   ReasoningDeltaEvent,
@@ -224,6 +225,7 @@ export interface EventHandler {
       | AgentLogEvent
       | ContextUsageEvent
       | ToolExecuteBatchRequest
+      | ProviderOutputItemsEvent
       | { result: ToolEndEvent },
     metadata?: Record<string, unknown>,
     graph?: StandardGraph | MultiAgentGraph
