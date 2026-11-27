@@ -38,6 +38,7 @@ import type {
 import type { ToolCall, ToolCallChunk } from '@langchain/core/messages/tool';
 import {
   getBoundedCacheControlledTextToolContent,
+  getBoundedSingleTextToolContent,
   getComputerCallOutputScreenshot,
   isComputerCallOutputMessage,
   serializeStructuredValueBounded,
@@ -364,8 +365,23 @@ export function _convertMessagesToOpenAIParams(
 
     let hasReasoningBlock = false;
 
+    let toolText: string | undefined;
+    if (role === 'tool' && options?.preserveToolCacheControl === true) {
+      toolText =
+        typeof message.content === 'string'
+          ? message.content
+          : getBoundedSingleTextToolContent(
+            message.content,
+            HARD_MAX_TOOL_RESULT_CHARS
+          );
+    }
+
     let content: unknown;
-    if (
+    if (toolText != null && toolText !== '') {
+      // The tail breakpoint needs a text block; sending every tool result as
+      // one keeps its bytes the same before and after the marker moves on.
+      content = [{ type: 'text', text: toolText }];
+    } else if (
       role === 'tool' &&
       typeof message.content !== 'string' &&
       !isComputerCallOutputMessage(message)
