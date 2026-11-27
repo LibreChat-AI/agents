@@ -1913,9 +1913,16 @@ export class AgentContext {
           message.id == null ? [] : [[message.id, message] as const]
         )
       );
+      const omitted =
+        omittedIndexes.length > 0 ? new Set(omittedIndexes) : undefined;
       if (this.providerProjectionRequiresRecount && this.tokenCounter != null) {
         const recounted: Record<string, number> = {};
         for (let i = 0; i < messages.length; i++) {
+          if (omitted?.has(i) === true) {
+            /** Priced as the marker its request sends, never as the image a floor remembers. */
+            recounted[i] = this.tokenCounter(projection[i]);
+            continue;
+          }
           const localCount = this.tokenCounter(messages[i]);
           const conservativeFloor = this.providerProjectionRecountFloors?.get(
             messages[i]
@@ -1928,10 +1935,10 @@ export class AgentContext {
         this.indexTokenCountMap = recounted;
         this.providerProjectionRequiresRecount = false;
         this.providerProjectionRecountFloors = undefined;
-      } else if (omittedIndexes.length > 0 && this.tokenCounter != null) {
+      } else if (omitted != null && this.tokenCounter != null) {
         /** A host count priced the image; a new map keeps other agents' counts intact. */
         const counts = { ...this.indexTokenCountMap };
-        for (const index of omittedIndexes) {
+        for (const index of omitted) {
           counts[index] = this.tokenCounter(projection[index]);
         }
         this.indexTokenCountMap = counts;
