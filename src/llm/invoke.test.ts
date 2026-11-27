@@ -16,13 +16,17 @@ import type { StructuredToolInterface } from '@langchain/core/tools';
 import type { BaseMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
 import { _convertMessagesToAnthropicPayload } from '@/llm/anthropic/utils/message_inputs';
-import { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
+import {
+  ToolOutputReferenceRegistry,
+  nextReferenceTurn,
+} from '@/tools/toolOutputReferences';
 import { convertMessageContentToParts } from '@/llm/google/utils/common';
 import { _convertMessagesToOpenAIParams } from '@/llm/openai/utils';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { StreamLimitExceededError } from '@/llm/streamLimits';
 import { toLangChainContent } from '@/messages/langchain';
-import { Constants, Providers } from '@/common';
+import { formatAgentMessages } from '@/messages/format';
+import { Constants, ContentTypes, Providers } from '@/common';
 import { ToolNode } from '@/tools/ToolNode';
 import { ChatOpenAI } from '@/llm/openai';
 
@@ -156,7 +160,7 @@ describe('attemptInvoke applies lazy ref annotation', () => {
     expect(messages[0].content).toBe('output');
   });
 
-  it('passes messages unchanged when no registry is exposed on context (e.g. summarization)', async () => {
+  it('labels a restored _refKey when no registry is exposed on context (e.g. summarization)', async () => {
     const messages: BaseMessage[] = [
       new ToolMessage({
         name: 'echo',
@@ -176,7 +180,7 @@ describe('attemptInvoke applies lazy ref annotation', () => {
     });
 
     expect(invokeMessages).toHaveLength(1);
-    expect(invokeMessages[0][0].content).toBe('output');
+    expect(invokeMessages[0][0].content).toBe('[ref: tool0turn0]\noutput');
   });
 
   it('replaces native computer screenshots for non-Responses providers', async () => {
@@ -655,7 +659,7 @@ describe('attemptInvoke applies lazy ref annotation', () => {
     ]);
   });
 
-  it('skips annotation for stale _refKey not present in current run registry (cross-run scenario)', async () => {
+  it('annotates a restored _refKey that is not in the current run registry (cross-run scenario)', async () => {
     const registry = new ToolOutputReferenceRegistry();
     // run-3 registry holds tool0turn0 - the current run's live ref
     registry.set('run-3', 'tool0turn0', 'live-stored');
@@ -665,10 +669,8 @@ describe('attemptInvoke applies lazy ref annotation', () => {
     } as unknown as Parameters<typeof attemptInvoke>[0]['context'];
 
     const messages: BaseMessage[] = [
-      // Stale ToolMessage from a hydrated prior run - its _refKey points
-      // at a key that exists in registry, but conceptually different
-      // semantics. For this test, use a key that doesn't exist in the
-      // current registry to demonstrate the no-op behavior.
+      // ToolMessage restored from a prior run: its _refKey is absent from
+      // the current registry but is still its stable name on the wire.
       new ToolMessage({
         name: 'echo',
         tool_call_id: 'old',
@@ -698,8 +700,52 @@ describe('attemptInvoke applies lazy ref annotation', () => {
     );
 
     const sent = invokeMessages[0];
-    expect(sent[0].content).toBe('old-output');
+    expect(sent[0].content).toBe('[ref: tool5turn5]\nold-output');
     expect(sent[1].content).toBe('[ref: tool0turn0]\nnew-output');
+  });
+
+  it('sends a restored tool round with the same bytes when tool output references are off in this run', async () => {
+    // Code execution switched off since the round ran: this run has no
+    // registry, while the earlier turns sent the round labelled.
+    const { messages: history } = formatAgentMessages([
+      { role: 'user', content: 'list files' },
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: 'c1',
+              name: 'bash_tool',
+              args: '{"command":"ls"}',
+              output: 'a.txt',
+              ref: 'tool0turn0',
+            },
+          },
+        ],
+      },
+      { role: 'user', content: 'thanks' },
+    ]);
+    const send = async (
+      registry: ToolOutputReferenceRegistry | undefined
+    ): Promise<string> => {
+      const { invokeMessages, model } = buildCapturingModel();
+      await attemptInvoke({
+        model: model as t.ChatModel,
+        messages: history,
+        provider: Providers.OPENAI,
+        context: {
+          getOrCreateToolOutputRegistry: () => registry,
+        } as unknown as Parameters<typeof attemptInvoke>[0]['context'],
+      });
+      return JSON.stringify(_convertMessagesToOpenAIParams(invokeMessages[0]));
+    };
+
+    const codeOn = await send(new ToolOutputReferenceRegistry());
+    const codeOff = await send(undefined);
+
+    expect(codeOn).toContain('"content":"[ref: tool0turn0]\\na.txt"');
+    expect(codeOff).toBe(codeOn);
   });
 
   it('applies unresolved-refs annotation regardless of registry presence', async () => {
@@ -1139,17 +1185,15 @@ describe('invocation attribution metadata', () => {
 });
 
 describe('cross-run hydration through ToolNode + attemptInvoke', () => {
-  it('annotates run 2 refs but leaves hydrated run 1 ToolMessages untouched', async () => {
+  it('labels hydrated run 1 ToolMessages and gives run 2 keys that do not repeat them', async () => {
     /**
      * Smoke test for the headline scenario: ToolMessages produced in
-     * run 1 are persisted with clean content + `_refKey`/`_refScope`
-     * metadata. When those messages are hydrated into run 2's state
-     * and run 2 produces its own tool output, the annotation transform
-     * must (a) annotate run 2's fresh tool message because its
-     * `_refScope` is live in run 2's registry, and (b) leave run 1's
-     * tool message clean because run 1's scope is not in run 2's
-     * registry. Same `tool0turn0` key collides across runs without any
-     * confusion.
+     * run 1 are persisted with clean content + `_refKey` metadata. When
+     * those messages are hydrated into run 2's state, the annotation
+     * transform must (a) keep labelling run 1's message with its
+     * persisted key although run 2's registry never held it, and (b)
+     * label run 2's message with a key that does not repeat run 1's,
+     * because run 2's turn counter is seeded from the hydrated history.
      */
     const echo = tool(async (input) => (input as { command: string }).command, {
       name: 'echo',
@@ -1186,6 +1230,9 @@ describe('cross-run hydration through ToolNode + attemptInvoke', () => {
       tools: [echo],
       toolOutputReferences: { enabled: true },
     });
+    run2Node
+      ._unsafeGetToolOutputRegistry()!
+      .seedTurn('run-2', nextReferenceTurn([run1ToolMsg]));
     const run2Result = (await run2Node.invoke(
       {
         messages: [
@@ -1202,7 +1249,7 @@ describe('cross-run hydration through ToolNode + attemptInvoke', () => {
 
     const run2ToolMsg = run2Result.messages[0];
     expect(run2ToolMsg.content).toBe('run-2-output');
-    expect(run2ToolMsg.additional_kwargs._refKey).toBe('tool0turn0');
+    expect(run2ToolMsg.additional_kwargs._refKey).toBe('tool0turn1');
     expect(run2ToolMsg.additional_kwargs._refScope).toBe('run-2');
 
     /* Hydrate run 1's message + run 2's message into a single state */
@@ -1231,10 +1278,8 @@ describe('cross-run hydration through ToolNode + attemptInvoke', () => {
     );
 
     const sent = invokeMessages[0];
-    /* Run 1's hydrated tool message stays clean — its scope is stale */
-    expect(sent[1].content).toBe('run-1-output');
-    /* Run 2's tool message gets annotated — its scope is live */
-    expect(sent[3].content).toBe('[ref: tool0turn0]\nrun-2-output');
+    expect(sent[1].content).toBe('[ref: tool0turn0]\nrun-1-output');
+    expect(sent[3].content).toBe('[ref: tool0turn1]\nrun-2-output');
 
     /* Persisted state is unchanged */
     expect(hydrated[1].content).toBe('run-1-output');
