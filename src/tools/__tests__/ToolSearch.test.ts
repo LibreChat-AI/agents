@@ -1622,3 +1622,49 @@ describe('tool_search mcp_server filtering', () => {
     expect(output).not.toContain('The tool registry is empty');
   });
 });
+
+describe('createToolSearch with a dispatcher', () => {
+  const registry = new Map([
+    [
+      'lookup_order_mcp_shop',
+      {
+        name: 'lookup_order_mcp_shop',
+        description: 'Looks up an order.',
+        parameters: { type: 'object', properties: { order: { type: 'string' } } },
+        defer_loading: true,
+      },
+    ],
+  ]);
+  const search = async (
+    toolDispatch?: string
+  ): Promise<{
+    tools: Array<{ name: string; parameters?: unknown }>;
+    call_with?: string;
+  }> =>
+    JSON.parse(
+      String(
+        await createToolSearch({
+          mode: 'local',
+          toolRegistry: registry as never,
+          mcpNameFormat: 'base',
+          toolDispatch,
+        }).invoke({ query: 'order' })
+      )
+    );
+
+  it('returns full names and schemas and points to the dispatcher', async () => {
+    const result = await search('call_tool');
+    expect(result.tools[0]).toMatchObject({
+      name: 'lookup_order_mcp_shop',
+      parameters: { properties: { order: { type: 'string' } } },
+    });
+    expect(result.call_with).toContain('call_tool');
+  });
+
+  it('keeps the plain output without a dispatcher', async () => {
+    const result = await search();
+    expect(result.tools[0].name).toBe('lookup_order');
+    expect(result.tools[0].parameters).toBeUndefined();
+    expect(result.call_with).toBeUndefined();
+  });
+});

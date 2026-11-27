@@ -1212,3 +1212,49 @@ describe('ContentAggregator citation deltas', () => {
     });
   });
 });
+
+describe('ContentAggregator dispatched tool calls', () => {
+  it('keeps the dispatched target on the completed dispatcher call', () => {
+    const { contentParts, aggregateContent } = createContentAggregator();
+    contentParts.push({
+      type: ContentTypes.TOOL_CALL,
+      tool_call: {
+        id: 'call_late',
+        name: 'call_tool',
+        args: '{"name":"late_tool","arguments":"{}"}',
+      },
+    });
+
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP_COMPLETED,
+      data: {
+        result: {
+          id: '',
+          index: 0,
+          type: 'tool_call',
+          tool_call: {
+            id: 'call_late',
+            name: 'call_tool',
+            args: '{"name":"late_tool","arguments":"{}"}',
+            output: 'found',
+            progress: 1,
+            dispatched: { name: 'late_tool', args: '{}' },
+          } as t.ProcessedToolCall,
+        },
+      } as { result: t.ToolEndEvent },
+    });
+
+    expect(contentParts[0]).toEqual({
+      type: ContentTypes.TOOL_CALL,
+      tool_call: {
+        id: 'call_late',
+        name: 'call_tool',
+        args: '{"name":"late_tool","arguments":"{}"}',
+        type: 'tool_call',
+        output: 'found',
+        progress: 1,
+        dispatched: { name: 'late_tool', args: '{}' },
+      },
+    });
+  });
+});

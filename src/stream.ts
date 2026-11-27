@@ -42,6 +42,7 @@ import {
   coerceRecordArgs,
   normalizeError,
 } from '@/tools/eagerEventExecution';
+import { TOOL_DISPATCHER_NAME } from '@/tools/toolDispatch';
 import {
   serializeStructuredValueBounded,
   serializeToolContentBounded,
@@ -199,6 +200,20 @@ function isEagerExecutionExcludedTool(
   // A protected result must be inspected before its completion is published,
   // which only the committed ToolNode path guarantees.
   if (graph.toolResultProtection?.toolNames.includes(name) === true) {
+    return true;
+  }
+  // ToolNode unwraps dispatched calls and refuses disabled tools; a prestart
+  // would run them before that happens.
+  const toolDef =
+    agentContext?.toolRegistry?.get(name) ??
+    agentContext?.toolDefinitions?.find((def) => def.name === name);
+  const dispatch =
+    agentContext?.toolDispatch != null && agentContext.toolDispatch !== false;
+  if (
+    (dispatch && name === TOOL_DISPATCHER_NAME) ||
+    toolDef?.disabled != null ||
+    (dispatch && toolDef?.defer_loading === true)
+  ) {
     return true;
   }
   // Run-scoped circuit breaker: once a prestart for this tool diverged from
@@ -2677,9 +2692,13 @@ export function createContentAggregator(): t.ContentAggregatorResult {
         }
       }
 
+      const dispatched = finalUpdate
+        ? (contentPart.tool_call as t.ToolCallPart).dispatched
+        : undefined;
       contentParts[index] = {
         type: ContentTypes.TOOL_CALL,
-        tool_call: newToolCall,
+        tool_call:
+          dispatched != null ? { ...newToolCall, dispatched } : newToolCall,
       };
       indexContentPart(index, contentParts[index]);
       indexedContentLength = Math.max(indexedContentLength, index + 1);

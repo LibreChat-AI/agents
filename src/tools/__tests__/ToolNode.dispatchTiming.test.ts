@@ -302,3 +302,363 @@ describe('tool dispatch timing', () => {
     ]);
   });
 });
+
+describe('call_tool dispatcher', () => {
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  const definitions = new Map<string, t.LCTool>([
+    ['bound_tool', { name: 'bound_tool' }],
+    [
+      'late_tool',
+      {
+        name: 'late_tool',
+        defer_loading: true,
+        parameters: { type: 'object', properties: { q: { type: 'string' } } },
+      },
+    ],
+  ]);
+
+  const createNode = (): ToolNode =>
+    new ToolNode({
+      tools: [makeTool('bound_tool'), makeTool('late_tool')],
+      eventDrivenMode: true,
+      toolDefinitions: definitions,
+      toolDispatch: true,
+      toolCallStepIds: new Map([
+        ['call_ok', 'step_ok'],
+        ['call_bad', 'step_bad'],
+      ]),
+    });
+
+  /** Args the step-completed event carried for a call, as the host would persist them. */
+  const completedArgs = (
+    dispatch: { mock: { calls: unknown[][] } },
+    id: string
+  ): unknown => {
+    type Completed = { result: { tool_call?: { id: string; args: unknown } } };
+    const call = dispatch.mock.calls.find(
+      ([event, data]) =>
+        event === GraphEvents.ON_RUN_STEP_COMPLETED &&
+        (data as Completed).result.tool_call?.id === id
+    );
+    const args = (call?.[1] as Completed | undefined)?.result.tool_call?.args;
+    return typeof args === 'string' ? JSON.parse(args) : args;
+  };
+
+  const invoke = (
+    node: ToolNode,
+    id: string,
+    args: Record<string, unknown>,
+    name = 'call_tool'
+  ): Promise<{ messages: ToolMessage[] }> =>
+    node.invoke({
+      messages: [
+        new AIMessage({
+          content: '',
+          tool_calls: [{ id, name, args }],
+        }),
+      ],
+    }) as Promise<{ messages: ToolMessage[] }>;
+
+  it('runs the target on the host and answers under the dispatcher call', async () => {
+    const requests: t.ToolCallRequest[] = [];
+    const completions: t.ProcessedToolCall[] = [];
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data): Promise<void> => {
+        if (event === GraphEvents.ON_TOOL_EXECUTE) {
+          const batch = data as t.ToolExecuteBatchRequest;
+          requests.push(...batch.toolCalls);
+          batch.resolve([
+            { toolCallId: 'call_ok', content: 'found', status: 'success' },
+          ]);
+        } else if (event === GraphEvents.ON_RUN_STEP_COMPLETED) {
+          completions.push(
+            (data as { result: t.ToolCompleteEvent }).result.tool_call
+          );
+        }
+      });
+    const dispatcherArgs = { name: 'late_tool', arguments: '{"q":"bolts"}' };
+
+    const result = await invoke(createNode(), 'call_ok', dispatcherArgs);
+
+    expect(requests).toEqual([
+      expect.objectContaining({
+        id: 'call_ok',
+        name: 'late_tool',
+        args: { q: 'bolts' },
+      }),
+    ]);
+    expect(result.messages[0]).toMatchObject({
+      name: 'call_tool',
+      tool_call_id: 'call_ok',
+      content: 'found',
+    });
+    expect(completions).toEqual([
+      expect.objectContaining({
+        id: 'call_ok',
+        name: 'call_tool',
+        args: JSON.stringify(dispatcherArgs),
+        dispatched: { name: 'late_tool', args: '{"q":"bolts"}' },
+      }),
+    ]);
+  });
+
+  it('answers a call to a tool that is not deferred with an error and does not run it', async () => {
+    const execute = jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockResolvedValue(undefined);
+
+    const result = await invoke(createNode(), 'call_bad', {
+      name: 'bound_tool',
+    });
+
+    expect(result.messages[0]).toMatchObject({
+      name: 'call_tool',
+      tool_call_id: 'call_bad',
+      status: 'error',
+    });
+    expect(result.messages[0].content).toContain(
+      'not available through call_tool'
+    );
+    expect(
+      execute.mock.calls.some(([event]) => event === GraphEvents.ON_TOOL_EXECUTE)
+    ).toBe(false);
+  });
+
+  it('stores a direct call to a deferred tool as a dispatcher call', async () => {
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data): Promise<void> => {
+        if (event === GraphEvents.ON_TOOL_EXECUTE) {
+          const batch = data as t.ToolExecuteBatchRequest;
+          batch.resolve([
+            { toolCallId: 'call_ok', content: 'found', status: 'success' },
+          ]);
+        }
+      });
+    const ai = new AIMessage({
+      id: 'ai_1',
+      content: [
+        { type: 'tool_use', id: 'call_ok', name: 'late_tool', input: { q: 'x' } },
+      ],
+      additional_kwargs: {
+        tool_calls: [
+          {
+            id: 'call_ok',
+            type: 'function',
+            function: { name: 'late_tool', arguments: '{"q":"x"}' },
+          },
+        ],
+      },
+      response_metadata: {
+        output: [
+          {
+            type: 'function_call',
+            id: 'fc_1',
+            call_id: 'call_ok',
+            name: 'late_tool',
+            arguments: '{"q":"x"}',
+          },
+        ],
+      },
+      tool_calls: [{ id: 'call_ok', name: 'late_tool', args: { q: 'x' } }],
+    });
+
+    const result = (await createNode().invoke({ messages: [ai] })) as {
+      messages: Array<AIMessage | ToolMessage>;
+    };
+
+    const [rewritten, answer] = result.messages as [AIMessage, ToolMessage];
+    const dispatcherArgs = { name: 'late_tool', arguments: '{"q":"x"}' };
+    expect(rewritten.tool_calls?.[0]).toMatchObject({
+      id: 'call_ok',
+      name: 'call_tool',
+      args: dispatcherArgs,
+    });
+    expect(rewritten.content).toEqual([
+      {
+        type: 'tool_use',
+        id: 'call_ok',
+        name: 'call_tool',
+        input: dispatcherArgs,
+      },
+    ]);
+    expect(rewritten.additional_kwargs.tool_calls?.[0].function).toEqual({
+      name: 'call_tool',
+      arguments: JSON.stringify(dispatcherArgs),
+    });
+    expect(rewritten.response_metadata.output).toEqual([
+      {
+        type: 'function_call',
+        id: 'fc_1',
+        call_id: 'call_ok',
+        name: 'call_tool',
+        arguments: JSON.stringify(dispatcherArgs),
+      },
+    ]);
+    expect(answer).toMatchObject({ name: 'call_tool', content: 'found' });
+  });
+
+  it('refuses a deferred target that canDispatch rejects without running it', async () => {
+    const execute = jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockResolvedValue(undefined);
+    const node = new ToolNode({
+      tools: [makeTool('bound_tool'), makeTool('late_tool')],
+      eventDrivenMode: true,
+      toolDefinitions: definitions,
+      toolDispatch: { canDispatch: (name) => name !== 'late_tool' },
+      toolCallStepIds: new Map([['call_bad', 'step_bad']]),
+    });
+
+    const result = await invoke(node, 'call_bad', {
+      name: 'late_tool',
+      arguments: '{"q":"x"}',
+    });
+
+    expect(result.messages[0]).toMatchObject({
+      name: 'call_tool',
+      tool_call_id: 'call_bad',
+      status: 'error',
+    });
+    expect(completedArgs(execute, 'call_bad')).toEqual({
+      name: 'late_tool',
+      arguments: '{"q":"x"}',
+    });
+    expect(result.messages[0].content).toContain(
+      'not available through call_tool'
+    );
+    expect(
+      execute.mock.calls.some(([event]) => event === GraphEvents.ON_TOOL_EXECUTE)
+    ).toBe(false);
+  });
+
+  it('refuses a disabled tool without running it', async () => {
+    const execute = jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockResolvedValue(undefined);
+    const node = new ToolNode({
+      tools: [makeTool('off_tool')],
+      eventDrivenMode: true,
+      toolDefinitions: new Map([
+        ['off_tool', { name: 'off_tool', disabled: { reason: 'switched off' } }],
+      ]),
+      toolCallStepIds: new Map([['call_bad', 'step_bad']]),
+    });
+
+    const result = await invoke(node, 'call_bad', { q: 'x' }, 'off_tool');
+
+    expect(result.messages[0]).toMatchObject({
+      name: 'off_tool',
+      status: 'error',
+    });
+    expect(result.messages[0].content).toContain('switched off');
+    expect(completedArgs(execute, 'call_bad')).toEqual({ q: 'x' });
+    expect(
+      execute.mock.calls.some(([event]) => event === GraphEvents.ON_TOOL_EXECUTE)
+    ).toBe(false);
+  });
+
+  it('completes a failed dispatched call under the dispatcher call, not through the error handler', async () => {
+    const completions: t.ProcessedToolCall[] = [];
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data): Promise<void> => {
+        if (event === GraphEvents.ON_RUN_STEP_COMPLETED) {
+          completions.push(
+            (data as { result: t.ToolCompleteEvent }).result.tool_call
+          );
+        }
+      });
+    const errorHandler = jest.fn(async () => true);
+    const node = new ToolNode({
+      tools: [
+        makeTool('late_tool', async () => {
+          throw new Error('boom');
+        }),
+      ],
+      toolDefinitions: definitions,
+      toolDispatch: true,
+      errorHandler:
+        errorHandler as unknown as t.ToolNodeConstructorParams['errorHandler'],
+      toolCallStepIds: new Map([['call_ok', 'step_ok']]),
+    });
+
+    const result = await invoke(node, 'call_ok', {
+      name: 'late_tool',
+      arguments: '{"q":"x"}',
+    });
+
+    expect(errorHandler).not.toHaveBeenCalled();
+    expect(result.messages[0]).toMatchObject({
+      name: 'call_tool',
+      status: 'error',
+    });
+    expect(completions).toEqual([
+      expect.objectContaining({
+        id: 'call_ok',
+        name: 'call_tool',
+        dispatched: { name: 'late_tool', args: '{"q":"x"}' },
+      }),
+    ]);
+  });
+
+  it('unwraps and refuses calls that arrive through Send like those in an assistant message', async () => {
+    const requests: t.ToolCallRequest[] = [];
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data): Promise<void> => {
+        if (event === GraphEvents.ON_TOOL_EXECUTE) {
+          const batch = data as t.ToolExecuteBatchRequest;
+          requests.push(...batch.toolCalls);
+          batch.resolve(
+            batch.toolCalls.map((call) => ({
+              toolCallId: call.id,
+              content: 'found',
+              status: 'success' as const,
+            }))
+          );
+        }
+      });
+    const node = new ToolNode({
+      tools: [makeTool('late_tool'), makeTool('off_tool')],
+      eventDrivenMode: true,
+      toolDefinitions: new Map([
+        ...definitions,
+        ['off_tool', { name: 'off_tool', disabled: { reason: 'switched off' } }],
+      ]),
+      toolDispatch: true,
+    });
+    const send = (
+      id: string,
+      name: string,
+      args: Record<string, unknown>
+    ): Promise<{ messages: ToolMessage[] }> =>
+      node.invoke({
+        messages: [],
+        lg_tool_call: { id, name, args },
+      }) as Promise<{ messages: ToolMessage[] }>;
+
+    const dispatched = await send('call_ok', 'call_tool', {
+      name: 'late_tool',
+      arguments: '{"q":"x"}',
+    });
+    const disabled = await send('call_off', 'off_tool', {});
+
+    expect(requests).toEqual([
+      expect.objectContaining({ id: 'call_ok', name: 'late_tool' }),
+    ]);
+    expect(dispatched.messages[0]).toMatchObject({
+      name: 'call_tool',
+      content: 'found',
+    });
+    expect(disabled.messages[0]).toMatchObject({
+      name: 'off_tool',
+      status: 'error',
+    });
+    expect(disabled.messages[0].content).toContain('switched off');
+  });
+});
