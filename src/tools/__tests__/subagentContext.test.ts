@@ -24,6 +24,7 @@ import {
   SUBAGENT_CONTEXT_VERSION,
 } from '@/common';
 import { SubagentExecutor } from '../subagent/SubagentExecutor';
+import { OMITTED_IMAGE_TEXT } from '@/messages/vision';
 import { StandardGraph } from '@/graphs/Graph';
 import { HandlerRegistry } from '@/events';
 import { FakeChatModel } from '@/llm/fake';
@@ -237,6 +238,38 @@ describe('host-owned subagent context', () => {
     expect(harness.hookContexts).toContainEqual(prepared[0].executionContext);
   });
 
+  it('@scenario:text-only-subagent gives a text-only child a marker for a shared image', async () => {
+    const image = {
+      type: 'image_url',
+      image_url: { url: 'data:image/png;base64,aGVsbG8=' },
+    };
+    const note = { type: 'text', text: 'Shared chart' };
+    const adapter: SubagentContextAdapter = {
+      prepare: async () => ({
+        messages: [new HumanMessage({ content: [note, image] })],
+      }),
+    };
+    const sent = jest.spyOn(FakeChatModel.prototype, '_streamResponseChunks');
+    try {
+      const harness = createHarness({
+        adapter,
+        childConfig: config({ ...agent(), vision: false }),
+      });
+      const result = await harness.execute();
+
+      expect(result.error).toBeUndefined();
+      expect(sent).toHaveBeenCalled();
+      for (const [messages] of sent.mock.calls) {
+        expect(messages.map((message) => message.content)).toContainEqual([
+          note,
+          { type: 'text', text: OMITTED_IMAGE_TEXT },
+        ]);
+      }
+    } finally {
+      sent.mockRestore();
+    }
+  });
+
   it('isolates simultaneous copies of the same agent and reauthorizes a completed retry', async () => {
     const prepared: SubagentContextInput[] = [];
     const adapter: SubagentContextAdapter = {
@@ -358,7 +391,9 @@ describe('host-owned subagent context', () => {
 
   it('unwinds when preparation ignores cancellation', async () => {
     const controller = new AbortController();
-    const prepare = jest.fn(() => new Promise<PreparedSubagentContext>(() => undefined));
+    const prepare = jest.fn(
+      () => new Promise<PreparedSubagentContext>(() => undefined)
+    );
     const harness = createHarness({
       adapter: { prepare },
     });

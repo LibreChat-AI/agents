@@ -33,10 +33,17 @@ import {
   appendInstructionlessHandoffCue,
   removePredecessorHandoffCue,
 } from '@/messages';
+import {
+  omitImageBlock,
+  isImageContentBlock,
+  toOmittedImageBlock,
+} from '@/messages/vision';
 import { createToolHistoryPreparation } from '@/messages/toolHistoryProjection';
+import { flattenLegacyContent, isLegacyConvertible } from '@/messages/content';
 import { isAnthropicLike, isGoogleLike, isOpenAILike } from '@/utils/llm';
 import { annotateMessagesForLLM } from '@/tools/toolOutputReferences';
 import { providerRequiresStrictAlternation } from '@/llm/providers';
+import { hasComputerCallOutputMarker } from '@/utils/toolContent';
 import { getProviderFamily } from '@/llm/providerRegistry';
 import { Providers } from '@/common';
 
@@ -132,6 +139,10 @@ export interface PrepareProviderRequestParams {
   maxToolResultChars?: number;
   measure?: (messages: BaseMessage[]) => ProviderPayloadMeasurement;
   toolHistory?: ToolHistoryPreparation;
+  /** `false` replaces images with a text marker for a model without image input. */
+  vision?: boolean;
+  /** Flattens messages the image replacement leaves text-only, as `formatContentStrings` does. */
+  useLegacyContent?: boolean;
 }
 
 export function usesNativeOpenAIResponses(
@@ -211,6 +222,12 @@ function resolveProviderMessageProjectionMode(
     : 'chat-messages';
 }
 
+/** How a request for a model without image input treats images. */
+interface ImageOmission {
+  /** Flattens a turn left with only text, as `formatContentStrings` does. */
+  legacyContent: boolean;
+}
+
 interface ProjectMessagesForProviderParams {
   model: t.ChatModel;
   messages: BaseMessage[];
@@ -219,6 +236,8 @@ interface ProjectMessagesForProviderParams {
   callOptions?: unknown;
   toolHistory?: ToolHistoryPreparation;
   resolve?: ResolveReference;
+  vision?: boolean;
+  useLegacyContent?: boolean;
 }
 
 function isSerializedBuffer(value: object): value is SerializedBuffer {
@@ -505,7 +524,8 @@ function projectAttachmentsForProvider(
   messages: BaseMessage[],
   provider: t.ProviderName,
   projectionMode: ProviderMessageProjectionMode,
-  resolve?: ResolveReference
+  resolve?: ResolveReference,
+  imageOmission?: ImageOmission
 ): BaseMessage[] {
   const native =
     provider === Providers.BEDROCK || getProviderFamily(provider) === 'bedrock';
@@ -517,11 +537,24 @@ function projectAttachmentsForProvider(
       continue;
     }
     const projectsTimedMedia = message.getType() !== 'tool';
+    /** A native computer-call output keeps its screenshot: the Responses API takes no other output. */
+    const omitsImages =
+      imageOmission != null && !hasComputerCallOutputMarker(message);
     const sourceContent = message.content as ProviderContentBlock[];
     let content: ProviderContentBlock[] | undefined;
     let displaced: ReturnType<typeof getCacheControl>;
+    let omittedImage = false;
     for (let blockIndex = 0; blockIndex < sourceContent.length; blockIndex++) {
       const block = sourceContent[blockIndex];
+      const omitted = omitsImages
+        ? omitImageBlock(block as MessageContentComplex)
+        : undefined;
+      if (omitted != null && omitted !== block) {
+        content ??= copyUsableContentPrefix(sourceContent, blockIndex);
+        content.push(omitted);
+        omittedImage = true;
+        continue;
+      }
       const resolved =
         resolve != null && isIDContentBlock(block) ? resolve(block) : undefined;
       if (resolved !== undefined) {
@@ -529,6 +562,9 @@ function projectAttachmentsForProvider(
         const marker = getCacheControl(block);
         if (resolved === null) {
           displaced = marker ?? displaced;
+        } else if (omitsImages && isImageContentBlock(resolved)) {
+          content.push(toOmittedImageBlock(block as MessageContentComplex));
+          omittedImage = true;
         } else {
           content.push(
             marker == null ? resolved : withCacheControl(resolved, marker)
@@ -595,10 +631,15 @@ function projectAttachmentsForProvider(
     if (displaced != null) {
       anchorCacheControl(content as MessageContentComplex[], displaced);
     }
+    const projectedContent = content as MessageContentComplex[];
     projected ??= [...messages];
     projected[messageIndex] = cloneMessage(
       message,
-      content as MessageContentComplex[]
+      omittedImage &&
+        imageOmission?.legacyContent === true &&
+        isLegacyConvertible(message, projectedContent)
+        ? flattenLegacyContent(projectedContent)
+        : projectedContent
     );
   }
   return projected ?? messages;
@@ -611,11 +652,14 @@ function projectMessagesForProviderMode(
     maxToolResultChars,
     toolHistory,
     resolve,
+    vision,
+    useLegacyContent,
   }: ProjectMessagesForProviderParams,
   projectionMode: ProviderMessageProjectionMode
 ): BaseMessage[] {
   const providerFamily = getProviderFamily(provider);
   const nativeOpenAIResponses = projectionMode === 'openai-responses';
+  /** Images go before tool results are serialized, so none lands in them as base64 text. */
   const providerInputMessages = projectAttachmentsForProvider(
     projectToolStreamContentForProvider(
       messages,
@@ -625,7 +669,8 @@ function projectMessagesForProviderMode(
     ),
     provider,
     projectionMode,
-    resolve
+    resolve,
+    vision === false ? { legacyContent: useLegacyContent === true } : undefined
   );
   if (nativeOpenAIResponses) {
     return projectOpenAIResponsesToolMessageContent(
@@ -736,6 +781,8 @@ export function prepareProviderRequest({
   maxToolResultChars,
   measure,
   toolHistory = createToolHistoryPreparation(),
+  vision,
+  useLegacyContent,
 }: PrepareProviderRequestParams): PreparedProviderRequest {
   const projectionMode = resolveProviderMessageProjectionMode(
     model,
@@ -752,6 +799,8 @@ export function prepareProviderRequest({
       maxToolResultChars,
       callOptions: config,
       toolHistory,
+      vision,
+      useLegacyContent,
       resolve:
         resolveAttachment == null
           ? undefined

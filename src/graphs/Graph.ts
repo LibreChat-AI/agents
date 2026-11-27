@@ -3573,7 +3573,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       }
       this.config = config;
 
-      let messagesToUse = messages;
       let contextUsage: t.ContextUsageEvent | null = null;
       /**
        * Held outside the prune block so overflow recovery — which detours to
@@ -3584,9 +3583,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       const canProjectContext =
         agentContext.tokenCounter != null &&
         agentContext.maxContextTokens != null;
-      const providerMessages = canProjectContext
-        ? agentContext.getProviderProjectedMessages(messages)
-        : messages;
+      /** A model without image input reads history through the projection even
+       *  without a pruner, so no later transform (tool folding included) sees
+       *  image bytes before the request replaces them. */
+      const providerMessages =
+        canProjectContext || agentContext.vision === false
+          ? agentContext.getProviderProjectedMessages(messages)
+          : messages;
+      let messagesToUse = providerMessages;
       if (
         !agentContext.pruneMessages &&
         agentContext.tokenCounter &&
@@ -3633,7 +3637,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           effectiveInstructionTokens,
         } = agentContext.pruneMessages({
           messages: providerMessages,
-          canonicalMessages: messages,
+          canonicalMessages:
+            agentContext.getProviderCanonicalMessages(messages),
           canonicalPrefixStable: true,
           usageMetadata: agentContext.currentUsage,
           lastCallUsage: agentContext.lastCallUsage,
@@ -4392,6 +4397,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         config,
         maxToolResultChars: maxProviderToolResultChars,
         toolHistory,
+        vision: agentContext.vision,
+        useLegacyContent: agentContext.useLegacyContent,
         measure: (preparedMessages) =>
           measureProviderPayload(
             trackProviderMessageOrigins(
@@ -4967,6 +4974,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                       config: fallbackConfig,
                       maxToolResultChars: fallbackToolResultChars,
                       toolHistory: fallbackToolHistory,
+                      vision: agentContext.vision,
+                      useLegacyContent: agentContext.useLegacyContent,
                       measure: (prepared) => {
                         projection = measureFallback(
                           trackProviderMessageOrigins(cached, prepared)
