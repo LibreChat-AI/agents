@@ -3201,7 +3201,7 @@ describe('AgentContext', () => {
         tokenCounter,
       });
 
-      const usage = ctx.projectContextUsage([
+      const messages = [
         new HumanMessage({
           content: [
             { type: 'text', text: 'What is this?' },
@@ -3213,9 +3213,15 @@ describe('AgentContext', () => {
         }),
         new AIMessage('A chart.'),
         new HumanMessage('Which quarter was best?'),
-      ]);
+      ];
+      const hostCounts = { 0: 50_000, 1: 10, 2: 10 };
 
-      expect(usage?.breakdown.messageCount).toBe(3);
+      expect(ctx.projectContextUsage(messages)?.breakdown.messageCount).toBe(3);
+      expect(
+        ctx.projectContextUsage(messages, { indexTokenCountMap: hostCounts })
+          ?.breakdown.messageCount
+      ).toBe(3);
+      expect(hostCounts[0]).toBe(50_000);
     });
 
     it('does not mutate the context (local pruner, no field writes)', () => {

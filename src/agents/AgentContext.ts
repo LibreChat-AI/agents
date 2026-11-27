@@ -2280,23 +2280,22 @@ export class AgentContext {
      *  content arrays in place, which would otherwise corrupt the caller's
      *  history, and a model without image input reads each image as its
      *  marker. (Slot replacements land on the mapped array, not the caller's.) */
-    const projections = messages.map((message) => this.projectMessage(message));
-    const projected = projections.map(({ message }) => message);
-    let indexTokenCountMap = opts?.indexTokenCountMap;
-    if (indexTokenCountMap == null) {
-      indexTokenCountMap = {};
-      for (let i = 0; i < messages.length; i++) {
+    const supplied = opts?.indexTokenCountMap;
+    let indexTokenCountMap: Record<string, number | undefined> = supplied ?? {};
+    const projected: BaseMessage[] = [];
+    for (let i = 0; i < messages.length; i++) {
+      const { message, omittedImages } = this.projectMessage(messages[i]);
+      projected.push(message);
+      if (supplied == null) {
         indexTokenCountMap[String(i)] = tokenCounter(
-          projections[i].omittedImages ? projected[i] : messages[i]
+          omittedImages ? message : messages[i]
         );
-      }
-    } else if (projections.some(({ omittedImages }) => omittedImages)) {
-      /** A host count priced the image the marker replaces. */
-      indexTokenCountMap = { ...indexTokenCountMap };
-      for (let i = 0; i < projections.length; i++) {
-        if (projections[i].omittedImages) {
-          indexTokenCountMap[String(i)] = tokenCounter(projected[i]);
+      } else if (omittedImages) {
+        /** A supplied count priced the image the marker replaces; the copy keeps the caller's map intact. */
+        if (indexTokenCountMap === supplied) {
+          indexTokenCountMap = { ...supplied };
         }
+        indexTokenCountMap[String(i)] = tokenCounter(message);
       }
     }
     const prune = createPruneMessages({
