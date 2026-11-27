@@ -124,9 +124,43 @@ export type {
 export * from './decisions';
 export * from './rerank';
 
-export { PROVIDER_TEXT_PROTECTION_VERSION, ProviderTextProtectionError } from './protection/providerText';
+export {
+  PROVIDER_TEXT_PROTECTION_VERSION,
+  PROVIDER_TEXT_BATCHING_VERSION,
+  ProviderTextProtectionError,
+  serializeProviderTextProtectionError,
+  deserializeProviderTextProtectionError,
+} from './protection/providerText';
 export type {
+  ProviderTextBatching,
   ProviderTextProtection,
   ProviderTextProtectionResult,
   ProviderTextProtectionErrorCode,
+  ProviderTextProtectionFailure,
 } from './protection/providerText';
+export {
+  TOOL_RESULT_PROTECTION_VERSION,
+  ToolResultProtectionError,
+} from './protection/toolResult';
+export type {
+  ToolResultProtection,
+  ToolResultProtectionResult,
+} from './protection/toolResult';
+
+export {
+  GEMINI_PARTS,
+  GEMINI_REPLAY_UNSUPPORTED,
+  captureGeminiReplayParts,
+  restoreGeminiReplayParts,
+  isGeminiReplayParts,
+} from './llm/google/utils/signatures';
+export type { GeminiReplayPart } from './llm/google/utils/signatures';
+
+/* Host execution harness */
+export * from './harness';
+
+export { ProviderTextAdmission } from './protection/providerTextAdmission';
+export type {
+  ProviderTextAdmissionLimits,
+  ProviderTextAdmissionSnapshot,
+} from './protection/providerTextAdmission';

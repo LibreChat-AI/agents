@@ -9,6 +9,7 @@ TypeScript utilities for building LibreChat agent workflows. The package provide
 - Tool calling, tool search, subagent handoffs, and programmatic tool execution
 - Provider adapters for Anthropic, Bedrock, Vertex AI, OpenAI-compatible providers, Google, Mistral, DeepSeek, and xAI
 - Message formatting, context pruning, summarization, and cache-control helpers
+- [Host provider-text protection](docs/host-provider-text.md), with scoped admission, inspection deadlines, and retained-work accounting
 
 ## Installation
 

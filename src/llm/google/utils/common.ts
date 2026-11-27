@@ -30,6 +30,7 @@ import {
   type InlineDataPart,
   type FunctionCallPart,
   type GenerateContentCandidate,
+  type GenerateContentResponse,
   type EnhancedGenerateContentResponse,
   type FunctionDeclaration as GenerativeAIFunctionDeclaration,
   type FunctionDeclarationsTool as GoogleGenerativeAIFunctionDeclarationsTool,
@@ -41,6 +42,12 @@ import {
   GOOGLE_STREAMED_TOOL_CALL_ADAPTER,
 } from '@/tools/streamedToolCallSeals';
 import {
+  GEMINI_PARTS,
+  GEMINI_REPLAY_UNSUPPORTED,
+  captureGeminiReplayParts,
+  restoreGeminiReplayParts,
+} from './signatures';
+import {
   jsonSchemaToGeminiParameters,
   schemaToGenerativeAIParameters,
 } from './zod_to_genai_parameters';
@@ -49,6 +56,9 @@ import { GoogleGenerativeAIToolType } from '../types';
 
 export const _FUNCTION_CALL_THOUGHT_SIGNATURES_MAP_KEY =
   '__gemini_function_call_thought_signatures__';
+
+type GoogleResponse = GenerateContentResponse &
+  Partial<EnhancedGenerateContentResponse>;
 
 const DUMMY_SIGNATURE =
   'ErYCCrMCAdHtim9kOoOkrPiCNVsmlpMIKd7ZMxgiFbVQOkgp7nlLcDMzVsZwIzvuT7nQROivoXA72ccC2lSDvR0Gh7dkWaGuj7ctv6t7ZceHnecx0QYa+ix8tYpRfjhyWozQ49lWiws6+YGjCt10KRTyWsZ2h6O7iHTYJwKIRwGUHRKy/qK/6kFxJm5ML00gLq4D8s5Z6DBpp2ZlR+uF4G8jJgeWQgyHWVdx2wGYElaceVAc66tZdPQRdOHpWtgYSI1YdaXgVI8KHY3/EfNc2YqqMIulvkDBAnuMhkAjV9xmBa54Tq+ih3Im4+r3DzqhGqYdsSkhS0kZMwte4Hjs65dZzCw9lANxIqYi1DJ639WNPYihp/DCJCos7o+/EeSPJaio5sgWDyUnMGkY1atsJZ+m7pj7DD5tvQ==';
@@ -66,6 +76,10 @@ type GoogleServerSideToolPartMetadata = {
 
 type GoogleFunctionCallWithId = FunctionCallPart['functionCall'] & {
   id?: string;
+};
+
+type GoogleFunctionCallPart = FunctionCallPart & {
+  functionCall: GoogleFunctionCallWithId;
 };
 
 type GoogleFunctionResponseWithId = {
@@ -475,6 +489,75 @@ function _convertLangChainContentToPart(
   }
 }
 
+function convertFallbackContentWithCalls(
+  content: MessageContentComplex[],
+  isMultimodalModel: boolean,
+  functionCalls: GoogleFunctionCallPart[]
+): Part[] {
+  const callsById = new Map<string, number[]>();
+  const callNames = new Set<string>();
+  for (let i = functionCalls.length - 1; i >= 0; i--) {
+    const { id, name } = functionCalls[i].functionCall;
+    callNames.add(name);
+    if (id == null) continue;
+    const indices = callsById.get(id);
+    if (indices == null) callsById.set(id, [i]);
+    else indices.push(i);
+  }
+
+  const parts: (Part | undefined)[] = [];
+  const placed = new Set<number>();
+  let slotsByName: Map<string, { indices: number[]; next: number }> | undefined;
+  for (const block of content) {
+    if ('functionCall' in block && block.functionCall != null) {
+      const { id: nativeId, name } =
+        block.functionCall as GoogleFunctionCallWithId;
+      const id = getGoogleFunctionId(nativeId);
+      if (id != null) {
+        const index = callsById.get(id)?.pop();
+        if (index != null) {
+          placed.add(index);
+          parts.push(functionCalls[index]);
+        }
+      } else if (callNames.has(name)) {
+        slotsByName ??= new Map();
+        let slots = slotsByName.get(name);
+        if (slots == null) {
+          slots = { indices: [], next: 0 };
+          slotsByName.set(name, slots);
+        }
+        slots.indices.push(parts.length);
+        parts.push(undefined);
+      }
+      continue;
+    }
+
+    const part = _convertLangChainContentToPart(block, isMultimodalModel);
+    if (part == null) continue;
+    if ('functionCall' in part && part.functionCall != null) {
+      const { id, name } = part.functionCall as GoogleFunctionCallWithId;
+      if (id != null ? callsById.has(id) : callNames.has(name)) continue;
+    }
+    parts.push(part);
+  }
+
+  // Reserve exact ID matches before filling any name-only slots.
+  for (let i = 0; i < functionCalls.length; i++) {
+    if (placed.has(i)) continue;
+    const part = functionCalls[i];
+    const slots = slotsByName?.get(part.functionCall.name);
+    if (slots != null && slots.next < slots.indices.length) {
+      parts[slots.indices[slots.next++]] = part;
+    } else {
+      parts.push(part);
+    }
+  }
+
+  return slotsByName == null
+    ? (parts as Part[])
+    : parts.filter((part) => part != null);
+}
+
 export function convertMessageContentToParts(
   message: BaseMessage,
   isMultimodalModel: boolean,
@@ -519,26 +602,13 @@ export function convertMessageContentToParts(
     ];
   }
 
-  let functionCalls: FunctionCallPart[] = [];
-  const messageParts: Part[] = [];
+  const replayParts = restoreGeminiReplayParts(message);
+  if (replayParts != null) return replayParts as Part[];
 
-  if (typeof message.content === 'string' && message.content) {
-    messageParts.push({ text: message.content });
-  }
-
-  if (Array.isArray(message.content)) {
-    messageParts.push(
-      ...(message.content
-        .map((c) => _convertLangChainContentToPart(c, isMultimodalModel))
-        .filter((p) => p !== undefined) as Part[])
-    );
-  }
-
-  const functionThoughtSignatures = (
-    message.additional_kwargs as BaseMessage['additional_kwargs'] | undefined
-  )?.[_FUNCTION_CALL_THOUGHT_SIGNATURES_MAP_KEY] as
-    | Record<string, string>
-    | undefined;
+  let functionCalls: GoogleFunctionCallPart[] = [];
+  const storedSignatures = message.additional_kwargs[_FUNCTION_CALL_THOUGHT_SIGNATURES_MAP_KEY] as Record<string, string> | undefined;
+  let functionThoughtSignatures = storedSignatures != null && Object.keys(storedSignatures).length > 0 ? storedSignatures : undefined;
+  if (Object.hasOwn(message.additional_kwargs, GEMINI_PARTS) && message.additional_kwargs[GEMINI_REPLAY_UNSUPPORTED] !== true) functionThoughtSignatures = {};
 
   if (isAIMessage(message) && (message.tool_calls?.length ?? 0) > 0) {
     functionCalls = (message.tool_calls ?? []).map((tc) => {
@@ -549,7 +619,7 @@ export function convertMessageContentToParts(
             return signature;
           }
         }
-        if (isGemini3PlusModel(model)) {
+        if (isGemini3PlusModel(model) && functionThoughtSignatures == null) {
           return DUMMY_SIGNATURE;
         }
         return '';
@@ -568,28 +638,21 @@ export function convertMessageContentToParts(
     });
   }
 
-  const parsedFunctionCallIds = new Set(
-    functionCalls.flatMap((part) => {
-      const functionCall = part.functionCall as GoogleFunctionCallWithId;
-      return functionCall.id != null ? [functionCall.id] : [];
-    })
-  );
-  const parsedFunctionCallNames = new Set(
-    functionCalls.map((part) => part.functionCall.name)
-  );
-  const contentWithoutParsedMirrors = messageParts.filter((part) => {
-    if (!('functionCall' in part) || part.functionCall == null) {
-      return true;
-    }
-    const functionCall = part.functionCall as GoogleFunctionCallWithId;
-    return !(
-      (functionCall.id != null && parsedFunctionCallIds.has(functionCall.id)) ||
-      (functionCall.id == null &&
-        parsedFunctionCallNames.has(functionCall.name))
+  if (!Array.isArray(message.content)) {
+    return typeof message.content === 'string' && message.content
+      ? [{ text: message.content }, ...functionCalls]
+      : functionCalls;
+  }
+  if (functionCalls.length > 0) {
+    return convertFallbackContentWithCalls(
+      message.content,
+      isMultimodalModel,
+      functionCalls
     );
-  });
-
-  return [...contentWithoutParsedMirrors, ...functionCalls];
+  }
+  return message.content
+    .map((block) => _convertLangChainContentToPart(block, isMultimodalModel))
+    .filter((part) => part != null);
 }
 
 export function convertBaseMessagesToContent(
@@ -700,6 +763,7 @@ const GEMINI_FLASH_VERSION_PATTERN = /^gemini-(\d+)(?:\.(\d+))?-flash(?:$|-)/;
 const NO_PREFILL_GEMINI_MODELS = [
   'gemini-3.5-flash-lite',
   'gemini-4-argon',
+  'gemini-4-hydrogen',
 ] as const;
 
 export function rejectsModelTurnPrefill(model?: string): boolean {
@@ -732,10 +796,10 @@ export function rejectsModelTurnPrefill(model?: string): boolean {
  * HTTP 400 for it, so we drop it and let the model generate fresh from the
  * preceding user turn. No-op for every other model, preserving working prefill.
  */
-export function dropUnsupportedModelTurnPrefill(
-  contents: Content[] | undefined,
+export function dropUnsupportedModelTurnPrefill<T extends { role: string }>(
+  contents: T[] | undefined,
   model?: string
-): Content[] | undefined {
+): T[] | undefined {
   if (
     contents == null ||
     contents.length === 0 ||
@@ -751,10 +815,11 @@ export function dropUnsupportedModelTurnPrefill(
 }
 
 export function convertResponseContentToChatGenerationChunk(
-  response: EnhancedGenerateContentResponse,
+  response: GoogleResponse,
   extra: {
     usageMetadata?: UsageMetadata | undefined;
     index: number;
+    model?: string;
   }
 ): ChatGenerationChunk | null {
   if (!response.candidates || response.candidates.length === 0) {
@@ -906,7 +971,7 @@ export function convertResponseContentToChatGenerationChunk(
       }
       : undefined;
 
-  return new ChatGenerationChunk({
+  const chunk = new ChatGenerationChunk({
     text,
     message: new AIMessageChunk({
       content: content,
@@ -920,15 +985,18 @@ export function convertResponseContentToChatGenerationChunk(
     }),
     generationInfo,
   });
+  captureGeminiReplayParts(chunk.message, candidateContent?.parts ?? [], extra.model);
+  return chunk;
 }
 
 /**
  * Maps a Google GenerateContentResult to a LangChain ChatResult
  */
 export function mapGenerateContentResultToChatResult(
-  response: EnhancedGenerateContentResponse,
+  response: GoogleResponse,
   extra?: {
     usageMetadata: UsageMetadata | undefined;
+    model?: string;
   }
 ): ChatResult {
   if (!response.candidates || response.candidates.length === 0) {
@@ -1060,6 +1128,7 @@ export function mapGenerateContentResultToChatResult(
     }),
     generationInfo,
   };
+  captureGeminiReplayParts(generation.message, candidateContent?.parts ?? [], extra?.model);
   return {
     generations: [generation],
     llmOutput: {

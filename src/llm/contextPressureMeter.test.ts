@@ -13,6 +13,55 @@ function contentLength(message: BaseMessage): number {
 }
 
 describe('createContextPressureMeter', () => {
+  it.each([
+    {
+      scenario: '@scenario:an-unchanged-oversized-retained-baseline-does-not-fit',
+      length: 147,
+      projectedMessageTokens: 150,
+      fits: false,
+    },
+    {
+      scenario: '@scenario:a-compacted-projection-one-token-above-capacity-does-not-fit',
+      length: 88,
+      projectedMessageTokens: 91,
+      fits: false,
+    },
+    {
+      scenario: '@scenario:a-compacted-projection-exactly-at-capacity-fits',
+      length: 87,
+      projectedMessageTokens: 90,
+      fits: true,
+    },
+  ])(
+    '$scenario preserves baseline overage when projected content has $length tokens',
+    ({ length, projectedMessageTokens, fits }) => {
+      const retained = new HumanMessage('x'.repeat(147));
+      const meter = createContextPressureMeter({
+        tokenCounter: contentLength,
+        sourceMessages: [retained],
+        retainedMessages: [retained],
+        indexTokenCountMap: { 0: 147 },
+        contextUsage: {
+          contextBudget: 100,
+          effectiveInstructionTokens: 10,
+          remainingContextTokens: -60,
+          calibrationRatio: 1,
+        },
+        instructionTokens: 10,
+        calibrationRatio: 1,
+      });
+      const projected =
+        length === 147 ? retained : new HumanMessage('x'.repeat(length));
+      meter.trackClone(retained, projected);
+
+      expect(meter.measure([projected])).toMatchObject({
+        fits,
+        projectedMessageTokens,
+        availableMessageTokens: 90,
+      });
+    }
+  );
+
   it('preserves provider-grounded attribution while caching exact counts', () => {
     const source = [
       new HumanMessage({ id: 'first', content: 'a' }),

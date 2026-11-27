@@ -2,7 +2,9 @@
 /* eslint-disable no-console */
 // content.test.ts
 import * as fs from 'fs';
-import { processContent } from './content';
+import type { ReferenceMatcher } from './content';
+import type { MediaReference } from './types';
+import { MAX_MATCHER_NODES, processContent, buildMatcher } from './content';
 
 describe('Link Processor', () => {
   afterAll(() => {
@@ -54,6 +56,165 @@ describe('Link Processor', () => {
     expect(result.links.length).toBe(2);
     expect(result.markdown).toContain('link#1');
     expect(result.markdown).toContain('link#2');
+  });
+
+  test('prefers the longest known URL at a position, including URLs with parentheses @scenario:scraped-page-references-keep-their-previous-output', () => {
+    const html = `
+      <a href="https://w.org/wiki/Foo_(bar)">a</a>
+      <a href="https://w.org/wiki/Foo_">b</a>
+      <a href="https://w.org/wiki/Foo_(bar)_baz">c</a>
+    `;
+    const markdown =
+      '[a](https://w.org/wiki/Foo_(bar)) [b](https://w.org/wiki/Foo_) [c](https://w.org/wiki/Foo_(bar)_baz "T x") (https://w.org/wiki/Foo_';
+
+    const result = processContent(html, markdown);
+
+    expect(result.markdown).toBe(
+      '[a](link#1) [b](link#2) [c](link#3 "T x") (https://w.org/wiki/Foo_'
+    );
+  });
+
+  test('handles a URL whose prefix repeats without a quadratic rescan or a regex limit', () => {
+    /** A trie walk restarted at every inner parenthesis took ~6 s here, and one
+     *  regex per URL threw "Invalid regular expression" for a URL this long. */
+    const prefix = 'https://x/(';
+    const html = `<a href="${prefix.repeat(5000)}a">x</a>`;
+    const markdown = `(${prefix.repeat(5000)}b) [x](${prefix.repeat(5000)}a)`;
+
+    const start = performance.now();
+    const result = processContent(html, markdown);
+    const elapsed = performance.now() - start;
+
+    expect(result.markdown).toBe(`(${prefix.repeat(5000)}b) [x](link#1)`);
+    expect(elapsed).toBeLessThan(1500);
+  });
+
+  test('stays fast when many URLs are suffixes of one another', () => {
+    /** Each URL ends with the previous one, so every segment end reports several
+     *  nested references; only the outermost one at each opening is applied. */
+    const url = (k: number) => 'https://x/' + ')(https://x/'.repeat(k - 1);
+    let html = '';
+    for (let k = 1; k <= 200; k++) {
+      html += `<a href="${url(k)}">x</a>`;
+    }
+    const markdown = Array.from({ length: 200 }, () => `[x](${url(200)})`).join(
+      '\n'
+    );
+
+    const start = performance.now();
+    const result = processContent(html, markdown);
+    const elapsed = performance.now() - start;
+
+    expect(result.markdown.split('\n')).toEqual(
+      Array.from({ length: 200 }, () => '[x](link#200)')
+    );
+    expect(elapsed).toBeLessThan(1500);
+  });
+
+  test('keeps the image reference when a URL is both an image and a link', () => {
+    const html =
+      '<a href="https://x.io/a.png">a</a><img src="https://x.io/a.png" alt="i">';
+    const markdown = '![i](https://x.io/a.png) [a](https://x.io/a.png "t")';
+
+    const result = processContent(html, markdown);
+
+    expect(result.markdown).toBe('![i](image#1) [a](image#1 "t")');
+    expect(result.links).toHaveLength(1);
+    expect(result.images).toHaveLength(1);
+  });
+
+  test('rewrites a link-heavy page in time linear in its size', () => {
+    /** One regex per URL over the whole page grew with links times page size (4,000
+     *  links took ~3 s, doubling the page quintupled it) and blocked the event loop. */
+    let html = '<html><body>';
+    let markdown = '';
+    for (let i = 0; i < 6000; i++) {
+      const url = `https://example.com/docs/section-${i}/page-${i * 7}`;
+      html += `<p><a href="${url}">l${i}</a> <img src="${url}.png" alt="i${i}"></p>`;
+      markdown += `text [l${i}](${url}) ![i${i}](${url}.png)\n`;
+    }
+
+    const start = performance.now();
+    const result = processContent(html, markdown);
+    const elapsed = performance.now() - start;
+
+    expect(result.links).toHaveLength(6000);
+    expect(result.images).toHaveLength(6000);
+    expect(result.markdown).not.toMatch(/\]\(https:\/\/example\.com\//);
+    expect(elapsed).toBeLessThan(1500);
+  });
+
+  test('rewrites links of many different lengths in time linear in the page @scenario:link-heavy-scraped-page-is-rewritten-in-linear-time', () => {
+    /** A query that grows per entry gives every link its own URL length, which
+     *  defeats any scheme that tries every known length at every position. */
+    let html = '<html><body>';
+    let markdown = '';
+    for (let i = 0; i < 2000; i++) {
+      const url = `https://example.com/search?q=${'a'.repeat(i)}`;
+      html += `<p><a href="${url}">l${i}</a></p>`;
+      markdown += `text [l${i}](${url} "t${i}")\n`;
+    }
+
+    const start = performance.now();
+    const result = processContent(html, markdown);
+    const elapsed = performance.now() - start;
+
+    expect(result.links).toHaveLength(2000);
+    expect(result.markdown).toContain('[l1999](link#2000 "t1999")');
+    expect(result.markdown).not.toMatch(/\]\(https:\/\/example\.com\//);
+    expect(elapsed).toBeLessThan(1500);
+  });
+
+  test('stores 6,000 long URLs that share no path in 18 bytes per node', () => {
+    /** An array per node and a map entry per edge retained 116 MB for these URLs.
+     *  Node count and buffer sizes are exact, where heap readings are not. */
+    const urls = longDistinctUrls(6000, 270);
+    const nodes = 2 + 20 + (6 + 60 + 600 + 6000) + 6000 * 246;
+    const html = urls.map((url, i) => `<a href="${url}">l${i}</a>`).join('');
+    const markdown = urls.map((url, i) => `[l${i}](${url})`).join('\n');
+
+    const { targets, ...buffers } = linkMatcher(urls);
+    const result = processContent(html, markdown);
+
+    expect(buffers.depth).toHaveLength(nodes);
+    expect(
+      Object.values(buffers).reduce((sum, buffer) => sum + buffer.byteLength, 0)
+    ).toBe(18 * nodes + 4);
+    expect(targets.size).toBe(6000);
+    expect(result.links).toHaveLength(6000);
+    expect(result.markdown).toBe(
+      urls.map((_, i) => `[l${i}](link#${i + 1})`).join('\n')
+    );
+  });
+
+  test('leaves the whole page unchanged when its URLs exceed the matcher cap', () => {
+    const urls = longDistinctUrls(6000, 400);
+    const html =
+      '<img src="https://x.io/a.png" alt="i"><video src="https://x.io/v.mp4"></video>' +
+      urls.map((url, i) => `<a href="${url}">l${i}</a>`).join('');
+    const markdown =
+      '![i](https://x.io/a.png) [v](https://x.io/v.mp4)\n' +
+      urls.map((url, i) => `[l${i}](${url})`).join('\n');
+
+    const result = processContent(html, markdown);
+
+    expect(buildMatcher([['link', referenceMap(urls)]])).toBeUndefined();
+    expect(result.markdown).toBe(markdown);
+    expect(result.links).toHaveLength(6000);
+    expect(result.links[5999].originalUrl).toBe(urls[5999]);
+    expect(result.images).toEqual([
+      { originalUrl: 'https://x.io/a.png', title: 'i' },
+    ]);
+    expect(result.videos).toEqual([{ originalUrl: 'https://x.io/v.mp4' }]);
+  });
+
+  test('builds a matcher of exactly the node cap and none above it', () => {
+    const atCap = 'a'.repeat(MAX_MATCHER_NODES - 2);
+
+    expect(linkMatcher([atCap]).depth).toHaveLength(MAX_MATCHER_NODES);
+    expect(
+      buildMatcher([['link', referenceMap([atCap + 'a'])]])
+    ).toBeUndefined();
   });
 
   // Performance test with large files
@@ -128,6 +289,30 @@ describe('Link Processor', () => {
     }
   });
 });
+
+/** `count` URLs of `length` characters that share only their 20-character origin. */
+function longDistinctUrls(count: number, length: number): string[] {
+  return Array.from({ length: count }, (_, i) => {
+    const head = `https://example.com/${String(i).padStart(4, '0')}/`;
+    return (
+      head + String.fromCharCode(97 + (i % 26)).repeat(length - head.length)
+    );
+  });
+}
+
+function referenceMap(urls: string[]): Map<string, MediaReference> {
+  return new Map<string, MediaReference>(
+    urls.map((url) => [url, { originalUrl: url }])
+  );
+}
+
+function linkMatcher(urls: string[]): ReferenceMatcher {
+  const matcher = buildMatcher([['link', referenceMap(urls)]]);
+  if (matcher == null) {
+    throw new Error('Expected the URLs to fit the matcher cap');
+  }
+  return matcher;
+}
 
 // Helper function to generate large HTML test data
 function generateLargeHtml(linkCount: number): string {

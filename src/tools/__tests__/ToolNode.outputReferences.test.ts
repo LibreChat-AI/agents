@@ -355,7 +355,7 @@ describe('ToolNode tool output references', () => {
       expect(getRefKey(messages[1])).toBe('tool1turn0');
     });
 
-    it('reports unresolved placeholders after the output', async () => {
+    it('rejects unresolved placeholders before invocation', async () => {
       const capturedArgs: string[] = [];
       const t1 = createEchoTool({ capturedArgs, outputs: ['done'] });
       const node = new ToolNode({
@@ -371,8 +371,9 @@ describe('ToolNode tool output references', () => {
         },
       ]);
 
-      expect(capturedArgs[0]).toBe('see {{tool9turn9}}');
-      expect(msg.content).toBe('done');
+      expect(capturedArgs).toEqual([]);
+      expect(msg.status).toBe('error');
+      expect(msg.content).toContain('nothing was run');
       expect(getUnresolvedRefs(msg)).toEqual(['tool9turn9']);
     });
 
@@ -615,7 +616,7 @@ describe('ToolNode tool output references', () => {
       ).toBeUndefined();
     });
 
-    it('surfaces unresolved refs on thrown-error ToolMessages', async () => {
+    it('rejects missing refs before a throwing tool runs', async () => {
       const boom = tool(
         async () => {
           throw new Error('nope');
@@ -636,12 +637,13 @@ describe('ToolNode tool output references', () => {
         { id: 'c1', name: 'boom', command: 'see {{tool9turn9}}' },
       ]);
 
-      expect(msg.content).toContain('Error: nope');
+      expect(msg.status).toBe('error');
+      expect(msg.content).toContain('nothing was run');
       expect(msg.content as string).not.toContain('[unresolved refs:');
       expect(getUnresolvedRefs(msg)).toEqual(['tool9turn9']);
     });
 
-    it('surfaces unresolved refs on tool-returned error ToolMessages', async () => {
+    it('rejects missing refs before a tool can return an error', async () => {
       const errReturn = tool(
         async () =>
           new ToolMessage({
@@ -666,7 +668,8 @@ describe('ToolNode tool output references', () => {
         { id: 'c1', name: 'errReturn', command: 'see {{tool9turn9}}' },
       ]);
 
-      expect(msg.content).toBe('handled failure');
+      expect(msg.status).toBe('error');
+      expect(msg.content).toContain('nothing was run');
       expect(getUnresolvedRefs(msg)).toEqual(['tool9turn9']);
     });
 
@@ -821,7 +824,8 @@ describe('ToolNode tool output references', () => {
         ],
       })) as { messages: ToolMessage[] };
 
-      expect(capturedArgs[1]).toBe('echo {{tool0turn0}}');
+      expect(capturedArgs).toEqual(['a']);
+      expect(result.messages[0].status).toBe('error');
       expect(getUnresolvedRefs(result.messages[0])).toEqual(['tool0turn0']);
     });
 
@@ -932,7 +936,7 @@ describe('ToolNode tool output references', () => {
       expect(JSON.parse(stepCompletedArgs[1]).command).toBe('echo STORED');
     });
 
-    it('records unresolved refs on multipart ToolMessage content within the cap', async () => {
+    it('rejects missing refs before a multipart result is produced', async () => {
       const complexTool = tool(
         async () =>
           new ToolMessage({
@@ -962,14 +966,8 @@ describe('ToolNode tool output references', () => {
         'non-string'
       );
 
-      expect(Array.isArray(msg.content)).toBe(true);
-      const blocks = msg.content as Array<{ type: string; text?: string }>;
-      // In-budget multi-part content stays intact; the lazy transform handles
-      // the unresolved-refs warning at request time.
-      expect(blocks).toHaveLength(2);
-      expect(blocks[0].type).toBe('text');
-      expect(blocks[0].text).toBe('data');
-      expect(blocks[1].type).toBe('image_url');
+      expect(msg.status).toBe('error');
+      expect(msg.content).toContain('nothing was run');
       expect(getUnresolvedRefs(msg)).toEqual(['tool9turn9']);
     });
 
@@ -1004,9 +1002,9 @@ describe('ToolNode tool output references', () => {
         { configurable: { run_id: 'run-B' } }
       )) as { messages: ToolMessage[] };
 
-      expect(capturedArgs[1]).toBe('echo {{tool0turn0}}');
-      expect(resultB.messages[0].content).toBe('from-run-B');
-      expect(getRefKey(resultB.messages[0])).toBe('tool0turn0');
+      expect(capturedArgs).toEqual(['first']);
+      expect(resultB.messages[0].status).toBe('error');
+      expect(getRefKey(resultB.messages[0])).toBeUndefined();
       expect(getUnresolvedRefs(resultB.messages[0])).toEqual(['tool0turn0']);
     });
   });
@@ -1135,7 +1133,7 @@ describe('ToolNode tool output references', () => {
       expect(capturedRequests[0].args).toEqual({ command: 'see FIRST' });
     });
 
-    it('surfaces unresolved refs on host-returned error results', async () => {
+    it('rejects missing refs without depending on a host error', async () => {
       const node = new ToolNode({
         tools: [createSchemaStub('echo')],
         eventDrivenMode: true,
@@ -1167,14 +1165,15 @@ describe('ToolNode tool output references', () => {
         ],
       })) as { messages: ToolMessage[] };
 
-      expect(result.messages[0].content).toContain('Error: host failure');
+      expect(result.messages[0].status).toBe('error');
+      expect(result.messages[0].content).toContain('nothing was run');
       expect(result.messages[0].content as string).not.toContain(
         '[unresolved refs:'
       );
       expect(getUnresolvedRefs(result.messages[0])).toEqual(['tool9turn9']);
     });
 
-    it('reports unresolved refs even when the host succeeds', async () => {
+    it('rejects missing refs before the host can succeed', async () => {
       const node = new ToolNode({
         tools: [createSchemaStub('echo')],
         eventDrivenMode: true,
@@ -1201,7 +1200,8 @@ describe('ToolNode tool output references', () => {
         ],
       })) as { messages: ToolMessage[] };
 
-      expect(result.messages[0].content).toBe('done');
+      expect(result.messages[0].status).toBe('error');
+      expect(result.messages[0].content).toContain('nothing was run');
       expect(getUnresolvedRefs(result.messages[0])).toEqual(['tool9turn9']);
     });
 
@@ -1391,19 +1391,10 @@ describe('ToolNode tool output references', () => {
         { configurable: { run_id: 'snap-run' } }
       );
 
-      // Hook injected `{{tool0turn0}}`. The direct tool registered
-      // `tool0turn0` in the same batch, but the snapshot was taken
-      // pre-direct so the placeholder must remain unresolved.
-      expect(hostCapturedArgs).toHaveLength(1);
-      expect(hostCapturedArgs[0]).toEqual({
-        command: 'see {{tool0turn0}}',
-      });
+      expect(hostCapturedArgs).toEqual([]);
     });
 
     it('keeps same-turn refs isolated in the mixed direct+event path', async () => {
-      // Build a ToolNode with both a direct tool (via directToolNames)
-      // and an event-driven schema stub. Share one registry across
-      // both batches so refs only cross batch boundaries.
       const sharedRegistry = new ToolOutputReferenceRegistry();
 
       const directCapturedArgs: string[] = [];
@@ -1452,14 +1443,6 @@ describe('ToolNode tool output references', () => {
         toolOutputRegistry: sharedRegistry,
       });
 
-      // Batch 1: mixed direct (index 0) + event (index 1). The event
-      // call attempts `{{tool0turn0}}` — which points at the direct
-      // call running *in the same batch*. Correct behavior: the
-      // placeholder stays unresolved (cross-batch only), and the
-      // event args received by the host carry the literal template
-      // string. The unresolved-refs hint is stamped into the resulting
-      // ToolMessage's `additional_kwargs._unresolvedRefs` so the lazy
-      // annotation transform surfaces it to the LLM at request time.
       await node.invoke(
         {
           messages: [
@@ -1483,13 +1466,8 @@ describe('ToolNode tool output references', () => {
         { configurable: { run_id: 'mixed-run' } }
       );
 
-      expect(hostCapturedArgs).toHaveLength(1);
-      expect(hostCapturedArgs[0]).toEqual({
-        command: 'echo {{tool0turn0}}',
-      });
+      expect(hostCapturedArgs).toEqual([]);
 
-      // Batch 2: ref across the boundary now resolves — direct's
-      // registered output from batch 1 (tool0turn0) is available.
       await node.invoke(
         {
           messages: [
@@ -1513,7 +1491,7 @@ describe('ToolNode tool output references', () => {
         { configurable: { run_id: 'mixed-run' } }
       );
 
-      expect(hostCapturedArgs[1]).toEqual({
+      expect(hostCapturedArgs[0]).toEqual({
         command: 'echo direct-A-output',
       });
     });
@@ -1522,9 +1500,12 @@ describe('ToolNode tool output references', () => {
       const hooks = new HookRegistry();
       hooks.register('PreToolUse', {
         hooks: [
-          async (): Promise<{ updatedInput: { command: string } }> => ({
-            updatedInput: { command: 'rewritten {{tool0turn0}}' },
-          }),
+          async (input): Promise<PreToolUseHookOutput> =>
+            input.toolInput.command === 'first'
+              ? {}
+              : {
+                updatedInput: { command: 'rewritten {{tool0turn0}}' },
+              },
         ],
       });
       const node = new ToolNode({
@@ -1697,14 +1678,7 @@ describe('ToolNode tool output references', () => {
         'run-snapshot-iso'
       );
 
-      // Pre-fix: capturedArgs[0] would have been 'leak=sibling-output'
-      // because c1 won the race and c0's late re-resolve picked it up.
-      // With the snapshot fix: same-turn isolation holds — the
-      // placeholder stays unresolved in c0's args (and an
-      // `[unresolved refs: …]` marker shows up downstream).
-      const c0Index = capturedArgs.findIndex((a) => a.startsWith('leak='));
-      expect(c0Index).toBeGreaterThanOrEqual(0);
-      expect(capturedArgs[c0Index]).not.toContain('sibling-output');
+      expect(capturedArgs).toEqual(['instant']);
     });
   });
 });

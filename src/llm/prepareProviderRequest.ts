@@ -1,4 +1,5 @@
 import { Buffer } from 'node:buffer';
+import { isIDContentBlock } from '@langchain/core/messages';
 import type {
   BaseMessage,
   Data,
@@ -19,16 +20,19 @@ import {
   projectToolStreamContentForProvider,
 } from '@/messages/core';
 import {
+  stripAnthropicCacheControl,
+  stripBedrockCacheControl,
+  isTailCacheableBlock,
+  withCacheControl,
+  getCacheControl,
+  cloneMessage,
+} from '@/messages/cache';
+import {
   coalesceAdjacentUserTurns,
   appendPredecessorHandoffCue,
   appendInstructionlessHandoffCue,
   removePredecessorHandoffCue,
 } from '@/messages';
-import {
-  stripAnthropicCacheControl,
-  stripBedrockCacheControl,
-  cloneMessage,
-} from '@/messages/cache';
 import { createToolHistoryPreparation } from '@/messages/toolHistoryProjection';
 import { isAnthropicLike, isGoogleLike, isOpenAILike } from '@/utils/llm';
 import { annotateMessagesForLLM } from '@/tools/toolOutputReferences';
@@ -112,7 +116,12 @@ type PreparedProviderRequestData = Omit<
 export interface ProviderRequestContext {
   getOrCreateToolOutputRegistry?(): ToolOutputReferenceRegistry | undefined;
   isRunProducedMessage?(message: BaseMessage): boolean;
+  resolveAttachment?: t.AttachmentResolver;
 }
+
+type ResolveReference = (
+  reference: t.AttachmentReference
+) => MessageContentComplex | null | undefined;
 
 export interface PrepareProviderRequestParams {
   model: t.ChatModel;
@@ -209,6 +218,7 @@ interface ProjectMessagesForProviderParams {
   maxToolResultChars?: number;
   callOptions?: unknown;
   toolHistory?: ToolHistoryPreparation;
+  resolve?: ResolveReference;
 }
 
 function isSerializedBuffer(value: object): value is SerializedBuffer {
@@ -321,6 +331,134 @@ function canProjectBedrockDocument(
   return false;
 }
 
+/** How one provider request takes audio and video. */
+type TimedMediaInput = 'gemini' | 'openai' | 'none';
+
+/**
+ * Gemini and Vertex read audio and video as `media` parts. OpenAI-compatible
+ * Chat Completions endpoints read `input_audio` and `video_url` parts, where
+ * the endpoint and model accept them, which only the host can tell. Claude,
+ * Bedrock's Converse converter and the Responses API read none of them.
+ */
+function getTimedMediaInput(
+  provider: t.ProviderName,
+  projectionMode: ProviderMessageProjectionMode
+): TimedMediaInput {
+  if (isGoogleLike(provider)) {
+    return 'gemini';
+  }
+  const family = getProviderFamily(provider);
+  if (
+    projectionMode === 'openai-responses' ||
+    provider === Providers.ANTHROPIC ||
+    family === 'anthropic' ||
+    provider === Providers.BEDROCK ||
+    family === 'bedrock'
+  ) {
+    return 'none';
+  }
+  return 'openai';
+}
+
+/** The audio or video MIME type a block names, normalized; `undefined` for anything else. */
+function getTimedMediaMimeType(mimeType: unknown): string | undefined {
+  if (typeof mimeType !== 'string') {
+    return undefined;
+  }
+  const normalized = mimeType.split(';', 1)[0].trim().toLowerCase();
+  return normalized.startsWith('audio/') || normalized.startsWith('video/')
+    ? normalized
+    : undefined;
+}
+
+/** Gemini's MIME type for each `input_audio` format it plays; raw PCM names no sample rate. */
+const GEMINI_AUDIO_MIME_TYPES: Readonly<Partial<Record<string, string>>> = {
+  aac: 'audio/aac',
+  aiff: 'audio/aiff',
+  flac: 'audio/flac',
+  m4a: 'audio/mp4',
+  mp3: 'audio/mp3',
+  ogg: 'audio/ogg',
+  wav: 'audio/wav',
+  webm: 'audio/webm',
+};
+
+/** The MIME type and payload of a base64 `data:` URL. */
+function parseDataUrl(
+  url: string
+): { mimeType: string; data: string } | undefined {
+  const comma = url.indexOf(',');
+  if (!url.startsWith('data:') || comma < 0) {
+    return undefined;
+  }
+  const [mimeType, ...parameters] = url.slice(5, comma).split(';');
+  if (parameters.at(-1)?.trim().toLowerCase() !== 'base64') {
+    return undefined;
+  }
+  const data = url.slice(comma + 1);
+  return data === '' ? undefined : { mimeType, data };
+}
+
+/** An OpenAI-compatible audio or video part as Gemini inline media, when it carries its bytes. */
+function toGeminiMedia(
+  block: ProviderContentBlock
+): ProviderContentBlock | null {
+  if (block.type === 'input_audio') {
+    const audio = (
+      block as { input_audio?: { data?: unknown; format?: unknown } }
+    ).input_audio;
+    const mimeType =
+      typeof audio?.format === 'string'
+        ? GEMINI_AUDIO_MIME_TYPES[audio.format.toLowerCase()]
+        : undefined;
+    return mimeType != null &&
+      typeof audio?.data === 'string' &&
+      audio.data !== ''
+      ? { type: 'media', mimeType, data: audio.data }
+      : null;
+  }
+  const video = (block as { video_url?: string | { url?: unknown } | null })
+    .video_url;
+  const url = typeof video === 'string' ? video : video?.url;
+  const parsed = typeof url === 'string' ? parseDataUrl(url) : undefined;
+  const mimeType = getTimedMediaMimeType(parsed?.mimeType);
+  return parsed != null && mimeType != null
+    ? { type: 'media', mimeType, data: parsed.data }
+    : null;
+}
+
+/**
+ * The part a request that takes `input` gets for an audio or video part: the
+ * part itself when its provider reads it, Gemini inline media rewritten from
+ * an OpenAI-compatible part, or `null` to leave it out. `undefined` for any
+ * other block.
+ */
+function projectTimedMedia(
+  block: ProviderContentBlock,
+  input: TimedMediaInput
+): ProviderContentBlock | null | undefined {
+  if (block.type === 'media') {
+    const media = block as { mimeType?: unknown; mime_type?: unknown };
+    if (getTimedMediaMimeType(media.mimeType ?? media.mime_type) == null) {
+      return undefined;
+    }
+    return input === 'gemini' ? block : null;
+  }
+  if (block.type === 'input_audio' || block.type === 'video_url') {
+    if (input === 'openai') {
+      return block;
+    }
+    return input === 'gemini' ? toGeminiMedia(block) : null;
+  }
+  if (
+    isStandardFileBlock(block) &&
+    getTimedMediaMimeType(block.mime_type) != null
+  ) {
+    return input === 'gemini' ? block : null;
+  }
+  return undefined;
+}
+
 function isBlankTextBlock(block: ProviderContentBlock): boolean {
   return (
     block.type === 'text' &&
@@ -344,27 +482,85 @@ function copyUsableContentPrefix(
   return content;
 }
 
-/** Reprojects persisted provider-native attachments without changing history. */
+/** Puts the breakpoint a dropped reference carried on the last block that can hold one. */
+function anchorCacheControl(
+  content: MessageContentComplex[],
+  marker: NonNullable<ReturnType<typeof getCacheControl>>
+): void {
+  for (let index = content.length - 1; index >= 0; index--) {
+    if (isTailCacheableBlock(content[index])) {
+      content[index] = withCacheControl(content[index], marker);
+      return;
+    }
+  }
+}
+
+/**
+ * Resolves referenced attachments and reprojects persisted provider-native
+ * ones, in one pass and without changing history. Audio and video reach each
+ * provider in the part it reads, or not at all (`projectTimedMedia`); tool
+ * results keep their own tool-output projection.
+ */
 function projectAttachmentsForProvider(
   messages: BaseMessage[],
-  provider: t.ProviderName
+  provider: t.ProviderName,
+  projectionMode: ProviderMessageProjectionMode,
+  resolve?: ResolveReference
 ): BaseMessage[] {
-  if (
-    provider === Providers.BEDROCK ||
-    getProviderFamily(provider) === 'bedrock'
-  ) {
-    return messages;
-  }
+  const native =
+    provider === Providers.BEDROCK || getProviderFamily(provider) === 'bedrock';
+  const timedMediaInput = getTimedMediaInput(provider, projectionMode);
   let projected: BaseMessage[] | undefined;
   for (let messageIndex = 0; messageIndex < messages.length; messageIndex++) {
     const message = messages[messageIndex];
     if (!Array.isArray(message.content)) {
       continue;
     }
+    const projectsTimedMedia = message.getType() !== 'tool';
     const sourceContent = message.content as ProviderContentBlock[];
     let content: ProviderContentBlock[] | undefined;
+    let displaced: ReturnType<typeof getCacheControl>;
     for (let blockIndex = 0; blockIndex < sourceContent.length; blockIndex++) {
       const block = sourceContent[blockIndex];
+      const resolved =
+        resolve != null && isIDContentBlock(block) ? resolve(block) : undefined;
+      if (resolved !== undefined) {
+        content ??= copyUsableContentPrefix(sourceContent, blockIndex);
+        const marker = getCacheControl(block);
+        if (resolved === null) {
+          displaced = marker ?? displaced;
+        } else {
+          content.push(
+            marker == null ? resolved : withCacheControl(resolved, marker)
+          );
+        }
+        continue;
+      }
+      const media = projectsTimedMedia
+        ? projectTimedMedia(block, timedMediaInput)
+        : undefined;
+      if (media === block) {
+        content?.push(block);
+        continue;
+      }
+      if (media !== undefined) {
+        content ??= copyUsableContentPrefix(sourceContent, blockIndex);
+        const marker = getCacheControl(block);
+        if (media === null) {
+          displaced = marker ?? displaced;
+        } else {
+          content.push(
+            marker == null ? media : withCacheControl(media, marker)
+          );
+        }
+        continue;
+      }
+      if (native) {
+        if (content != null && !isBlankTextBlock(block)) {
+          content.push(block);
+        }
+        continue;
+      }
       if (isStandardFileBlock(block)) {
         if (shouldRetainStandardFile(provider, block.mime_type)) {
           content?.push(block);
@@ -396,6 +592,9 @@ function projectAttachmentsForProvider(
     if (content.length === 0) {
       content.push({ type: 'text', text: OMITTED_ATTACHMENT_TEXT });
     }
+    if (displaced != null) {
+      anchorCacheControl(content as MessageContentComplex[], displaced);
+    }
     projected ??= [...messages];
     projected[messageIndex] = cloneMessage(
       message,
@@ -411,6 +610,7 @@ function projectMessagesForProviderMode(
     provider,
     maxToolResultChars,
     toolHistory,
+    resolve,
   }: ProjectMessagesForProviderParams,
   projectionMode: ProviderMessageProjectionMode
 ): BaseMessage[] {
@@ -423,7 +623,9 @@ function projectMessagesForProviderMode(
       maxToolResultChars,
       toolHistory
     ),
-    provider
+    provider,
+    projectionMode,
+    resolve
   );
   if (nativeOpenAIResponses) {
     return projectOpenAIResponsesToolMessageContent(
@@ -540,6 +742,8 @@ export function prepareProviderRequest({
     provider,
     config
   );
+  const modelId = resolveServingModelId(model);
+  const resolveAttachment = context?.resolveAttachment;
   const projected = projectMessagesForProviderMode(
     {
       model,
@@ -548,6 +752,15 @@ export function prepareProviderRequest({
       maxToolResultChars,
       callOptions: config,
       toolHistory,
+      resolve:
+        resolveAttachment == null
+          ? undefined
+          : (reference): MessageContentComplex | null | undefined =>
+            resolveAttachment(reference, {
+              provider,
+              modelId,
+              projectionMode,
+            }),
     },
     projectionMode
   );
@@ -555,7 +768,6 @@ export function prepareProviderRequest({
   const runId = config?.configurable?.run_id as string | undefined;
   const annotated = annotateMessagesForLLM(projected, registry, runId);
   const isRunProduced = context?.isRunProducedMessage;
-  const modelId = resolveServingModelId(model);
   const handoffGrounded = appendInstructionlessHandoffCue(annotated, config);
   const cued = isAnthropicLike(provider, {
     model: modelId,

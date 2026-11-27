@@ -3,6 +3,7 @@ import { AIMessage, ToolMessage } from '@langchain/core/messages';
 import { tool, DynamicStructuredTool } from '@langchain/core/tools';
 import { AsyncLocalStorageProviderSingleton } from '@langchain/core/singletons';
 import type { ToolCall } from '@langchain/core/messages/tool';
+import type { ToolResultProtection } from '@/protection/toolResult';
 import { ToolOutputReferenceRegistry } from '../toolOutputReferences';
 import { PreparedSubagents } from '../preparedSubagents';
 import { HookRegistry } from '@/hooks';
@@ -16,7 +17,11 @@ const call: ToolCall = {
 };
 const config = { configurable: { run_id: 'run', thread_id: 'thread' } };
 
-function fixture(hookRegistry?: HookRegistry, nonCooperative = false) {
+function fixture(
+  hookRegistry?: HookRegistry,
+  nonCooperative = false,
+  toolResultProtection?: ToolResultProtection
+) {
   let starts = 0;
   let finish!: (value: string) => void;
   let fail!: (error: Error) => void;
@@ -54,6 +59,7 @@ function fixture(hookRegistry?: HookRegistry, nonCooperative = false) {
     eagerEventToolExecution: { enabled: true },
     toolOutputRegistry: registry,
     hookRegistry,
+    toolResultProtection,
   });
   return {
     node,
@@ -229,6 +235,45 @@ describe('ToolNode prepared subagent adoption', () => {
     )) as ToolMessage[];
     expect(output[0].status).toBe('error');
     expect(f.starts()).toBe(0);
+  });
+
+  it('leaves a subagent tool with protected results on the normal path', async () => {
+    const f = fixture(undefined, false, {
+      version: 1,
+      toolNames: [Constants.SUBAGENT],
+      timeoutMs: 1000,
+      maxAttemptBytes: 4096,
+      maxBufferedBytes: 4096,
+      classify: () => 'prose',
+      inspect: () => ({
+        version: 1,
+        ok: true,
+        value: { content: 'inspected', replacements: 1, categories: [] },
+      }),
+    });
+    /** Earlier adoptions stamp their token on the shared call object. */
+    const call: ToolCall = {
+      id: 'protected-call',
+      name: Constants.SUBAGENT,
+      args: { description: 'Research this', subagent_type: 'researcher' },
+    };
+    f.prepared.begin('attempt');
+    f.node.prestartSubagent(call, 'attempt', config, 4);
+    const startedEarly = await Promise.race([
+      f.started.then(() => true),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 50)),
+    ]);
+    expect(startedEarly).toBe(false);
+    f.prepared.finish('attempt', [call]);
+    const pending = f.node.invoke(
+      [new AIMessage({ content: '', tool_calls: [call] })],
+      config
+    );
+    await f.started;
+    f.finish('raw child answer');
+    const output = (await pending) as ToolMessage[];
+    expect(f.starts()).toBe(1);
+    expect(output[0].content).toBe('inspected');
   });
 
   it.each([{ run_in_background: true }, { subagent_thread_id: 'thread' }])(
