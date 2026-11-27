@@ -2319,6 +2319,62 @@ describe('AgentContext', () => {
         'original result'
       );
     });
+
+    it('prices a replaced image as its marker, also after the projection is rebuilt', () => {
+      const image = {
+        type: 'image_url',
+        image_url: { url: 'data:image/png;base64,AA==' },
+      };
+      const tokenCounter: t.TokenCounter = (message) =>
+        Array.isArray(message.content) &&
+        message.content.some((block) => block.type === 'image_url')
+          ? 50_000
+          : 10;
+      const context = createBasicContext({
+        agentConfig: { vision: false, maxContextTokens: 1_000 },
+        tokenCounter,
+        indexTokenCountMap: { 0: 50_000, 1: 10 },
+      });
+      const imageTurn = new HumanMessage({
+        content: [{ type: 'text', text: 'What is this?' }, image],
+      });
+
+      context.getProviderProjectedMessages([
+        imageTurn,
+        new AIMessage('A chart.'),
+      ]);
+      expect(context.indexTokenCountMap[0]).toBe(10);
+
+      context.getProviderProjectedMessages([
+        imageTurn,
+        new AIMessage('Rewritten.'),
+      ]);
+      expect(context.indexTokenCountMap[0]).toBe(10);
+    });
+
+    it('leaves the host counts of a vision agent alone', () => {
+      const counts = { 0: 50_000, 1: 10 };
+      const context = createBasicContext({
+        agentConfig: { maxContextTokens: 1_000 },
+        tokenCounter: () => 10,
+        indexTokenCountMap: counts,
+      });
+
+      context.getProviderProjectedMessages([
+        new HumanMessage({
+          content: [
+            {
+              type: 'image_url',
+              image_url: { url: 'data:image/png;base64,AA==' },
+            },
+          ],
+        }),
+        new AIMessage('A chart.'),
+      ]);
+
+      expect(context.indexTokenCountMap[0]).toBe(50_000);
+      expect(counts[0]).toBe(50_000);
+    });
   });
 
   describe('reset()', () => {
@@ -3132,6 +3188,40 @@ describe('AgentContext', () => {
       expect(max - (usage!.remainingContextTokens ?? 0)).toBeLessThanOrEqual(
         max
       );
+    });
+
+    it('prices an image as its marker for a model without image input', () => {
+      const tokenCounter: t.TokenCounter = (message) =>
+        Array.isArray(message.content) &&
+        message.content.some((block) => block.type === 'image_url')
+          ? 50_000
+          : 10;
+      const ctx = createBasicContext({
+        agentConfig: { vision: false, maxContextTokens: 1_000 },
+        tokenCounter,
+      });
+
+      const messages = [
+        new HumanMessage({
+          content: [
+            { type: 'text', text: 'What is this?' },
+            {
+              type: 'image_url',
+              image_url: { url: 'data:image/png;base64,AA==' },
+            },
+          ],
+        }),
+        new AIMessage('A chart.'),
+        new HumanMessage('Which quarter was best?'),
+      ];
+      const hostCounts = { 0: 50_000, 1: 10, 2: 10 };
+
+      expect(ctx.projectContextUsage(messages)?.breakdown.messageCount).toBe(3);
+      expect(
+        ctx.projectContextUsage(messages, { indexTokenCountMap: hostCounts })
+          ?.breakdown.messageCount
+      ).toBe(3);
+      expect(hostCounts[0]).toBe(50_000);
     });
 
     it('does not mutate the context (local pruner, no field writes)', () => {
