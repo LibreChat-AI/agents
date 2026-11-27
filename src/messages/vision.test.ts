@@ -2,6 +2,7 @@ import { describe, expect, it } from '@jest/globals';
 import type { MessageContentComplex } from '@langchain/core/messages';
 import {
   OMITTED_IMAGE_TEXT,
+  omitImageBlocks,
   isImageContentBlock,
   toOmittedImageBlock,
 } from './vision';
@@ -72,6 +73,26 @@ describe('isImageContentBlock', () => {
     ['a file block without a MIME type', { type: 'file', file_id: 'file-1' }],
   ])('leaves %s alone', (_name, block) => {
     expect(isImageContentBlock(block)).toBe(false);
+  });
+});
+
+describe('omitImageBlocks', () => {
+  it('returns undefined when no block holds an image', () => {
+    expect(omitImageBlocks([text])).toBeUndefined();
+  });
+
+  it('replaces top-level images and images inside a native tool_result', () => {
+    const toolResult = {
+      type: 'tool_result',
+      tool_use_id: 'call-1',
+      content: [text, imageUrl],
+    };
+
+    expect(omitImageBlocks([imageUrl, toolResult])).toEqual([
+      marker,
+      { ...toolResult, content: [text, marker] },
+    ]);
+    expect(toolResult.content).toEqual([text, imageUrl]);
   });
 });
 

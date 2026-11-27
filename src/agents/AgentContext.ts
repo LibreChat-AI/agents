@@ -10,6 +10,7 @@ import type {
   BaseMessage,
   BaseMessageFields,
   BaseMessageLike,
+  MessageContentComplex,
 } from '@langchain/core/messages';
 import type { RunnableConfig, Runnable } from '@langchain/core/runnables';
 import type { ExactTokenCountCache } from '@/llm/contextPressureMeter';
@@ -59,12 +60,15 @@ import {
 import { isTokenCounterCacheCompatible } from '@/llm/tokenCounterCacheCompatibility';
 import { normalizeToBashIdentifier } from '@/tools/BashProgrammaticToolCalling';
 import { snapshotCompactionSemanticIndex } from '@/summarization/semanticIndex';
+import { flattenLegacyContent, isLegacyConvertible } from '@/messages/content';
 import { normalizeToPythonIdentifier } from '@/tools/ProgrammaticToolCalling';
 import { createExactTokenCountCache } from '@/llm/contextPressureMeter';
 import { markProviderTextInput } from '@/protection/providerTextInput';
+import { hasComputerCallOutputMarker } from '@/utils/toolContent';
 import { buildSummaryCarrierText } from '@/summarization/shared';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { apportionTokenCounts } from '@/utils/tokens';
+import { omitImageBlocks } from '@/messages/vision';
 import { isThinkingEnabled } from '@/llm/request';
 import { toJsonSchema } from '@/utils/schema';
 
@@ -1894,11 +1898,14 @@ export class AgentContext {
         this.pendingOriginalToolContent = undefined;
         this.prepareProviderProjectionRecount(sources);
       }
-      projection = messages.map((message) =>
-        Array.isArray(message.content)
-          ? cloneMessage(message, [...message.content])
-          : message
-      );
+      const omittedIndexes: number[] = [];
+      projection = messages.map((message, index) => {
+        const projected = this.projectMessage(message);
+        if (projected.omittedImages) {
+          omittedIndexes.push(index);
+        }
+        return projected.message;
+      });
       this.providerProjectedMessages = projection;
       this.providerProjectionSources = [...messages];
       this.providerProjectionSourcesById = new Map(
@@ -1921,6 +1928,13 @@ export class AgentContext {
         this.indexTokenCountMap = recounted;
         this.providerProjectionRequiresRecount = false;
         this.providerProjectionRecountFloors = undefined;
+      } else if (omittedIndexes.length > 0 && this.tokenCounter != null) {
+        /** A host count priced the image; a new map keeps other agents' counts intact. */
+        const counts = { ...this.indexTokenCountMap };
+        for (const index of omittedIndexes) {
+          counts[index] = this.tokenCounter(projection[index]);
+        }
+        this.indexTokenCountMap = counts;
       }
       return projection;
     }
@@ -1931,13 +1945,39 @@ export class AgentContext {
       if (message.id != null) {
         this.providerProjectionSourcesById?.set(message.id, message);
       }
-      projection.push(
-        Array.isArray(message.content)
-          ? cloneMessage(message, [...message.content])
-          : message
-      );
+      projection.push(this.projectMessage(message).message);
     }
     return projection;
+  }
+
+  /** The projection's copy of `message`; without image input, its images become markers. */
+  private projectMessage(message: BaseMessage): {
+    message: BaseMessage;
+    omittedImages: boolean;
+  } {
+    if (!Array.isArray(message.content)) {
+      return { message, omittedImages: false };
+    }
+    const content = message.content as MessageContentComplex[];
+    const omitted =
+      this.vision === false && !hasComputerCallOutputMarker(message)
+        ? omitImageBlocks(content)
+        : undefined;
+    if (omitted == null) {
+      return {
+        message: cloneMessage(message, [...content]),
+        omittedImages: false,
+      };
+    }
+    return {
+      message: cloneMessage(
+        message,
+        this.useLegacyContent && isLegacyConvertible(message, omitted)
+          ? flattenLegacyContent(omitted)
+          : omitted
+      ),
+      omittedImages: true,
+    };
   }
 
   /**

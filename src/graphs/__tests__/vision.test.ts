@@ -246,6 +246,48 @@ describe('an agent whose model cannot read images', () => {
     );
   });
 
+  it('keeps an image turn whose marker fits instead of pruning it at image cost', async () => {
+    /** Prices an image the way a host count does; anything else is cheap. */
+    const tokenCounter: t.TokenCounter = (message) =>
+      hasImage([message]) ? 50_000 : 10;
+    const run = await Run.create<t.IState>({
+      runId: 'text-only-prune',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: Providers.ANTHROPIC,
+          disableStreaming: true,
+          streamUsage: false,
+        },
+        maxContextTokens: 1_000,
+        vision: false,
+      },
+      tokenCounter,
+      indexTokenCountMap: { 0: 50_000, 1: 10, 2: 10 },
+      returnContent: true,
+      skipCleanup: true,
+    });
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+    const model = new RecordingModel();
+    run.Graph.overrideModel = model;
+
+    await run.processStream(
+      {
+        messages: [
+          imageTurn(),
+          new AIMessage('It shows revenue by quarter.'),
+          new HumanMessage('Which quarter was best?'),
+        ],
+      },
+      { ...summaryStreamConfig, configurable: { thread_id: 'text-only-prune' } }
+    );
+
+    expect(model.calls).toHaveLength(1);
+    expect(sentContent(model.calls[0])).toContainEqual([question, marker]);
+  });
+
   it('@scenario:text-only-summary gets a marker in the history its summary request sends', async () => {
     const [firstTurn] = await captureSummaryRequest({});
 

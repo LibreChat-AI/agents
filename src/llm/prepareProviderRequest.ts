@@ -33,9 +33,13 @@ import {
   appendInstructionlessHandoffCue,
   removePredecessorHandoffCue,
 } from '@/messages';
+import {
+  omitImageBlock,
+  isImageContentBlock,
+  toOmittedImageBlock,
+} from '@/messages/vision';
 import { createToolHistoryPreparation } from '@/messages/toolHistoryProjection';
 import { flattenLegacyContent, isLegacyConvertible } from '@/messages/content';
-import { isImageContentBlock, toOmittedImageBlock } from '@/messages/vision';
 import { isAnthropicLike, isGoogleLike, isOpenAILike } from '@/utils/llm';
 import { annotateMessagesForLLM } from '@/tools/toolOutputReferences';
 import { providerRequiresStrictAlternation } from '@/llm/providers';
@@ -542,9 +546,12 @@ function projectAttachmentsForProvider(
     let omittedImage = false;
     for (let blockIndex = 0; blockIndex < sourceContent.length; blockIndex++) {
       const block = sourceContent[blockIndex];
-      if (omitsImages && isImageContentBlock(block as MessageContentComplex)) {
+      const omitted = omitsImages
+        ? omitImageBlock(block as MessageContentComplex)
+        : undefined;
+      if (omitted != null && omitted !== block) {
         content ??= copyUsableContentPrefix(sourceContent, blockIndex);
-        content.push(toOmittedImageBlock(block as MessageContentComplex));
+        content.push(omitted);
         omittedImage = true;
         continue;
       }

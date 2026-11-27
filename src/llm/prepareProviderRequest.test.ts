@@ -941,6 +941,46 @@ describe('prepareProviderRequest', () => {
       }
     );
 
+    it.each([Providers.ANTHROPIC, Providers.OPENAI])(
+      'replaces an image nested in a native tool_result for %s',
+      (provider) => {
+        const { model } = createCapturingModel();
+        const toolCall = new AIMessage({
+          content: '',
+          tool_calls: [{ id: 'native-1', name: 'native_tool', args: {} }],
+        });
+        const toolResult = new ToolMessage({
+          tool_call_id: 'native-1',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'native-1',
+              cache_control: { type: 'ephemeral', ttl: '1h' },
+              content: [
+                { type: 'text', text: 'native result' },
+                {
+                  type: 'image_url',
+                  image_url: 'data:image/png;base64,AA==',
+                },
+              ],
+            },
+          ],
+        });
+
+        const request = prepareProviderRequest({
+          model: model as t.ChatModel,
+          messages: [new HumanMessage('Run it'), toolCall, toolResult],
+          provider,
+          vision: false,
+        });
+
+        const wire = JSON.stringify(request.messages[2].content);
+        expect(wire).toContain(OMITTED_IMAGE_TEXT);
+        expect(wire).toContain('native result');
+        expect(wire).not.toContain('base64');
+      }
+    );
+
     it('keeps the screenshot a native Responses computer-call output requires', () => {
       const { model } = createCapturingModel();
       model._useResponsesApi = (): boolean => true;
