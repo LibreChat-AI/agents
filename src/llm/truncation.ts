@@ -84,6 +84,22 @@ export function getProviderStopReasons(
 }
 
 /**
+ * Whether Anthropic paused the turn (`stop_reason: 'pause_turn'`). Anthropic
+ * returns this when a long-running server tool loop hit its iteration limit;
+ * the caller is expected to send the response back unchanged so the turn
+ * continues. Reads the same invoke (`response_metadata`) and stream
+ * (`additional_kwargs`) fields as {@link getProviderStopReasons}.
+ */
+export function isPauseTurn(
+  message:
+    | Pick<BaseMessage, 'response_metadata' | 'additional_kwargs'>
+    | undefined
+    | null
+): boolean {
+  return getProviderStopReasons(message).includes('pause_turn');
+}
+
+/**
  * Reads the truncation stop reason off a message, covering every provider
  * shape we stream:
  * - `response_metadata.stopReason` (Bedrock Converse, non-streaming)

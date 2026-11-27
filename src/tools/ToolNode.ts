@@ -138,6 +138,8 @@ import {
   StreamLimitExceededError,
   RUN_BREAKER_SCOPE_CONFIG_KEY,
 } from '@/llm/streamLimits';
+import { isPauseTurn } from '@/llm/truncation';
+import { isAnthropicServerToolResultType } from '@/messages/anthropicServerTools';
 import {
   resolveLocalToolRegistry,
   resolveLocalExecutionTools,
@@ -6442,14 +6444,63 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   }
 }
 
+/**
+ * Ids of Anthropic server tool calls (`srvtoolu_`) whose result block already
+ * sits in the message content. The provider executes server tools inside the
+ * same response and returns its result block (for example
+ * `code_execution_tool_result`, or a `web_search_tool_result` holding an error
+ * or no hits; see `ANTHROPIC_SERVER_TOOL_RESULT_TYPES`) next to the call, so such a call is settled even when
+ * `handleAnthropicSearchResults` never marked it invoked.
+ */
+function getSettledServerToolCallIds(
+  content: AIMessage['content']
+): Set<string> {
+  const settled = new Set<string>();
+  if (!Array.isArray(content)) return settled;
+  for (const block of content) {
+    const { type, tool_use_id: toolUseId } = block as {
+      type?: unknown;
+      tool_use_id?: unknown;
+    };
+    if (
+      typeof type === 'string' &&
+      isAnthropicServerToolResultType(type) &&
+      typeof toolUseId === 'string' &&
+      toolUseId.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX)
+    ) {
+      settled.add(toolUseId);
+    }
+  }
+  return settled;
+}
+
+/**
+ * Whether every tool call is already settled: it is in `invokedToolIds`, or it
+ * is a server call whose result block is already in the message content (see
+ * {@link getSettledServerToolCallIds}). Routing a settled server call to the
+ * tool node would run nothing (ToolNode skips `srvtoolu_` calls) and the graph
+ * would call the model again, so the answer is written twice.
+ *
+ * A `pause_turn` stop is excluded from the content check: Anthropic paused a
+ * long server tool loop and expects the request to be repeated to continue,
+ * and routing back is the only way the turn continues.
+ */
 function areToolCallsInvoked(
   message: AIMessage,
   invokedToolIds?: Set<string>
 ): boolean {
-  if (!invokedToolIds || invokedToolIds.size === 0) return false;
+  const settledIds = isPauseTurn(message)
+    ? new Set<string>()
+    : getSettledServerToolCallIds(message.content);
+  if ((!invokedToolIds || invokedToolIds.size === 0) && settledIds.size === 0) {
+    return false;
+  }
   return (
     message.tool_calls?.every(
-      (toolCall) => toolCall.id != null && invokedToolIds.has(toolCall.id)
+      (toolCall) =>
+        toolCall.id != null &&
+        (invokedToolIds?.has(toolCall.id) === true ||
+          settledIds.has(toolCall.id))
     ) ?? false
   );
 }
@@ -6643,9 +6694,10 @@ export function toolsCondition<T extends string>(
    * call is provider-server-executed (`srvtoolu_` — ToolNode's batch filter
    * excludes those before execution, so nothing re-runs): that covers both the
    * invalid-only turn and the Anthropic server-call + malformed-client-call
-   * mix, where `handleAnthropicSearchResults` marks the server call invoked
-   * and the first branch declines. A valid NON-server call that was invoked
-   * externally stays conservative (no routing) — ToolNode does not filter on
+   * mix, where the server call is settled (marked invoked by
+   * `handleAnthropicSearchResults`, or its result block is in the
+   * message content) and the first branch declines. A valid NON-server call
+   * that was invoked externally stays conservative (no routing) — ToolNode does not filter on
    * `invokedToolIds`, so entering it would re-execute that call.
    *
    * Mirrors ToolNode's own gating exactly, or the routed turn would no-op and
