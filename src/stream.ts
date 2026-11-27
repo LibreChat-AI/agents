@@ -63,8 +63,10 @@ import { resolveToolOutcome, outcomeFieldsFromResult } from '@/tools/intentArg';
 import { snapshotValidatedModelChunk } from '@/graphs/acceptedModelResponse';
 import { ProviderTextProtectionError } from '@/protection/providerText';
 import { TOOL_OUTPUT_REF_PATTERN } from '@/tools/toolOutputReferences';
+import { getGoogleGroundingMetadata } from '@/tools/search/google';
 import { formatToolErrorContent } from '@/tools/toolErrorContent';
 import { PreparedSubagentError } from '@/tools/preparedSubagents';
+import { applyTextEdits } from '@/tools/search/citations';
 import { isReasoningContentBlock } from '@/messages/core';
 import { composeAbortSignals } from '@/utils/misc';
 import { isGoogleLike } from '@/utils/llm';
@@ -192,6 +194,11 @@ function isEagerExecutionExcludedTool(
   }
   const excluded = graph.eagerEventToolExecution?.excludeToolNames;
   if (excluded != null && excluded.includes(name)) {
+    return true;
+  }
+  // A protected result must be inspected before its completion is published,
+  // which only the committed ToolNode path guarantees.
+  if (graph.toolResultProtection?.toolNames.includes(name) === true) {
     return true;
   }
   // Run-scoped circuit breaker: once a prestart for this tool diverged from
@@ -1811,6 +1818,12 @@ export class ChatModelStreamHandler implements t.EventHandler {
     if (metadata?.summarization === true) return;
 
     const agentContext = graph.getAgentContext(metadata);
+    const grounding = isGoogleLike(agentContext.provider)
+      ? getGoogleGroundingMetadata(chunk)
+      : undefined;
+    if (grounding != null) {
+      graph.groundSearchCitations(metadata, grounding);
+    }
 
     const content = getChunkContent({
       chunk,
@@ -2499,16 +2512,24 @@ export function createContentAggregator(): t.ContentAggregatorResult {
       citations?: t.MessageDeltaUpdate['citations'];
     };
     const incomingCitations = Array.isArray(citations) ? citations : undefined;
+    const { edits } = contentPart as { edits?: t.MessageDeltaUpdate['edits'] };
+    const incomingEdits = Array.isArray(edits) ? edits : undefined;
 
     if (
       partType.startsWith(ContentTypes.TEXT) &&
-      (incomingText !== undefined || incomingCitations !== undefined)
+      (incomingText !== undefined ||
+        incomingCitations !== undefined ||
+        incomingEdits !== undefined)
     ) {
       // TODO: update this!!
       const currentContent = contentParts[index] as t.MessageDeltaUpdate;
+      const text = (currentContent.text || '') + (incomingText ?? '');
       const update: t.MessageDeltaUpdate = {
         type: ContentTypes.TEXT,
-        text: (currentContent.text || '') + (incomingText ?? ''),
+        text:
+          incomingEdits === undefined
+            ? text
+            : applyTextEdits(text, incomingEdits),
       };
 
       if (contentPart.tool_call_ids) {

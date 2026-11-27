@@ -96,6 +96,10 @@ import {
   type CallbackEntry,
 } from '@/utils/callbacks';
 import {
+  BATCHED_PROVIDER_EVENT_OWNER,
+  ProviderTextProtectionError,
+} from '@/protection/providerText';
+import {
   resolveLangfuseRuntimeScope,
   withLangfuseRuntimeScope,
 } from '@/langfuseRuntimeScope';
@@ -108,10 +112,10 @@ import {
   createTitleRunnable,
 } from '@/utils/title';
 import { applyGraphRuntimeConfig } from '@/graphs/applyGraphRuntimeConfig';
-import { ProviderTextProtectionError } from '@/protection/providerText';
 import { LANGFUSE_OPERATION_METADATA_KEY } from '@/langfuseOperation';
 import { createTokenCounter, encodingForModel } from '@/utils/tokens';
 import { stampSyntheticProviderMessage } from '@/messages/provenance';
+import { ToolResultProtectionError } from '@/protection/toolResult';
 import { isOpenAILike, isLibreChatOpenAIModel } from '@/utils/llm';
 import { executeHooks, mergeAggregatedHookResults } from '@/hooks';
 import { convertInjectedMessages } from '@/messages/injected';
@@ -397,9 +401,7 @@ async function resolveCompletedSegmentConfig(
   );
 }
 
-function getFirstPersistedInterrupt(
-  snapshot: InterruptStateSnapshot
-):
+function getFirstPersistedInterrupt(snapshot: InterruptStateSnapshot):
   | {
       id: string;
       value: unknown;
@@ -511,6 +513,7 @@ export class Run<_T extends t.BaseGraphState> {
   private preemption?: t.StreamPreemption;
   private maxStopContinuations: number;
   private providerTextProtection?: t.StandardGraphInput['providerTextProtection'];
+  private toolResultProtection?: t.StandardGraphInput['toolResultProtection'];
   private resolveAttachment?: t.StandardGraphInput['resolveAttachment'];
   private streamLimits?: t.StreamLimits;
   private subagentTasks?: t.SubagentTaskConfig;
@@ -616,6 +619,7 @@ export class Run<_T extends t.BaseGraphState> {
     );
     this.streamLimits = config.streamLimits;
     this.providerTextProtection = config.providerTextProtection;
+    this.toolResultProtection = config.toolResultProtection;
     this.resolveAttachment = config.resolveAttachment;
 
     if (!config.graphConfig) {
@@ -626,6 +630,21 @@ export class Run<_T extends t.BaseGraphState> {
       config.graphConfig.providerTextProtection != null
     ) {
       throw new ProviderTextProtectionError('incompatible');
+    }
+    if (
+      'toolResultProtection' in config.graphConfig &&
+      config.graphConfig.toolResultProtection != null
+    ) {
+      throw new ToolResultProtectionError('incompatible');
+    }
+
+    if (
+      this.providerTextProtection?.batching != null &&
+      (config.humanInTheLoop?.enabled === true ||
+        ('agents' in config.graphConfig &&
+          config.graphConfig.agents.length !== 1))
+    ) {
+      throw new ProviderTextProtectionError('unsupported');
     }
 
     /** Handle different graph types */
@@ -727,6 +746,7 @@ export class Run<_T extends t.BaseGraphState> {
         preemption: this.preemption,
         streamLimits: this.streamLimits,
         providerTextProtection: this.providerTextProtection,
+        toolResultProtection: this.toolResultProtection,
         resolveAttachment: this.resolveAttachment,
         toolExecution: this.toolExecution,
         clientDelegatedToolNames: this.clientDelegatedToolNames,
@@ -776,6 +796,7 @@ export class Run<_T extends t.BaseGraphState> {
         preemption: this.preemption,
         streamLimits: this.streamLimits,
         providerTextProtection: this.providerTextProtection,
+        toolResultProtection: this.toolResultProtection,
         resolveAttachment: this.resolveAttachment,
         toolExecution: this.toolExecution,
       },
@@ -1619,6 +1640,14 @@ export class Run<_T extends t.BaseGraphState> {
         for await (const event of stream) {
           const { data, metadata, ...info } = event;
           const eventName: t.EventName = info.event;
+          // The batched attempt owns start and delta delivery and their deadline.
+          if (
+            this.providerTextProtection?.batching != null &&
+            (eventName === GraphEvents.CHAT_MODEL_START ||
+              eventName === GraphEvents.CHAT_MODEL_STREAM) &&
+            metadata[BATCHED_PROVIDER_EVENT_OWNER] === true
+          )
+            continue;
 
           if (CUSTOM_GRAPH_EVENTS.has(eventName)) {
             continue;
@@ -1663,6 +1692,7 @@ export class Run<_T extends t.BaseGraphState> {
           }
 
           if (eventName === GraphEvents.CHAT_MODEL_END && this.Graph != null) {
+            await this.Graph.settleSearchCitations(metadata);
             await this.Graph.closeOpenMessageStep(metadata, modelEndAt);
           }
 
@@ -3082,7 +3112,9 @@ export class Run<_T extends t.BaseGraphState> {
       reasoningChainOptions.runName ?? REASONING_LABEL_TRACE_NAME;
     const reasoningTags = ['librechat', 'reasoning-label', 'reasoning-step'];
     const reasoningRunLangfuse = withoutSkillsAvailable(this.langfuse);
-    const reasoningLangfuseOverlay = withoutSkillsAvailable(reasoningContext?.langfuse);
+    const reasoningLangfuseOverlay = withoutSkillsAvailable(
+      reasoningContext?.langfuse
+    );
     const reasoningLangfuseConfig = resolveLangfuseConfig(
       reasoningRunLangfuse,
       reasoningLangfuseOverlay

@@ -125,16 +125,26 @@ export * from './rerank';
 
 export {
   PROVIDER_TEXT_PROTECTION_VERSION,
+  PROVIDER_TEXT_BATCHING_VERSION,
   ProviderTextProtectionError,
   serializeProviderTextProtectionError,
   deserializeProviderTextProtectionError,
 } from './protection/providerText';
 export type {
+  ProviderTextBatching,
   ProviderTextProtection,
   ProviderTextProtectionResult,
   ProviderTextProtectionErrorCode,
   ProviderTextProtectionFailure,
 } from './protection/providerText';
+export {
+  TOOL_RESULT_PROTECTION_VERSION,
+  ToolResultProtectionError,
+} from './protection/toolResult';
+export type {
+  ToolResultProtection,
+  ToolResultProtectionResult,
+} from './protection/toolResult';
 
 export {
   GEMINI_PARTS,

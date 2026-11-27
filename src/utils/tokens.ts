@@ -86,6 +86,8 @@ const _GEMINI_PDF_TOKENS_PER_PAGE = 258;
 const BASE64_BYTES_PER_PDF_PAGE = 75_000;
 /** Fallback token cost for URL-referenced documents without local data. */
 const URL_DOCUMENT_FALLBACK_TOKENS = 2000;
+/** Approximate decoded bytes per token for a binary (Office) document. */
+const BINARY_DOCUMENT_BYTES_PER_TOKEN = 4;
 
 /**
  * Timed media (video/audio) is priced by DURATION, not size, and the content
@@ -276,12 +278,33 @@ export function estimateImageBlockTokens(
 }
 
 /**
+ * A base64 document that is neither a PDF nor an image reaches the model as
+ * its contents, not as base64: a textual one is counted by its decoded text,
+ * a binary one (Office formats) by its decoded size. Tokenizing the base64
+ * itself roughly doubles a text file's count.
+ */
+function estimateBase64DocumentTokens(
+  data: string,
+  mimeType: string,
+  getTokenCount: (text: string) => number
+): number {
+  if (!mimeType.startsWith('text/')) {
+    return Math.ceil(
+      Buffer.byteLength(data, 'base64') / BINARY_DOCUMENT_BYTES_PER_TOKEN
+    );
+  }
+  return getTokenCount(Buffer.from(data, 'base64').toString('utf8'));
+}
+
+/**
  * Estimates token cost for a document/file content block.
  * Handles both LangChain standard format (`type: 'file'` with `source_type`)
  * and Anthropic format (`type: 'document'` with `source`).
  *
  * - Plain text: tokenized directly via `getTokenCount`.
+ * - Audio and video: priced by duration, as {@link estimateTimedMediaBlockTokens}.
  * - Base64 PDF: page count estimated from base64 length × per-page cost.
+ * - Other base64 documents: decoded text, or decoded size when binary.
  * - URL reference: conservative flat estimate.
  */
 export function estimateDocumentBlockTokens(
@@ -305,6 +328,14 @@ export function estimateDocumentBlockTokens(
       return getTokenCount(block.text as string);
     }
 
+    const mediaMimeType = normalizeMediaMimeType(mimeType);
+    if (
+      mediaMimeType.startsWith('audio/') ||
+      mediaMimeType.startsWith('video/')
+    ) {
+      return estimateTimedMediaBlockTokens({ ...block, type: 'media' });
+    }
+
     if (sourceType === 'base64' && typeof block.data === 'string') {
       if (mimeType === 'application/pdf' || mimeType === '') {
         const pageEstimate = Math.max(
@@ -324,7 +355,11 @@ export function estimateDocumentBlockTokens(
           encoding
         );
       }
-      return getTokenCount(block.data as string);
+      return estimateBase64DocumentTokens(
+        block.data as string,
+        mimeType,
+        getTokenCount
+      );
     }
 
     if (sourceType === 'url') {
@@ -367,7 +402,7 @@ export function estimateDocumentBlockTokens(
         encoding
       );
     }
-    return getTokenCount(source.data);
+    return estimateBase64DocumentTokens(source.data, mediaType, getTokenCount);
   }
 
   if (source.type === 'url') {

@@ -1,7 +1,7 @@
 import { concat } from '@langchain/core/utils/stream';
 import { AIMessageChunk } from '@langchain/core/messages';
 import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
-import { getCallbackManagerForConfig } from '@langchain/core/runnables';
+import { ensureConfig, getCallbackManagerForConfig } from '@langchain/core/runnables';
 import type { Serialized } from '@langchain/core/load/serializable';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { ChatGeneration } from '@langchain/core/outputs';
@@ -25,8 +25,10 @@ import {
   STREAM_LIMIT_ATTEMPT_KEY,
 } from '@/llm/streamLimits';
 import {
+  BATCHED_PROVIDER_EVENT_OWNER,
   validateProviderTextProtection,
   ProviderTextProtectionError,
+  ProviderTextAttempt,
   createProviderTextRestartCancellation,
   isProviderTextRestartCancellation,
 } from '@/protection/providerText';
@@ -205,6 +207,74 @@ function withModelStartHandler({
     callbacks: appendCallbacks(config.callbacks, [
       createModelStartHandler({ config, mode, provider, captureRunId }),
     ]),
+  };
+}
+
+/** Publication errors must not start a second attempt after text was committed. */
+async function dispatchBatchEvent(
+  attempt: ProviderTextAttempt,
+  dispatch: () => void | Promise<void>
+): Promise<void> {
+  attempt.check();
+  try {
+    const pending = dispatch();
+    if (pending != null) await attempt.wait(pending, false);
+    attempt.check();
+  } catch (error) {
+    attempt.check();
+    if (error instanceof StreamLimitExceededError || error instanceof PreparedSubagentError) {
+      throw error;
+    }
+    const failure = new ProviderTextProtectionError('unavailable');
+    attempt.stop(failure);
+    throw failure;
+  }
+}
+
+function withBatchCloseDeadline(
+  stream: AsyncIterable<AIMessageChunk>,
+  attempt: ProviderTextAttempt
+): AsyncIterable<AIMessageChunk> {
+  return {
+    [Symbol.asyncIterator](): AsyncIterator<AIMessageChunk> {
+      const iterator = stream[Symbol.asyncIterator]();
+      return {
+        next: iterator.next.bind(iterator),
+        async return(): Promise<IteratorResult<AIMessageChunk>> {
+          // LangChain's iterator close can wait on an in-flight native callback.
+          const closing = iterator.return?.();
+          if (closing != null) await attempt.wait(closing, false).catch(() => {});
+          return { done: true, value: undefined };
+        },
+      };
+    },
+  };
+}
+
+function captureBatchStart(context: InvokeContext | undefined): {
+  callback: BaseCallbackHandler;
+  dispatch: (attempt: ProviderTextAttempt) => Promise<void>;
+} | undefined {
+  const handler = context?.handlerRegistry?.getHandler(GraphEvents.CHAT_MODEL_START);
+  if (handler == null) return;
+  let start: { messages: BaseMessage[][]; metadata?: Record<string, unknown> } | undefined;
+  const callback = BaseCallbackHandler.fromMethods({
+    handleChatModelStart(_llm, messages, _runId, _parentId, _extra, _tags, metadata): void {
+      start = { messages, metadata };
+    },
+  });
+  callback.name = 'batched-provider-start';
+  callback.awaitHandlers = true;
+  return {
+    callback,
+    dispatch: (attempt): Promise<void> => {
+      const event = start;
+      start = undefined;
+      if (event == null) throw new ProviderTextProtectionError('incompatible');
+      return dispatchBatchEvent(attempt, () => handler.handle(
+        GraphEvents.CHAT_MODEL_START, { input: { messages: event.messages } }, event.metadata, context
+      ));
+    },
   };
 }
 
@@ -665,6 +735,9 @@ export async function attemptInvoke(
   const policy =
     params.providerTextProtection ?? params.context?.providerTextProtection;
   if (policy != null) validateProviderTextProtection(policy);
+  if (policy?.batching != null && params.context?.preemption != null) {
+    throw new ProviderTextProtectionError('unsupported');
+  }
   const provider = resolveAttemptProvider(params);
   const providerStampedConfig: RunnableConfig = {
     ...config,
@@ -676,12 +749,36 @@ export async function attemptInvoke(
     },
   };
   const preparedRequest = resolveAttemptRequest(params, providerStampedConfig);
+  const batchConfig = policy?.batching == null ? undefined : ensureConfig(providerStampedConfig);
+  const batchStart = batchConfig == null ? undefined : captureBatchStart(params.context);
+  let batchAttempt: ProviderTextAttempt | undefined;
+  let unbindBatchSignal: (() => void) | undefined;
+  let batchEntered = false;
+  let finishBatch: (() => void) | undefined;
+  const batchInvocation = batchConfig == null ? undefined : {
+    getAttempt(signal?: AbortSignal): ProviderTextAttempt {
+      const attempt = batchAttempt;
+      if (attempt == null || batchEntered) throw new ProviderTextProtectionError('incompatible');
+      attempt.signal.throwIfAborted();
+      attempt.check();
+      unbindBatchSignal = attempt.followSignal(signal);
+      batchEntered = true;
+      finishBatch = attempt.holdFinish();
+      return attempt;
+    },
+    dispatchStart: batchStart?.dispatch,
+  };
   const request =
     policy == null
       ? preparedRequest
       : {
         ...preparedRequest,
-        model: withProviderTextBoundary(preparedRequest.model, policy, provider),
+        model: withProviderTextBoundary(
+          preparedRequest.model,
+          policy,
+          provider,
+          batchInvocation
+        ),
       };
   const configuredModel =
     providerStampedConfig.metadata?.[Constants.INVOKED_MODEL];
@@ -689,9 +786,10 @@ export async function attemptInvoke(
     request.modelId ??
     (typeof configuredModel === 'string' ? configuredModel : undefined);
   const stampedConfig: RunnableConfig = {
-    ...providerStampedConfig,
+    ...(batchConfig ?? providerStampedConfig),
+    ...(batchStart != null && { callbacks: appendCallbacks(batchConfig?.callbacks, [batchStart.callback]) }),
     metadata: {
-      ...providerStampedConfig.metadata,
+      ...(batchConfig ?? providerStampedConfig).metadata,
       ...(modelId == null
         ? {}
         : {
@@ -708,6 +806,7 @@ export async function attemptInvoke(
        * rebuild that already attributes the serving provider.
        */
       [STREAM_LIMIT_ATTEMPT_KEY]: ++streamLimitAttemptSeq,
+      ...(batchInvocation != null && { [BATCHED_PROVIDER_EVENT_OWNER]: true }),
     },
   };
   const rawLeaseTarget = params.context ?? params.streamLimitState;
@@ -732,6 +831,12 @@ export async function attemptInvoke(
   const preparedAttempt = resolveGenerationKey(stampedConfig.metadata);
   prepared?.begin(preparedAttempt, stampedConfig);
   try {
+    if (batchConfig != null && policy != null) {
+      batchAttempt = new ProviderTextAttempt(policy, batchConfig.signal);
+      const attempt = batchAttempt;
+      finishBatch = (): void => attempt.finish();
+      stampedConfig.signal = attempt.signal;
+    }
     const result = await attemptInvokeBody(
       {
         request,
@@ -740,9 +845,11 @@ export async function attemptInvoke(
         onModelComplete: params.onModelComplete,
         preemptAgentId: params.preemptAgentId,
         providerTextProtection: policy,
+        ...(batchInvocation != null && { batchAttempt: (): ProviderTextAttempt | undefined => batchAttempt }),
       },
       stampedConfig
     );
+    batchAttempt?.check();
     const calls = collectAttemptToolCalls(result.messages);
     prepared?.finish(preparedAttempt, calls);
     return result;
@@ -757,9 +864,30 @@ export async function attemptInvoke(
       prepared?.finish(preparedAttempt, undefined, cancelled);
       throw cancelled;
     }
-    prepared?.finish(preparedAttempt, undefined, error);
-    throw error;
+    let failure = error;
+    if (
+      !(error instanceof StreamLimitExceededError) &&
+      !(error instanceof PreparedSubagentError)
+    ) {
+      // An awaited native error callback can replace the provider's error.
+      if (batchAttempt != null) {
+        try {
+          batchAttempt.check();
+          if (batchAttempt.hasPublishedText && !(error instanceof ProviderTextProtectionError)) {
+            const unavailable = new ProviderTextProtectionError('unavailable');
+            batchAttempt.stop(unavailable);
+            failure = unavailable;
+          }
+        } catch (abort) {
+          failure = abort;
+        }
+      }
+    }
+    prepared?.finish(preparedAttempt, undefined, failure);
+    throw failure;
   } finally {
+    unbindBatchSignal?.();
+    finishBatch?.();
     const chunks = params.context?.eagerEventToolCallChunks;
     if (prepared != null && chunks != null) {
       const prefix = `prepared:${preparedAttempt}\u0000`;
@@ -783,6 +911,7 @@ async function attemptInvokeBody(
     onModelComplete,
     preemptAgentId,
     providerTextProtection,
+    batchAttempt,
   }: Pick<
     AttemptInvokeCommonParams,
     | 'context'
@@ -792,6 +921,7 @@ async function attemptInvokeBody(
     | 'providerTextProtection'
   > & {
     request: PreparedProviderRequest;
+    batchAttempt?: () => ProviderTextAttempt | undefined;
   },
   config: RunnableConfig
 ): Promise<Partial<t.BaseGraphState>> {
@@ -1095,7 +1225,11 @@ async function attemptInvokeBody(
        * close below is conditional.
        */
       if (!evaluatePreemptRestart()) {
-        const stream = await model.stream(messagesForProvider, streamConfig);
+        const nativeStream = await model.stream(messagesForProvider, streamConfig);
+        const attempt = batchAttempt?.();
+        const stream = attempt == null
+          ? nativeStream
+          : withBatchCloseDeadline(nativeStream, attempt);
         if (onChunk) {
           const attemptMetadata = config.metadata as
             | Record<string, unknown>
@@ -1115,18 +1249,23 @@ async function attemptInvokeBody(
                 chunk,
               });
             }
-            await onChunk(chunk, attemptMetadata);
+            const attempt = batchAttempt?.();
+            if (attempt == null) await onChunk(chunk, attemptMetadata);
+            else await dispatchBatchEvent(attempt, () => onChunk(chunk, attemptMetadata));
             finalChunk = appendStreamChunk({
               current: finalChunk,
               next: chunk,
               provider,
             });
           }
-        } else if (registeredStreamHandler == null) {
+        } else if (registeredStreamHandler == null || batchAttempt != null) {
           const metadata = config.metadata as
             | Record<string, unknown>
             | undefined;
-          const streamHandler = new ChatModelStreamHandler();
+          const streamHandler = registeredStreamHandler ?? new ChatModelStreamHandler();
+          const observer = batchAttempt != null && registeredStreamHandler == null
+            ? context?.handlerRegistry?.getHandler(GraphEvents.CHAT_MODEL_STREAM)
+            : undefined;
           for await (const rawChunk of stream) {
             throwIfBreakerTripped();
             const chunk = snapshotValidatedModelChunk(rawChunk);
@@ -1150,12 +1289,16 @@ async function attemptInvokeBody(
             if (handlingChunk != null) {
               dispatchingChunk = true;
               try {
-                await streamHandler.handle(
-                  GraphEvents.CHAT_MODEL_STREAM,
-                  { chunk: handlingChunk },
-                  metadata,
-                  context
-                );
+                const attempt = batchAttempt?.();
+                if (attempt == null) {
+                  await streamHandler.handle(GraphEvents.CHAT_MODEL_STREAM, { chunk: handlingChunk }, metadata, context);
+                } else {
+                  const data = { chunk: handlingChunk };
+                  await dispatchBatchEvent(attempt, () => streamHandler.handle(GraphEvents.CHAT_MODEL_STREAM, data, metadata, context));
+                  if (observer != null) {
+                    await dispatchBatchEvent(attempt, () => observer.handle(GraphEvents.CHAT_MODEL_STREAM, data, metadata, context));
+                  }
+                }
               } finally {
                 dispatchingChunk = false;
               }
@@ -1456,6 +1599,7 @@ async function attemptInvokeBody(
       );
     }
 
+    batchAttempt?.()?.check();
     if (finalChunk == null) {
       throw new Error(EMPTY_PROVIDER_RESPONSE_MESSAGE);
     }

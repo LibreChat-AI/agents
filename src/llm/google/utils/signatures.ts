@@ -1,8 +1,10 @@
 import { createHash } from 'node:crypto';
 import { AIMessageChunk, isAIMessage } from '@langchain/core/messages';
+import type { ToolCall } from '@langchain/core/messages/tool';
 import type { BaseMessage } from '@langchain/core/messages';
 import type { GeminiPart } from '@langchain/google-common';
 import type { Part } from '@google/generative-ai';
+import { stripSearchAnchors } from '@/tools/search/citations';
 
 export const GEMINI_PARTS = '__gemini_parts__';
 export const GEMINI_REPLAY_UNSUPPORTED = '__gemini_replay_unsupported__';
@@ -140,43 +142,13 @@ export function captureGeminiReplayParts(
   delete message.additional_kwargs[GEMINI_REPLAY_UNSUPPORTED];
 }
 
-/** Returns original parts only when the current message still matches every text hash and call id. */
-export function restoreGeminiReplayParts(
-  message: BaseMessage,
-  replay: unknown = message.additional_kwargs[GEMINI_PARTS]
+function matchReplayParts(
+  replay: readonly GeminiReplayPart[],
+  text: string,
+  reasoning: string,
+  toolCalls: readonly ToolCall[]
 ): GeminiPart[] | undefined {
-  if (
-    message.additional_kwargs[GEMINI_REPLAY_UNSUPPORTED] === true ||
-    !isAIMessage(message) ||
-    !isGeminiReplayParts(replay)
-  )
-    return undefined;
-  let text = '';
-  let contentReasoning: string | undefined;
-  if (typeof message.content === 'string') text = message.content;
-  else
-    for (const block of message.content) {
-      if (block.type === 'text' && typeof block.text === 'string')
-        text += block.text;
-      else if (block.type === 'thinking' && typeof block.thinking === 'string')
-        contentReasoning = (contentReasoning ?? '') + block.thinking;
-      else if (
-        block.type === 'reasoning' &&
-        typeof block.reasoning === 'string'
-      )
-        contentReasoning = (contentReasoning ?? '') + block.reasoning;
-      else if (!('functionCall' in block)) return undefined;
-    }
-  let reasoning = contentReasoning ?? '';
-  if (typeof message.additional_kwargs.reasoning_content === 'string')
-    reasoning = message.additional_kwargs.reasoning_content;
-  if (typeof message.additional_kwargs.reasoning === 'string')
-    reasoning = message.additional_kwargs.reasoning;
-  if (contentReasoning != null && contentReasoning !== reasoning)
-    return undefined;
-  const calls = new Map(
-    (message.tool_calls ?? []).map((call) => [call.id, call])
-  );
+  const calls = new Map(toolCalls.map((call) => [call.id, call]));
   const parts: GeminiPart[] = [];
   let textOffset = 0;
   let reasoningOffset = 0;
@@ -219,4 +191,48 @@ export function restoreGeminiReplayParts(
     calls.size === 0
     ? parts
     : undefined;
+}
+
+/** Returns original parts only when the current message still matches every text hash and call id. */
+export function restoreGeminiReplayParts(
+  message: BaseMessage,
+  replay: unknown = message.additional_kwargs[GEMINI_PARTS]
+): GeminiPart[] | undefined {
+  if (
+    message.additional_kwargs[GEMINI_REPLAY_UNSUPPORTED] === true ||
+    !isAIMessage(message) ||
+    !isGeminiReplayParts(replay)
+  )
+    return undefined;
+  let text = '';
+  let contentReasoning: string | undefined;
+  if (typeof message.content === 'string') text = message.content;
+  else
+    for (const block of message.content) {
+      if (block.type === 'text' && typeof block.text === 'string')
+        text += block.text;
+      else if (block.type === 'thinking' && typeof block.thinking === 'string')
+        contentReasoning = (contentReasoning ?? '') + block.thinking;
+      else if (
+        block.type === 'reasoning' &&
+        typeof block.reasoning === 'string'
+      )
+        contentReasoning = (contentReasoning ?? '') + block.reasoning;
+      else if (!('functionCall' in block)) return undefined;
+    }
+  let reasoning = contentReasoning ?? '';
+  if (typeof message.additional_kwargs.reasoning_content === 'string')
+    reasoning = message.additional_kwargs.reasoning_content;
+  if (typeof message.additional_kwargs.reasoning === 'string')
+    reasoning = message.additional_kwargs.reasoning;
+  if (contentReasoning != null && contentReasoning !== reasoning)
+    return undefined;
+  const toolCalls = message.tool_calls ?? [];
+  const parts = matchReplayParts(replay, text, reasoning, toolCalls);
+  if (parts != null) return parts;
+  /** Citation anchors added to the saved answer are not part of what Gemini signed. */
+  const stripped = stripSearchAnchors(text);
+  return stripped === text
+    ? undefined
+    : matchReplayParts(replay, stripped, reasoning, toolCalls);
 }

@@ -22,7 +22,7 @@ const root = path.resolve(fileURLToPath(import.meta.url), '../..');
 test(
   'packed runtime works in an independent consumer with no LibreChat checkout',
   { timeout: 300000 },
-  async () => {
+  async (t) => {
     const directory = await mkdtemp(
       path.join(os.tmpdir(), 'agents-runtime-package-')
     );
@@ -59,23 +59,31 @@ test(
         ],
         { cwd: directory, timeout: 240000 }
       );
-      await run(
-        process.execPath,
-        [
-          path.join(root, 'node_modules/typescript/bin/tsc'),
-          '--noEmit',
-          '--strict',
-          '--skipLibCheck',
-          '--module',
-          'ESNext',
-          '--moduleResolution',
-          'bundler',
-          '--target',
-          'ES2022',
-          'consumer-types.mts',
-        ],
-        { cwd: directory, timeout: 30000 }
-      );
+      for (const [module, resolution] of [
+        ['ESNext', 'Bundler'],
+        ['NodeNext', 'NodeNext'],
+      ]) {
+        await t.test(`packed ESM declarations resolve with ${resolution}`, () =>
+          run(
+            process.execPath,
+            [
+              path.join(root, 'node_modules/typescript/bin/tsc'),
+              '--noEmit',
+              '--strict',
+              '--skipLibCheck',
+              '--module',
+              module,
+              '--moduleResolution',
+              resolution,
+              '--target',
+              'ES2022',
+              'consumer-exports.mts',
+              'consumer-types.mts',
+            ],
+            { cwd: directory, timeout: 30000 }
+          )
+        );
+      }
       await run(
         process.execPath,
         [
