@@ -844,6 +844,70 @@ describe('prepareProviderRequest', () => {
       expect(request.messages[0].content).toEqual([question, marker]);
     });
 
+    it.each([Providers.OPENAI, Providers.GOOGLE])(
+      'puts the marker, not the image bytes, into a %s tool result',
+      (provider) => {
+        const { model } = createCapturingModel();
+        const toolCall = new AIMessage({
+          content: '',
+          tool_calls: [{ id: 'chart-1', name: 'render_chart', args: {} }],
+        });
+        const toolResult = new ToolMessage({
+          tool_call_id: 'chart-1',
+          name: 'render_chart',
+          content: [{ type: 'text', text: 'Rendered the chart.' }, image],
+        });
+
+        const request = prepareProviderRequest({
+          model: model as t.ChatModel,
+          messages: [new HumanMessage('Chart it'), toolCall, toolResult],
+          provider,
+          vision: false,
+        });
+
+        const wire = JSON.stringify(request.messages[2].content);
+        expect(wire).toContain(OMITTED_IMAGE_TEXT);
+        expect(wire).toContain('Rendered the chart.');
+        expect(wire).not.toContain('base64');
+      }
+    );
+
+    it('keeps the screenshot a native Responses computer-call output requires', () => {
+      const { model } = createCapturingModel();
+      model._useResponsesApi = (): boolean => true;
+      const computerCall = new AIMessage({
+        content: '',
+        response_metadata: {
+          output: [
+            {
+              type: 'computer_call',
+              call_id: 'computer-1',
+              action: { type: 'screenshot' },
+            },
+          ],
+        },
+      });
+      const screenshot = {
+        type: 'input_image',
+        image_url: 'data:image/png;base64,AA==',
+      };
+      const computerOutput = new ToolMessage({
+        tool_call_id: 'computer-1',
+        content: [screenshot],
+        additional_kwargs: { type: 'computer_call_output' },
+      });
+
+      const request = prepareProviderRequest({
+        model: model as t.ChatModel,
+        messages: [computerCall, computerOutput],
+        provider: Providers.OPENAI,
+        vision: false,
+      });
+
+      expect(request.projectionMode).toBe('openai-responses');
+      expect(request.messages[1].content).toEqual([screenshot]);
+    });
+
     it('flattens a turn left with only text for a legacy-content agent', () => {
       const { model } = createCapturingModel();
 

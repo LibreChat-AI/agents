@@ -4,6 +4,7 @@ import type {
 } from '@langchain/core/messages';
 import { cloneMessage, getCacheControl, withCacheControl } from './cache';
 import { flattenLegacyContent, isLegacyConvertible } from './content';
+import { hasComputerCallOutputMarker } from '@/utils/toolContent';
 import { getMediaMimeType } from '@/utils/tokens';
 
 /** Stands in for each image a model without image input cannot read. */
@@ -19,7 +20,7 @@ export function isImageContentBlock(block: MessageContentComplex): boolean {
   if (typeof type !== 'string') {
     return false;
   }
-  if (IMAGE_BLOCK_TYPES.has(type)) {
+  if (IMAGE_BLOCK_TYPES.has(type) || type.startsWith('image/')) {
     return true;
   }
   if (!MIME_TYPED_BLOCK_TYPES.has(type)) {
@@ -38,6 +39,8 @@ export function isImageContentBlock(block: MessageContentComplex): boolean {
  * cloned, and a replaced block's prompt-cache breakpoint moves to its marker.
  * With `legacyContent`, a message left with only text is flattened to a
  * string, as `formatContentStrings` does for legacy-content agents.
+ * A native computer-call output keeps its screenshot: the Responses API
+ * accepts no other output for it, and other providers get it as text later.
  */
 export function replaceImageContent(
   messages: BaseMessage[],
@@ -46,7 +49,10 @@ export function replaceImageContent(
   let projected: BaseMessage[] | undefined;
   for (let messageIndex = 0; messageIndex < messages.length; messageIndex++) {
     const message = messages[messageIndex];
-    if (!Array.isArray(message.content)) {
+    if (
+      !Array.isArray(message.content) ||
+      hasComputerCallOutputMarker(message)
+    ) {
       continue;
     }
     const source = message.content as MessageContentComplex[];

@@ -37,6 +37,7 @@ describe('isImageContentBlock', () => {
       'a Responses input_image',
       { type: 'input_image', image_url: 'https://x/y.png' },
     ],
+    ['a block typed by its MIME type', { type: 'image/png', data: 'AA==' }],
     [
       'an image media block',
       { type: 'media', mimeType: 'image/webp', data: 'AA==' },
@@ -114,6 +115,18 @@ describe('replaceImageContent', () => {
       { type: 'text', text: 'chart.png' },
       marker,
     ]);
+  });
+
+  it('leaves a native computer-call output its screenshot', () => {
+    const source = new ToolMessage({
+      tool_call_id: 'computer-1',
+      content: [
+        { type: 'input_image', image_url: 'data:image/png;base64,AA==' },
+      ],
+      additional_kwargs: { type: 'computer_call_output' },
+    });
+
+    expect(replaceImageContent([source])[0]).toBe(source);
   });
 
   it('moves a prompt-cache breakpoint from the image to its marker', () => {

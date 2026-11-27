@@ -123,6 +123,56 @@ class RecordingModel extends Runnable<BaseMessage[], AIMessageChunk> {
   }
 }
 
+/** Runs one summarize-only turn for a text-only agent and returns what the summarizer was sent. */
+async function captureSummaryRequest(
+  overrides: Pick<t.AgentInputs, 'useLegacyContent'>
+): Promise<BaseMessage[]> {
+  const run = await Run.create<t.IState>({
+    runId: 'text-only-summary',
+    graphConfig: {
+      type: 'standard',
+      llmConfig: {
+        provider: Providers.ANTHROPIC,
+        disableStreaming: true,
+        streamUsage: false,
+      },
+      maxContextTokens: 100_000,
+      summarizationEnabled: true,
+      summarizeOnly: true,
+      vision: false,
+      ...overrides,
+    },
+    tokenCounter: () => 10,
+    returnContent: true,
+    skipCleanup: true,
+  });
+  if (!run.Graph) {
+    throw new Error('Expected graph to be initialized');
+  }
+  run.Graph.overrideModel = new RecordingModel();
+  const summarizer = new RecordingModel();
+  const spy = jest.spyOn(init, 'initializeModel').mockReturnValue(summarizer);
+  try {
+    await run.processStream(
+      {
+        messages: [
+          imageTurn(),
+          new AIMessage('It shows revenue by quarter.'),
+          new HumanMessage('Which quarter was best?'),
+          new AIMessage('The fourth.'),
+          new HumanMessage('Thanks.'),
+          new AIMessage('You are welcome.'),
+        ],
+      },
+      summaryStreamConfig
+    );
+  } finally {
+    spy.mockRestore();
+  }
+  expect(summarizer.calls).toHaveLength(1);
+  return summarizer.calls[0];
+}
+
 describe('an agent whose model cannot read images', () => {
   it('@scenario:text-only-chain gets a marker while the vision agent before it gets the image', async () => {
     const model = new CapturingChatModel(['A read the chart', 'B answered']);
@@ -197,49 +247,14 @@ describe('an agent whose model cannot read images', () => {
   });
 
   it('@scenario:text-only-summary gets a marker in the history its summary request sends', async () => {
-    const run = await Run.create<t.IState>({
-      runId: 'text-only-summary',
-      graphConfig: {
-        type: 'standard',
-        llmConfig: {
-          provider: Providers.ANTHROPIC,
-          disableStreaming: true,
-          streamUsage: false,
-        },
-        maxContextTokens: 100_000,
-        summarizationEnabled: true,
-        summarizeOnly: true,
-        vision: false,
-      },
-      tokenCounter: () => 10,
-      returnContent: true,
-      skipCleanup: true,
-    });
-    if (!run.Graph) {
-      throw new Error('Expected graph to be initialized');
-    }
-    run.Graph.overrideModel = new RecordingModel();
-    const summarizer = new RecordingModel();
-    const spy = jest.spyOn(init, 'initializeModel').mockReturnValue(summarizer);
-    try {
-      await run.processStream(
-        {
-          messages: [
-            imageTurn(),
-            new AIMessage('It shows revenue by quarter.'),
-            new HumanMessage('Which quarter was best?'),
-            new AIMessage('The fourth.'),
-            new HumanMessage('Thanks.'),
-            new AIMessage('You are welcome.'),
-          ],
-        },
-        summaryStreamConfig
-      );
-    } finally {
-      spy.mockRestore();
-    }
+    const [firstTurn] = await captureSummaryRequest({});
 
-    expect(summarizer.calls).toHaveLength(1);
-    expect(summarizer.calls[0][0].content).toEqual([question, marker]);
+    expect(firstTurn.content).toEqual([question, marker]);
+  });
+
+  it('gets that history turn as one string when it formats content as strings', async () => {
+    const [firstTurn] = await captureSummaryRequest({ useLegacyContent: true });
+
+    expect(firstTurn.content).toBe(`${question.text}\n${OMITTED_IMAGE_TEXT}`);
   });
 });

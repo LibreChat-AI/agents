@@ -224,6 +224,8 @@ interface ProjectMessagesForProviderParams {
   callOptions?: unknown;
   toolHistory?: ToolHistoryPreparation;
   resolve?: ResolveReference;
+  vision?: boolean;
+  useLegacyContent?: boolean;
 }
 
 function isSerializedBuffer(value: object): value is SerializedBuffer {
@@ -616,12 +618,14 @@ function projectMessagesForProviderMode(
     maxToolResultChars,
     toolHistory,
     resolve,
+    vision,
+    useLegacyContent,
   }: ProjectMessagesForProviderParams,
   projectionMode: ProviderMessageProjectionMode
 ): BaseMessage[] {
   const providerFamily = getProviderFamily(provider);
   const nativeOpenAIResponses = projectionMode === 'openai-responses';
-  const providerInputMessages = projectAttachmentsForProvider(
+  const attachedMessages = projectAttachmentsForProvider(
     projectToolStreamContentForProvider(
       messages,
       nativeOpenAIResponses ? 'native' : 'fallback',
@@ -632,6 +636,11 @@ function projectMessagesForProviderMode(
     projectionMode,
     resolve
   );
+  /** Before tool results are serialized, so no image lands in them as base64 text. */
+  const providerInputMessages =
+    vision === false
+      ? replaceImageContent(attachedMessages, useLegacyContent === true)
+      : attachedMessages;
   if (nativeOpenAIResponses) {
     return projectOpenAIResponsesToolMessageContent(
       stripAnthropicCacheControl(
@@ -759,6 +768,8 @@ export function prepareProviderRequest({
       maxToolResultChars,
       callOptions: config,
       toolHistory,
+      vision,
+      useLegacyContent,
       resolve:
         resolveAttachment == null
           ? undefined
@@ -771,13 +782,9 @@ export function prepareProviderRequest({
     },
     projectionMode
   );
-  const readable =
-    vision === false
-      ? replaceImageContent(projected, useLegacyContent === true)
-      : projected;
   const registry = context?.getOrCreateToolOutputRegistry?.();
   const runId = config?.configurable?.run_id as string | undefined;
-  const annotated = annotateMessagesForLLM(readable, registry, runId);
+  const annotated = annotateMessagesForLLM(projected, registry, runId);
   const isRunProduced = context?.isRunProducedMessage;
   const handoffGrounded = appendInstructionlessHandoffCue(annotated, config);
   const cued = isAnthropicLike(provider, {
