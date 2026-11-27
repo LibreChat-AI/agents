@@ -40,9 +40,9 @@ export function toOmittedImageBlock(
 }
 
 /**
- * `block` with its image replaced by the marker, or a native `tool_result`
- * with the images in its `content` replaced; `block` itself when it holds no
- * image.
+ * `block` with its image replaced by the marker, or a native `tool_result` or
+ * custom-content `document` with the images inside it replaced; `block` itself
+ * when it holds no image.
  */
 export function omitImageBlock(
   block: MessageContentComplex
@@ -50,11 +50,44 @@ export function omitImageBlock(
   if (isImageContentBlock(block)) {
     return toOmittedImageBlock(block);
   }
-  if (block.type !== 'tool_result' || !Array.isArray(block.content)) {
+  if (block.type === 'tool_result' && Array.isArray(block.content)) {
+    const nested = omitImageBlocks(block.content as MessageContentComplex[]);
+    return nested == null ? block : { ...block, content: nested };
+  }
+  const source =
+    block.type === 'document'
+      ? (block as { source?: { type?: unknown; content?: unknown } }).source
+      : undefined;
+  if (
+    source == null ||
+    typeof source !== 'object' ||
+    source.type !== 'content' ||
+    !Array.isArray(source.content)
+  ) {
     return block;
   }
-  const nested = omitImageBlocks(block.content as MessageContentComplex[]);
-  return nested == null ? block : { ...block, content: nested };
+  const nested = omitImageBlocks(source.content as MessageContentComplex[]);
+  return nested == null
+    ? block
+    : { ...block, source: { ...source, content: nested } };
+}
+
+/**
+ * A tool artifact with the images in its `content` replaced by markers, for
+ * the request it is expanded into; `undefined` when it holds none.
+ */
+export function omitArtifactImages(
+  artifact: unknown
+): Record<string, unknown> | undefined {
+  if (artifact == null || typeof artifact !== 'object') {
+    return undefined;
+  }
+  const { content } = artifact as { content?: unknown };
+  if (!Array.isArray(content)) {
+    return undefined;
+  }
+  const omitted = omitImageBlocks(content as MessageContentComplex[]);
+  return omitted == null ? undefined : { ...artifact, content: omitted };
 }
 
 /** `content` with every image replaced by its marker; `undefined` when it holds none. */

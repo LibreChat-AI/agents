@@ -3,6 +3,7 @@ import type { MessageContentComplex } from '@langchain/core/messages';
 import {
   OMITTED_IMAGE_TEXT,
   omitImageBlocks,
+  omitArtifactImages,
   isImageContentBlock,
   toOmittedImageBlock,
 } from './vision';
@@ -93,6 +94,50 @@ describe('omitImageBlocks', () => {
       { ...toolResult, content: [text, marker] },
     ]);
     expect(toolResult.content).toEqual([text, imageUrl]);
+  });
+
+  it('replaces the images of an Anthropic document whose source is custom content', () => {
+    const image = {
+      type: 'image',
+      source: { type: 'base64', media_type: 'image/png', data: 'AA==' },
+    };
+    const document = {
+      type: 'document',
+      title: 'Quarterly chart',
+      source: { type: 'content', content: [text, image] },
+    };
+
+    expect(omitImageBlocks([document])).toEqual([
+      { ...document, source: { type: 'content', content: [text, marker] } },
+    ]);
+    expect(document.source.content).toEqual([text, image]);
+  });
+
+  it('leaves a PDF document alone', () => {
+    const pdf = {
+      type: 'document',
+      source: { type: 'base64', media_type: 'application/pdf', data: 'AA==' },
+    };
+
+    expect(omitImageBlocks([pdf])).toBeUndefined();
+  });
+});
+
+describe('omitArtifactImages', () => {
+  it('replaces the images of a tool artifact without changing it', () => {
+    const artifact = { content: [imageUrl, text], structuredContent: {} };
+
+    expect(omitArtifactImages(artifact)).toEqual({
+      content: [marker, text],
+      structuredContent: {},
+    });
+    expect(artifact.content).toEqual([imageUrl, text]);
+  });
+
+  it('returns undefined for an artifact without images or content', () => {
+    expect(omitArtifactImages({ content: [text] })).toBeUndefined();
+    expect(omitArtifactImages({ content: 'plain' })).toBeUndefined();
+    expect(omitArtifactImages(undefined)).toBeUndefined();
   });
 });
 

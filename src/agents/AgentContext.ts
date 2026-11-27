@@ -1,6 +1,7 @@
 /* eslint-disable no-console */
 import { RunnableLambda } from '@langchain/core/runnables';
 import {
+  ToolMessage,
   HumanMessage,
   SystemMessage,
   coerceMessageLikeToMessage,
@@ -57,18 +58,21 @@ import {
   Constants,
   Providers,
 } from '@/common';
+import {
+  hasComputerCallOutputMarker,
+  cloneToolMessageWithContent,
+} from '@/utils/toolContent';
 import { isTokenCounterCacheCompatible } from '@/llm/tokenCounterCacheCompatibility';
 import { normalizeToBashIdentifier } from '@/tools/BashProgrammaticToolCalling';
 import { snapshotCompactionSemanticIndex } from '@/summarization/semanticIndex';
 import { flattenLegacyContent, isLegacyConvertible } from '@/messages/content';
 import { normalizeToPythonIdentifier } from '@/tools/ProgrammaticToolCalling';
 import { createExactTokenCountCache } from '@/llm/contextPressureMeter';
+import { omitImageBlocks, omitArtifactImages } from '@/messages/vision';
 import { markProviderTextInput } from '@/protection/providerTextInput';
-import { hasComputerCallOutputMarker } from '@/utils/toolContent';
 import { buildSummaryCarrierText } from '@/summarization/shared';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { apportionTokenCounts } from '@/utils/tokens';
-import { omitImageBlocks } from '@/messages/vision';
 import { isThinkingEnabled } from '@/llm/request';
 import { toJsonSchema } from '@/utils/schema';
 
@@ -1900,54 +1904,52 @@ export class AgentContext {
         this.pendingOriginalToolContent = undefined;
         this.prepareProviderProjectionRecount(sources);
       }
-      const omittedIndexes: number[] = [];
+      const counter = this.tokenCounter;
+      const recount = this.providerProjectionRequiresRecount && counter != null;
+      const floors = this.providerProjectionRecountFloors;
+      const hostCounts = this.indexTokenCountMap;
+      /** A rewrite recounts every message; otherwise host counts stand, and the first replaced image copies them so other agents' maps stay intact. */
+      let counts: Record<string, number | undefined> = recount
+        ? {}
+        : hostCounts;
       const canonical: BaseMessage[] | undefined =
         this.vision === false ? [] : undefined;
+      const nextSources: BaseMessage[] = [];
+      const sourcesById = new Map<string, BaseMessage>();
       projection = messages.map((message, index) => {
-        const projected = this.projectMessage(message);
-        if (projected.omittedImages) {
-          omittedIndexes.push(index);
+        nextSources.push(message);
+        if (message.id != null) {
+          sourcesById.set(message.id, message);
         }
+        const projected = this.projectMessage(message);
         canonical?.push(projected.canonical);
-        return projected.message;
-      });
-      this.providerProjectedMessages = projection;
-      this.providerProjectionCanonical = canonical;
-      this.providerProjectionSources = [...messages];
-      this.providerProjectionSourcesById = new Map(
-        messages.flatMap((message) =>
-          message.id == null ? [] : [[message.id, message] as const]
-        )
-      );
-      const omitted =
-        omittedIndexes.length > 0 ? new Set(omittedIndexes) : undefined;
-      if (this.providerProjectionRequiresRecount && this.tokenCounter != null) {
-        const recounted: Record<string, number> = {};
-        for (let i = 0; i < messages.length; i++) {
-          if (omitted?.has(i) === true) {
-            /** Priced as the marker its request sends, never as the image a floor remembers. */
-            recounted[i] = this.tokenCounter(projection[i]);
-            continue;
+        if (counter == null) {
+          return projected.message;
+        }
+        if (projected.omittedImages) {
+          if (counts === hostCounts) {
+            counts = { ...hostCounts };
           }
-          const localCount = this.tokenCounter(messages[i]);
-          const conservativeFloor = this.providerProjectionRecountFloors?.get(
-            messages[i]
-          );
-          recounted[i] =
+          /** Priced as the marker its request sends, never as the image a host count or floor remembers. */
+          counts[index] = counter(projected.message);
+        } else if (recount) {
+          const localCount = counter(message);
+          const conservativeFloor = floors?.get(message);
+          counts[index] =
             conservativeFloor == null
               ? localCount
               : Math.max(localCount, conservativeFloor);
         }
-        this.indexTokenCountMap = recounted;
+        return projected.message;
+      });
+      this.providerProjectedMessages = projection;
+      this.providerProjectionCanonical = canonical;
+      this.providerProjectionSources = nextSources;
+      this.providerProjectionSourcesById = sourcesById;
+      this.indexTokenCountMap = counts;
+      if (recount) {
         this.providerProjectionRequiresRecount = false;
         this.providerProjectionRecountFloors = undefined;
-      } else if (omitted != null && this.tokenCounter != null) {
-        /** A host count priced the image; a new map keeps other agents' counts intact. */
-        const counts = { ...this.indexTokenCountMap };
-        for (const index of omitted) {
-          counts[index] = this.tokenCounter(projection[index]);
-        }
-        this.indexTokenCountMap = counts;
       }
       return projection;
     }
@@ -1977,39 +1979,53 @@ export class AgentContext {
 
   /**
    * The projection's copy of `message` and the canonical message it is
-   * rewritten from; without image input, both read each image as its marker.
+   * rewritten from; without image input, both read each image as its marker,
+   * also in a tool artifact the request expands later. `omittedImages` marks a
+   * content change that needs a new count.
    */
   private projectMessage(message: BaseMessage): {
     message: BaseMessage;
     canonical: BaseMessage;
     omittedImages: boolean;
   } {
-    if (!Array.isArray(message.content)) {
-      return { message, canonical: message, omittedImages: false };
-    }
-    const content = message.content as MessageContentComplex[];
+    const content = Array.isArray(message.content)
+      ? (message.content as MessageContentComplex[])
+      : undefined;
+    const omits =
+      this.vision === false && !hasComputerCallOutputMarker(message);
     const omitted =
-      this.vision === false && !hasComputerCallOutputMarker(message)
-        ? omitImageBlocks(content)
+      omits && content != null ? omitImageBlocks(content) : undefined;
+    const artifact =
+      omits && message instanceof ToolMessage
+        ? omitArtifactImages(message.artifact)
         : undefined;
-    if (omitted == null) {
+    if (omitted == null && artifact == null) {
       return {
-        message: cloneMessage(message, [...content]),
+        message:
+          content == null ? message : cloneMessage(message, [...content]),
         canonical: message,
         omittedImages: false,
       };
     }
-    const readable =
-      this.useLegacyContent && isLegacyConvertible(message, omitted)
-        ? flattenLegacyContent(omitted)
-        : omitted;
+    let readable = message.content as string | MessageContentComplex[];
+    if (omitted != null) {
+      readable =
+        this.useLegacyContent && isLegacyConvertible(message, omitted)
+          ? flattenLegacyContent(omitted)
+          : omitted;
+    }
+    const copy = (value: string | MessageContentComplex[]): BaseMessage =>
+      artifact == null
+        ? cloneMessage(message, value)
+        : cloneToolMessageWithContent(
+            message as ToolMessage,
+            value as BaseMessage['content'],
+            artifact
+        );
     return {
-      message: cloneMessage(
-        message,
-        typeof readable === 'string' ? readable : [...readable]
-      ),
-      canonical: cloneMessage(message, readable),
-      omittedImages: true,
+      message: copy(typeof readable === 'string' ? readable : [...readable]),
+      canonical: copy(readable),
+      omittedImages: omitted != null,
     };
   }
 

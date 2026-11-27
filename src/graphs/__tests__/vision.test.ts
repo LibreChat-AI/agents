@@ -1,3 +1,5 @@
+import { z } from 'zod';
+import { tool } from '@langchain/core/tools';
 import { Runnable } from '@langchain/core/runnables';
 import { describe, expect, it, jest } from '@jest/globals';
 import {
@@ -393,6 +395,75 @@ describe('an agent whose model cannot read images', () => {
     const sent = JSON.stringify(model.calls[0]);
     expect(sent).not.toContain(data);
     expect(sent).toContain(OMITTED_IMAGE_TEXT);
+  });
+
+  it('keeps the text of a tool artifact whose image would not fit at image cost', async () => {
+    /** Prices an image the way a host count does; anything else is cheap. */
+    const tokenCounter: t.TokenCounter = (message) =>
+      hasImage([message]) ? 50_000 : 10;
+    const run = await Run.create<t.IState>({
+      runId: 'text-only-artifact',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: Providers.OPENAI,
+          disableStreaming: true,
+          streamUsage: false,
+        },
+        maxContextTokens: 1_000,
+        vision: false,
+        tools: [
+          tool(async () => 'unused', {
+            name: 'screenshot',
+            description: 'Takes a screenshot of the page',
+            schema: z.object({}),
+          }),
+        ],
+      },
+      tokenCounter,
+      indexTokenCountMap: { 0: 10, 1: 10, 2: 10 },
+      returnContent: true,
+      skipCleanup: true,
+    });
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+    const model = new RecordingModel();
+    run.Graph.overrideModel = model;
+    const toolMessage = new ToolMessage({
+      tool_call_id: 'call_1',
+      name: 'screenshot',
+      content: 'Screenshot taken.',
+      artifact: {
+        content: [
+          image,
+          { type: 'text', text: 'The page shows a login form.' },
+        ],
+      },
+    });
+
+    await run.processStream(
+      {
+        messages: [
+          new HumanMessage('Open the page.'),
+          new AIMessage({
+            content: '',
+            tool_calls: [{ id: 'call_1', name: 'screenshot', args: {} }],
+          }),
+          toolMessage,
+        ],
+      },
+      {
+        ...summaryStreamConfig,
+        configurable: { thread_id: 'text-only-artifact' },
+      }
+    );
+
+    expect(model.calls).toHaveLength(1);
+    const sent = JSON.stringify(model.calls[0]);
+    expect(sent).toContain('The page shows a login form.');
+    expect(sent).toContain(OMITTED_IMAGE_TEXT);
+    expect(toolMessage.artifact.content[0]).toBe(image);
   });
 
   it('@scenario:text-only-summary gets a marker in the history its summary request sends', async () => {
