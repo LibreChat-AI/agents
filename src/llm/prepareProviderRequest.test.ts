@@ -822,7 +822,7 @@ describe('prepareProviderRequest', () => {
       expect(source.content).toEqual([question, image]);
     });
 
-    it('replaces an image that an attachment reference resolves to', () => {
+    it('replaces an image reference without resolving its bytes', () => {
       const { model } = createCapturingModel();
       const reference = {
         type: 'image' as const,
@@ -840,8 +840,77 @@ describe('prepareProviderRequest', () => {
         vision: false,
       });
 
+      expect(resolveAttachment).not.toHaveBeenCalled();
+      expect(request.messages[0].content).toEqual([question, marker]);
+    });
+
+    it('replaces an image a file reference turns out to be', () => {
+      const { model } = createCapturingModel();
+      const reference = {
+        type: 'file' as const,
+        source_type: 'id' as const,
+        id: 'file-1',
+      };
+      const resolveAttachment = jest.fn<t.AttachmentResolver>(() => image);
+
+      const request = prepareProviderRequest({
+        model: model as t.ChatModel,
+        messages: [new HumanMessage({ content: [question, reference] })],
+        provider: Providers.ANTHROPIC,
+        context: { resolveAttachment },
+        vision: false,
+      });
+
       expect(resolveAttachment).toHaveBeenCalledTimes(1);
       expect(request.messages[0].content).toEqual([question, marker]);
+    });
+
+    it('puts one marker where each image was and keeps the rest of the turn', () => {
+      const { model } = createCapturingModel();
+      const plain = new HumanMessage('An earlier turn');
+      const source = new HumanMessage({ content: [image, question, image] });
+
+      const request = prepareProviderRequest({
+        model: model as t.ChatModel,
+        messages: [plain, source],
+        provider: Providers.ANTHROPIC,
+        vision: false,
+      });
+
+      expect(request.messages[0]).toBe(plain);
+      expect(request.messages[1].content).toEqual([marker, question, marker]);
+      expect(source.content).toEqual([image, question, image]);
+    });
+
+    it('keeps the tool call link and the prompt-cache breakpoint of a replaced tool image', () => {
+      const { model } = createCapturingModel();
+      const cacheControl = { type: 'ephemeral' as const };
+      const toolCall = new AIMessage({
+        content: '',
+        tool_calls: [{ id: 'chart-1', name: 'render_chart', args: {} }],
+      });
+      const toolResult = new ToolMessage({
+        tool_call_id: 'chart-1',
+        name: 'render_chart',
+        content: [
+          { type: 'text', text: 'Rendered the chart.' },
+          { ...image, cache_control: cacheControl },
+        ],
+      });
+
+      const request = prepareProviderRequest({
+        model: model as t.ChatModel,
+        messages: [new HumanMessage('Chart it'), toolCall, toolResult],
+        provider: Providers.ANTHROPIC,
+        vision: false,
+      });
+
+      const projectedResult = request.messages[2] as ToolMessage;
+      expect(projectedResult.tool_call_id).toBe('chart-1');
+      expect(projectedResult.content).toEqual([
+        { type: 'text', text: 'Rendered the chart.' },
+        { ...marker, cache_control: cacheControl },
+      ]);
     });
 
     it.each([Providers.OPENAI, Providers.GOOGLE])(
