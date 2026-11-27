@@ -62,6 +62,10 @@ import {
   hasToolCallChunks,
   getReasoningKwargsText,
 } from '@/llm/stream/chunkAdapters';
+import {
+  splitTypedDeltaContent,
+  flattenTypedMessageContent,
+} from './typedContent';
 import { registerProviderTextChunkConstructor } from '@/llm/providerTextChunk';
 import { createResponsesToolArgumentConverter } from './responseToolArguments';
 import { isReasoningModel, _convertMessagesToOpenAIParams } from './utils';
@@ -1398,7 +1402,14 @@ async function* filterOpenAIChatCompletionStream(
     if (chunk == null) {
       continue;
     }
-    yield chunk;
+    const pieces = splitTypedDeltaContent(chunk);
+    if (pieces == null) {
+      yield chunk;
+      continue;
+    }
+    for (const piece of pieces) {
+      yield piece;
+    }
   }
 }
 
@@ -1408,10 +1419,12 @@ async function completionWithFilteredOpenAIStream(
   completionWithRetry: OpenAIChatCompletionRetry
 ): Promise<OpenAIChatCompletionResult> {
   if (request.stream !== true) {
-    return (await completionWithRetry(
-      request,
-      requestOptions
-    )) as OpenAIChatCompletion;
+    return flattenTypedMessageContent(
+      (await completionWithRetry(
+        request,
+        requestOptions
+      )) as OpenAIChatCompletion
+    );
   }
 
   const stream = await completionWithRetry(request, requestOptions);
