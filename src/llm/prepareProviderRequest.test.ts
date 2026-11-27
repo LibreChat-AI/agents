@@ -19,6 +19,7 @@ import { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import { _convertMessagesToOpenAIParams } from '@/llm/openai/utils';
 import { createContextPressureMeter } from './contextPressureMeter';
 import { foldToolBlocksForToollessAgent } from '@/messages/format';
+import { OMITTED_IMAGE_TEXT } from '@/messages/vision';
 import { attemptInvoke } from '@/llm/invoke';
 import { Providers } from '@/common';
 
@@ -428,6 +429,201 @@ describe('prepareProviderRequest', () => {
     expect(request.messages[0].content[0]).toBe(document);
   });
 
+  describe('attachments carried by reference', () => {
+    const reference = {
+      type: 'file' as const,
+      source_type: 'id' as const,
+      id: 'file-1',
+      mime_type: 'application/pdf',
+      metadata: { name: 'report.pdf' },
+    };
+    const bedrockDocument = {
+      type: 'document',
+      document: {
+        name: 'report',
+        format: 'pdf',
+        source: { bytes: new Uint8Array([37, 80, 68, 70]) },
+      },
+    };
+    const text = { type: 'text', text: 'Summarize the report' };
+
+    it('puts the host content into the request and leaves the reference in the source', () => {
+      const { model } = createCapturingModel();
+      const source = new HumanMessage({ content: [text, reference] });
+      const resolveAttachment = jest.fn<t.AttachmentResolver>(
+        () => bedrockDocument
+      );
+      const measure = jest.fn((messages: BaseMessage[]) => ({
+        fits: true,
+        projectedMessageTokens: messages.length,
+      }));
+
+      const request = prepareProviderRequest({
+        model: model as t.ChatModel,
+        messages: [source],
+        provider: Providers.BEDROCK,
+        context: { resolveAttachment },
+        measure,
+      });
+
+      expect(request.messages[0]).not.toBe(source);
+      expect(request.messages[0].content).toEqual([text, bedrockDocument]);
+      expect(request.messages[0].content[1]).toBe(bedrockDocument);
+      expect(source.content).toEqual([text, reference]);
+      expect(JSON.stringify(source)).not.toContain('"bytes"');
+      expect(resolveAttachment).toHaveBeenCalledTimes(1);
+      expect(resolveAttachment).toHaveBeenCalledWith(reference, {
+        provider: Providers.BEDROCK,
+        modelId: 'prepared-model',
+        projectionMode: 'chat-messages',
+      });
+      expect(measure).toHaveBeenCalledWith(request.messages);
+    });
+
+    it('resolves for the provider that is being served and sends the result as returned', () => {
+      const { model } = createCapturingModel();
+      const source = new HumanMessage({ content: [text, reference] });
+      const spreadsheet = {
+        type: 'file',
+        source_type: 'base64',
+        mime_type: 'text/csv',
+        data: 'Y29sMQ==',
+        metadata: { name: 'sales.csv' },
+      };
+      const resolveAttachment: t.AttachmentResolver = (_reference, target) =>
+        target.provider === Providers.BEDROCK ? bedrockDocument : spreadsheet;
+
+      const request = prepareProviderRequest({
+        model: model as t.ChatModel,
+        messages: [source],
+        provider: Providers.OPENAI,
+        context: { resolveAttachment },
+      });
+
+      expect(request.messages[0].content).toEqual([text, spreadsheet]);
+    });
+
+    it('leaves a reference the host does not own, and the message, as they are', () => {
+      const { model } = createCapturingModel();
+      const source = new HumanMessage({ content: [text, reference] });
+
+      for (const provider of [Providers.BEDROCK, Providers.OPENAI]) {
+        const request = prepareProviderRequest({
+          model: model as t.ChatModel,
+          messages: [source],
+          provider,
+          context: { resolveAttachment: () => undefined },
+        });
+        expect(request.messages[0]).toBe(source);
+      }
+      expect(
+        prepareProviderRequest({
+          model: model as t.ChatModel,
+          messages: [source],
+          provider: Providers.BEDROCK,
+        }).messages[0]
+      ).toBe(source);
+    });
+
+    it('drops a reference with nothing to send and keeps an attachment-only turn valid', () => {
+      const { model } = createCapturingModel();
+      const context = { resolveAttachment: (): null => null };
+
+      const withText = prepareProviderRequest({
+        model: model as t.ChatModel,
+        messages: [new HumanMessage({ content: [text, reference] })],
+        provider: Providers.BEDROCK,
+        context,
+      });
+      const alone = prepareProviderRequest({
+        model: model as t.ChatModel,
+        messages: [new HumanMessage({ content: [reference] })],
+        provider: Providers.ANTHROPIC,
+        context,
+      });
+
+      expect(withText.messages[0].content).toEqual([text]);
+      expect(alone.messages[0].content).toEqual([
+        {
+          type: 'text',
+          text: '[Attachment omitted because its binary format is unsupported by this provider.]',
+        },
+      ]);
+    });
+
+    it('keeps the prompt cache breakpoint a reference was carrying', () => {
+      const { model } = createCapturingModel();
+      const marker = { type: 'ephemeral' as const };
+      const marked = { ...reference, cache_control: marker };
+      const anthropicDocument = {
+        type: 'document',
+        source: {
+          type: 'base64',
+          media_type: 'application/pdf',
+          data: 'JVBERg==',
+        },
+      };
+      const prepare = (
+        content: Array<typeof text | typeof marked>,
+        resolveAttachment: t.AttachmentResolver
+      ): BaseMessage['content'] =>
+        prepareProviderRequest({
+          model: model as t.ChatModel,
+          messages: [new HumanMessage({ content })],
+          provider: Providers.ANTHROPIC,
+          context: { resolveAttachment },
+        }).messages[0].content;
+      const own = { type: 'ephemeral' as const, ttl: '1h' as const };
+
+      expect(prepare([text, marked], () => anthropicDocument)).toEqual([
+        text,
+        { ...anthropicDocument, cache_control: marker },
+      ]);
+      expect(
+        prepare([text, marked], () => ({
+          ...anthropicDocument,
+          cache_control: own,
+        }))
+      ).toEqual([text, { ...anthropicDocument, cache_control: own }]);
+      expect(prepare([text, marked], () => null)).toEqual([
+        { ...text, cache_control: marker },
+      ]);
+      expect(prepare([marked], () => null)).toEqual([
+        {
+          type: 'text',
+          text: '[Attachment omitted because its binary format is unsupported by this provider.]',
+          cache_control: marker,
+        },
+      ]);
+    });
+
+    it('still reprojects a provider-native document beside a resolved reference', () => {
+      const { model } = createCapturingModel();
+      const resolved = {
+        type: 'file',
+        source_type: 'base64',
+        mime_type: 'application/pdf',
+        data: 'JVBERg==',
+        metadata: { name: 'report.pdf' },
+      };
+      const source = new HumanMessage({
+        content: [reference, bedrockDocument],
+      });
+
+      const request = prepareProviderRequest({
+        model: model as t.ChatModel,
+        messages: [source],
+        provider: Providers.OPENAI,
+        context: { resolveAttachment: () => resolved },
+      });
+
+      expect(request.messages[0].content).toEqual([
+        resolved,
+        { ...resolved, metadata: { name: 'report' } },
+      ]);
+    });
+  });
+
   it('keeps an attachment-only turn valid when its binary block is unsupported', () => {
     const { model } = createCapturingModel();
     const source = new HumanMessage({
@@ -595,5 +791,260 @@ describe('prepareProviderRequest', () => {
       )
     ).rejects.toThrow('does not match invocation options');
     expect(invocations).toHaveLength(0);
+  });
+
+  describe('for a model without image input', () => {
+    const image = {
+      type: 'image_url',
+      image_url: { url: 'data:image/png;base64,AA==' },
+    };
+    const question = { type: 'text', text: 'What does the chart show?' };
+    const marker = { type: 'text', text: OMITTED_IMAGE_TEXT };
+
+    it('@scenario:text-only-request sends and measures a marker in place of each image', () => {
+      const { model } = createCapturingModel();
+      const source = new HumanMessage({ content: [question, image] });
+      const measure = jest.fn((messages: BaseMessage[]) => ({
+        fits: true,
+        projectedMessageTokens: messages.length,
+      }));
+
+      const request = prepareProviderRequest({
+        model: model as t.ChatModel,
+        messages: [source],
+        provider: Providers.OPENAI,
+        measure,
+        vision: false,
+      });
+
+      expect(request.messages[0].content).toEqual([question, marker]);
+      expect(measure).toHaveBeenCalledWith(request.messages);
+      expect(source.content).toEqual([question, image]);
+    });
+
+    it('replaces an image reference without resolving its bytes', () => {
+      const { model } = createCapturingModel();
+      const reference = {
+        type: 'image' as const,
+        source_type: 'id' as const,
+        id: 'image-1',
+        mime_type: 'image/png',
+      };
+      const resolveAttachment = jest.fn<t.AttachmentResolver>(() => image);
+
+      const request = prepareProviderRequest({
+        model: model as t.ChatModel,
+        messages: [new HumanMessage({ content: [question, reference] })],
+        provider: Providers.ANTHROPIC,
+        context: { resolveAttachment },
+        vision: false,
+      });
+
+      expect(resolveAttachment).not.toHaveBeenCalled();
+      expect(request.messages[0].content).toEqual([question, marker]);
+    });
+
+    it('replaces an image a file reference turns out to be', () => {
+      const { model } = createCapturingModel();
+      const reference = {
+        type: 'file' as const,
+        source_type: 'id' as const,
+        id: 'file-1',
+      };
+      const resolveAttachment = jest.fn<t.AttachmentResolver>(() => image);
+
+      const request = prepareProviderRequest({
+        model: model as t.ChatModel,
+        messages: [new HumanMessage({ content: [question, reference] })],
+        provider: Providers.ANTHROPIC,
+        context: { resolveAttachment },
+        vision: false,
+      });
+
+      expect(resolveAttachment).toHaveBeenCalledTimes(1);
+      expect(request.messages[0].content).toEqual([question, marker]);
+    });
+
+    it('puts one marker where each image was and keeps the rest of the turn', () => {
+      const { model } = createCapturingModel();
+      const plain = new HumanMessage('An earlier turn');
+      const source = new HumanMessage({ content: [image, question, image] });
+
+      const request = prepareProviderRequest({
+        model: model as t.ChatModel,
+        messages: [plain, source],
+        provider: Providers.ANTHROPIC,
+        vision: false,
+      });
+
+      expect(request.messages[0]).toBe(plain);
+      expect(request.messages[1].content).toEqual([marker, question, marker]);
+      expect(source.content).toEqual([image, question, image]);
+    });
+
+    it('keeps the tool call link and the prompt-cache breakpoint of a replaced tool image', () => {
+      const { model } = createCapturingModel();
+      const cacheControl = { type: 'ephemeral' as const };
+      const toolCall = new AIMessage({
+        content: '',
+        tool_calls: [{ id: 'chart-1', name: 'render_chart', args: {} }],
+      });
+      const toolResult = new ToolMessage({
+        tool_call_id: 'chart-1',
+        name: 'render_chart',
+        content: [
+          { type: 'text', text: 'Rendered the chart.' },
+          { ...image, cache_control: cacheControl },
+        ],
+      });
+
+      const request = prepareProviderRequest({
+        model: model as t.ChatModel,
+        messages: [new HumanMessage('Chart it'), toolCall, toolResult],
+        provider: Providers.ANTHROPIC,
+        vision: false,
+      });
+
+      const projectedResult = request.messages[2] as ToolMessage;
+      expect(projectedResult.tool_call_id).toBe('chart-1');
+      expect(projectedResult.content).toEqual([
+        { type: 'text', text: 'Rendered the chart.' },
+        { ...marker, cache_control: cacheControl },
+      ]);
+    });
+
+    it.each([Providers.OPENAI, Providers.GOOGLE])(
+      'puts the marker, not the image bytes, into a %s tool result',
+      (provider) => {
+        const { model } = createCapturingModel();
+        const toolCall = new AIMessage({
+          content: '',
+          tool_calls: [{ id: 'chart-1', name: 'render_chart', args: {} }],
+        });
+        const toolResult = new ToolMessage({
+          tool_call_id: 'chart-1',
+          name: 'render_chart',
+          content: [{ type: 'text', text: 'Rendered the chart.' }, image],
+        });
+
+        const request = prepareProviderRequest({
+          model: model as t.ChatModel,
+          messages: [new HumanMessage('Chart it'), toolCall, toolResult],
+          provider,
+          vision: false,
+        });
+
+        const wire = JSON.stringify(request.messages[2].content);
+        expect(wire).toContain(OMITTED_IMAGE_TEXT);
+        expect(wire).toContain('Rendered the chart.');
+        expect(wire).not.toContain('base64');
+      }
+    );
+
+    it.each([Providers.ANTHROPIC, Providers.OPENAI])(
+      'replaces an image nested in a native tool_result for %s',
+      (provider) => {
+        const { model } = createCapturingModel();
+        const toolCall = new AIMessage({
+          content: '',
+          tool_calls: [{ id: 'native-1', name: 'native_tool', args: {} }],
+        });
+        const toolResult = new ToolMessage({
+          tool_call_id: 'native-1',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'native-1',
+              cache_control: { type: 'ephemeral', ttl: '1h' },
+              content: [
+                { type: 'text', text: 'native result' },
+                {
+                  type: 'image_url',
+                  image_url: 'data:image/png;base64,AA==',
+                },
+              ],
+            },
+          ],
+        });
+
+        const request = prepareProviderRequest({
+          model: model as t.ChatModel,
+          messages: [new HumanMessage('Run it'), toolCall, toolResult],
+          provider,
+          vision: false,
+        });
+
+        const wire = JSON.stringify(request.messages[2].content);
+        expect(wire).toContain(OMITTED_IMAGE_TEXT);
+        expect(wire).toContain('native result');
+        expect(wire).not.toContain('base64');
+      }
+    );
+
+    it('keeps the screenshot a native Responses computer-call output requires', () => {
+      const { model } = createCapturingModel();
+      model._useResponsesApi = (): boolean => true;
+      const computerCall = new AIMessage({
+        content: '',
+        response_metadata: {
+          output: [
+            {
+              type: 'computer_call',
+              call_id: 'computer-1',
+              action: { type: 'screenshot' },
+            },
+          ],
+        },
+      });
+      const screenshot = {
+        type: 'input_image',
+        image_url: 'data:image/png;base64,AA==',
+      };
+      const computerOutput = new ToolMessage({
+        tool_call_id: 'computer-1',
+        content: [screenshot],
+        additional_kwargs: { type: 'computer_call_output' },
+      });
+
+      const request = prepareProviderRequest({
+        model: model as t.ChatModel,
+        messages: [computerCall, computerOutput],
+        provider: Providers.OPENAI,
+        vision: false,
+      });
+
+      expect(request.projectionMode).toBe('openai-responses');
+      expect(request.messages[1].content).toEqual([screenshot]);
+    });
+
+    it('flattens a turn left with only text for a legacy-content agent', () => {
+      const { model } = createCapturingModel();
+
+      const request = prepareProviderRequest({
+        model: model as t.ChatModel,
+        messages: [new HumanMessage({ content: [question, image] })],
+        provider: Providers.OPENAI,
+        vision: false,
+        useLegacyContent: true,
+      });
+
+      expect(request.messages[0].content).toBe(
+        `${question.text}\n${OMITTED_IMAGE_TEXT}`
+      );
+    });
+
+    it.each([undefined, true])('keeps images when vision is %s', (vision) => {
+      const { model } = createCapturingModel();
+      const source = new HumanMessage({ content: [question, image] });
+
+      const request = prepareProviderRequest({
+        model: model as t.ChatModel,
+        messages: [source],
+        provider: Providers.OPENAI,
+        vision,
+      });
+
+      expect(request.messages[0]).toBe(source);
+    });
   });
 });

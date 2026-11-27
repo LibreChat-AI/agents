@@ -33,13 +33,33 @@ const EPHEMERAL_AGENT_SENDER_SEPARATOR = '___';
 const EPHEMERAL_AGENT_INDEX_SEPARATOR = '____';
 const DEPRECATED_TRACE_INPUT_ATTRIBUTE = 'langfuse.trace.input';
 const DEPRECATED_TRACE_OUTPUT_ATTRIBUTE = 'langfuse.trace.output';
-const OBSERVATION_METADATA_LANGGRAPH_NODE = `${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.langgraph_node`;
-const OBSERVATION_METADATA_OPERATION = `${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.${LANGFUSE_OPERATION_METADATA_KEY}`;
+const OBSERVATION_METADATA_LANGGRAPH_NODE = 'langgraph_node';
+const OBSERVATION_METADATA_OPERATION = LANGFUSE_OPERATION_METADATA_KEY;
 const OBSERVATION_METADATA_COMPACTION_SEMANTIC_INDEX_ENTRIES = `${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.compaction_semantic_index_entries`;
 const COMPACTION_SEMANTIC_INDEX_OPEN = '<compaction-semantic-index>';
 const COMPACTION_SEMANTIC_INDEX_CLOSE = '</compaction-semantic-index>';
 const REDACTED_COMPACTION_SEMANTIC_INDEX =
   '<compaction-semantic-index redacted="true" />\n\n';
+
+/**
+ * Returns an observation metadata value. `@langfuse/tracing` stores each
+ * metadata value on the span as JSON, strings included.
+ */
+export function getObservationMetadataAttribute(
+  attributes: Record<string, unknown>,
+  key: string
+): unknown {
+  const value =
+    attributes[`${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.${key}`];
+  if (typeof value !== 'string') {
+    return value;
+  }
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+}
 
 type MutableSpan = ReadableSpan & {
   name: string;
@@ -481,7 +501,10 @@ function isAgentModelCallSpan(span: MutableSpan): boolean {
   ) {
     return false;
   }
-  const node = span.attributes[OBSERVATION_METADATA_LANGGRAPH_NODE];
+  const node = getObservationMetadataAttribute(
+    span.attributes,
+    OBSERVATION_METADATA_LANGGRAPH_NODE
+  );
   return (
     typeof node === 'string' && node.startsWith(LANGGRAPH_AGENT_NODE_PREFIX)
   );
@@ -501,22 +524,30 @@ function shapeActivityPhaseSpan(span: MutableSpan): void {
 function shapeGenerationSpan(span: MutableSpan): void {
   if (
     hasTraceTag(span, ACTIVITY_LABEL_TRACE_TAG) &&
-    span.attributes[OBSERVATION_METADATA_OPERATION] === ACTIVITY_LABEL_RUN_NAME
+    getObservationMetadataAttribute(
+      span.attributes,
+      OBSERVATION_METADATA_OPERATION
+    ) === ACTIVITY_LABEL_RUN_NAME
   ) {
     span.name = ACTIVITY_LABEL_RUN_NAME;
     return;
   }
   if (
     hasTraceTag(span, REASONING_LABEL_TRACE_TAG) &&
-    span.attributes[OBSERVATION_METADATA_OPERATION] === REASONING_LABEL_RUN_NAME
+    getObservationMetadataAttribute(
+      span.attributes,
+      OBSERVATION_METADATA_OPERATION
+    ) === REASONING_LABEL_RUN_NAME
   ) {
     span.name = REASONING_LABEL_RUN_NAME;
     return;
   }
   if (
     hasTraceTag(span, ACTIVITY_PHASE_TRACE_TAG) &&
-    span.attributes[OBSERVATION_METADATA_OPERATION] ===
-      ACTIVITY_PHASE_LABEL_RUN_NAME
+    getObservationMetadataAttribute(
+      span.attributes,
+      OBSERVATION_METADATA_OPERATION
+    ) === ACTIVITY_PHASE_LABEL_RUN_NAME
   ) {
     span.name = ACTIVITY_PHASE_LABEL_RUN_NAME;
     return;
@@ -534,7 +565,10 @@ function isGraphSpan(span: MutableSpan): boolean {
   }
   return (
     isRootSpan(span) ||
-    typeof span.attributes[OBSERVATION_METADATA_LANGGRAPH_NODE] === 'string' ||
+    typeof getObservationMetadataAttribute(
+      span.attributes,
+      OBSERVATION_METADATA_LANGGRAPH_NODE
+    ) === 'string' ||
     hasTraceTag(span, AGENT_TRACE_TAG)
   );
 }
@@ -581,12 +615,15 @@ function isToolSpan(span: MutableSpan): boolean {
 
 /**
  * Whether the span is a LangGraph node execution whose node id is the span
- * name — the shape of the outer workflow-agent node. `@langfuse/tracing`
- * flattens object metadata to per-key attributes with string values stored
- * raw, so LangGraph's `langgraph_node` arrives directly comparable.
+ * name — the shape of the outer workflow-agent node.
  */
 function isWorkflowNodeSpan(span: MutableSpan): boolean {
-  return span.attributes[OBSERVATION_METADATA_LANGGRAPH_NODE] === span.name;
+  return (
+    getObservationMetadataAttribute(
+      span.attributes,
+      OBSERVATION_METADATA_LANGGRAPH_NODE
+    ) === span.name
+  );
 }
 
 /**

@@ -1351,6 +1351,100 @@ describe('AgentContext', () => {
       expect(result[0].content).not.toContain('run_tools_with_bash');
     });
 
+    it.each([
+      [Constants.BASH_PROGRAMMATIC_TOOL_CALLING, 'Bash'],
+      [Constants.PROGRAMMATIC_TOOL_CALLING, 'Python'],
+    ])('shows sandbox names for %s', async (runnerName, runtime) => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          instructions: 'Base',
+          toolDefinitions: [{ name: runnerName }],
+          toolRegistry: new Map([
+            [
+              'stub_echo_mcp_hypen-server',
+              {
+                name: 'stub_echo_mcp_hypen-server',
+                allowed_callers: ['code_execution'],
+              },
+            ],
+            [
+              'both_mcp_my-server',
+              {
+                name: 'both_mcp_my-server',
+                allowed_callers: ['direct', 'code_execution'],
+              },
+            ],
+            ['direct_only', { name: 'direct_only' }],
+          ]),
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([]);
+      const content = String(result[0].content);
+      expect(content).toContain(
+        'Use sandbox names in both code and `tool_manifest`'
+      );
+      expect(content).toContain(
+        `\`stub_echo_mcp_hypen-server\`: ${runtime} \`stub_echo_mcp_hypen_server\``
+      );
+      expect(content).toContain(
+        `\`both_mcp_my-server\`: ${runtime} \`both_mcp_my_server\``
+      );
+      expect(content).toContain(
+        'registered names are also accepted in `tool_manifest`'
+      );
+    });
+
+    it.each([
+      [Constants.BASH_PROGRAMMATIC_TOOL_CALLING, 'Bash', 'code_execution'],
+      [Constants.PROGRAMMATIC_TOOL_CALLING, 'Python', 'code_execution'],
+      [Constants.BASH_PROGRAMMATIC_TOOL_CALLING, 'Bash', 'direct'],
+      [Constants.PROGRAMMATIC_TOOL_CALLING, 'Python', 'direct'],
+    ] as const)(
+      'uses registered manifests for %s (%s, other caller: %s)',
+      async (runnerName, runtime, otherCaller) => {
+        const registeredName = 'delete_record_mcp_prod-server';
+        const sandboxName = 'delete_record_mcp_prod_server';
+        const ctx = createBasicContext({
+          agentConfig: {
+            toolDefinitions: [{ name: runnerName }],
+            toolRegistry: new Map([
+              [
+                registeredName,
+                {
+                  name: registeredName,
+                  allowed_callers: ['code_execution'],
+                },
+              ],
+              [
+                sandboxName,
+                {
+                  name: sandboxName,
+                  allowed_callers: [otherCaller],
+                },
+              ],
+            ]),
+          },
+        });
+
+        const content = String(
+          (await ctx.systemRunnable!.invoke([]))[0].content
+        );
+        expect(content).toContain(
+          'For colliding sandbox names, use registered names in `tool_manifest` and sandbox names in code. Select only one tool per sandbox name'
+        );
+        expect(content).toContain(
+          `- \`${registeredName}\`: ${runtime} code \`${sandboxName}\``
+        );
+        expect(content).not.toContain(
+          `- \`${registeredName}\`: ${runtime} \`${sandboxName}\``
+        );
+        expect(content).not.toContain(
+          'Use sandbox names in both code and `tool_manifest`'
+        );
+      }
+    );
+
     it('makes mixed direct and programmatic caller boundaries explicit', async () => {
       const toolRegistry: t.LCToolRegistry = new Map([
         [
@@ -2382,6 +2476,62 @@ describe('AgentContext', () => {
         'original result'
       );
     });
+
+    it('prices a replaced image as its marker, also after the projection is rebuilt', () => {
+      const image = {
+        type: 'image_url',
+        image_url: { url: 'data:image/png;base64,AA==' },
+      };
+      const tokenCounter: t.TokenCounter = (message) =>
+        Array.isArray(message.content) &&
+        message.content.some((block) => block.type === 'image_url')
+          ? 50_000
+          : 10;
+      const context = createBasicContext({
+        agentConfig: { vision: false, maxContextTokens: 1_000 },
+        tokenCounter,
+        indexTokenCountMap: { 0: 50_000, 1: 10 },
+      });
+      const imageTurn = new HumanMessage({
+        content: [{ type: 'text', text: 'What is this?' }, image],
+      });
+
+      context.getProviderProjectedMessages([
+        imageTurn,
+        new AIMessage('A chart.'),
+      ]);
+      expect(context.indexTokenCountMap[0]).toBe(10);
+
+      context.getProviderProjectedMessages([
+        imageTurn,
+        new AIMessage('Rewritten.'),
+      ]);
+      expect(context.indexTokenCountMap[0]).toBe(10);
+    });
+
+    it('leaves the host counts of a vision agent alone', () => {
+      const counts = { 0: 50_000, 1: 10 };
+      const context = createBasicContext({
+        agentConfig: { maxContextTokens: 1_000 },
+        tokenCounter: () => 10,
+        indexTokenCountMap: counts,
+      });
+
+      context.getProviderProjectedMessages([
+        new HumanMessage({
+          content: [
+            {
+              type: 'image_url',
+              image_url: { url: 'data:image/png;base64,AA==' },
+            },
+          ],
+        }),
+        new AIMessage('A chart.'),
+      ]);
+
+      expect(context.indexTokenCountMap[0]).toBe(50_000);
+      expect(counts[0]).toBe(50_000);
+    });
   });
 
   describe('reset()', () => {
@@ -3195,6 +3345,40 @@ describe('AgentContext', () => {
       expect(max - (usage!.remainingContextTokens ?? 0)).toBeLessThanOrEqual(
         max
       );
+    });
+
+    it('prices an image as its marker for a model without image input', () => {
+      const tokenCounter: t.TokenCounter = (message) =>
+        Array.isArray(message.content) &&
+        message.content.some((block) => block.type === 'image_url')
+          ? 50_000
+          : 10;
+      const ctx = createBasicContext({
+        agentConfig: { vision: false, maxContextTokens: 1_000 },
+        tokenCounter,
+      });
+
+      const messages = [
+        new HumanMessage({
+          content: [
+            { type: 'text', text: 'What is this?' },
+            {
+              type: 'image_url',
+              image_url: { url: 'data:image/png;base64,AA==' },
+            },
+          ],
+        }),
+        new AIMessage('A chart.'),
+        new HumanMessage('Which quarter was best?'),
+      ];
+      const hostCounts = { 0: 50_000, 1: 10, 2: 10 };
+
+      expect(ctx.projectContextUsage(messages)?.breakdown.messageCount).toBe(3);
+      expect(
+        ctx.projectContextUsage(messages, { indexTokenCountMap: hostCounts })
+          ?.breakdown.messageCount
+      ).toBe(3);
+      expect(hostCounts[0]).toBe(50_000);
     });
 
     it('does not mutate the context (local pruner, no field writes)', () => {

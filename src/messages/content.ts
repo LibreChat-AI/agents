@@ -2,24 +2,32 @@ import type {
   BaseMessage,
   MessageContentComplex,
 } from '@langchain/core/messages';
+import {
+  GEMINI_PARTS,
+  isGeminiReplayParts,
+} from '@/llm/google/utils/signatures';
 import { ContentTypes } from '@/common';
 import { cloneMessage } from './cache';
 
 /**
  * Whether {@link formatContentStrings} will flatten this message's content:
  * a human/ai/system message whose content is an array of text-only blocks.
+ * Pass `content` to judge replacement content before cloning the message.
  */
-export const isLegacyConvertible = (message: BaseMessage): boolean => {
+export const isLegacyConvertible = (
+  message: BaseMessage,
+  content: BaseMessage['content'] | MessageContentComplex[] = message.content
+): boolean => {
   const messageType = message.getType();
   const isValidMessage =
     messageType === 'human' || messageType === 'ai' || messageType === 'system';
   if (!isValidMessage) {
     return false;
   }
-  if (!Array.isArray(message.content)) {
+  if (!Array.isArray(content)) {
     return false;
   }
-  return message.content.every((block) => block.type === ContentTypes.TEXT);
+  return content.every((block) => block.type === ContentTypes.TEXT);
 };
 
 /** Joins the text of {@link isLegacyConvertible} content blocks into the exact
@@ -53,12 +61,18 @@ export const formatContentStrings = (
       continue;
     }
 
-    result.push(
-      cloneMessage(
-        message,
-        flattenLegacyContent(message.content as MessageContentComplex[])
-      )
-    );
+    const blocks = message.content as MessageContentComplex[];
+    const preserveNativeText =
+      message.getType() === 'ai' &&
+      isGeminiReplayParts(message.additional_kwargs[GEMINI_PARTS]);
+    const content = preserveNativeText
+      ? blocks
+        .map((block) =>
+          'text' in block && typeof block.text === 'string' ? block.text : ''
+        )
+        .join('')
+      : flattenLegacyContent(blocks);
+    result.push(cloneMessage(message, content));
   }
 
   return result;

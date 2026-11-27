@@ -12,6 +12,7 @@ import type {
 } from './stream';
 import type { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import type { LangfuseConfig, SubagentExecutionContext } from './graph';
+import type { ToolResultProtection } from '@/protection/toolResult';
 import type { PreparedSubagents } from '@/tools/preparedSubagents';
 import type { RunBreakerScope } from '@/llm/streamLimits';
 import type { HandoffRouting } from '@/graphs/handoff';
@@ -271,6 +272,8 @@ export type ToolNodeOptions = {
    * precedence over `toolOutputReferences` when both are set.
    */
   toolOutputRegistry?: ToolOutputReferenceRegistry;
+  /** Host inspection of selected tools' result text; see {@link ToolResultProtection}. */
+  toolResultProtection?: ToolResultProtection;
   /**
    * Selects where built-in code execution tools run. Defaults to the
    * remote LibreChat Code API sandbox; `local` swaps those same tool names

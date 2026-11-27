@@ -6,6 +6,13 @@ import type {
 } from '@/types/graph';
 import type { JsonSchemaType } from '@/types/tools';
 
+/**
+ * Feature probe: `self` subagent configs may declare `hostArgs` together with
+ * `resolveAgentInputs` and a `configId`. Calls that pass host arguments are
+ * resolved through the resolver; calls that pass none reuse the self inputs.
+ */
+export const SELF_SUBAGENT_HOST_ARGS_SUPPORTED = true;
+
 /** Bounds on host-declared subagent call arguments and their values. */
 export const SUBAGENT_HOST_ARG_LIMITS = Object.freeze({
   argsPerSubagent: 8,

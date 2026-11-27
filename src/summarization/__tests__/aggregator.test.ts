@@ -233,4 +233,66 @@ describe('createContentAggregator – SUMMARY accumulation', () => {
 
     consoleSpy.mockRestore();
   });
+
+  it('discards what was streamed when a delta is marked reset', () => {
+    const { aggregateContent, contentParts } = createContentAggregator();
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP,
+      data: {
+        stepIndex: 0,
+        id: 'step_sum_reset',
+        type: StepTypes.MESSAGE_CREATION,
+        index: 0,
+        stepDetails: {
+          type: StepTypes.MESSAGE_CREATION,
+          message_creation: { message_id: 'step_sum_reset' },
+        },
+        summary: { type: ContentTypes.SUMMARY, content: [] },
+        usage: null,
+      } as t.RunStep,
+    });
+    const delta = (text: string, reset?: boolean): t.SummarizeDeltaData => ({
+      id: 'step_sum_reset',
+      ...(reset === true ? { reset } : {}),
+      delta: {
+        summary: {
+          type: ContentTypes.SUMMARY,
+          content: text === '' ? [] : [{ type: 'text', text }],
+          model: 'summarizer',
+        },
+      },
+    });
+    const text = (): string =>
+      ((contentParts[0] as t.SummaryContentBlock).content ?? [])
+        .map((block) => (block as { text: string }).text)
+        .join('');
+
+    aggregateContent({
+      event: GraphEvents.ON_SUMMARIZE_DELTA,
+      data: delta('abandoned '),
+    });
+    aggregateContent({
+      event: GraphEvents.ON_SUMMARIZE_DELTA,
+      data: delta('attempt'),
+    });
+    expect(text()).toBe('abandoned attempt');
+
+    aggregateContent({
+      event: GraphEvents.ON_SUMMARIZE_DELTA,
+      data: delta('Second ', true),
+    });
+    aggregateContent({
+      event: GraphEvents.ON_SUMMARIZE_DELTA,
+      data: delta('attempt'),
+    });
+    expect(text()).toBe('Second attempt');
+    expect(contentParts[0]).toMatchObject({ model: 'summarizer' });
+
+    aggregateContent({
+      event: GraphEvents.ON_SUMMARIZE_DELTA,
+      data: delta('', true),
+    });
+    expect(text()).toBe('');
+    expect(contentParts[0]).toMatchObject({ type: ContentTypes.SUMMARY });
+  });
 });

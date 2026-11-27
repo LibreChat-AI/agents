@@ -37,6 +37,7 @@ import type {
   GraphFactoryRequest,
 } from '@/graphs/graphFactory';
 import type { OverflowRecoveryPlan } from '@/llm/contextOverflowRecovery';
+import type { GoogleGroundingMetadata } from '@/tools/search/types';
 import type { FallbackErrorContext } from '@/llm/invoke';
 import type { HandoffRouting } from './handoff';
 import type { HookRegistry } from '@/hooks';
@@ -164,6 +165,10 @@ import {
   serializeToolContentBounded,
 } from '@/utils/toolContent';
 import {
+  createToolResultGate,
+  ToolResultProtectionError,
+} from '@/protection/toolResult';
+import {
   appendCallbacks,
   findCallback,
   type CallbackEntry,
@@ -180,6 +185,7 @@ import {
   isThinkingEnabled,
   getConfiguredCompletionTokens,
 } from '@/llm/request';
+import { handleNativeSearchCitations, handleToolCalls } from '@/tools/handlers';
 import { createToolHistoryPreparation } from '@/messages/toolHistoryProjection';
 import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
 import { shouldTraceToolNodeForLangfuse } from '@/langfuseToolOutputTracing';
@@ -199,11 +205,11 @@ import { isRunStepResumeState } from '@/tools/runStepResume';
 import { resolveLocalToolsForBinding } from '@/tools/local';
 import { createSummarizeNode } from '@/summarization/node';
 import { getTruncationStopReason } from '@/llm/truncation';
+import { SearchCitations } from '@/tools/search/citations';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { AgentContext } from '@/agents/AgentContext';
 import { createFakeStreamingLLM } from '@/llm/fake';
 import { handoffStateAnnotation } from './handoff';
-import { handleToolCalls } from '@/tools/handlers';
 import { resolveMaxSeals } from '@/llm/preempt';
 import { initializeModel } from '@/llm/init';
 import { HandlerRegistry } from '@/events';
@@ -843,6 +849,8 @@ export abstract class Graph<
   callerSignal?: AbortSignal;
   /** Set of invoked tool call IDs from non-message run steps completed mid-run, if any */
   invokedToolIds?: Set<string>;
+  /** Provider-native web search sources and the anchors still owed to their citations. */
+  searchCitations = new SearchCitations();
   /** Explicit host policy. Never inferred from missing ToolNode claims. */
   clientDelegatedToolNames?: ReadonlySet<string>;
   handlerRegistry: HandlerRegistry | undefined;
@@ -951,6 +959,7 @@ export abstract class Graph<
     this.messageStepHasToolCalls = new Map();
     this.prelimMessageIdsByStepKey = new Map();
     this.invokedToolIds = undefined;
+    this.searchCitations = new SearchCitations();
     this.handlerRegistry = undefined;
     this.parentToolHandlerRegistry = undefined;
     this.hookRegistry = undefined;
@@ -1174,7 +1183,10 @@ export abstract class Graph<
     }
     const savedStateKeys = new Set<string>();
     const toolNodeStatesByKey = new Map<string, SubagentToolNodeResumeState>();
-    const legacyNodeStatesByKey = new Map<string, SubagentToolNodeResumeState>();
+    const legacyNodeStatesByKey = new Map<
+      string,
+      SubagentToolNodeResumeState
+    >();
     for (const nodeState of state.toolNodes) {
       const identity = parseSubagentToolNodeStateKey(nodeState.stateKey);
       if (identity == null) {
@@ -1437,6 +1449,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   streamLimits: ResolvedStreamLimits;
   /** Default-off mandatory provider prose release. */
   providerTextProtection?: t.StandardGraphInput['providerTextProtection'];
+  /** Default-off host inspection of selected tools' result text. */
+  toolResultProtection?: t.StandardGraphInput['toolResultProtection'];
+  /** Host lookup for attachments carried by reference; read while a provider request is prepared. */
+  resolveAttachment?: t.StandardGraphInput['resolveAttachment'];
   /**
    * Cumulative streamed argument bytes per in-flight tool call, keyed by
    * generation key + chunk index (see `resolveGenerationKey`). Per-run
@@ -1617,6 +1633,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       preemption,
       streamLimits,
       providerTextProtection,
+      toolResultProtection,
+      resolveAttachment,
       toolExecution,
       clientDelegatedToolNames,
     }: t.StandardGraphInput,
@@ -1648,7 +1666,32 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     this.streamLimits = resolveStreamLimits(streamLimits);
     if (providerTextProtection != null)
       validateProviderTextProtection(providerTextProtection);
+    if (providerTextProtection?.batching != null) {
+      const agent = agents[0];
+      if (
+        this.isMultiAgentGraph() ||
+        agents.length !== 1 ||
+        preemption != null ||
+        (clientDelegatedToolNames?.length ?? 0) > 0 ||
+        (agent.tools?.length ?? 0) > 0 ||
+        (agent.graphTools?.length ?? 0) > 0 ||
+        (agent.toolDefinitions?.length ?? 0) > 0 ||
+        (agent.toolRegistry?.size ?? 0) > 0 ||
+        (agent.subagentConfigs?.length ?? 0) > 0 ||
+        agent.summarizationEnabled === true ||
+        agent.summarizeOnly === true ||
+        agent.initialSummary != null
+      ) {
+        throw new ProviderTextProtectionError('unsupported');
+      }
+    }
     this.providerTextProtection = providerTextProtection;
+    const toolResultGate =
+      toolResultProtection == null
+        ? undefined
+        : createToolResultGate(toolResultProtection);
+    this.toolResultProtection = toolResultProtection;
+    this.resolveAttachment = resolveAttachment;
     this.toolExecution = toolExecution;
     if (
       clientDelegatedToolNames != null &&
@@ -1659,6 +1702,13 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       }
       if (clientDelegatedToolNames.some((name) => !name.trim())) {
         throw new Error('Client delegated tool names must be nonempty');
+      }
+      if (
+        clientDelegatedToolNames.some(
+          (name) => toolResultGate?.toolNames.has(name) === true
+        )
+      ) {
+        throw new ToolResultProtectionError('unsupported');
       }
       this.clientDelegatedToolNames = new Set(clientDelegatedToolNames);
     }
@@ -1828,6 +1878,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       new Map()
     );
     this.invokedToolIds = resetIfNotEmpty(this.invokedToolIds, undefined);
+    this.searchCitations = new SearchCitations();
     this.resetPreemptTurnState();
     this.resetPreemptTotals();
     const hasScopedCheckpoint =
@@ -2330,6 +2381,15 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       return false;
     }
 
+    const anchors = this.searchCitations.release(stepId);
+    if (anchors != null && this.config != null) {
+      await this.dispatchMessageDelta(
+        stepId,
+        { content: [{ type: ContentTypes.TEXT, text: anchors.text }] },
+        anchors.metadata ?? options?.metadata
+      );
+    }
+
     const closedAt = options?.at ?? Date.now();
     runStep.status = status;
     if (status === 'completed') {
@@ -2456,6 +2516,54 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       return;
     }
     await this.closeRunStep(stepId, 'completed', { metadata, at: closeAt });
+  }
+
+  /** Gemini grounding and OpenAI url_citation arrive after the text they cite. */
+  private tracksSearchText(metadata?: Record<string, unknown>): boolean {
+    if (metadata == null) {
+      return false;
+    }
+    try {
+      const { provider } = this.getAgentContext(metadata);
+      return (
+        isGoogleLike(provider) ||
+        provider === Providers.OPENAI ||
+        provider === Providers.AZURE
+      );
+    } catch (_e) {
+      return false;
+    }
+  }
+
+  /** Keeps a Gemini chunk's grounding for the lane's model call. */
+  groundSearchCitations(
+    metadata: Record<string, unknown> | undefined,
+    grounding: GoogleGroundingMetadata
+  ): void {
+    this.searchCitations.ground(
+      this.getStepAgentKey(metadata),
+      grounding,
+      metadata
+    );
+  }
+
+  /**
+   * Turns the web search citations a finished agent model call carried into
+   * a `web_search` result and anchors in its text. Model calls outside an
+   * agent node (summaries, tool internals) never own the lane's text.
+   */
+  async settleSearchCitations(
+    metadata?: Record<string, unknown>
+  ): Promise<void> {
+    const node = metadata?.langgraph_node;
+    if (typeof node !== 'string' || !node.startsWith(AGENT)) {
+      return;
+    }
+    const call = this.searchCitations.take(this.getStepAgentKey(metadata));
+    if (call == null) {
+      return;
+    }
+    await handleNativeSearchCitations({ graph: this, call, metadata });
   }
 
   /**
@@ -3024,6 +3132,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         maxContextTokens: agentContext?.maxContextTokens,
         maxToolResultChars: agentContext?.maxToolResultChars,
         toolOutputRegistry: this.getOrCreateToolOutputRegistry(),
+        toolResultProtection: this.toolResultProtection,
         fileCheckpointer: this.getOrCreateFileCheckpointer(),
         getBreakerSignal: (): AbortSignal => this.breakerAbort.signal,
         getRunScope: (): RunBreakerScope => this.runScope,
@@ -3107,6 +3216,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       maxContextTokens: agentContext?.maxContextTokens,
       maxToolResultChars: agentContext?.maxToolResultChars,
       toolOutputRegistry: this.getOrCreateToolOutputRegistry(),
+      toolResultProtection: this.toolResultProtection,
       fileCheckpointer: this.getOrCreateFileCheckpointer(),
       getBreakerSignal: (): AbortSignal => this.breakerAbort.signal,
       getRunScope: (): RunBreakerScope => this.runScope,
@@ -3406,7 +3516,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       }
       this.config = config;
 
-      let messagesToUse = messages;
       let contextUsage: t.ContextUsageEvent | null = null;
       /**
        * Held outside the prune block so overflow recovery — which detours to
@@ -3417,9 +3526,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       const canProjectContext =
         agentContext.tokenCounter != null &&
         agentContext.maxContextTokens != null;
-      const providerMessages = canProjectContext
-        ? agentContext.getProviderProjectedMessages(messages)
-        : messages;
+      /** A model without image input reads history through the projection even
+       *  without a pruner, so no later transform (tool folding included) sees
+       *  image bytes before the request replaces them. */
+      const providerMessages =
+        canProjectContext || agentContext.vision === false
+          ? agentContext.getProviderProjectedMessages(messages)
+          : messages;
+      let messagesToUse = providerMessages;
       if (
         !agentContext.pruneMessages &&
         agentContext.tokenCounter &&
@@ -3466,7 +3580,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           effectiveInstructionTokens,
         } = agentContext.pruneMessages({
           messages: providerMessages,
-          canonicalMessages: messages,
+          canonicalMessages:
+            agentContext.getProviderCanonicalMessages(messages),
           canonicalPrefixStable: true,
           usageMetadata: agentContext.currentUsage,
           lastCallUsage: agentContext.lastCallUsage,
@@ -4225,6 +4340,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         config,
         maxToolResultChars: maxProviderToolResultChars,
         toolHistory,
+        vision: agentContext.vision,
+        useLegacyContent: agentContext.useLegacyContent,
         measure: (preparedMessages) =>
           measureProviderPayload(
             trackProviderMessageOrigins(
@@ -4786,6 +4903,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                       config: fallbackConfig,
                       maxToolResultChars: fallbackToolResultChars,
                       toolHistory: fallbackToolHistory,
+                      vision: agentContext.vision,
+                      useLegacyContent: agentContext.useLegacyContent,
                       measure: (prepared) => {
                         projection = measureFallback(
                           trackProviderMessageOrigins(cached, prepared)
@@ -5442,6 +5561,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           onResolutionFailure: this.onSubagentResolutionFailure,
           streamLimits: this.streamLimits,
           providerTextProtection: this.providerTextProtection,
+          toolResultProtection: this.toolResultProtection,
+          resolveAttachment: this.resolveAttachment,
           humanInTheLoop: this.humanInTheLoop,
           checkpointer: this.compileOptions?.checkpointer,
           maxDepth: effectiveSubagentDepth,
@@ -5757,6 +5878,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               return getConfig();
             },
             runId: this.runId,
+            resolveAttachment: this.resolveAttachment,
             isMultiAgent: this.isMultiAgentGraph(),
             getSubagentExecutionContext: () => this.subagentExecutionContext,
             hookRegistry: this.hookRegistry,
@@ -5920,6 +6042,12 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
   createWorkflow(): t.CompiledStateWorkflow {
     this.hasCompiledCheckpointer = this.compileOptions?.checkpointer != null;
+    if (
+      this.hasCompiledCheckpointer &&
+      this.providerTextProtection?.batching != null
+    ) {
+      throw new ProviderTextProtectionError('unsupported');
+    }
     const agentNode = this.createAgentNode(this.defaultAgentId);
     const StateAnnotation = Annotation.Root({
       messages: Annotation<BaseMessage[]>({
@@ -6287,11 +6415,23 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     if (!this.config) {
       throw new Error('No config provided');
     }
+    const content = Array.isArray(delta.content)
+      ? (this.searchCitations.anchor(id, delta.content, metadata) ??
+        delta.content)
+      : delta.content;
     const messageDelta: t.MessageDeltaEvent = {
       id,
-      delta,
+      delta: content === delta.content ? delta : { ...delta, content },
     };
-    if (hasTextDeltaContent(delta.content)) {
+    if (content != null && this.tracksSearchText(metadata)) {
+      this.searchCitations.track(
+        this.getStepAgentKey(metadata),
+        id,
+        content,
+        metadata
+      );
+    }
+    if (hasTextDeltaContent(content)) {
       this.messageStepHasTextDeltas.add(id);
     }
     const handler = this.handlerRegistry?.getHandler(
