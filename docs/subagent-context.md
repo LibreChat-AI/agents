@@ -69,8 +69,13 @@ The synchronous callback receives:
   classes or codes to classify it. Never log its message, name, stack, or body.
 
 Return one of `workspace_unavailable`, `agent_unavailable`, `model_unavailable`,
-`configuration_changed`, or `unknown`. The SDK builds the parent message from
-fixed text; arbitrary runtime return values also fall back to `unknown`.
+`authentication_required`, `tools_unavailable`, `configuration_changed`,
+`host_argument_rejected`, or `unknown`. Use `authentication_required` when required
+child-tool sign-in is incomplete and the user must complete authentication. Use
+`tools_unavailable` for unavailable required tools, including temporary connection
+or credential-refresh failures that do not establish a need to sign in again.
+The SDK builds the parent message from fixed text; arbitrary runtime return values
+also fall back to `unknown`.
 The input diagnostic starts with `cause: 'unknown'`. Log the mapped cause and
 `getSubagentResolutionFailureMessage(cause)` in the host callback:
 
