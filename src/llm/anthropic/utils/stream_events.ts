@@ -16,6 +16,7 @@ import type {
   AnthropicMessageStreamEvent,
 } from '../types';
 import type { AnthropicUsageData } from './message_outputs';
+import { isAnthropicServerToolResultType } from '@/messages/anthropicServerTools';
 import { getAnthropicUsageMetadata } from './message_outputs';
 
 type AnthropicContentBlock =
@@ -75,12 +76,17 @@ export async function* convertAnthropicStream(
   let usageSnapshot: UsageMetadata | undefined;
   let eventUsage: AnthropicEventUsage | undefined;
   let stopReason: string | null = null;
+  let container: Extract<
+    AnthropicMessageStreamEvent,
+    { type: 'message_start' }
+  >['message']['container'] = null;
 
   for await (const data of source) {
     switch (data.type) {
     // ── Message lifecycle ──────────────────────────────────
     case 'message_start': {
       const { usage, id, model } = data.message;
+      container = data.message.container;
       if (shouldStreamUsage) {
         eventUsage = {
           inputTokens: usage.input_tokens,
@@ -106,6 +112,7 @@ export async function* convertAnthropicStream(
 
     case 'message_delta': {
       stopReason = data.delta.stop_reason;
+      container = data.delta.container ?? container;
       if (shouldStreamUsage) {
         eventUsage = updateEventUsage(eventUsage, data.usage);
         usageSnapshot = buildUsageSnapshot(eventUsage);
@@ -130,7 +137,10 @@ export async function* convertAnthropicStream(
         event: 'message-finish' as const,
         reason: mapStopReason(stopReason),
         ...(usageSnapshot ? { usage: usageSnapshot } : {}),
-        responseMetadata: { model_provider: 'anthropic' },
+        responseMetadata: {
+          model_provider: 'anthropic',
+          ...(container != null ? { container } : {}),
+        },
       };
       yield finishEvent;
       break;
@@ -295,27 +305,21 @@ function mapBlockToContentBlock(
   case 'redacted_thinking':
     return { ...block, index };
   case 'tool_use':
-    return {
-      type: 'tool_call_chunk' as const,
-      id: block.id,
-      name: block.name,
-      args: '',
-      index,
-    };
   case 'server_tool_use':
     return {
-      type: 'server_tool_call_chunk' as const,
+      type: block.type === 'tool_use' ? 'tool_call_chunk' : 'server_tool_call_chunk',
       id: block.id,
       name: block.name,
+      ...('caller' in block ? { caller: block.caller } : {}),
       args: '',
       index,
     };
-  case 'web_search_tool_result':
-    return { ...block, index };
   case 'compaction':
     return { ...block, index };
   default:
-    return { type: 'non_standard' as const, value: { ...block }, index };
+    return isAnthropicServerToolResultType(block.type)
+      ? { ...block, index }
+      : { type: 'non_standard' as const, value: { ...block }, index };
   }
 }
 
@@ -463,6 +467,7 @@ function finalizeBlock(accumulated: BlockAccumulator): ContentBlock {
       id: getStringField(accumulated, 'id'),
       name: getStringField(accumulated, 'name'),
       args: parsedArgs,
+      ...(accumulated.caller != null ? { caller: accumulated.caller } : {}),
     } as ContentBlock;
   }
 

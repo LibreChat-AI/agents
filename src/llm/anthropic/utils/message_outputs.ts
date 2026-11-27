@@ -6,6 +6,7 @@ import type { ChatGeneration } from '@langchain/core/outputs';
 import type Anthropic from '@anthropic-ai/sdk';
 import type { AnthropicMessageResponse } from '../types';
 import type { MessageContentComplex } from '@/types';
+import { isAnthropicServerToolResultType } from '@/messages/anthropicServerTools';
 import { toLangChainContent } from '@/messages/langchain';
 import { extractToolCalls } from './output_parsers';
 
@@ -51,6 +52,8 @@ function _isAnthropicCompactionBlock(
     block.type === 'compaction'
   );
 }
+
+const OTHER_REPLAYABLE_BLOCK_TYPES: ReadonlySet<string> = new Set(['tool_use', 'document', 'server_tool_use']);
 
 export function _makeMessageChunkFromAnthropicEvent(
   data: Anthropic.Beta.Messages.BetaRawMessageStreamEvent,
@@ -115,47 +118,17 @@ export function _makeMessageChunkFromAnthropicEvent(
     };
   } else if (
     data.type === 'content_block_start' &&
-    [
-      'tool_use',
-      'document',
-      'server_tool_use',
-      'web_search_tool_result',
-    ].includes(data.content_block.type)
+    (OTHER_REPLAYABLE_BLOCK_TYPES.has(data.content_block.type) ||
+      isAnthropicServerToolResultType(data.content_block.type))
   ) {
-    const contentBlock = data.content_block;
-    let toolCallChunks: ToolCallChunk[];
-    if (contentBlock.type === 'tool_use') {
-      toolCallChunks = [
-        {
-          id: contentBlock.id,
-          index: data.index,
-          name: contentBlock.name,
-          args: '',
-        },
-      ];
-    } else if (contentBlock.type === 'server_tool_use') {
-      // Handle anthropic built-in server tool use (like web search)
-      toolCallChunks = [
-        {
-          id: contentBlock.id,
-          index: data.index,
-          name: contentBlock.name,
-          args: '',
-        },
-      ];
-    } else {
-      toolCallChunks = [];
-    }
+    const block = data.content_block;
+    const isToolUse =
+      block.type === 'tool_use' || block.type === 'server_tool_use';
+    const toolCallChunks: ToolCallChunk[] = isToolUse
+      ? [{ id: block.id, index: data.index, name: block.name, args: '' }]
+      : [];
     const content = [
-      {
-        index: data.index,
-        ...data.content_block,
-        input:
-          contentBlock.type === 'server_tool_use' ||
-          contentBlock.type === 'tool_use'
-            ? ''
-            : undefined,
-      },
+      { ...block, index: data.index, ...(isToolUse ? { input: '' } : {}) },
     ];
     return {
       chunk: new AIMessageChunk({

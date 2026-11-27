@@ -403,12 +403,21 @@ export interface ReasoningDelta {
   content?: MessageContentComplex[];
 }
 
+/** Replaces `[start, end)` of a text part's accumulated text; an insertion when both match. */
+export type TextEdit = { start: number; end: number; text: string };
+
 export type MessageDeltaUpdate = {
   type: ContentTypes.TEXT;
   text: string;
   tool_call_ids?: string[];
   /** Provider-supplied source citations, accumulated across deltas. */
   citations?: Anthropic.TextCitation[];
+  /**
+   * Rewrites of text this part already holds, for citations a provider sends
+   * after the text they cite (Google grounding, OpenAI `url_citation`). Never
+   * stored on the part; a delta carrying them has no `text`.
+   */
+  edits?: TextEdit[];
 };
 export type BedrockReasoningReplayBlock = {
   type: ContentTypes.REASONING_CONTENT;

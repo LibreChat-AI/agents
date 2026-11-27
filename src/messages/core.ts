@@ -9,13 +9,13 @@ import {
 } from '@langchain/core/messages';
 import type { ContentBlock as LangChainContentBlock } from '@langchain/core/messages';
 import type { ToolCall, ToolCallChunk } from '@langchain/core/messages/tool';
-import type { ProviderMessageProvenancePart } from './provenance';
-import type * as t from '@/types';
 import type {
   ResponsesReplayPosition,
   ToolHistoryPreparation,
   OrderedToolHistoryProjection,
 } from './toolHistoryProjection';
+import type { ProviderMessageProvenancePart } from './provenance';
+import type * as t from '@/types';
 import {
   cloneToolMessageWithContent,
   compactToolContent,
@@ -28,24 +28,25 @@ import {
   serializeToolContentBounded,
 } from '@/utils/toolContent';
 import {
-  getProviderMessageProvenance,
-  getProviderSourceMessageIds,
-  hasBijectiveProviderContentPartMapping,
-  setProviderMessageProvenance,
-  stampSyntheticProviderMessage,
-} from './provenance';
-import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
-import { stripAnthropicCacheControl } from './cache';
-import { isReasoningContentBlock } from './reasoningTypes';
-import { ContentTypes, Providers } from '@/common';
-import { toLangChainContent } from './langchain';
-import {
   OPENAI_RESPONSES_REPLAY_POSITIONS_KEY,
   createToolHistoryPreparation,
   getGeneratedImageMimeType,
   getResponsesHistorySource,
   isResponsesReplayPosition,
 } from './toolHistoryProjection';
+import {
+  getProviderMessageProvenance,
+  getProviderSourceMessageIds,
+  hasBijectiveProviderContentPartMapping,
+  setProviderMessageProvenance,
+  stampSyntheticProviderMessage,
+} from './provenance';
+import { ANTHROPIC_SERVER_TOOL_RESULT_TYPES } from './anthropicServerTools';
+import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
+import { isReasoningContentBlock } from './reasoningTypes';
+import { stripAnthropicCacheControl } from './cache';
+import { ContentTypes, Providers } from '@/common';
+import { toLangChainContent } from './langchain';
 
 type ReasoningSummary = { summary?: Array<{ text?: string }> };
 type ReasoningDetail = { type?: string; text?: string };
@@ -91,7 +92,7 @@ const allowedTypesByProvider: Record<string, string[]> = {
     'thinking',
     'redacted_thinking',
     'server_tool_use',
-    'web_search_tool_result',
+    ...ANTHROPIC_SERVER_TOOL_RESULT_TYPES,
     'web_search_result',
   ],
   [Providers.BEDROCK]: [..._allowedTypes, 'reasoning_content'],

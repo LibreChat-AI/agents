@@ -27,6 +27,8 @@ import type { RecoveryClaim } from './recovery/server';
 import type { SdkAgentIdentity } from './identity';
 import {
   Run,
+  ToolResultProtectionError,
+  ProviderTextProtectionError,
   executeHooks,
   GraphEvents,
   HOOK_EVENTS,
@@ -64,6 +66,10 @@ export async function createRemoteSdkRun({
     throw new Error(
       'Remote SDK client-owned tools require a supported ownership adapter'
     );
+  if (config.toolResultProtection != null)
+    throw new ToolResultProtectionError('unsupported');
+  if (config.providerTextProtection?.batching != null)
+    throw new ProviderTextProtectionError('unsupported');
   if (config.providerTextProtection && !hostServices?.providerText)
     throw new Error(
       'Remote SDK provider protection requires a supported policy adapter'

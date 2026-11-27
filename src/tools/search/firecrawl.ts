@@ -5,7 +5,9 @@ import { processContent } from './content';
 
 /**
  * Firecrawl scraper implementation
- * Uses the Firecrawl API to scrape web pages
+ * Uses the Firecrawl API to scrape web pages. Without an API key, requests go
+ * out with no Authorization header, which a self-hosted instance running
+ * without authentication accepts.
  */
 export class FirecrawlScraper implements t.BaseScraper {
   private apiKey: string;
@@ -67,7 +69,9 @@ export class FirecrawlScraper implements t.BaseScraper {
     this.httpsAgent = config.httpsAgent;
 
     if (!this.apiKey) {
-      this.logger.warn('FIRECRAWL_API_KEY is not set. Scraping will not work.');
+      this.logger.debug(
+        'FIRECRAWL_API_KEY is not set; Firecrawl requests are sent without an API key'
+      );
     }
 
     this.logger.debug(
@@ -85,16 +89,6 @@ export class FirecrawlScraper implements t.BaseScraper {
     url: string,
     options: t.FirecrawlScrapeOptions = {}
   ): Promise<[string, t.FirecrawlScrapeResponse]> {
-    if (!this.apiKey) {
-      return [
-        url,
-        {
-          success: false,
-          error: 'FIRECRAWL_API_KEY is not set',
-        },
-      ];
-    }
-
     try {
       const payload = omitUndefined({
         url,
@@ -119,11 +113,14 @@ export class FirecrawlScraper implements t.BaseScraper {
         changeTrackingOptions:
           options.changeTrackingOptions ?? this.changeTrackingOptions,
       });
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+      };
+      if (this.apiKey) {
+        headers.Authorization = `Bearer ${this.apiKey}`;
+      }
       const response = await axios.post(this.apiUrl, payload, {
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${this.apiKey}`,
-        },
+        headers,
         timeout: this.timeout,
         httpAgent: this.httpAgent,
         httpsAgent: this.httpsAgent,
