@@ -1,6 +1,10 @@
 import { ChatGoogle } from '@langchain/google-gauth';
 import { ChatConnection } from '@langchain/google-common';
-import { AIMessageChunk, isAIMessage, isToolMessage } from '@langchain/core/messages';
+import {
+  AIMessageChunk,
+  isAIMessage,
+  isToolMessage,
+} from '@langchain/core/messages';
 import type {
   GeminiContent,
   GoogleAIAPI,
@@ -114,18 +118,24 @@ export function fixThoughtSignatures(
       modelContents[i].parts = replay;
       continue;
     }
-    if (Object.hasOwn(aiMessages[i].additional_kwargs, GEMINI_PARTS) && aiMessages[i].additional_kwargs[GEMINI_REPLAY_UNSUPPORTED] !== true) {
+    if (
+      Object.hasOwn(aiMessages[i].additional_kwargs, GEMINI_PARTS) &&
+      aiMessages[i].additional_kwargs[GEMINI_REPLAY_UNSUPPORTED] !== true
+    ) {
       for (const part of modelContents[i].parts) delete part.thoughtSignature;
       continue;
     }
-    const signatureMap = aiMessages[i].additional_kwargs[GEMINI_SIGNATURES] as Record<string, string> | undefined;
+    const signatureMap = aiMessages[i].additional_kwargs[GEMINI_SIGNATURES] as
+      | Record<string, string>
+      | undefined;
     if (signatureMap != null) {
       let callIndex = 0;
       for (const part of modelContents[i].parts) {
         if (!('functionCall' in part)) continue;
         const id = aiMessages[i].tool_calls?.[callIndex++]?.id;
         const signature = id != null ? signatureMap[id] : undefined;
-        if (typeof signature === 'string' && signature !== '') part.thoughtSignature = signature;
+        if (typeof signature === 'string' && signature !== '')
+          part.thoughtSignature = signature;
         else delete part.thoughtSignature;
       }
       continue;
@@ -137,30 +147,101 @@ export function fixThoughtSignatures(
     const content = modelContents[i];
     const callCount = aiMessages[i].tool_calls?.length ?? 0;
     const mismatchedSlots = signatures.length !== content.parts.length;
-    if (mismatchedSlots && content.parts.some((part) => 'text' in part)) continue;
-    if (mismatchedSlots && signatures.slice(callCount).some((signature) => signature != null && signature !== '')) continue;
+    if (mismatchedSlots && content.parts.some((part) => 'text' in part))
+      continue;
+    if (
+      mismatchedSlots &&
+      signatures
+        .slice(callCount)
+        .some((signature) => signature != null && signature !== '')
+    )
+      continue;
     for (let index = 0; index < content.parts.length; index++) {
       const part = content.parts[index];
       const signature = signatures[index];
-      if ((part.thoughtSignature == null || part.thoughtSignature === '') &&
-          typeof signature === 'string' && signature !== '') {
+      if (
+        (part.thoughtSignature == null || part.thoughtSignature === '') &&
+        typeof signature === 'string' &&
+        signature !== ''
+      ) {
         part.thoughtSignature = signature;
       }
     }
   }
 }
 
-type VertexResponseData = Omit<Partial<GenerateContentResponseData>, 'candidates'> & {
-  candidates?: Array<Omit<Partial<GeminiResponseCandidate>, 'content'> & {
-    content?: GeminiResponseCandidate['content'];
-  }>;
+type VertexResponseData = Omit<
+  Partial<GenerateContentResponseData>,
+  'candidates'
+> & {
+  candidates?: Array<
+    Omit<Partial<GeminiResponseCandidate>, 'content'> & {
+      content?: GeminiResponseCandidate['content'];
+      continuationToken?: string;
+    }
+  >;
 };
+
+type ContinuationParams = { continuationToken?: string };
+
+type ContinuationGenerationInfo = {
+  continuation_token?: string;
+  finish_reason?: string;
+  usage_metadata?: UsageMetadata;
+};
+
+function withContinuationToken(
+  chunk: ChatGenerationChunk | null,
+  data: VertexResponseData
+): ChatGenerationChunk | null {
+  const continuationToken = data.candidates?.[0]?.continuationToken;
+  if (chunk == null || continuationToken == null) return chunk;
+  chunk.generationInfo = {
+    ...chunk.generationInfo,
+    continuation_token: continuationToken,
+  };
+  return chunk;
+}
 
 class CustomChatConnection extends ChatConnection<VertexAIClientOptions> {
   thinkingConfig?: GoogleThinkingConfig;
 
   buildGeminiAPI(): GoogleAIAPI {
     const api = super.buildGeminiAPI();
+    const toChatGeneration: GoogleAIAPI['responseToChatGeneration'] = (
+      response
+    ): ChatGenerationChunk | null => {
+      const data = response.data as VertexResponseData;
+      const candidate = data.candidates?.[0];
+      if (candidate?.content == null)
+        return api.responseToChatGeneration(response);
+      const parts = candidate.content.parts;
+      if (parts.length === 0) return api.responseToChatGeneration(response);
+      let combined: ChatGenerationChunk | undefined;
+      let generationInfo: ChatGenerationChunk['generationInfo'];
+      for (const part of parts) {
+        const chunk = api.responseToChatGeneration({
+          data: {
+            ...data,
+            candidates: [
+              {
+                ...candidate,
+                content: { ...candidate.content, parts: [part] },
+              },
+            ],
+          } as GenerateContentResponseData,
+        });
+        if (chunk != null) {
+          generationInfo ??= chunk.generationInfo;
+          chunk.generationInfo = undefined;
+          combined = combined == null ? chunk : combined.concat(chunk);
+        }
+      }
+      if (combined == null) return null;
+      combined.generationInfo = generationInfo;
+      captureGeminiReplayParts(combined.message, parts, this.model);
+      return combined;
+    };
     return {
       ...api,
       responseToChatResult: (response): ChatResult => {
@@ -175,38 +256,11 @@ class CustomChatConnection extends ChatConnection<VertexAIClientOptions> {
           );
         return result;
       },
-      responseToChatGeneration: (response): ChatGenerationChunk | null => {
-        const data = response.data as VertexResponseData;
-        const candidate = data.candidates?.[0];
-        if (candidate?.content == null) return api.responseToChatGeneration(response);
-        const parts = candidate.content.parts;
-        if (parts.length === 0)
-          return api.responseToChatGeneration(response);
-        let combined: ChatGenerationChunk | undefined;
-        let generationInfo: ChatGenerationChunk['generationInfo'];
-        for (const part of parts) {
-          const chunk = api.responseToChatGeneration({
-            data: {
-              ...data,
-              candidates: [
-                {
-                  ...candidate,
-                  content: { ...candidate.content, parts: [part] },
-                },
-              ],
-            } as GenerateContentResponseData,
-          });
-          if (chunk != null) {
-            generationInfo ??= chunk.generationInfo;
-            chunk.generationInfo = undefined;
-            combined = combined == null ? chunk : combined.concat(chunk);
-          }
-        }
-        if (combined == null) return null;
-        combined.generationInfo = generationInfo;
-        captureGeminiReplayParts(combined.message, parts, this.model);
-        return combined;
-      },
+      responseToChatGeneration: (response) =>
+        withContinuationToken(
+          toChatGeneration(response),
+          response.data as VertexResponseData
+        ),
     };
   }
 
@@ -260,7 +314,9 @@ class CustomChatConnection extends ChatConnection<VertexAIClientOptions> {
             if (call.id != null) callNames.set(call.id, call.name);
           }
         } else if (isToolMessage(message)) {
-          functionResponseNames.push(callNames.get(message.tool_call_id) ?? message.name);
+          functionResponseNames.push(
+            callNames.get(message.tool_call_id) ?? message.name
+          );
         }
       }
       let responseIndex = 0;
@@ -275,6 +331,13 @@ class CustomChatConnection extends ChatConnection<VertexAIClientOptions> {
           (content as { role: string }).role = 'user';
         }
       }
+    }
+    const continuationToken = (
+      parameters as GoogleAIModelRequestParams & ContinuationParams
+    ).continuationToken;
+    if (continuationToken != null) {
+      (formattedData as GeminiRequest & ContinuationParams).continuationToken =
+        continuationToken;
     }
     return formattedData;
   }
@@ -583,8 +646,16 @@ export class ChatVertexAI extends ChatGoogle {
         ? { ...(params ?? {}), model: modelOrFields }
         : modelOrFields;
     const dynamicThinkingBudget = fields?.thinkingBudget === -1;
+    const model = (fields?.model ?? fields?.modelName)
+      ?.toLowerCase()
+      .split('/')
+      .pop();
+    const apiVersion =
+      fields?.apiVersion ??
+      (model?.startsWith('gemini-4-') === true ? 'v1beta1' : undefined);
     super({
       ...fields,
+      ...(apiVersion != null ? { apiVersion } : {}),
       platformType: 'gcp',
     });
     this.dynamicThinkingBudget = dynamicThinkingBudget;
@@ -595,6 +666,14 @@ export class ChatVertexAI extends ChatGoogle {
     options?: this['ParsedCallOptions'] | undefined
   ): GoogleAIModelRequestParams {
     const params = super.invocationParams(options);
+    const continuationToken = (
+      options as (this['ParsedCallOptions'] & ContinuationParams) | undefined
+    )?.continuationToken;
+    if (continuationToken != null) {
+      (
+        params as GoogleAIModelRequestParams & ContinuationParams
+      ).continuationToken = continuationToken;
+    }
     if (this.dynamicThinkingBudget) {
       params.maxReasoningTokens = -1;
     }
@@ -617,29 +696,70 @@ export class ChatVertexAI extends ChatGoogle {
     messages: BaseMessage[],
     options: this['ParsedCallOptions']
   ): AsyncGenerator<ChatGenerationChunk> {
-    let lastGoodUsage: UsageMetadata | undefined;
-    for await (const chunk of super._streamResponseChunks(
-      messages,
-      options,
-      undefined
-    )) {
-      const genUsage = (
-        chunk.generationInfo as { usage_metadata?: UsageMetadata } | undefined
-      )?.usage_metadata;
-      if (genUsage) {
-        lastGoodUsage = genUsage;
-      }
-      if (chunk.message instanceof AIMessageChunk) {
-        const repaired = repairStreamUsageMetadata(
-          chunk.message.usage_metadata,
-          lastGoodUsage
-        );
-        if (repaired !== chunk.message.usage_metadata) {
-          chunk.message.usage_metadata = repaired;
+    type StreamOptions = this['ParsedCallOptions'] & ContinuationParams;
+    let nextOptions = options as StreamOptions;
+    let initialPromptTokens: number | undefined;
+    for (;;) {
+      const continued = nextOptions.continuationToken != null;
+      let lastGoodUsage: UsageMetadata | undefined;
+      let finishReason: string | undefined;
+      let token: string | undefined;
+      let shouldContinue = false;
+      for await (const chunk of super._streamResponseChunks(
+        messages,
+        nextOptions,
+        undefined
+      )) {
+        const info = chunk.generationInfo as
+          | ContinuationGenerationInfo
+          | undefined;
+        const genUsage = info?.usage_metadata;
+        if (genUsage) {
+          lastGoodUsage = genUsage;
+          initialPromptTokens ??= genUsage.input_tokens;
         }
-        sealCompleteStreamedToolCalls(chunk.message);
+        finishReason = info?.finish_reason?.toUpperCase() ?? finishReason;
+        token = info?.continuation_token ?? token;
+        if (chunk.message instanceof AIMessageChunk) {
+          const repaired = repairStreamUsageMetadata(
+            chunk.message.usage_metadata,
+            lastGoodUsage
+          );
+          if (repaired !== chunk.message.usage_metadata) {
+            chunk.message.usage_metadata = repaired;
+          }
+          sealCompleteStreamedToolCalls(chunk.message);
+        }
+        shouldContinue = token != null && finishReason === 'CONTINUATION';
+        if (
+          chunk.generationInfo != null &&
+          (info?.continuation_token != null || shouldContinue)
+        ) {
+          chunk.generationInfo = { ...chunk.generationInfo };
+          delete chunk.generationInfo.continuation_token;
+          if (shouldContinue) {
+            delete chunk.generationInfo.finish_reason;
+            delete chunk.generationInfo.finishReason;
+          }
+        }
+        if (
+          continued &&
+          !shouldContinue &&
+          info?.finish_reason != null &&
+          initialPromptTokens != null &&
+          chunk.message instanceof AIMessageChunk
+        ) {
+          chunk.message.response_metadata = {
+            ...chunk.message.response_metadata,
+            initial_prompt_token_count: initialPromptTokens,
+          };
+        }
+        yield chunk;
       }
-      yield chunk;
+      if (!shouldContinue || options.signal?.aborted === true) {
+        break;
+      }
+      nextOptions = { ...nextOptions, continuationToken: token };
     }
   }
   buildConnection(

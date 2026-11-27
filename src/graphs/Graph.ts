@@ -3194,7 +3194,25 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       'usage_metadata' in finalMessage &&
       finalMessage.usage_metadata != null
     ) {
-      return finalMessage.usage_metadata as Partial<UsageMetadata>;
+      const usage = finalMessage.usage_metadata as Partial<UsageMetadata>;
+      /** Long decode re-prefills each segment for billing, but only the first
+       * prompt describes the conversation context. Cumulative cache details
+       * must not be reused with that smaller input count. */
+      const initial = (
+        finalMessage.response_metadata as {
+          initial_prompt_token_count?: number;
+        }
+      ).initial_prompt_token_count;
+      if (typeof initial === 'number' && Number.isFinite(initial)) {
+        const output = usage.output_tokens ?? 0;
+        return {
+          input_tokens: initial,
+          output_tokens: output,
+          total_tokens: initial + output,
+          output_token_details: usage.output_token_details,
+        };
+      }
+      return usage;
     }
   }
 
