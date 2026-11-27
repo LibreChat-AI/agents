@@ -29,9 +29,9 @@ import type {
   MessageContentReasoningBlock,
 } from '../types';
 import { serializeStructuredValueBounded } from '@/utils/toolContent';
-import { neutralizeHarmonyRequest } from './harmony';
 import { isReasoningContentBlock } from '@/messages/reasoningTypes';
 import { HARD_MAX_TOOL_RESULT_CHARS } from '@/utils/truncation';
+import { neutralizeHarmonyRequest } from './harmony';
 
 /**
  * Reasoning blocks from other providers, relative to Bedrock. Bedrock's native
@@ -272,8 +272,9 @@ const mimeTypeToDocumentFormat: Partial<Record<string, DocumentFormat>> = {
   'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
 };
 
+/** Decodes natively: `atob` plus a per-character copy takes ~45 ms per MB on the request path. */
 function base64ToBytes(data: string): Uint8Array {
-  return Uint8Array.from(atob(data), (char) => char.charCodeAt(0));
+  return Buffer.from(data, 'base64');
 }
 
 function getMediaFormat<T extends string>(
@@ -583,9 +584,7 @@ function convertLangChainContentBlockToConverseContentBlock({
         image: {
           format,
           source: {
-            bytes: Uint8Array.from(atob(imageBlock.data), (c) =>
-              c.charCodeAt(0)
-            ),
+            bytes: base64ToBytes(imageBlock.data),
           },
         },
       };
@@ -1141,37 +1140,31 @@ export interface ConvertToConverseMessagesOptions {
   model?: string;
 }
 
-/**
- * Whether the model is an identified OpenAI model on Bedrock (`openai.*`, a geo/global
- * inference profile such as `global.openai.*`, or an ARN naming one). Missing model IDs and
- * opaque resource ARNs are not identified.
- */
-export function isBedrockOpenAIModel(model?: string): boolean {
-  if (model == null || model === '') {
-    return false;
-  }
-  let id = model.toLowerCase();
-  if (id.startsWith('arn:')) {
-    const modelId =
-      /^arn:[^:]+:bedrock:[^:]*:[^:]*:(?:foundation-model|inference-profile)\/(.+)$/.exec(
-        id
-      )?.[1];
-    if (modelId == null) {
-      return false;
-    }
-    id = modelId;
-  }
-  return /(?:^|\.)openai\./.test(id);
+const BEDROCK_NAMED_MODEL_ARN =
+  /^arn:[^:]+:bedrock:[^:]*:[^:]*:(?:foundation-model|inference-profile)\/(.+)$/;
+
+function bedrockReplayException(
+  model?: string
+): 'openai' | 'grok-4.7' | undefined {
+  if (model == null || model === '') return undefined;
+  const normalized = model.toLowerCase();
+  const id = normalized.startsWith('arn:')
+    ? BEDROCK_NAMED_MODEL_ARN.exec(normalized)?.[1]
+    : normalized;
+  if (id == null) return undefined;
+  if (/(?:^|\.)openai\./.test(id)) return 'openai';
+  if (/(?:^|\.)xai\.grok-4\.7(?:$|[-:])/.test(id)) return 'grok-4.7';
+  return undefined;
 }
 
-/**
- * OpenAI Bedrock models reject prior `reasoningContent`, including on Claude-to-GPT handoffs.
- * Only suppress replay for identified OpenAI targets; other model families retain the existing
- * behavior because their Bedrock reasoning-replay requirements have not been verified here.
- * Missing model IDs and opaque resource ARNs also retain the existing behavior.
- */
+/** Identifies OpenAI models on Bedrock, including named inference profiles. */
+export function isBedrockOpenAIModel(model?: string): boolean {
+  return bedrockReplayException(model) === 'openai';
+}
+
+/** OpenAI and Grok 4.7 reject prior reasoning; opaque resources keep replay. */
 export function replaysBedrockReasoning(model?: string): boolean {
-  return !isBedrockOpenAIModel(model);
+  return bedrockReplayException(model) == null;
 }
 
 /**
@@ -1184,8 +1177,8 @@ export function convertToConverseMessages(
   converseMessages: BedrockMessage[];
   converseSystem: BedrockSystemContentBlock[];
 } {
-  const openAITarget = isBedrockOpenAIModel(options.model);
-  const replayReasoning = !openAITarget;
+  const replayException = bedrockReplayException(options.model);
+  const replayReasoning = replayException == null;
   const converseSystem = messages
     .filter((msg) => msg._getType() === 'system')
     .flatMap((msg) => convertSystemMessageToConverseMessage(msg));
@@ -1251,7 +1244,7 @@ export function convertToConverseMessages(
     );
   }
 
-  if (!openAITarget) {
+  if (replayException !== 'openai') {
     return { converseMessages: combinedConverseMessages, converseSystem };
   }
   return {

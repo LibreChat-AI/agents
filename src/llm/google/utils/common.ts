@@ -78,6 +78,10 @@ type GoogleFunctionCallWithId = FunctionCallPart['functionCall'] & {
   id?: string;
 };
 
+type GoogleFunctionCallPart = FunctionCallPart & {
+  functionCall: GoogleFunctionCallWithId;
+};
+
 type GoogleFunctionResponseWithId = {
   name: string;
   response: object;
@@ -485,6 +489,75 @@ function _convertLangChainContentToPart(
   }
 }
 
+function convertFallbackContentWithCalls(
+  content: MessageContentComplex[],
+  isMultimodalModel: boolean,
+  functionCalls: GoogleFunctionCallPart[]
+): Part[] {
+  const callsById = new Map<string, number[]>();
+  const callNames = new Set<string>();
+  for (let i = functionCalls.length - 1; i >= 0; i--) {
+    const { id, name } = functionCalls[i].functionCall;
+    callNames.add(name);
+    if (id == null) continue;
+    const indices = callsById.get(id);
+    if (indices == null) callsById.set(id, [i]);
+    else indices.push(i);
+  }
+
+  const parts: (Part | undefined)[] = [];
+  const placed = new Set<number>();
+  let slotsByName: Map<string, { indices: number[]; next: number }> | undefined;
+  for (const block of content) {
+    if ('functionCall' in block && block.functionCall != null) {
+      const { id: nativeId, name } =
+        block.functionCall as GoogleFunctionCallWithId;
+      const id = getGoogleFunctionId(nativeId);
+      if (id != null) {
+        const index = callsById.get(id)?.pop();
+        if (index != null) {
+          placed.add(index);
+          parts.push(functionCalls[index]);
+        }
+      } else if (callNames.has(name)) {
+        slotsByName ??= new Map();
+        let slots = slotsByName.get(name);
+        if (slots == null) {
+          slots = { indices: [], next: 0 };
+          slotsByName.set(name, slots);
+        }
+        slots.indices.push(parts.length);
+        parts.push(undefined);
+      }
+      continue;
+    }
+
+    const part = _convertLangChainContentToPart(block, isMultimodalModel);
+    if (part == null) continue;
+    if ('functionCall' in part && part.functionCall != null) {
+      const { id, name } = part.functionCall as GoogleFunctionCallWithId;
+      if (id != null ? callsById.has(id) : callNames.has(name)) continue;
+    }
+    parts.push(part);
+  }
+
+  // Reserve exact ID matches before filling any name-only slots.
+  for (let i = 0; i < functionCalls.length; i++) {
+    if (placed.has(i)) continue;
+    const part = functionCalls[i];
+    const slots = slotsByName?.get(part.functionCall.name);
+    if (slots != null && slots.next < slots.indices.length) {
+      parts[slots.indices[slots.next++]] = part;
+    } else {
+      parts.push(part);
+    }
+  }
+
+  return slotsByName == null
+    ? (parts as Part[])
+    : parts.filter((part) => part != null);
+}
+
 export function convertMessageContentToParts(
   message: BaseMessage,
   isMultimodalModel: boolean,
@@ -532,21 +605,7 @@ export function convertMessageContentToParts(
   const replayParts = restoreGeminiReplayParts(message);
   if (replayParts != null) return replayParts as Part[];
 
-  let functionCalls: FunctionCallPart[] = [];
-  const messageParts: Part[] = [];
-
-  if (typeof message.content === 'string' && message.content) {
-    messageParts.push({ text: message.content });
-  }
-
-  if (Array.isArray(message.content)) {
-    messageParts.push(
-      ...(message.content
-        .map((c) => _convertLangChainContentToPart(c, isMultimodalModel))
-        .filter((p) => p !== undefined) as Part[])
-    );
-  }
-
+  let functionCalls: GoogleFunctionCallPart[] = [];
   const storedSignatures = message.additional_kwargs[_FUNCTION_CALL_THOUGHT_SIGNATURES_MAP_KEY] as Record<string, string> | undefined;
   let functionThoughtSignatures = storedSignatures != null && Object.keys(storedSignatures).length > 0 ? storedSignatures : undefined;
   if (Object.hasOwn(message.additional_kwargs, GEMINI_PARTS) && message.additional_kwargs[GEMINI_REPLAY_UNSUPPORTED] !== true) functionThoughtSignatures = {};
@@ -579,28 +638,21 @@ export function convertMessageContentToParts(
     });
   }
 
-  const parsedFunctionCallIds = new Set(
-    functionCalls.flatMap((part) => {
-      const functionCall = part.functionCall as GoogleFunctionCallWithId;
-      return functionCall.id != null ? [functionCall.id] : [];
-    })
-  );
-  const parsedFunctionCallNames = new Set(
-    functionCalls.map((part) => part.functionCall.name)
-  );
-  const contentWithoutParsedMirrors = messageParts.filter((part) => {
-    if (!('functionCall' in part) || part.functionCall == null) {
-      return true;
-    }
-    const functionCall = part.functionCall as GoogleFunctionCallWithId;
-    return !(
-      (functionCall.id != null && parsedFunctionCallIds.has(functionCall.id)) ||
-      (functionCall.id == null &&
-        parsedFunctionCallNames.has(functionCall.name))
+  if (!Array.isArray(message.content)) {
+    return typeof message.content === 'string' && message.content
+      ? [{ text: message.content }, ...functionCalls]
+      : functionCalls;
+  }
+  if (functionCalls.length > 0) {
+    return convertFallbackContentWithCalls(
+      message.content,
+      isMultimodalModel,
+      functionCalls
     );
-  });
-
-  return [...contentWithoutParsedMirrors, ...functionCalls];
+  }
+  return message.content
+    .map((block) => _convertLangChainContentToPart(block, isMultimodalModel))
+    .filter((part) => part != null);
 }
 
 export function convertBaseMessagesToContent(

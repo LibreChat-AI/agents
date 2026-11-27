@@ -75,6 +75,27 @@ export interface SearchResultData {
   error?: string;
 }
 
+/**
+ * Gemini's `groundingMetadata` as the API returns it. The
+ * `@google/generative-ai` declarations type `segment` as a string and
+ * misspell `groundingChunkIndices`, so they cannot describe it.
+ */
+export type GoogleGroundingMetadata = {
+  webSearchQueries?: string[];
+  groundingChunks?: {
+    web?: { uri?: string; title?: string; domain?: string };
+  }[];
+  groundingSupports?: {
+    segment?: {
+      partIndex?: number;
+      startIndex?: number;
+      endIndex?: number;
+      text?: string;
+    };
+    groundingChunkIndices?: number[];
+  }[];
+};
+
 export interface SearchResult {
   data?: SearchResultData;
   error?: string;

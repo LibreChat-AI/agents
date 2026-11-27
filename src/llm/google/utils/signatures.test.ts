@@ -394,6 +394,22 @@ describe('Gemini native part replay', () => {
     expect(restoreGeminiReplayParts(edited)).toBeUndefined();
   });
 
+  test('restores signed text after citation anchors were added to the saved answer @scenario:gemini-cited-history', () => {
+    const message = mapGenerateContentResultToChatResult(response(parts))
+      .generations[0].message as AIMessage;
+    const cited = plain(message);
+    cited.content =
+      'Checking \ue200\ue202turn0search0\ue202turn1search2\ue201and finishing.\ue202turn0search0';
+    expect(restoreGeminiReplayParts(cited)).toEqual(parts);
+    expect(
+      convertMessageContentToParts(cited, true, [], 'gemini-4-hydrogen')
+    ).toEqual(parts);
+    cited.content = 'Checking and finishing!\ue202turn0search0';
+    expect(restoreGeminiReplayParts(cited)).toBeUndefined();
+    cited.content = 'Checking and finishing.\\ue202turn0search0';
+    expect(restoreGeminiReplayParts(cited)).toBeUndefined();
+  });
+
   test('keeps signatures isolated over multiple model turns', () => {
     const first = mapGenerateContentResultToChatResult(response(parts))
       .generations[0].message as AIMessage;

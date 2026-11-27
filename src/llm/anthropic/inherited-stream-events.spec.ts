@@ -1105,21 +1105,7 @@ describe('CustomAnthropic._streamChatModelEvents (inherited native)', () => {
       ]);
 
       const payload = _convertMessagesToAnthropicPayload([message]);
-      expect(payload.messages[0]?.content).toEqual([
-        {
-          type: 'web_search_tool_result',
-          tool_use_id: 'srvtoolu_01WEB',
-          content: [
-            {
-              type: 'web_search_result',
-              url: 'https://example.com',
-              title: 'Example',
-              encrypted_content: 'encrypted',
-              page_age: null,
-            },
-          ],
-        },
-      ]);
+      expect(payload.messages[0]?.content).toEqual(message.content);
     });
 
     test('output preserves server tool arguments for follow-up turns', async () => {
