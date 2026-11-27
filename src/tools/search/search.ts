@@ -240,9 +240,13 @@ const createSerperAPI = (
 ): {
   getSources: (params: t.GetSourcesParams) => Promise<t.SearchResult>;
 } => {
+  const baseUrl = process.env.SERPER_BASE_URL;
   const config = {
     apiKey: apiKey ?? process.env.SERPER_API_KEY,
-    apiUrl: 'https://google.serper.dev/search',
+    baseUrl: (baseUrl == null || baseUrl === ''
+      ? 'https://google.serper.dev'
+      : baseUrl
+    ).replace(/\/+$/, ''),
     timeout: 10000,
   };
 
@@ -284,13 +288,13 @@ const createSerperAPI = (
       }
 
       // Determine the API endpoint based on the search type
-      let apiEndpoint = config.apiUrl;
+      let apiEndpoint = `${config.baseUrl}/search`;
       if (type === 'images') {
-        apiEndpoint = 'https://google.serper.dev/images';
+        apiEndpoint = `${config.baseUrl}/images`;
       } else if (type === 'videos') {
-        apiEndpoint = 'https://google.serper.dev/videos';
+        apiEndpoint = `${config.baseUrl}/videos`;
       } else if (type === 'news') {
-        apiEndpoint = 'https://google.serper.dev/news';
+        apiEndpoint = `${config.baseUrl}/news`;
       }
 
       const response = await axios.post<t.SerperResultData>(
