@@ -302,6 +302,7 @@ function estimateBase64DocumentTokens(
  * and Anthropic format (`type: 'document'` with `source`).
  *
  * - Plain text: tokenized directly via `getTokenCount`.
+ * - Audio and video: priced by duration, as {@link estimateTimedMediaBlockTokens}.
  * - Base64 PDF: page count estimated from base64 length × per-page cost.
  * - Other base64 documents: decoded text, or decoded size when binary.
  * - URL reference: conservative flat estimate.
@@ -325,6 +326,14 @@ export function estimateDocumentBlockTokens(
 
     if (sourceType === 'text' && typeof block.text === 'string') {
       return getTokenCount(block.text as string);
+    }
+
+    const mediaMimeType = normalizeMediaMimeType(mimeType);
+    if (
+      mediaMimeType.startsWith('audio/') ||
+      mediaMimeType.startsWith('video/')
+    ) {
+      return estimateTimedMediaBlockTokens({ ...block, type: 'media' });
     }
 
     if (sourceType === 'base64' && typeof block.data === 'string') {
