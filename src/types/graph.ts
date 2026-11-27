@@ -1046,6 +1046,14 @@ interface AgentInputFields {
   /** Format content blocks as strings (for legacy compatibility i.e. Ollama/Azure Serverless) */
   useLegacyContent?: boolean;
   /**
+   * Whether this agent's model reads image input. `false` replaces every
+   * image in the agent's provider requests (its own calls, fallbacks and
+   * summarization) with a short text marker, so a text-only model in a
+   * multi-agent run never receives images the other agents can read. Unset
+   * sends images unchanged.
+   */
+  vision?: boolean;
+  /**
    * Tool definitions for all tools, including deferred and programmatic.
    * Used for tool search and programmatic tool calling.
    * Maps tool name to LCTool definition.

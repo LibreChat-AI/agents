@@ -516,7 +516,10 @@ function timedMediaKind(
   return null;
 }
 
-function getMediaMimeType(block: Record<string, unknown>): string | undefined {
+/** The normalized MIME type a media or file content block declares, if any. */
+export function getMediaMimeType(
+  block: Record<string, unknown>
+): string | undefined {
   if (typeof block.mimeType === 'string') {
     return normalizeMediaMimeType(block.mimeType);
   }
