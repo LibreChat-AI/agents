@@ -3190,6 +3190,34 @@ describe('AgentContext', () => {
       );
     });
 
+    it('prices an image as its marker for a model without image input', () => {
+      const tokenCounter: t.TokenCounter = (message) =>
+        Array.isArray(message.content) &&
+        message.content.some((block) => block.type === 'image_url')
+          ? 50_000
+          : 10;
+      const ctx = createBasicContext({
+        agentConfig: { vision: false, maxContextTokens: 1_000 },
+        tokenCounter,
+      });
+
+      const usage = ctx.projectContextUsage([
+        new HumanMessage({
+          content: [
+            { type: 'text', text: 'What is this?' },
+            {
+              type: 'image_url',
+              image_url: { url: 'data:image/png;base64,AA==' },
+            },
+          ],
+        }),
+        new AIMessage('A chart.'),
+        new HumanMessage('Which quarter was best?'),
+      ]);
+
+      expect(usage?.breakdown.messageCount).toBe(3);
+    });
+
     it('does not mutate the context (local pruner, no field writes)', () => {
       const { ctx, messages } = buildBranch(3_000, 1_000, 6);
       const mapBefore = { ...ctx.indexTokenCountMap };

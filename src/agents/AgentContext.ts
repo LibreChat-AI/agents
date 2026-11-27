@@ -329,6 +329,8 @@ export class AgentContext {
   private providerProjectedMessages?: BaseMessage[];
   /** Canonical object identities corresponding to the projected slots. */
   private providerProjectionSources?: BaseMessage[];
+  /** Without image input, the image-free history the pruner rewrites the projection from. */
+  private providerProjectionCanonical?: BaseMessage[];
   /** Canonical messages by ID, used to distinguish identity replay from replacement. */
   private providerProjectionSourcesById?: Map<string, BaseMessage>;
   /** Conservative counts retained by canonical identity across a rebuild. */
@@ -1899,14 +1901,18 @@ export class AgentContext {
         this.prepareProviderProjectionRecount(sources);
       }
       const omittedIndexes: number[] = [];
+      const canonical: BaseMessage[] | undefined =
+        this.vision === false ? [] : undefined;
       projection = messages.map((message, index) => {
         const projected = this.projectMessage(message);
         if (projected.omittedImages) {
           omittedIndexes.push(index);
         }
+        canonical?.push(projected.canonical);
         return projected.message;
       });
       this.providerProjectedMessages = projection;
+      this.providerProjectionCanonical = canonical;
       this.providerProjectionSources = [...messages];
       this.providerProjectionSourcesById = new Map(
         messages.flatMap((message) =>
@@ -1952,18 +1958,34 @@ export class AgentContext {
       if (message.id != null) {
         this.providerProjectionSourcesById?.set(message.id, message);
       }
-      projection.push(this.projectMessage(message).message);
+      const projected = this.projectMessage(message);
+      projection.push(projected.message);
+      this.providerProjectionCanonical?.push(projected.canonical);
     }
     return projection;
   }
 
-  /** The projection's copy of `message`; without image input, its images become markers. */
+  /**
+   * The canonical history the pruner rewrites the projection from: for a model
+   * without image input, the messages last given to
+   * `getProviderProjectedMessages` with each image as its marker, so fading,
+   * masking and input caps never bring an image back; otherwise `messages`.
+   */
+  getProviderCanonicalMessages(messages: BaseMessage[]): BaseMessage[] {
+    return this.providerProjectionCanonical ?? messages;
+  }
+
+  /**
+   * The projection's copy of `message` and the canonical message it is
+   * rewritten from; without image input, both read each image as its marker.
+   */
   private projectMessage(message: BaseMessage): {
     message: BaseMessage;
+    canonical: BaseMessage;
     omittedImages: boolean;
   } {
     if (!Array.isArray(message.content)) {
-      return { message, omittedImages: false };
+      return { message, canonical: message, omittedImages: false };
     }
     const content = message.content as MessageContentComplex[];
     const omitted =
@@ -1973,16 +1995,20 @@ export class AgentContext {
     if (omitted == null) {
       return {
         message: cloneMessage(message, [...content]),
+        canonical: message,
         omittedImages: false,
       };
     }
+    const readable =
+      this.useLegacyContent && isLegacyConvertible(message, omitted)
+        ? flattenLegacyContent(omitted)
+        : omitted;
     return {
       message: cloneMessage(
         message,
-        this.useLegacyContent && isLegacyConvertible(message, omitted)
-          ? flattenLegacyContent(omitted)
-          : omitted
+        typeof readable === 'string' ? readable : [...readable]
       ),
+      canonical: cloneMessage(message, readable),
       omittedImages: true,
     };
   }
@@ -2038,6 +2064,7 @@ export class AgentContext {
     this.providerProjectedMessages = undefined;
     this.providerProjectionSources = undefined;
     this.providerProjectionSourcesById = undefined;
+    this.providerProjectionCanonical = undefined;
   }
 
   private prepareProviderProjectionRecount(
@@ -2249,19 +2276,27 @@ export class AgentContext {
     /** Refresh stale system overhead (handoff/summary changes) so instruction
      *  tokens match the prompt a real call would send. */
     this.initializeSystemRunnable();
-    /** Clone array-content messages: the pruner unshifts reasoning blocks into
-     *  AI content arrays in place, which would otherwise corrupt the caller's
-     *  history. (Slot replacements land on the mapped array, not the caller's.) */
-    const projected = messages.map((message) =>
-      Array.isArray(message.content)
-        ? cloneMessage(message, [...message.content])
-        : message
-    );
+    /** The projection's copies: the pruner unshifts reasoning blocks into AI
+     *  content arrays in place, which would otherwise corrupt the caller's
+     *  history, and a model without image input reads each image as its
+     *  marker. (Slot replacements land on the mapped array, not the caller's.) */
+    const projections = messages.map((message) => this.projectMessage(message));
+    const projected = projections.map(({ message }) => message);
     let indexTokenCountMap = opts?.indexTokenCountMap;
     if (indexTokenCountMap == null) {
       indexTokenCountMap = {};
       for (let i = 0; i < messages.length; i++) {
-        indexTokenCountMap[String(i)] = tokenCounter(messages[i]);
+        indexTokenCountMap[String(i)] = tokenCounter(
+          projections[i].omittedImages ? projected[i] : messages[i]
+        );
+      }
+    } else if (projections.some(({ omittedImages }) => omittedImages)) {
+      /** A host count priced the image the marker replaces. */
+      indexTokenCountMap = { ...indexTokenCountMap };
+      for (let i = 0; i < projections.length; i++) {
+        if (projections[i].omittedImages) {
+          indexTokenCountMap[String(i)] = tokenCounter(projected[i]);
+        }
       }
     }
     const prune = createPruneMessages({

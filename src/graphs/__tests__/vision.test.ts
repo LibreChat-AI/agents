@@ -2,8 +2,9 @@ import { Runnable } from '@langchain/core/runnables';
 import { describe, expect, it, jest } from '@jest/globals';
 import {
   AIMessage,
-  AIMessageChunk,
+  ToolMessage,
   HumanMessage,
+  AIMessageChunk,
   getBufferString,
 } from '@langchain/core/messages';
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
@@ -286,6 +287,112 @@ describe('an agent whose model cannot read images', () => {
 
     expect(model.calls).toHaveLength(1);
     expect(sentContent(model.calls[0])).toContainEqual([question, marker]);
+  });
+
+  it('keeps the history when fading trims a tool result that holds an image', async () => {
+    /** Prices an image the way a host count does; anything else is cheap. */
+    const tokenCounter: t.TokenCounter = (message) =>
+      hasImage([message]) ? 50_000 : 10;
+    const run = await Run.create<t.IState>({
+      runId: 'text-only-fading',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: Providers.ANTHROPIC,
+          disableStreaming: true,
+          streamUsage: false,
+        },
+        maxContextTokens: 1_000,
+        vision: false,
+      },
+      tokenCounter,
+      indexTokenCountMap: { 0: 10, 1: 10, 2: 50_000, 3: 10, 4: 10 },
+      returnContent: true,
+      skipCleanup: true,
+    });
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+    const model = new RecordingModel();
+    run.Graph.overrideModel = model;
+
+    await run.processStream(
+      {
+        messages: [
+          new HumanMessage('Chart the revenue.'),
+          new AIMessage({
+            content: '',
+            tool_calls: [{ id: 'call_1', name: 'chart', args: {} }],
+          }),
+          new ToolMessage({
+            tool_call_id: 'call_1',
+            name: 'chart',
+            content: [{ type: 'text', text: 'Q'.repeat(20_000) }, image],
+          }),
+          new AIMessage('It shows revenue by quarter.'),
+          new HumanMessage('Which quarter was best?'),
+        ],
+      },
+      {
+        ...summaryStreamConfig,
+        configurable: { thread_id: 'text-only-fading' },
+      }
+    );
+
+    expect(model.calls).toHaveLength(1);
+    const sent = JSON.stringify(model.calls[0]);
+    expect(sent).toContain('[truncated: ');
+    expect(sent).toContain('Chart the revenue.');
+  });
+
+  it('gets a marker for a folded tool image when it has no tools and no context limit', async () => {
+    const data = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk';
+    const run = await Run.create<t.IState>({
+      runId: 'text-only-fold',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: Providers.OPENAI,
+          disableStreaming: true,
+          streamUsage: false,
+        },
+        vision: false,
+      },
+      returnContent: true,
+      skipCleanup: true,
+    });
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+    const model = new RecordingModel();
+    run.Graph.overrideModel = model;
+
+    await run.processStream(
+      {
+        messages: [
+          new HumanMessage('Chart the revenue.'),
+          new AIMessage({
+            content: '',
+            tool_calls: [{ id: 'call_1', name: 'chart', args: {} }],
+          }),
+          new ToolMessage({
+            tool_call_id: 'call_1',
+            name: 'chart',
+            content: [
+              { type: 'text', text: 'Here is the chart.' },
+              { type: 'media', mimeType: 'image/png', data },
+            ],
+          }),
+          new HumanMessage('What does it show?'),
+        ],
+      },
+      { ...summaryStreamConfig, configurable: { thread_id: 'text-only-fold' } }
+    );
+
+    expect(model.calls).toHaveLength(1);
+    const sent = JSON.stringify(model.calls[0]);
+    expect(sent).not.toContain(data);
+    expect(sent).toContain(OMITTED_IMAGE_TEXT);
   });
 
   it('@scenario:text-only-summary gets a marker in the history its summary request sends', async () => {
