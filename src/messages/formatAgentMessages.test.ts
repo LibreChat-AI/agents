@@ -8648,3 +8648,56 @@ describe('formatAgentMessages', () => {
     });
   });
 });
+
+describe('projectArtifactPayload bridgeUserAfterTool', () => {
+  /** Mirrors the fixture style used by the projectArtifactPayload cases above. */
+  const buildToolRun = (): BaseMessage[] => [
+    new HumanMessage({ content: 'draw a cat' }),
+    new AIMessage({
+      content: '',
+      tool_calls: [{ id: 'call_1', name: 'image_gen', args: {} }],
+    }),
+    new ToolMessage({
+      content: 'generated',
+      tool_call_id: 'call_1',
+      artifact: {
+        content: [
+          { type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } },
+        ],
+      },
+    }),
+  ];
+
+  it('places an assistant bridge before the projected user message', () => {
+    const formatted = projectArtifactPayload(buildToolRun(), 200, {
+      bridgeUserAfterTool: true,
+    });
+    const roles = formatted.map((m) => m.getType());
+    /** No `user` directly after `tool` - that is what Mistral/Scaleway reject. */
+    expect(roles).toEqual(['human', 'ai', 'tool', 'ai', 'human']);
+  });
+
+  it('omits the bridge by default, preserving the existing shape', () => {
+    const formatted = projectArtifactPayload(buildToolRun(), 200);
+    expect(formatted.map((m) => m.getType())).toEqual([
+      'human',
+      'ai',
+      'tool',
+      'human',
+    ]);
+  });
+
+  it('adds nothing when there is no artifact to project', () => {
+    const messages = [
+      new HumanMessage({ content: 'hi' }),
+      new AIMessage({
+        content: '',
+        tool_calls: [{ id: 'call_1', name: 'noop', args: {} }],
+      }),
+      new ToolMessage({ content: 'done', tool_call_id: 'call_1' }),
+    ];
+    expect(
+      projectArtifactPayload(messages, 200, { bridgeUserAfterTool: true })
+    ).toBe(messages);
+  });
+});
