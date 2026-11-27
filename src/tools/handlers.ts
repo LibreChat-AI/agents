@@ -25,6 +25,7 @@ import {
   isAnthropicWebSearchResult,
 } from '@/tools/search/anthropic';
 import { coerceGoogleGroundingResults } from '@/tools/search/google';
+import { coerceOpenAICitationResults } from '@/tools/search/openai';
 import { formatSearchAnchors } from '@/tools/search/citations';
 import { formatResultsForLLM } from '@/tools/search/format';
 import { getMessageId } from '@/messages';
@@ -430,18 +431,23 @@ function getNativeSearchResults(
   graph: StandardGraph | MultiAgentGraph,
   call: NativeSearchCall
 ): NativeSearchResults | undefined {
-  if (call.grounding == null || bindsSearchTool(graph)) {
+  if (bindsSearchTool(graph)) {
     return undefined;
   }
-  return coerceGoogleGroundingResults(call.grounding, call.text);
+  if (call.grounding != null) {
+    return coerceGoogleGroundingResults(call.grounding, call.text);
+  }
+  return call.citations.length > 0
+    ? coerceOpenAICitationResults(call.citations, call.text, call.blocks)
+    : undefined;
 }
 
 /**
- * Settles the web search citations Gemini grounding attaches to a finished
- * model call. They arrive after the text they cite has streamed, so the
- * sources reach TOOL_END handlers as one `web_search` turn (as Anthropic
- * results do) and the cited spans are rewritten into `turnNsearchM` anchors
- * through `edits` on the steps that hold the text.
+ * Settles the web search citations Gemini grounding and OpenAI `url_citation`
+ * attach to a finished model call. They arrive after the text they cite has
+ * streamed, so the sources reach TOOL_END handlers as one `web_search` turn
+ * (as Anthropic results do) and the cited spans are rewritten into
+ * `turnNsearchM` anchors through `edits` on the steps that hold the text.
  */
 export async function handleNativeSearchCitations({
   graph,
