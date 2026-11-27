@@ -26,6 +26,7 @@ import {
 } from '@/tools/CallerCapabilities';
 import {
   addTailCacheControl,
+  isSyntheticMetaMessage,
   stripAnthropicCacheControl,
   addCacheControlToStablePrefixMessages,
   buildAnthropicCacheControl,
@@ -33,6 +34,7 @@ import {
   resolvePromptCacheTtl,
   resolveBedrockPromptCacheTtl,
   cloneMessage,
+  getCacheControl,
   type PromptCacheTtl,
 } from '@/messages/cache';
 import {
@@ -47,6 +49,9 @@ import {
   ORIGINAL_CONTENT_MAX_CHARS,
   clampCalibrationRatio,
   createPruneMessages,
+  findLastIndex,
+  getProviderMessageProvenance,
+  isSyntheticProviderContextMessage,
   syncBudgetDerivedFields,
 } from '@/messages';
 import {
@@ -94,6 +99,41 @@ type ProgrammaticToolInstructionTarget = {
  * bounds spend as much as it bounds the compaction loop.
  */
 const MAX_SUMMARIZATION_FAILURES = 3;
+
+/**
+ * User-role context the SDK builds, such as tool history folded for an agent
+ * without tools or the payload `projectArtifactPayload` appends for a tool's
+ * images. Provenance survives the copies legacy formatting makes: a fold's
+ * starts with a synthetic part, and a tool payload's names no user part.
+ */
+function isProviderContextMessage(message: BaseMessage): boolean {
+  if (isSyntheticProviderContextMessage(message)) {
+    return true;
+  }
+  const parts = getProviderMessageProvenance(message)?.parts ?? [];
+  return (
+    parts.length > 0 &&
+    (parts.some((part) => part.attribution === 'synthetic') ||
+      !parts.some((part) => part.attribution === 'user'))
+  );
+}
+
+/** The user's own message: not a cue, a skill prime or context the SDK built. */
+function isUserMessage(message: BaseMessage): boolean {
+  return (
+    message.getType() === 'human' &&
+    !isSyntheticMetaMessage(message) &&
+    !isProviderContextMessage(message)
+  );
+}
+
+/** Whether a message carries a cache breakpoint. */
+function hasCacheMarker(message: BaseMessage): boolean {
+  return (
+    Array.isArray(message.content) &&
+    message.content.some((block) => getCacheControl(block) != null)
+  );
+}
 
 /**
  * Encapsulates agent-specific state that can vary between agents in a multi-agent system
@@ -1041,9 +1081,10 @@ export class AgentContext {
     }
 
     const promptCacheProvider = this.getPromptCacheProvider();
+    const anchorsOnUser = this.anchorsPromptCacheOnUser(promptCacheProvider);
     const shouldMoveDynamicInstructions =
       promptCacheProvider != null &&
-      stableInstructions !== '' &&
+      (stableInstructions !== '' || anchorsOnUser) &&
       dynamicInstructions !== '';
     const systemMessage = this.buildSystemMessage({
       stableInstructions,
@@ -1071,6 +1112,20 @@ export class AgentContext {
         this._summaryLocation === 'user_message' &&
         this.summaryText != null &&
         this.summaryText !== '';
+
+      if (anchorsOnUser) {
+        return [
+          ...prefix,
+          ...this.buildUserAnchoredPromptCacheBody({
+            messages,
+            dynamicInstructions: shouldMoveDynamicInstructions
+              ? dynamicInstructions
+              : '',
+            hasSummaryBody,
+            ttl: this.getPromptCacheTtl(promptCacheProvider),
+          }),
+        ];
+      }
 
       const bodyWithSummary =
         hasSummaryBody && promptCacheProvider == null
@@ -1175,6 +1230,84 @@ export class AgentContext {
     );
 
     return [...cacheablePrefix, ...tail, ...cacheableTrailingMessages];
+  }
+
+  /**
+   * OpenAI models behind OpenRouter read a cached prefix back only from a
+   * system, user or tool breakpoint (observed in live probes; an assistant
+   * breakpoint gives nothing to read), so their volatile context follows the
+   * latest user message, which carries the conversation breakpoint.
+   */
+  private anchorsPromptCacheOnUser(
+    promptCacheProvider: PromptCacheProvider | undefined
+  ): boolean {
+    if (promptCacheProvider !== Providers.OPENROUTER) {
+      return false;
+    }
+    const model = (this.clientOptions as { model?: string } | undefined)?.model;
+    return (
+      typeof model === 'string' && model.toLowerCase().startsWith('openai/')
+    );
+  }
+
+  private buildUserAnchoredPromptCacheBody({
+    messages,
+    dynamicInstructions,
+    hasSummaryBody,
+    ttl,
+  }: {
+    messages: BaseMessage[];
+    dynamicInstructions: string;
+    hasSummaryBody: boolean;
+    ttl?: PromptCacheTtl;
+  }): BaseMessage[] {
+    const summary = hasSummaryBody
+      ? [this.buildSummaryHumanMessage(undefined)]
+      : [];
+    const dynamic =
+      dynamicInstructions !== '' ? [new HumanMessage(dynamicInstructions)] : [];
+    const anchorIndex = findLastIndex(messages, isUserMessage);
+
+    if (anchorIndex < 0) {
+      return [...summary, ...this.markPromptCacheTail(messages, ttl), ...dynamic];
+    }
+
+    const summaryFirst = this.summaryPrecedesMessages;
+    return [
+      ...(summaryFirst ? summary : []),
+      ...stripAnthropicCacheControl(messages.slice(0, anchorIndex)),
+      ...(!summaryFirst ? summary : []),
+      ...addTailCacheControl([messages[anchorIndex]], ttl),
+      ...dynamic,
+      ...this.markPromptCacheTail(messages.slice(anchorIndex + 1), ttl),
+    ];
+  }
+
+  /**
+   * Marks the last message these models can read a cached prefix back from.
+   * Assistant breakpoints give them nothing to read, so the marker passes
+   * over assistant messages, such as a predecessor agent's reply before a
+   * handoff cue, and a tail with nothing else to mark carries none.
+   */
+  private markPromptCacheTail(
+    messages: BaseMessage[],
+    ttl?: PromptCacheTtl
+  ): BaseMessage[] {
+    const stripped = stripAnthropicCacheControl(messages);
+    for (let index = stripped.length - 1; index >= 0; index--) {
+      if (stripped[index].getType() === 'ai') {
+        continue;
+      }
+      const [marked] = addTailCacheControl([stripped[index]], ttl);
+      if (hasCacheMarker(marked)) {
+        return [
+          ...stripped.slice(0, index),
+          marked,
+          ...stripped.slice(index + 1),
+        ];
+      }
+    }
+    return stripped;
   }
 
   private getPromptCacheDynamicTailIndex(
@@ -1315,6 +1448,9 @@ export class AgentContext {
     }
 
     if (promptCacheProvider === Providers.OPENROUTER && !stableInstructions) {
+      if (shouldMoveDynamicInstructions) {
+        return undefined;
+      }
       return new SystemMessage(dynamicInstructions);
     }
 
