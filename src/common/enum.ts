@@ -12,6 +12,9 @@ export enum GraphEvents {
   /** Registry-only: ToolNode has taken ownership of an accepted message's calls. */
   ON_MODEL_TOOLS_CLAIMED = 'on_model_tools_claimed',
 
+  /** Registry-only: provider output items of a finished tool round, for the content aggregator. */
+  ON_PROVIDER_OUTPUT_ITEMS = 'on_provider_output_items',
+
   /** [Custom] Agent update event in multi-agent graph/workflow */
   ON_AGENT_UPDATE = 'on_agent_update',
   /** [Custom] Delta event for run steps (message creation and tool calls) */

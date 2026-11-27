@@ -163,6 +163,7 @@ async function captureFallback(
   fallbackConfig: t.FallbackConfig,
   options: Partial<Parameters<typeof createRun>[0]> & {
     legacy?: boolean;
+    replay?: boolean;
     textOnly?: boolean;
   } = {}
 ): Promise<BaseMessage[]> {
@@ -180,6 +181,9 @@ async function captureFallback(
   const context = run.Graph.agentContexts.get('default');
   if (context != null && options.legacy === true) {
     context.useLegacyContent = true;
+  }
+  if (context != null && options.replay === true) {
+    context.providerReasoningReplay = true;
   }
   if (context != null && options.textOnly === true) {
     context.vision = false;
@@ -344,6 +348,33 @@ describe('context overflow recovery', () => {
       }
     );
     expect(result.some((message) => message.getType() === 'tool')).toBe(false);
+  });
+
+  it('sends restored signed reasoning only to a fallback with the primary model', async () => {
+    const sent = async (fallbackModel: string, replay = true): Promise<boolean> =>
+      JSON.stringify(
+        await captureFallback(
+          [
+            new HumanMessage('Earlier question'),
+            new AIMessage({
+              content: [
+                { type: 'thinking', thinking: 'plan', signature: 'sig-1' },
+                { type: 'text', text: 'Earlier answer' },
+              ],
+            }),
+            new HumanMessage('Latest'),
+          ],
+          {
+            provider: Providers.ANTHROPIC,
+            clientOptions: { model: fallbackModel },
+          },
+          { model: 'claude-sonnet-5', replay }
+        )
+      ).includes('sig-1');
+
+    expect(await sent('claude-sonnet-5')).toBe(true);
+    expect(await sent('claude-haiku-5')).toBe(false);
+    expect(await sent('claude-haiku-5', false)).toBe(true);
   });
 
   it('compacts only synthetic fallback context to fit a smaller window', async () => {

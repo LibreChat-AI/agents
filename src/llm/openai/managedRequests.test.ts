@@ -163,6 +163,9 @@ describe('managed GPT-5.6 request fields', () => {
 
   it('requests encrypted reasoning whenever persisted or stateless replay may be needed', () => {
     expect(shouldIncludeEncryptedReasoning('gpt-5.6', {})).toBe(true);
+    expect(shouldIncludeEncryptedReasoning('openai.gpt-5.6-terra', {})).toBe(
+      true
+    );
     expect(
       shouldIncludeEncryptedReasoning('gpt-5.6', {
         reasoning: { context: 'all_turns' },
