@@ -7,6 +7,7 @@ import {
   SystemMessage,
   ToolMessage,
 } from '@langchain/core/messages';
+import type { ContentBlock } from '@langchain/core/messages';
 import {
   encodingForModel,
   createTokenCounter,
@@ -1098,6 +1099,58 @@ describe('estimateDocumentBlockTokens', () => {
     const block = { type: 'file', source_type: 'url', url: 'https://x/y.pdf' };
     expect(estimateDocumentBlockTokens(block, 'o200k_base', countChars)).toBe(
       2000
+    );
+  });
+
+  test.each([
+    ['audio/mpeg', 320_000],
+    ['video/mp4', 1_000_000],
+    ['Audio/WAV; rate=16000', 320_000],
+  ])(
+    '@scenario:timed-media-file-priced-by-duration prices %s in a file block by duration',
+    (mimeType, chars) => {
+      const data = 'A'.repeat(chars);
+      const block = {
+        type: 'file',
+        source_type: 'base64',
+        mime_type: mimeType,
+        data,
+      };
+      expect(estimateDocumentBlockTokens(block, 'o200k_base', countChars)).toBe(
+        estimateTimedMediaBlockTokens({ type: 'media', mimeType, data })
+      );
+    }
+  );
+
+  test('@scenario:timed-media-file-priced-by-duration counts a message carrying audio in a file block as it counts the same audio in a media part', () => {
+    const data = Buffer.alloc(2 * 1024 * 1024, 7).toString('base64');
+    const count = (part: ContentBlock): number =>
+      getTokenCountForMessage(
+        new HumanMessage({
+          content: [{ type: 'text', text: 'Summarize the recording' }, part],
+        }),
+        countChars
+      );
+
+    const asFile = count({
+      type: 'file',
+      source_type: 'base64',
+      mime_type: 'audio/mpeg',
+      data,
+    });
+    expect(asFile).toBe(count({ type: 'media', mimeType: 'audio/mpeg', data }));
+    expect(asFile).toBeLessThan(10_000);
+  });
+
+  test('remote audio in a file block uses the timed media fallback', () => {
+    const block = {
+      type: 'file',
+      source_type: 'url',
+      mime_type: 'audio/mpeg',
+      url: 'https://x/memo.mp3',
+    };
+    expect(estimateDocumentBlockTokens(block, 'o200k_base', countChars)).toBe(
+      960
     );
   });
 });
