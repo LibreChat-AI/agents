@@ -829,10 +829,53 @@ function parseSearchResults(stdout: string): t.ToolSearchResponse {
  * carried inside the JSON so the output stays parseable
  * @returns JSON string with search results
  */
+const TOOL_SEARCH_NEXT_GUIDANCE =
+  'call these directly; they stay loaded for the rest of the conversation';
+
+type ToolSearchRef = t.ToolSearchResponse['tool_references'][number];
+
+function findLoadedNameHits(
+  loadedTools: readonly t.LCTool[],
+  query: string,
+  maxResults: number
+): ToolSearchRef[] {
+  const trimmed = query.trim().toLowerCase();
+  if (trimmed === '' || loadedTools.length === 0) {
+    return [];
+  }
+  const tokens = new Set<string>([trimmed]);
+  for (const word of trimmed.split(/\s+/)) {
+    if (word !== '') {
+      tokens.add(word);
+    }
+  }
+
+  const hits: ToolSearchRef[] = [];
+  for (const lcTool of loadedTools) {
+    const fullName = lcTool.name.toLowerCase();
+    const baseName = getBaseToolName(lcTool.name).toLowerCase();
+    if (tokens.has(fullName) || tokens.has(baseName)) {
+      hits.push({
+        tool_name: lcTool.name,
+        match_score: 1,
+        matched_field: 'name',
+        snippet: lcTool.description
+          ? lcTool.description.slice(0, 120)
+          : lcTool.name,
+      });
+      if (hits.length >= maxResults) {
+        break;
+      }
+    }
+  }
+  return hits;
+}
+
 function formatSearchResults(
   searchResponse: t.ToolSearchResponse,
   nameFormat: t.McpNameFormat = 'full',
-  notes: string[] = []
+  notes: string[] = [],
+  loadedStatusByTool?: ReadonlyMap<string, 'loaded' | 'already_loaded'>
 ): string {
   const { tool_references, total_tools_searched, pattern_used } =
     searchResponse;
@@ -840,11 +883,13 @@ function formatSearchResults(
 
   const output = {
     found: tool_references.length,
+    ...(tool_references.length > 0 ? { next: TOOL_SEARCH_NEXT_GUIDANCE } : {}),
     tools: tool_references.map((ref) => ({
       name: useFullName ? ref.tool_name : getBaseToolName(ref.tool_name),
       score: Number(ref.match_score.toFixed(2)),
       matched_in: ref.matched_field,
       snippet: ref.snippet,
+      status: loadedStatusByTool?.get(ref.tool_name) ?? 'loaded',
     })),
     total_searched: total_tools_searched,
     query: pattern_used,
@@ -1121,6 +1166,7 @@ ${mcpNote}${toolsListSection}
        * single traversal, with no staging array and no copy of the registry. */
       const staged: t.LCTool[] | undefined = hasServerFilter ? [] : undefined;
       const deferredTools: t.ToolMetadata[] = [];
+      const loadedCandidates: t.LCTool[] = [];
       let searchableCount = 0;
 
       const describeTool = (lcTool: t.LCTool): t.ToolMetadata => ({
@@ -1140,6 +1186,7 @@ ${mcpNote}${toolsListSection}
           }
         }
         if (onlyDeferred === true && lcTool.defer_loading !== true) {
+          loadedCandidates.push(lcTool);
           continue;
         }
         searchableCount += 1;
@@ -1209,7 +1256,48 @@ ${mcpNote}${toolsListSection}
         }
       }
 
+      const loadedTools = hasServerFilter
+        ? loadedCandidates.filter((lcTool) =>
+          isFromAnyMcpServer(lcTool.name, matchedServers)
+        )
+        : loadedCandidates;
+
+      const isServerListing = hasServerFilter && query === '';
+      const loadedHits =
+        mode === 'local' && !isServerListing
+          ? findLoadedNameHits(loadedTools, query, max_results)
+          : [];
+
       if (deferredTools.length === 0) {
+        if (loadedHits.length > 0) {
+          const loadedStatusByTool = new Map<
+            string,
+            'loaded' | 'already_loaded'
+          >(loadedHits.map((hit) => [hit.tool_name, 'already_loaded']));
+          const formattedOutput = formatSearchResults(
+            {
+              tool_references: loadedHits,
+              total_tools_searched: 0,
+              pattern_used: query,
+            },
+            mcpNameFormat,
+            filterNotes,
+            loadedStatusByTool
+          );
+          return [
+            formattedOutput,
+            {
+              tool_references: [],
+              metadata: {
+                total_searched: 0,
+                pattern: query,
+                mcp_server:
+                  serverFilters.length > 0 ? serverFilters : undefined,
+                ...filterMetadata,
+              },
+            },
+          ];
+        }
         /** Say which of the three it is, so an empty result is not read as an
          * outage: nothing is registered, the name did not match anything, or
          * the named server genuinely has no tools. */
@@ -1264,8 +1352,6 @@ ${mcpNote}${toolsListSection}
         ];
       }
 
-      const isServerListing = hasServerFilter && query === '';
-
       if (isServerListing) {
         /** The listing's contract is parseable JSON, so the diagnostics go
          * inside the payload rather than in front of it. */
@@ -1297,11 +1383,39 @@ ${mcpNote}${toolsListSection}
           fields,
           max_results
         );
+        const loadedStatusByTool = new Map<
+          string,
+          'loaded' | 'already_loaded'
+        >();
+        const displayReferences: ToolSearchRef[] = [];
+        const seenNames = new Set<string>();
+        for (const hit of loadedHits) {
+          if (displayReferences.length >= max_results) {
+            break;
+          }
+          seenNames.add(hit.tool_name);
+          loadedStatusByTool.set(hit.tool_name, 'already_loaded');
+          displayReferences.push(hit);
+        }
+        for (const ref of searchResponse.tool_references) {
+          if (displayReferences.length >= max_results) {
+            break;
+          }
+          if (!seenNames.has(ref.tool_name)) {
+            seenNames.add(ref.tool_name);
+            loadedStatusByTool.set(ref.tool_name, 'loaded');
+            displayReferences.push(ref);
+          }
+        }
         /** Diagnostics ride inside the payload; this output is parsed. */
         const formattedOutput = formatSearchResults(
-          searchResponse,
+          {
+            ...searchResponse,
+            tool_references: displayReferences,
+          },
           mcpNameFormat,
-          filterNotes
+          filterNotes,
+          loadedStatusByTool
         );
 
         return [
