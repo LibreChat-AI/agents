@@ -152,7 +152,9 @@ export function fixThoughtSignatures(
 
 type VertexResponseData = Omit<Partial<GenerateContentResponseData>, 'candidates'> & {
   candidates?: Array<Omit<Partial<GeminiResponseCandidate>, 'content'> & {
-    content?: GeminiResponseCandidate['content'];
+    /** Vertex can send a candidate's `content` without `parts`, e.g. `{ role: 'model' }`. */
+    content?: Omit<GeminiResponseCandidate['content'], 'parts'> &
+      Partial<Pick<GeminiResponseCandidate['content'], 'parts'>>;
   }>;
 };
 
@@ -178,9 +180,8 @@ class CustomChatConnection extends ChatConnection<VertexAIClientOptions> {
       responseToChatGeneration: (response): ChatGenerationChunk | null => {
         const data = response.data as VertexResponseData;
         const candidate = data.candidates?.[0];
-        if (candidate?.content == null) return api.responseToChatGeneration(response);
-        const parts = candidate.content.parts;
-        if (parts.length === 0)
+        const parts = candidate?.content?.parts;
+        if (candidate?.content == null || parts == null || parts.length === 0)
           return api.responseToChatGeneration(response);
         let combined: ChatGenerationChunk | undefined;
         let generationInfo: ChatGenerationChunk['generationInfo'];
