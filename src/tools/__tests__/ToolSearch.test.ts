@@ -1622,3 +1622,137 @@ describe('tool_search mcp_server filtering', () => {
     expect(output).not.toContain('The tool registry is empty');
   });
 });
+
+describe('tool_search loaded status and already-loaded name hits', () => {
+  const buildRegistry = () =>
+    new Map(
+      [
+        {
+          name: 'append_to_file',
+          description: 'Append text to a file',
+          defer_loading: true,
+        },
+        {
+          name: 'read_file',
+          description: 'Read a file from disk',
+          defer_loading: false,
+        },
+        {
+          name: 'write_file_mcp_notes',
+          description: 'Write a note file',
+          defer_loading: false,
+        },
+      ].map((tool) => [
+        tool.name,
+        {
+          ...tool,
+          parameters: { type: 'object', properties: {} },
+        },
+      ])
+    );
+
+  it('marks newly discovered deferred tools as loaded and includes next guidance', async () => {
+    const tool = createToolSearch({
+      mode: 'local',
+      toolRegistry: buildRegistry() as never,
+    });
+    const [raw, artifact] = (await tool.func({
+      query: 'append_to_file',
+    })) as [string, { tool_references: { tool_name: string }[] }];
+    const parsed = JSON.parse(raw);
+
+    expect(parsed.found).toBe(1);
+    expect(parsed.next).toBe(
+      'call these directly; they stay loaded for the rest of the conversation'
+    );
+    expect(parsed.tools[0]).toMatchObject({
+      name: 'append_to_file',
+      status: 'loaded',
+    });
+    expect(artifact.tool_references.map((r) => r.tool_name)).toEqual([
+      'append_to_file',
+    ]);
+  });
+
+  it('returns already-loaded tools matched by base name first with already_loaded status', async () => {
+    const tool = createToolSearch({
+      mode: 'local',
+      toolRegistry: buildRegistry() as never,
+    });
+    const [raw, artifact] = (await tool.func({
+      query: 'read_file',
+    })) as [string, { tool_references: { tool_name: string }[] }];
+    const parsed = JSON.parse(raw);
+
+    expect(parsed.found).toBeGreaterThanOrEqual(1);
+    expect(parsed.next).toBe(
+      'call these directly; they stay loaded for the rest of the conversation'
+    );
+    expect(parsed.tools[0]).toMatchObject({
+      name: 'read_file',
+      status: 'already_loaded',
+    });
+    expect(
+      artifact.tool_references.some((r) => r.tool_name === 'read_file')
+    ).toBe(false);
+  });
+
+  it('matches already-loaded MCP tools by full name or base name inside a multi-word query', async () => {
+    const tool = createToolSearch({
+      mode: 'local',
+      toolRegistry: buildRegistry() as never,
+    });
+
+    const [byFull] = (await tool.func({
+      query: 'use write_file_mcp_notes now',
+    })) as [string, unknown];
+    const parsedFull = JSON.parse(byFull);
+    expect(parsedFull.tools[0]).toMatchObject({
+      name: 'write_file_mcp_notes',
+      status: 'already_loaded',
+    });
+
+    const [byBase] = (await tool.func({
+      query: 'write_file',
+    })) as [string, unknown];
+    const parsedBase = JSON.parse(byBase);
+    expect(parsedBase.tools[0]).toMatchObject({
+      name: 'write_file_mcp_notes',
+      status: 'already_loaded',
+    });
+  });
+
+  it('returns already-loaded name hits even when no deferred tools remain', async () => {
+    const allLoaded = new Map(
+      [
+        {
+          name: 'read_file',
+          description: 'Read a file',
+          defer_loading: false,
+        },
+      ].map((tool) => [
+        tool.name,
+        {
+          ...tool,
+          parameters: { type: 'object', properties: {} },
+        },
+      ])
+    );
+
+    const tool = createToolSearch({
+      mode: 'local',
+      toolRegistry: allLoaded as never,
+    });
+    const [raw, artifact] = (await tool.func({
+      query: 'read_file',
+    })) as [string, { tool_references: { tool_name: string }[] }];
+    const parsed = JSON.parse(raw);
+
+    expect(parsed.found).toBe(1);
+    expect(parsed.tools[0]).toMatchObject({
+      name: 'read_file',
+      status: 'already_loaded',
+    });
+    expect(artifact.tool_references).toEqual([]);
+  });
+});
