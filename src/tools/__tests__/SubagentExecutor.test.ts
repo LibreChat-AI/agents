@@ -2493,12 +2493,87 @@ describe('SubagentExecutor', () => {
         subagentRunId: 'test-run_sub_a_sub_b',
         subagentAgentId: 'grandchild',
         runId: 'test-run_sub_a',
+        modelCallRunId: 'lc-call-grandchild-1',
+        seq: 0,
       });
 
       expect(events).toHaveLength(1);
       expect(events[0].runId).toBe('test-run');
       expect(events[0].subagentRunId).toBe('test-run_sub_a_sub_b');
       expect(events[0].subagentType).toBe('nested-grandchild');
+      expect(events[0].modelCallRunId).toBe('lc-call-grandchild-1');
+      expect(events[0].seq).toBe(0);
+    });
+
+    it('preserves native modelCallRunId and per-callback seq across multiple calls and generation groups', async () => {
+      const events: SubagentUsageEvent[] = [];
+      const { factory } = makeCapturingGraphFactory({
+        drive: async (handler) => {
+          await handler.handleLLMEnd?.(
+            {
+              generations: [
+                [
+                  {
+                    text: 'group-0',
+                    message: {
+                      usage_metadata: {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                        total_tokens: 15,
+                      },
+                    },
+                  },
+                ],
+                [
+                  {
+                    text: 'group-1',
+                    message: {
+                      usage_metadata: {
+                        input_tokens: 20,
+                        output_tokens: 7,
+                        total_tokens: 27,
+                      },
+                    },
+                  },
+                ],
+              ],
+            } as unknown as LLMResult,
+            'lc-call-batch-1'
+          );
+          await handler.handleLLMEnd?.(
+            makeLLMEndOutput({
+              input_tokens: 30,
+              output_tokens: 10,
+              total_tokens: 40,
+            }),
+            'lc-call-2'
+          );
+        },
+      });
+      const executor = createExecutor({
+        usageSink: (event) => {
+          events.push(event);
+        },
+        createChildGraph: factory,
+      });
+
+      await executor.execute({
+        description: 'Research this topic',
+        subagentType: 'researcher',
+      });
+
+      expect(events).toHaveLength(3);
+      expect(
+        events.map((e) => ({
+          runId: e.runId,
+          modelCallRunId: e.modelCallRunId,
+          seq: e.seq,
+        }))
+      ).toEqual([
+        { runId: 'test-run', modelCallRunId: 'lc-call-batch-1', seq: 0 },
+        { runId: 'test-run', modelCallRunId: 'lc-call-batch-1', seq: 1 },
+        { runId: 'test-run', modelCallRunId: 'lc-call-2', seq: 0 },
+      ]);
     });
 
     it('does not attach a capture callback when no sink is provided', async () => {
