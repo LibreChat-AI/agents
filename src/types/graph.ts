@@ -907,6 +907,19 @@ export interface SubagentUsageEvent {
    * emitting child).
    */
   runId: string;
+  /**
+   * Native LangChain callback run ID of the model call (`handleLLMEnd(output, runId)`).
+   * Preserved verbatim across nested subagent forwarding so hosts can correlate
+   * and idempotently settle per-model-call usage.
+   */
+  modelCallRunId?: string;
+  /**
+   * Zero-based sequence index of this emitted usage event within the
+   * `modelCallRunId` callback (`0` for a single usage-bearing generation group;
+   * increments per usage-bearing generation group in batched calls). Preserved
+   * verbatim across nested subagent forwarding.
+   */
+  seq?: number;
 }
 
 /**

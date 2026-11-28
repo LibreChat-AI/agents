@@ -4146,6 +4146,7 @@ function createUsageCaptureHandler(args: {
         callInfo?.model ??
         resolveClientOptionsModel(memberInput?.clientOptions);
       const callProvider = callInfo?.provider ?? memberInput?.provider;
+      let seq = 0;
       for (const generationGroup of output.generations) {
         /**
          * At most ONE event per generation group: each group is one
@@ -4162,6 +4163,7 @@ function createUsageCaptureHandler(args: {
           if (usage == null) {
             continue;
           }
+          const eventSeq = seq++;
           /**
            * Awaited so async host sinks (billing/persistence) complete
            * before the model call resolves — `awaitHandlers` only waits on
@@ -4183,6 +4185,8 @@ function createUsageCaptureHandler(args: {
               depth: executionContext.depth,
               ancestry: executionContext.ancestry,
               runId: executionContext.rootRunId,
+              modelCallRunId: runId,
+              seq: eventSeq,
             });
           } catch {
             /* observational — a throwing/rejecting host sink must not break the child run */
