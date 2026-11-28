@@ -895,6 +895,28 @@ function retainCodeSessionInputs(
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
+const CODE_WRITING_TOOL_NAMES = new Set<string>([
+  Constants.EXECUTE_CODE,
+  'bash_tool',
+]);
+const READ_FILE_TOOL_NAME = 'read_file';
+
+function hasCodeWriterAndReadFile(calls: ReadonlyArray<ToolCall>): boolean {
+  let hasCodeWriter = false;
+  let hasReadFile = false;
+  for (const call of calls) {
+    if (CODE_WRITING_TOOL_NAMES.has(call.name)) {
+      hasCodeWriter = true;
+    } else if (call.name === READ_FILE_TOOL_NAME) {
+      hasReadFile = true;
+    }
+    if (hasCodeWriter && hasReadFile) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export class ToolNode<T = any> extends RunnableCallable<T, T> {
   private toolMap: Map<string, StructuredToolInterface | RunnableToolLike>;
   private loadRuntimeTools?: t.ToolRefGenerator;
@@ -5513,30 +5535,75 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       return restoreResult(call, result);
     };
 
+    const runPositionsGroup = async (
+      positions: number[]
+    ): Promise<(BaseMessage | Command)[]> => {
+      const groupCalls = positions.map((pos) => directCalls[pos]);
+      if (!hasCodeWriterAndReadFile(groupCalls)) {
+        const results = await Promise.allSettled(
+          positions.map((pos) => runOne(directCalls[pos], pos))
+        );
+        this.throwIfBreakerTripped(config);
+        const failed =
+          results.find(
+            (result) =>
+              result.status === 'rejected' && !isGraphInterrupt(result.reason)
+          ) ?? results.find((result) => result.status === 'rejected');
+        if (failed?.status === 'rejected') {
+          throw failed.reason;
+        }
+        return results.map((result) => {
+          if (result.status === 'rejected') {
+            throw result.reason;
+          }
+          return result.value.output;
+        });
+      }
+
+      const primarySlotIndices: number[] = [];
+      const readFileSlotIndices: number[] = [];
+      for (let slot = 0; slot < positions.length; slot++) {
+        if (directCalls[positions[slot]].name === READ_FILE_TOOL_NAME) {
+          readFileSlotIndices.push(slot);
+        } else {
+          primarySlotIndices.push(slot);
+        }
+      }
+
+      const groupOutputs: (BaseMessage | Command)[] = new Array(
+        positions.length
+      );
+      for (const phaseSlots of [primarySlotIndices, readFileSlotIndices]) {
+        const results = await Promise.allSettled(
+          phaseSlots.map((slot) => runOne(directCalls[positions[slot]], positions[slot]))
+        );
+        this.throwIfBreakerTripped(config);
+        const failed =
+          results.find(
+            (result) =>
+              result.status === 'rejected' && !isGraphInterrupt(result.reason)
+          ) ?? results.find((result) => result.status === 'rejected');
+        if (failed?.status === 'rejected') {
+          throw failed.reason;
+        }
+        phaseSlots.forEach((slot, k) => {
+          const result = results[k];
+          if (result.status === 'rejected') {
+            throw result.reason;
+          }
+          groupOutputs[slot] = result.value.output;
+        });
+      }
+      return groupOutputs;
+    };
+
     const interrupting = this.interruptingToolNames;
     const hasInterrupting =
       interrupting != null &&
       directCalls.some((call) => interrupting.has(call.name));
 
     if (!hasInterrupting) {
-      const results = await Promise.allSettled(
-        directCalls.map((call, i) => runOne(call, i))
-      );
-      this.throwIfBreakerTripped(config);
-      const failed =
-        results.find(
-          (result) =>
-            result.status === 'rejected' && !isGraphInterrupt(result.reason)
-        ) ?? results.find((result) => result.status === 'rejected');
-      if (failed?.status === 'rejected') {
-        throw failed.reason;
-      }
-      return results.map((result) => {
-        if (result.status === 'rejected') {
-          throw result.reason;
-        }
-        return result.value.output;
-      });
+      return runPositionsGroup(directCalls.map((_, i) => i));
     }
 
     const outputs: (BaseMessage | Command)[] = new Array(directCalls.length);
@@ -5632,11 +5699,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     this.throwIfBreakerTripped(config);
 
     // No interrupting call suspended — safe to run the remaining siblings.
-    const regularOutputs = await Promise.all(
-      regularPositions.map((i) => runOne(directCalls[i], i))
-    );
+    const regularOutputs = await runPositionsGroup(regularPositions);
     regularPositions.forEach((i, k) => {
-      outputs[i] = regularOutputs[k].output;
+      outputs[i] = regularOutputs[k];
     });
 
     return outputs;
@@ -5660,6 +5725,48 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     input: any,
     batchContext: DispatchBatchContext = {}
   ): Promise<T> {
+    if (hasCodeWriterAndReadFile(toolCalls)) {
+      const primaryIndices: number[] = [];
+      const readFileIndices: number[] = [];
+      for (let i = 0; i < toolCalls.length; i++) {
+        if (toolCalls[i].name === READ_FILE_TOOL_NAME) {
+          readFileIndices.push(i);
+        } else {
+          primaryIndices.push(i);
+        }
+      }
+      const sliceBatchContext = (indices: number[]): DispatchBatchContext => ({
+        ...batchContext,
+        ...(batchContext.batchIndices != null && {
+          batchIndices: indices.map((i) => batchContext.batchIndices![i]),
+        }),
+      });
+      const primaryResult = await this.dispatchToolEvents(
+        primaryIndices.map((i) => toolCalls[i]),
+        config,
+        sliceBatchContext(primaryIndices)
+      );
+      this.throwIfBreakerTripped(config);
+      const readFileResult = await this.dispatchToolEvents(
+        readFileIndices.map((i) => toolCalls[i]),
+        config,
+        sliceBatchContext(readFileIndices)
+      );
+      const orderedToolMessages: BaseMessage[] = new Array(toolCalls.length);
+      primaryIndices.forEach((origIdx, k) => {
+        orderedToolMessages[origIdx] = primaryResult.toolMessages[k];
+      });
+      readFileIndices.forEach((origIdx, k) => {
+        orderedToolMessages[origIdx] = readFileResult.toolMessages[k];
+      });
+      const outputs: BaseMessage[] = [
+        ...orderedToolMessages,
+        ...primaryResult.injected,
+        ...readFileResult.injected,
+      ];
+      return (Array.isArray(input) ? outputs : { messages: outputs }) as T;
+    }
+
     const { toolMessages, injected } = await this.dispatchToolEvents(
       toolCalls,
       config,
