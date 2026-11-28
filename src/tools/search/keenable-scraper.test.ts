@@ -3,6 +3,16 @@ import { createKeenableScraper } from './keenable-scraper';
 
 jest.mock('axios');
 const mockedAxios = axios as jest.Mocked<typeof axios>;
+const actualAxios = jest.requireActual<typeof axios>('axios');
+
+const httpError = (
+  status: number,
+  headers: Record<string, string> = {}
+): Error =>
+  Object.assign(new Error(`Request failed with status code ${status}`), {
+    isAxiosError: true,
+    response: { status, headers },
+  });
 
 const sampleResponse = {
   data: {
@@ -17,6 +27,7 @@ const sampleResponse = {
 describe('Keenable scraper', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    mockedAxios.isAxiosError.mockImplementation(actualAxios.isAxiosError);
     delete process.env.KEENABLE_API_KEY;
     delete process.env.KEENABLE_FETCH_URL;
   });
@@ -103,6 +114,79 @@ describe('Keenable scraper', () => {
 
     expect(response.success).toBe(false);
     expect(response.error).toContain('network down');
+  });
+
+  describe('rate limiting', () => {
+    beforeEach(() => {
+      jest.useFakeTimers();
+      jest.spyOn(Math, 'random').mockReturnValue(0);
+    });
+
+    afterEach(() => {
+      jest.useRealTimers();
+      jest.restoreAllMocks();
+    });
+
+    it('retries a 429 and returns the page once the retry succeeds', async () => {
+      mockedAxios.get
+        .mockRejectedValueOnce(httpError(429, { 'retry-after': '1' }))
+        .mockResolvedValueOnce(sampleResponse);
+
+      const scraper = createKeenableScraper();
+      const pending = scraper.scrapeUrl('https://example.com');
+      await jest.advanceTimersByTimeAsync(1000);
+      const [, response] = await pending;
+
+      expect(mockedAxios.get).toHaveBeenCalledTimes(2);
+      expect(response.success).toBe(true);
+      expect(response.data?.content).toContain('# Example Domain');
+    });
+
+    it('gives up after two retries and reports the 429', async () => {
+      const rateLimited = httpError(429, { 'retry-after': '1' });
+      mockedAxios.get
+        .mockRejectedValueOnce(rateLimited)
+        .mockRejectedValueOnce(rateLimited)
+        .mockRejectedValueOnce(rateLimited);
+
+      const scraper = createKeenableScraper();
+      const pending = scraper.scrapeUrl('https://example.com');
+      await jest.advanceTimersByTimeAsync(2000);
+      const [, response] = await pending;
+
+      expect(mockedAxios.get).toHaveBeenCalledTimes(3);
+      expect(response.success).toBe(false);
+      expect(response.error).toContain('status code 429');
+    });
+
+    it.each([
+      ['honors Retry-After', { 'retry-after': '2' }, 2000],
+      ['caps a long Retry-After', { 'retry-after': '60' }, 3000],
+      ['falls back without Retry-After', {}, 1000],
+    ])('%s', async (_name, headers, expectedDelayMs) => {
+      mockedAxios.get
+        .mockRejectedValueOnce(httpError(429, headers))
+        .mockResolvedValueOnce(sampleResponse);
+
+      const scraper = createKeenableScraper();
+      const pending = scraper.scrapeUrl('https://example.com');
+      await jest.advanceTimersByTimeAsync(expectedDelayMs - 1);
+      expect(mockedAxios.get).toHaveBeenCalledTimes(1);
+      await jest.advanceTimersByTimeAsync(1);
+      expect(mockedAxios.get).toHaveBeenCalledTimes(2);
+      expect((await pending)[1].success).toBe(true);
+    });
+
+    it('does not retry other HTTP errors', async () => {
+      mockedAxios.get.mockRejectedValueOnce(httpError(500));
+
+      const scraper = createKeenableScraper();
+      const [, response] = await scraper.scrapeUrl('https://example.com');
+
+      expect(mockedAxios.get).toHaveBeenCalledTimes(1);
+      expect(response.success).toBe(false);
+      expect(response.error).toContain('status code 500');
+    });
   });
 
   it('scrapes multiple URLs concurrently', async () => {
